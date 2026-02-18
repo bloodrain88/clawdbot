@@ -99,8 +99,8 @@ class LiveTrader:
 
         # Check USDC balance
         try:
-            bal = self.clob.get_collateral_balance()
-            print(f"{G}[CLOB] USDC balance: ${float(bal):.2f}{RS}")
+            bal = self.clob.get_balance_allowance()  # USDC collateral
+            print(f"{G}[CLOB] USDC balance: {bal}{RS}")
         except Exception as e:
             print(f"{Y}[CLOB] Balance check failed (need USDC on Polygon): {e}{RS}")
 
