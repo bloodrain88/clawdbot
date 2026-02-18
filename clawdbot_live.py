@@ -36,7 +36,8 @@ ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.06     # 6% min edge
-BET_SIZE_PCT   = 0.01     # 1% per trade
+MIN_BET        = 5.0      # $5 min per trade
+MAX_BET        = 10.0     # $10 max per trade
 MAX_DAILY_LOSS = 0.05     # 5% hard stop
 SCAN_INTERVAL  = 10
 PING_INTERVAL  = 5
@@ -316,7 +317,7 @@ class LiveTrader:
         side       = "Up" if edge_up > 0 else "Down"
         edge       = abs(edge_up)
         entry      = up_price if side == "Up" else (1 - up_price)
-        size       = round(min(self.bankroll * BET_SIZE_PCT, self.bankroll * 0.03), 2)
+        size       = round(max(MIN_BET, min(MAX_BET, self.bankroll * 0.10)), 2)
         token_id   = m["token_up"] if side == "Up" else m["token_down"]
 
         if not token_id:
