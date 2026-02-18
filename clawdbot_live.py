@@ -28,7 +28,7 @@ load_dotenv(os.path.expanduser("~/.clawdbot.env"))
 
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON, AMOY
-from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
+from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, AssetType, BalanceAllowanceParams
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
@@ -99,10 +99,13 @@ class LiveTrader:
 
         # Check USDC balance
         try:
-            bal = self.clob.get_balance_allowance()  # USDC collateral
-            print(f"{G}[CLOB] USDC balance: {bal}{RS}")
+            bal = self.clob.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            usdc = float(bal.get("balance", 0))
+            print(f"{G}[CLOB] USDC balance: ${usdc:.2f}{RS}")
+            if usdc < 10 and not DRY_RUN:
+                print(f"{R}[WARN] Saldo basso! Fondi il wallet prima di fare trading live.{RS}")
         except Exception as e:
-            print(f"{Y}[CLOB] Balance check failed (need USDC on Polygon): {e}{RS}")
+            print(f"{Y}[CLOB] Balance: {e}{RS}")
 
     # ── LOG ───────────────────────────────────────────────────────────────────
     def _init_log(self):
