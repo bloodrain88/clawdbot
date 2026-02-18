@@ -387,7 +387,7 @@ class PaperTrader:
                         self.prices[asset] = val
                         now = datetime.now(timezone.utc).timestamp()
                         for cid, m in self.active_mkts.items():
-                            if m.get("asset") == asset and cid not in self.open_prices:
+                            if m.get("asset") == asset:
                                 if abs(now - m.get("start_ts", 0)) < 30:
                                     self.open_prices[cid] = val
                         self._print_live(asset, val)
