@@ -147,7 +147,7 @@ class PaperTrader:
                             now = datetime.now(timezone.utc).timestamp()
                             # Capture open price for markets just starting
                             for cid, m in self.active_mkts.items():
-                                if m.get("asset") == asset and cid not in self.open_prices:
+                                if m.get("asset") == asset:
                                     st = m.get("start_ts", 0)
                                     if abs(now - st) < 30:
                                         self.open_prices[cid] = val
