@@ -413,6 +413,25 @@ class LiveTrader:
                 f"Bank ${self.bankroll:.2f} | WR {wr}"
             )
 
+            # Redeem winning tokens → USDC back to wallet
+            if won and not DRY_RUN:
+                asyncio.create_task(self._redeem(trade))
+
+    # ── REDEEM WINNING TOKENS → USDC ──────────────────────────────────────────
+    async def _redeem(self, trade: dict):
+        """After market resolves, redeem winning CTF tokens back to USDC."""
+        try:
+            loop = asyncio.get_event_loop()
+            token_id = trade["token_id"]
+            # Wait 60s for Polymarket to process resolution on-chain
+            await asyncio.sleep(60)
+            resp = await loop.run_in_executor(
+                None, lambda: self.clob.redeem(token_id=token_id)
+            )
+            print(f"{G}[REDEEM]{RS} {trade['asset']} {trade['side']} | USDC → wallet | {resp}")
+        except Exception as e:
+            print(f"{Y}[REDEEM] {trade['asset']}: {e} (may need manual redeem on polymarket.com){RS}")
+
     # ── MATH ──────────────────────────────────────────────────────────────────
     def _prob_up(self, current, open_price, mins_left, vol):
         if open_price <= 0 or vol <= 0 or mins_left <= 0:
