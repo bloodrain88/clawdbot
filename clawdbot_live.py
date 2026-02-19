@@ -340,18 +340,21 @@ class LiveTrader:
             side       = t.get("side", "?")
             size       = t.get("size", 0)
             open_p     = t.get("open_price", 0)
-            cur_p      = self._current_price(asset)
+            # Use Chainlink (resolution source) for win/loss; fall back to RTDS if unavailable
+            cl_p       = self.cl_prices.get(asset, 0)
+            cur_p      = cl_p if cl_p > 0 else self.prices.get(asset, 0)
             end_ts     = t.get("end_ts", 0)
             mins_left  = max(0, (end_ts - now_ts) / 60)
             title      = m.get("question", "")[:38]
+            src        = "CL" if cl_p > 0 else "RTDS"
             winning    = (side == "Up" and cur_p > open_p) or (side == "Down" and cur_p < open_p)
             move_pct   = ((cur_p - open_p) / open_p * 100) if open_p > 0 else 0
             c          = G if winning else R
             status_str = "WIN" if winning else "LOSS"
             payout_est = size / t.get("entry", 0.5) if winning else 0
             print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
-                  f"open={open_p:.2f} now={cur_p:.2f} ({move_pct:+.2f}%) | "
-                  f"bet=${size:.2f} est_return=${payout_est:.2f} | {mins_left:.1f}min left")
+                  f"open={open_p:.2f} {src}={cur_p:.2f} ({move_pct:+.2f}%) | "
+                  f"bet=${size:.2f} est=${payout_est:.2f} | {mins_left:.1f}min left")
 
     # ── RTDS ──────────────────────────────────────────────────────────────────
     async def stream_rtds(self):
