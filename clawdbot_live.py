@@ -408,8 +408,7 @@ class LiveTrader:
                     )
                     price   = data[1] / 1e8
                     updated = data[3]
-                    import time as _t
-                    age     = _t.time() - updated
+                    age     = _time.time() - updated
                     if age < 60:   # only use if fresh (<60s)
                         self.cl_prices[asset]  = price
                         self.cl_updated[asset] = updated
@@ -418,13 +417,13 @@ class LiveTrader:
             await asyncio.sleep(5)
 
     def _current_price(self, asset: str) -> float:
-        """Best available price: Chainlink if fresh (<45s), else RTDS fallback."""
-        import time as _t
-        cl = self.cl_prices.get(asset, 0)
-        cl_age = _t.time() - self.cl_updated.get(asset, 0)
-        if cl > 0 and cl_age < 45:
-            return cl
-        return self.prices.get(asset, 0)   # RTDS fallback
+        """For direction decisions: RTDS (real-time) is current price.
+        Chainlink is used only as open_price baseline (set once at market start).
+        Fallback to Chainlink if RTDS not yet streaming."""
+        rtds = self.prices.get(asset, 0)
+        if rtds > 0:
+            return rtds
+        return self.cl_prices.get(asset, 0)
 
     def _kelly_size(self, true_prob: float, entry: float, edge: float = 0.0) -> float:
         """Kelly bet size with dynamic ceiling scaled by edge strength.
