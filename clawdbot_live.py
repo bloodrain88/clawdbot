@@ -95,18 +95,33 @@ class LiveTrader:
         self.vols        = {"BTC": 0.65, "ETH": 0.80, "SOL": 1.20, "XRP": 0.90}
         self.open_prices = {}
         self.active_mkts = {}
-        self.pending     = {}   # cid → (m, trade)
-        self.seen        = set()
-        self.bankroll    = BANKROLL
-        self.start_bank  = BANKROLL
-        self.daily_pnl   = 0.0
-        self.total       = 0
-        self.wins        = 0
-        self.start_time  = datetime.now(timezone.utc)
-        self.rtds_ok     = False
-        self.clob        = None
+        self.pending         = {}   # cid → (m, trade)
+        self.pending_redeem  = {}   # cid → (side, asset)  — waiting on-chain resolution
+        self.seen            = set()
+        self.bankroll        = BANKROLL
+        self.start_bank      = BANKROLL
+        self.daily_pnl       = 0.0
+        self.total           = 0
+        self.wins            = 0
+        self.start_time      = datetime.now(timezone.utc)
+        self.rtds_ok         = False
+        self.clob            = None
+        self.w3              = None   # shared Polygon RPC connection
         self._init_log()
         self._load_pending()
+        self._init_w3()
+
+    def _init_w3(self):
+        for rpc in POLYGON_RPCS:
+            try:
+                _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+                _w3.eth.block_number
+                self.w3 = _w3
+                print(f"{G}[RPC] Connected: {rpc}{RS}")
+                return
+            except Exception:
+                continue
+        print(f"{Y}[RPC] No working Polygon RPC — on-chain redemption disabled{RS}")
 
     def _save_pending(self):
         try:
@@ -534,60 +549,57 @@ class LiveTrader:
                 f"Bank ${self.bankroll:.2f} | WR {wr}"
             )
 
-            # Redeem winning tokens → USDC back to wallet
+            # Queue winning tokens for instant on-chain redemption
             if won and not DRY_RUN:
-                asyncio.create_task(self._redeem(k, trade))
+                self.pending_redeem[k] = (trade["side"], asset)
 
-    # ── REDEEM WINNING TOKENS → USDC ──────────────────────────────────────────
-    async def _redeem(self, condition_id: str, trade: dict):
-        """Redeem winning CTF tokens on-chain via ConditionalTokens.redeemPositions()."""
-        await asyncio.sleep(300)   # wait 5 min for Polymarket to resolve on-chain
-        asset = trade["asset"]
-        try:
-            cfg        = get_contract_config(CHAIN_ID, neg_risk=False)
-            ctf_addr   = Web3.to_checksum_address(cfg.conditional_tokens)
-            collateral = Web3.to_checksum_address(cfg.collateral)
+    # ── REDEEM LOOP — polls every 30s, redeems as soon as on-chain resolved ──────
+    async def _redeem_loop(self):
+        if DRY_RUN or self.w3 is None:
+            return
+        cfg       = get_contract_config(CHAIN_ID, neg_risk=False)
+        ctf_addr  = Web3.to_checksum_address(cfg.conditional_tokens)
+        collat    = Web3.to_checksum_address(cfg.collateral)
+        acct      = Account.from_key(PRIVATE_KEY)
+        CTF_CHECK = [
+            {"inputs":[{"name":"conditionId","type":"bytes32"}],
+             "name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+        ] + CTF_ABI
+        ctf  = self.w3.eth.contract(address=ctf_addr, abi=CTF_CHECK)
+        loop = asyncio.get_event_loop()
 
-            w3 = None
-            for rpc in POLYGON_RPCS:
+        while True:
+            await asyncio.sleep(30)
+            if not self.pending_redeem:
+                continue
+            done = []
+            for cid, (side, asset) in list(self.pending_redeem.items()):
                 try:
-                    _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
-                    _w3.eth.block_number
-                    w3 = _w3
-                    break
-                except Exception:
-                    continue
-            if w3 is None:
-                print(f"{Y}[REDEEM] {asset}: no RPC — redeem manually on polymarket.com{RS}")
-                return
-
-            acct      = Account.from_key(PRIVATE_KEY)
-            ctf       = w3.eth.contract(address=ctf_addr, abi=CTF_ABI)
-            cid_bytes = bytes.fromhex(condition_id.lstrip("0x").zfill(64))
-            # Up = outcome index 0 → indexSet 1; Down = outcome index 1 → indexSet 2
-            index_set = 1 if trade["side"] == "Up" else 2
-
-            loop = asyncio.get_event_loop()
-            nonce = await loop.run_in_executor(
-                None, lambda: w3.eth.get_transaction_count(acct.address)
-            )
-            tx = ctf.functions.redeemPositions(
-                collateral, b'\x00' * 32, cid_bytes, [index_set]
-            ).build_transaction({
-                "from": acct.address, "nonce": nonce,
-                "gas": 200_000, "gasPrice": w3.eth.gas_price,
-            })
-            signed  = acct.sign_transaction(tx)
-            tx_hash = await loop.run_in_executor(
-                None, lambda: w3.eth.send_raw_transaction(signed.raw_transaction)
-            )
-            receipt = await loop.run_in_executor(
-                None, lambda: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            )
-            status = "OK" if receipt.status == 1 else "FAILED"
-            print(f"{G}[REDEEM]{RS} {asset} {trade['side']} | {status} | tx={tx_hash.hex()[:16]}")
-        except Exception as e:
-            print(f"{Y}[REDEEM] {asset}: {e}{RS}")
+                    cid_bytes = bytes.fromhex(cid.lstrip("0x").zfill(64))
+                    denom = await loop.run_in_executor(
+                        None, lambda b=cid_bytes: ctf.functions.payoutDenominator(b).call()
+                    )
+                    if denom == 0:
+                        continue   # not yet resolved on-chain, try again next cycle
+                    # Resolved — send redeemPositions tx immediately
+                    index_set = 1 if side == "Up" else 2
+                    nonce  = await loop.run_in_executor(None, lambda: self.w3.eth.get_transaction_count(acct.address))
+                    tx     = ctf.functions.redeemPositions(
+                        collat, b'\x00'*32, cid_bytes, [index_set]
+                    ).build_transaction({"from": acct.address, "nonce": nonce, "gas": 200_000, "gasPrice": self.w3.eth.gas_price})
+                    signed  = acct.sign_transaction(tx)
+                    tx_hash = await loop.run_in_executor(None, lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction))
+                    receipt = await loop.run_in_executor(None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60))
+                    if receipt.status == 1:
+                        print(f"{G}[REDEEM] {asset} {side} → USDC received | tx={tx_hash.hex()[:16]}{RS}")
+                        done.append(cid)
+                    else:
+                        print(f"{Y}[REDEEM] {asset} {side} tx failed, retrying...{RS}")
+                except Exception as e:
+                    print(f"{Y}[REDEEM] {asset}: {e}{RS}")
+            for cid in done:
+                self.pending_redeem.pop(cid, None)
 
     # ── MATH ──────────────────────────────────────────────────────────────────
     def _prob_up(self, current, open_price, mins_left, vol):
@@ -656,6 +668,7 @@ class LiveTrader:
             self.scan_loop(),
             self._status_loop(),
             self._refresh_balance(),
+            self._redeem_loop(),
         )
 
 
