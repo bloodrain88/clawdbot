@@ -597,7 +597,7 @@ class LiveTrader:
         self._save_seen()
 
         # ── Place real order ──────────────────────────────────────────────────
-        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left)
+        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob)
 
         trade = {
             "side":          side,
@@ -621,9 +621,10 @@ class LiveTrader:
             self._save_pending()
             self._log(m, trade)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left):
-        """GTC limit order at best_ask+tick — fills immediately if liquidity exists,
-        waits up to 10s, then cancels if unfilled. Returns order_id or None."""
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5):
+        """GTC limit order — checks CLOB price vs AMM price before placing.
+        Skips if CLOB asks more than 12¢ above AMM (illiquid spread destroys edge).
+        Returns order_id or None."""
         if DRY_RUN:
             fake_id = f"DRY-{asset[:3]}-{int(datetime.now(timezone.utc).timestamp())}"
             print(f"{Y}[DRY-RUN]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {price:.3f} | id={fake_id}")
@@ -640,9 +641,24 @@ class LiveTrader:
                 tick = float(book.tick_size or "0.01")
                 asks = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
                 best_ask = float(asks[0].price) if asks else price
-                # Aggressive: pay one tick above best ask to jump the queue
+
+                # Sanity check: CLOB price must be close to AMM price
+                # Large gap = illiquid market, real edge is far lower than calculated
+                clob_edge = true_prob - best_ask
+                gap = best_ask - price
+                if gap > 0.12 or best_ask > 0.92:
+                    print(f"{Y}[SKIP] {asset} {side}: CLOB={best_ask:.3f} >> AMM={price:.3f} "
+                          f"(gap={gap:.3f}) — illiquid, real edge={clob_edge:.3f}, skipping{RS}")
+                    return None
+                if clob_edge < MIN_EDGE:
+                    print(f"{Y}[SKIP] {asset} {side}: real CLOB edge={clob_edge:.3f} < {MIN_EDGE} after spread{RS}")
+                    return None
+
+                # Buy at best_ask + tick to ensure fill
                 buy_price = round(min(best_ask + tick, 0.97), 4)
                 size_tok  = round(size_usdc / buy_price, 2)
+                print(f"{B}[CLOB] {asset} {side}: AMM={price:.3f} CLOB_ask={best_ask:.3f} "
+                      f"real_edge={clob_edge:.3f} buying@{buy_price:.3f}{RS}")
 
                 order_args = OrderArgs(
                     token_id=token_id,
