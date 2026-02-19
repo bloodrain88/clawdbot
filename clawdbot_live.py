@@ -593,7 +593,17 @@ class LiveTrader:
         for k in expired:
             m, trade = self.pending.pop(k)
             self._save_pending()
-            asset  = trade["asset"]
+            asset = trade["asset"]
+
+            # SYNCED positions: we don't know open_price → can't use price comparison.
+            # Queue for on-chain check; _redeem_loop will handle redemption if won.
+            # Bankroll is refreshed by _refresh_balance() from real CLOB balance.
+            if trade.get("order_id") == "SYNCED":
+                print(f"{B}[RESOLVE] Synced {asset} {trade['side']} {trade['duration']}m expired → queued for on-chain check{RS}")
+                if not DRY_RUN:
+                    self.pending_redeem[k] = (trade["side"], asset)
+                continue
+
             price  = self.prices.get(asset, trade["open_price"])
             up_won = price >= trade["open_price"]
             won    = (trade["side"] == "Up" and up_won) or (trade["side"] == "Down" and not up_won)
@@ -707,29 +717,64 @@ class LiveTrader:
 
             self.seen.add(cid)
 
-            # Derive asset from title
-            asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
-                     else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+            # Defaults
+            asset    = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                        else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+            end_ts   = now + 30 * 60
+            start_ts = now - 60
+            duration = 15
+            token_up = token_down = ""
 
-            # Estimate end_ts: current value / size_tok = price → end soon
-            # We don't have exact end_ts but set 30min from now as safe upper bound
-            # _resolve() checks price movement, not exact end_ts for win/loss
-            entry  = (val / size_tok) if size_tok > 0 else 0.5
-            end_ts = now + 30 * 60   # conservative; will be replaced on next scan
+            # Fetch real market data from Gamma API using conditionId
+            try:
+                import requests as _req
+                mkt_data = _req.get(
+                    f"{GAMMA}/markets",
+                    params={"conditionId": cid},
+                    timeout=8
+                ).json()
+                mkt = mkt_data[0] if isinstance(mkt_data, list) and mkt_data else (
+                      mkt_data if isinstance(mkt_data, dict) else {})
+                end_str   = mkt.get("endDate") or mkt.get("end_date", "")
+                start_str = mkt.get("startDate") or mkt.get("start_date", "")
+                if end_str:
+                    end_ts = datetime.fromisoformat(end_str.replace("Z", "+00:00")).timestamp()
+                if start_str:
+                    start_ts = datetime.fromisoformat(start_str.replace("Z", "+00:00")).timestamp()
+                slug = mkt.get("seriesSlug") or mkt.get("series_slug", "")
+                if slug in SERIES:
+                    duration = SERIES[slug]["duration"]
+                    asset    = SERIES[slug]["asset"]
+                tokens = mkt.get("clobTokenIds") or []
+                if isinstance(tokens, str):
+                    try: tokens = json.loads(tokens)
+                    except: tokens = []
+                token_up   = tokens[0] if len(tokens) > 0 else ""
+                token_down = tokens[1] if len(tokens) > 1 else ""
+            except Exception as e:
+                print(f"{Y}[SYNC] Gamma lookup failed for {cid[:10]}: {e}{RS}")
+
+            # Skip if already expired
+            if end_ts <= now:
+                continue
+
+            entry     = (val / size_tok) if size_tok > 0 else 0.5
+            mins_left = (end_ts - now) / 60
 
             m = {"conditionId": cid, "question": title, "asset": asset,
-                 "duration": 15, "end_ts": end_ts, "start_ts": now - 60,
+                 "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
                  "up_price": entry if outcome == "Up" else 1 - entry,
-                 "mins_left": 30, "token_up": "", "token_down": ""}
+                 "mins_left": mins_left, "token_up": token_up, "token_down": token_down}
             trade = {"side": outcome, "size": val, "entry": entry,
                      "open_price": 0, "current_price": 0, "true_prob": 0.5,
-                     "mkt_price": entry, "edge": 0, "mins_left": 30,
-                     "end_ts": end_ts, "asset": asset, "duration": 15,
-                     "token_id": "", "order_id": "SYNCED"}
+                     "mkt_price": entry, "edge": 0, "mins_left": mins_left,
+                     "end_ts": end_ts, "asset": asset, "duration": duration,
+                     "token_id": token_up if outcome == "Up" else token_down,
+                     "order_id": "SYNCED"}
 
             self.pending[cid] = (m, trade)
             synced += 1
-            print(f"{Y}[SYNC] Open position restored: {title[:45]} {outcome} ~${val:.2f}{RS}")
+            print(f"{Y}[SYNC] Restored: {title[:45]} {outcome} ~${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
 
         if synced:
             self._save_pending()
