@@ -609,14 +609,15 @@ class LiveTrader:
         if open_price > 0 and abs(current - open_price) / open_price < MIN_MOVE:
             return
 
-        # Require Chainlink to also have moved — and agree on direction with RTDS.
-        # If they diverge, Polymarket may resolve opposite to what RTDS suggests → skip.
+        # Check RTDS vs Chainlink direction agreement.
+        # If they disagree (RTDS lag vs CL), require stronger CLOB edge to proceed.
         cl_now = self.cl_prices.get(asset, 0)
+        cl_agree = True
         if cl_now > 0 and open_price > 0:
             rtds_up = current > open_price
             cl_up   = cl_now  > open_price
             if rtds_up != cl_up:
-                return  # RTDS and Chainlink disagree on direction — too risky
+                cl_agree = False   # oracles disagree — will require higher CLOB edge
 
         # ── Combined probability: Black-Scholes + Momentum + Direction bias ──
         vol      = self.vols.get(asset, 0.70)
@@ -666,7 +667,7 @@ class LiveTrader:
         self._save_seen()
 
         # ── Place real order ──────────────────────────────────────────────────
-        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob)
+        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob, cl_agree)
 
         trade = {
             "side":          side,
@@ -690,7 +691,7 @@ class LiveTrader:
             self._save_pending()
             self._log(m, trade)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -721,10 +722,12 @@ class LiveTrader:
                 best_bid = float(bids[0].price) if bids else best_ask - 0.10
                 spread   = best_ask - best_bid
 
-                # Taker edge check (minimum bar — maker will be better)
+                # Taker edge check — raise bar when RTDS/Chainlink disagree on direction
+                edge_req   = MIN_EDGE if cl_agree else MIN_EDGE + 0.05
                 taker_edge = true_prob - best_ask
-                if taker_edge < MIN_EDGE:
-                    print(f"{Y}[SKIP] {asset} {side}: taker_edge={taker_edge:.3f} < {MIN_EDGE} "
+                if taker_edge < edge_req:
+                    reason = "oracles disagree" if not cl_agree else f"< {edge_req:.2f}"
+                    print(f"{Y}[SKIP] {asset} {side}: taker_edge={taker_edge:.3f} {reason} "
                           f"(ask={best_ask:.3f} model={true_prob:.3f}){RS}")
                     return None
 
