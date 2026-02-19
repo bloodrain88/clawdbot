@@ -1402,8 +1402,8 @@ class LiveTrader:
             await asyncio.sleep(SCAN_INTERVAL)
 
     async def _refresh_balance(self):
-        """Always sync bankroll from on-chain truth: USDC.e balance + open position values.
-        Never skips — no assumptions about local accounting."""
+        """Always sync bankroll, trades and win rate from on-chain truth.
+        Never skips — no local accounting assumptions."""
         USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
         ERC20_ABI = [{"inputs":[{"name":"account","type":"address"}],
                       "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
@@ -1417,10 +1417,12 @@ class LiveTrader:
             except Exception:
                 pass
 
+        tick = 0
         while True:
             await asyncio.sleep(STATUS_INTERVAL)
             if DRY_RUN or self.w3 is None:
                 continue
+            tick += 1
             try:
                 loop = asyncio.get_event_loop()
                 import requests as _req
@@ -1450,8 +1452,48 @@ class LiveTrader:
                     self.bankroll = total
                     if total > self.peak_bankroll:
                         self.peak_bankroll = total
+
+                # 3. Sync trades + win rate from Polymarket activity API (every 5 ticks ~2.5min)
+                if tick % 5 == 1:
+                    await self._sync_stats_from_api(loop, _req)
+
             except Exception as e:
                 print(f"{Y}[BANK] refresh error: {e}{RS}")
+
+    async def _sync_stats_from_api(self, loop, _req):
+        """Derive total trades and win count from Polymarket activity API.
+        BUY events = bets placed, REDEEM events = winning positions cashed out."""
+        try:
+            activity = await loop.run_in_executor(None, lambda: _req.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": ADDRESS, "limit": "500"},
+                timeout=10
+            ).json())
+            if not isinstance(activity, list):
+                return
+
+            seen_cids  = set()
+            total_bets = 0
+            total_wins = 0
+            for evt in activity:
+                typ = (evt.get("type") or "").upper()
+                cid = evt.get("conditionId") or evt.get("market", {}).get("conditionId", "")
+                if typ in ("BUY", "TRADE", "PURCHASE"):
+                    if cid and cid not in seen_cids:
+                        seen_cids.add(cid)
+                        total_bets += 1
+                elif typ == "REDEEM":
+                    total_wins += 1
+
+            if total_bets > 0:
+                old_t, old_w = self.total, self.wins
+                self.total = total_bets
+                self.wins  = total_wins
+                wr = f"{total_wins/total_bets*100:.1f}%"
+                print(f"{B}[STATS] API sync: {total_bets} trades, {total_wins} wins ({wr}) "
+                      f"[was {old_t}/{old_w}]{RS}")
+        except Exception as e:
+            print(f"{Y}[STATS] activity sync error: {e}{RS}")
 
     async def _redeemable_scan(self):
         """Every 60s, re-scan Polymarket API for redeemable positions not yet queued.
