@@ -121,6 +121,7 @@ class LiveTrader:
         self.active_mkts = {}
         self.pending         = {}   # cid → (m, trade)
         self.pending_redeem  = {}   # cid → (side, asset)  — waiting on-chain resolution
+        self._redeem_queued_ts = {}  # cid → timestamp when queued for redeem
         self.seen            = set()
         self._session        = None   # persistent aiohttp session
         self.cl_prices       = {}    # Chainlink oracle prices (resolution source)
@@ -379,7 +380,8 @@ class LiveTrader:
             else:
                 side_r, asset_r = val
                 size_r = 0; title_r = ""
-            print(f"  {Y}[SETTLING]{RS} {asset_r} {side_r} | {title_r} | bet=${size_r:.2f} | waiting on-chain...")
+            elapsed_r = (_time.time() - self._redeem_queued_ts.get(cid, _time.time())) / 60
+            print(f"  {Y}[SETTLING]{RS} {asset_r} {side_r} | {title_r} | bet=${size_r:.2f} | waiting {elapsed_r:.0f}min")
 
     # ── RTDS ──────────────────────────────────────────────────────────────────
     async def stream_rtds(self):
@@ -960,6 +962,7 @@ class LiveTrader:
             else:
                 # Live: queue for on-chain check — result determined by payoutNumerators
                 self.pending_redeem[k] = (m, trade)
+                self._redeem_queued_ts[k] = _time.time()
                 print(f"{B}[RESOLVE] {asset} {trade['side']} {trade['duration']}m → on-chain queue{RS}")
 
     # ── REDEEM LOOP — polls every 30s, determines win/loss on-chain ───────────
@@ -984,7 +987,7 @@ class LiveTrader:
         loop = asyncio.get_event_loop()
 
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
             if not self.pending_redeem:
                 continue
             done = []
