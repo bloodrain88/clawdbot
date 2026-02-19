@@ -47,6 +47,13 @@ ERC20_ABI = [
      "name":"allowance","outputs":[{"name":"","type":"uint256"}],
      "stateMutability":"view","type":"function"},
 ]
+CTF_ABI = [
+    {"inputs":[{"name":"collateralToken","type":"address"},
+               {"name":"parentCollectionId","type":"bytes32"},
+               {"name":"conditionId","type":"bytes32"},
+               {"name":"indexSets","type":"uint256[]"}],
+     "name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"},
+]
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
@@ -505,22 +512,58 @@ class LiveTrader:
 
             # Redeem winning tokens → USDC back to wallet
             if won and not DRY_RUN:
-                asyncio.create_task(self._redeem(trade))
+                asyncio.create_task(self._redeem(k, trade))
 
     # ── REDEEM WINNING TOKENS → USDC ──────────────────────────────────────────
-    async def _redeem(self, trade: dict):
-        """After market resolves, redeem winning CTF tokens back to USDC."""
+    async def _redeem(self, condition_id: str, trade: dict):
+        """Redeem winning CTF tokens on-chain via ConditionalTokens.redeemPositions()."""
+        await asyncio.sleep(300)   # wait 5 min for Polymarket to resolve on-chain
+        asset = trade["asset"]
         try:
+            cfg        = get_contract_config(CHAIN_ID, neg_risk=False)
+            ctf_addr   = Web3.to_checksum_address(cfg.conditional_tokens)
+            collateral = Web3.to_checksum_address(cfg.collateral)
+
+            w3 = None
+            for rpc in POLYGON_RPCS:
+                try:
+                    _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+                    _w3.eth.block_number
+                    w3 = _w3
+                    break
+                except Exception:
+                    continue
+            if w3 is None:
+                print(f"{Y}[REDEEM] {asset}: no RPC — redeem manually on polymarket.com{RS}")
+                return
+
+            acct      = Account.from_key(PRIVATE_KEY)
+            ctf       = w3.eth.contract(address=ctf_addr, abi=CTF_ABI)
+            cid_bytes = bytes.fromhex(condition_id.lstrip("0x").zfill(64))
+            # Up = outcome index 0 → indexSet 1; Down = outcome index 1 → indexSet 2
+            index_set = 1 if trade["side"] == "Up" else 2
+
             loop = asyncio.get_event_loop()
-            token_id = trade["token_id"]
-            # Wait 60s for Polymarket to process resolution on-chain
-            await asyncio.sleep(60)
-            resp = await loop.run_in_executor(
-                None, lambda: self.clob.redeem(token_id=token_id)
+            nonce = await loop.run_in_executor(
+                None, lambda: w3.eth.get_transaction_count(acct.address)
             )
-            print(f"{G}[REDEEM]{RS} {trade['asset']} {trade['side']} | USDC → wallet | {resp}")
+            tx = ctf.functions.redeemPositions(
+                collateral, b'\x00' * 32, cid_bytes, [index_set]
+            ).build_transaction({
+                "from": acct.address, "nonce": nonce,
+                "gas": 200_000, "gasPrice": w3.eth.gas_price,
+            })
+            signed  = acct.sign_transaction(tx)
+            tx_hash = await loop.run_in_executor(
+                None, lambda: w3.eth.send_raw_transaction(signed.raw_transaction)
+            )
+            receipt = await loop.run_in_executor(
+                None, lambda: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            )
+            status = "OK" if receipt.status == 1 else "FAILED"
+            print(f"{G}[REDEEM]{RS} {asset} {trade['side']} | {status} | tx={tx_hash.hex()[:16]}")
         except Exception as e:
-            print(f"{Y}[REDEEM] {trade['asset']}: {e} (may need manual redeem on polymarket.com){RS}")
+            print(f"{Y}[REDEEM] {asset}: {e}{RS}")
 
     # ── MATH ──────────────────────────────────────────────────────────────────
     def _prob_up(self, current, open_price, mins_left, vol):
