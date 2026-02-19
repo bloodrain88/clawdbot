@@ -342,11 +342,6 @@ class LiveTrader:
                         if asset:
                             self.prices[asset] = val
                             self.price_history[asset].append((_time.time(), val))
-                            now = datetime.now(timezone.utc).timestamp()
-                            for cid, m in self.active_mkts.items():
-                                if m.get("asset") == asset:
-                                    if abs(now - m.get("start_ts", 0)) < 30:
-                                        self.open_prices[cid] = val
             except Exception as e:
                 self.rtds_ok = False
                 print(f"{R}[RTDS] Reconnect: {e}{RS}")
@@ -537,9 +532,8 @@ class LiveTrader:
             return
 
         open_price = self.open_prices.get(cid)
-        if open_price is None:
-            open_price = current
-            self.open_prices[cid] = open_price
+        if not open_price:
+            return  # wait until scan_loop sets Chainlink-based open_price
 
         # Entry window: must have ≥40% of market life remaining (avoid near-expiry noise)
         total_life    = m["end_ts"] - m["start_ts"]
@@ -1187,6 +1181,15 @@ class LiveTrader:
                 if m["start_ts"] > now: continue
                 if (m["end_ts"] - now) / 60 < 1: continue
                 m["mins_left"] = (m["end_ts"] - now) / 60
+                # Set open_price from Chainlink the first time we see this market.
+                # Chainlink is the SAME source Polymarket uses for resolution.
+                # Must happen before evaluate() so direction comparison is correct.
+                if cid not in self.open_prices:
+                    asset = m.get("asset")
+                    ref = self.cl_prices.get(asset, 0) or self.prices.get(asset, 0)
+                    if ref > 0:
+                        self.open_prices[cid] = ref
+                        print(f"{B}[OPEN] {asset} ref={ref:.4f} (Chainlink){RS}")
                 if cid not in self.seen:
                     candidates.append(m)
             if candidates:
