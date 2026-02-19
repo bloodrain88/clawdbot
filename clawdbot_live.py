@@ -1222,6 +1222,44 @@ class LiveTrader:
             except Exception:
                 pass
 
+    async def _redeemable_scan(self):
+        """Every 60s, re-scan Polymarket API for redeemable positions not yet queued.
+        Catches winners that weren't on-chain resolved when _sync_redeemable ran at startup."""
+        if DRY_RUN or self.w3 is None:
+            return
+        while True:
+            await asyncio.sleep(60)
+            try:
+                loop = asyncio.get_event_loop()
+                import requests as _req
+                positions = await loop.run_in_executor(
+                    None, lambda: _req.get(
+                        "https://data-api.polymarket.com/positions",
+                        params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                        timeout=10
+                    ).json()
+                )
+                for pos in positions:
+                    cid        = pos.get("conditionId", "")
+                    redeemable = pos.get("redeemable", False)
+                    val        = float(pos.get("currentValue", 0))
+                    outcome    = pos.get("outcome", "")
+                    title      = pos.get("title", "")[:45]
+                    if not redeemable or val < 0.01 or not outcome or not cid:
+                        continue
+                    if cid in self.pending_redeem:
+                        continue
+                    asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                             else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+                    m_s = {"conditionId": cid, "question": title}
+                    t_s = {"side": outcome, "asset": asset, "size": val, "entry": 0.5,
+                           "duration": 0, "mkt_price": 0.5, "mins_left": 0,
+                           "open_price": 0, "token_id": "", "order_id": "SCAN"}
+                    self.pending_redeem[cid] = (m_s, t_s)
+                    print(f"{G}[SCAN-REDEEM] Queued: {title} {outcome} ~${val:.2f}{RS}")
+            except Exception as e:
+                print(f"{Y}[SCAN-REDEEM] Error: {e}{RS}")
+
     async def _status_loop(self):
         while True:
             await asyncio.sleep(STATUS_INTERVAL)
@@ -1247,6 +1285,7 @@ class LiveTrader:
             self._refresh_balance(),
             self._redeem_loop(),
             self.chainlink_loop(),
+            self._redeemable_scan(),
         )
 
 
