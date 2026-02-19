@@ -693,7 +693,7 @@ class LiveTrader:
                     self.pending_redeem[k] = (trade["side"], asset)
                 continue
 
-            price  = self.prices.get(asset, trade["open_price"])
+            price  = self._current_price(asset) or self.prices.get(asset, trade["open_price"])
             up_won = price >= trade["open_price"]
             won    = (trade["side"] == "Up" and up_won) or (trade["side"] == "Down" and not up_won)
 
@@ -962,11 +962,15 @@ class LiveTrader:
             await asyncio.sleep(SCAN_INTERVAL)
 
     async def _refresh_balance(self):
-        """Sync bankroll from real CLOB USDC balance every STATUS_INTERVAL."""
+        """Sync bankroll from real CLOB USDC balance every STATUS_INTERVAL.
+        Skips when positions are active — mid-trade CLOB balance is unreliable
+        (bet USDC is locked in CTF, not reflected until redeemed)."""
         while True:
             await asyncio.sleep(STATUS_INTERVAL)
             if DRY_RUN or self.clob is None:
                 continue
+            if self.pending or self.pending_redeem:
+                continue   # don't override local tracking mid-trade
             try:
                 loop = asyncio.get_event_loop()
                 bal  = await loop.run_in_executor(
@@ -975,7 +979,8 @@ class LiveTrader:
                     )
                 )
                 usdc = float(bal.get("balance", 0)) / 1e6
-                if usdc > 0:
+                if usdc > 0 and usdc != self.bankroll:
+                    print(f"{B}[BANK] Synced from CLOB: ${usdc:.2f} (was ${self.bankroll:.2f}){RS}")
                     self.bankroll = usdc
             except Exception:
                 pass
