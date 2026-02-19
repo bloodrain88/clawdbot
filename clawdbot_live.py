@@ -174,14 +174,38 @@ class LiveTrader:
         # Load also from Polymarket open positions (belt-and-suspenders)
         try:
             import requests as _req
-            r = _req.get(
+            positions = _req.get(
                 "https://data-api.polymarket.com/positions",
                 params={"user": ADDRESS, "sizeThreshold": "0.01"},
                 timeout=8
-            )
-            for p in r.json():
-                self.seen.add(p["conditionId"])
-            print(f"{Y}[RESUME] Synced seen from Polymarket positions ({len(self.seen)} total){RS}")
+            ).json()
+            now_ts = datetime.now(timezone.utc).timestamp()
+            restored = 0
+            for p in positions:
+                cid        = p.get("conditionId", "")
+                redeemable = p.get("redeemable", False)
+                outcome    = p.get("outcome", "")
+                val        = float(p.get("currentValue", 0))
+                size       = float(p.get("size", 0))
+                title      = p.get("title", "")
+                self.seen.add(cid)
+                # Restore active (unresolved) positions to pending so Open count is correct
+                if not redeemable and outcome and cid and cid not in self.pending:
+                    asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                             else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+                    end_ts = now_ts + 2 * 3600  # conservative 2h; _redeemable_scan handles real resolution
+                    m_r = {"conditionId": cid, "question": title, "asset": asset,
+                           "duration": 15, "end_ts": end_ts, "start_ts": now_ts - 60,
+                           "up_price": 0.5, "mins_left": 120, "token_up": "", "token_down": ""}
+                    t_r = {"side": outcome, "size": val, "entry": 0.5,
+                           "open_price": 0, "current_price": 0, "true_prob": 0.5,
+                           "mkt_price": 0.5, "edge": 0, "mins_left": 120,
+                           "end_ts": end_ts, "asset": asset, "duration": 15,
+                           "token_id": "", "order_id": "SYNCED"}
+                    self.pending[cid] = (m_r, t_r)
+                    restored += 1
+                    print(f"{Y}[RESUME] Active: {title[:45]} {outcome} ~${val:.2f}{RS}")
+            print(f"{Y}[RESUME] Synced {len(self.seen)} seen, {restored} active restored{RS}")
         except Exception:
             pass
         # Load pending trades
