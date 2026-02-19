@@ -68,6 +68,7 @@ SCAN_INTERVAL  = 10
 PING_INTERVAL  = 5
 STATUS_INTERVAL= 30
 LOG_FILE       = os.path.expanduser("~/clawdbot_live_trades.csv")
+PENDING_FILE   = os.path.expanduser("~/clawdbot_pending.json")
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
@@ -94,7 +95,7 @@ class LiveTrader:
         self.vols        = {"BTC": 0.65, "ETH": 0.80, "SOL": 1.20, "XRP": 0.90}
         self.open_prices = {}
         self.active_mkts = {}
-        self.pending     = {}   # cid → {order_id, token_id, side, size, entry, open_price, ...}
+        self.pending     = {}   # cid → (m, trade)
         self.seen        = set()
         self.bankroll    = BANKROLL
         self.start_bank  = BANKROLL
@@ -105,6 +106,27 @@ class LiveTrader:
         self.rtds_ok     = False
         self.clob        = None
         self._init_log()
+        self._load_pending()
+
+    def _save_pending(self):
+        try:
+            with open(PENDING_FILE, "w") as f:
+                json.dump({k: [m, t] for k, (m, t) in self.pending.items()}, f)
+        except Exception:
+            pass
+
+    def _load_pending(self):
+        if not os.path.exists(PENDING_FILE):
+            return
+        try:
+            with open(PENDING_FILE) as f:
+                data = json.load(f)
+            self.pending = {k: (m, t) for k, (m, t) in data.items()}
+            self.seen    = set(self.pending.keys())
+            if self.pending:
+                print(f"{Y}[RESUME] Loaded {len(self.pending)} pending trades from previous run{RS}")
+        except Exception as e:
+            print(f"{Y}[RESUME] Could not load pending: {e}{RS}")
 
     # ── CLOB INIT ─────────────────────────────────────────────────────────────
     def init_clob(self):
@@ -437,6 +459,7 @@ class LiveTrader:
         self.seen.add(cid)
         if order_id:
             self.pending[cid] = (m, trade)
+            self._save_pending()
             self._log(m, trade)
 
     async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left):
@@ -480,6 +503,7 @@ class LiveTrader:
 
         for k in expired:
             m, trade = self.pending.pop(k)
+            self._save_pending()
             asset  = trade["asset"]
             price  = self.prices.get(asset, trade["open_price"])
             up_won = price >= trade["open_price"]
