@@ -456,9 +456,10 @@ class LiveTrader:
                 None, lambda: self.clob.post_order(signed, OrderType.FOK)
             )
             order_id = resp.get("orderID") or resp.get("id") or str(resp)
+            self.bankroll -= size_usdc   # deduct immediately on fill
             print(
                 f"{Y}[ORDER]{RS} {side} {asset} {duration}m | "
-                f"${size_usdc:.2f} USDC @ {price:.3f} | order={order_id[:16]}..."
+                f"${size_usdc:.2f} USDC @ {price:.3f} | order={order_id[:16]}... | Bank ${self.bankroll:.2f}"
             )
             return order_id
         except Exception as e:
@@ -477,16 +478,18 @@ class LiveTrader:
             up_won = price >= trade["open_price"]
             won    = (trade["side"] == "Up" and up_won) or (trade["side"] == "Down" and not up_won)
 
-            # P&L: if won, receive 1 USDC per token bought at `entry` price
-            # tokens_bought = size_usdc / entry
-            # payout = tokens_bought * 1.0 = size_usdc / entry
-            # net pnl = payout - size_usdc = size_usdc * (1/entry - 1)
+            # Bet was already deducted from bankroll on order place.
+            # On WIN: add back full payout (size/entry) minus fee.
+            # On LOSS: bankroll already reduced, nothing to add.
+            # net pnl (for reporting) = payout - size = size*(1/entry - 1)
             pnl = trade["size"] * (1/trade["entry"] - 1) if won else -trade["size"]
             fee = trade["size"] * 0.0156 * (1 - abs(trade["mkt_price"] - 0.5) * 2)
             pnl = pnl - fee if won else pnl
 
             self.daily_pnl += pnl
-            self.bankroll  += pnl
+            if won:
+                payout = trade["size"] / trade["entry"] - fee
+                self.bankroll += payout   # add back payout (bet was already deducted)
             self.total     += 1
             if won: self.wins += 1
             self._log(m, trade, "WIN" if won else "LOSS", pnl)
@@ -545,6 +548,25 @@ class LiveTrader:
             await self._resolve()
             await asyncio.sleep(SCAN_INTERVAL)
 
+    async def _refresh_balance(self):
+        """Sync bankroll from real CLOB USDC balance every STATUS_INTERVAL."""
+        while True:
+            await asyncio.sleep(STATUS_INTERVAL)
+            if DRY_RUN or self.clob is None:
+                continue
+            try:
+                loop = asyncio.get_event_loop()
+                bal  = await loop.run_in_executor(
+                    None, lambda: self.clob.get_balance_allowance(
+                        BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                    )
+                )
+                usdc = float(bal.get("balance", 0)) / 1e6
+                if usdc > 0:
+                    self.bankroll = usdc
+            except Exception:
+                pass
+
     async def _status_loop(self):
         while True:
             await asyncio.sleep(STATUS_INTERVAL)
@@ -566,6 +588,7 @@ class LiveTrader:
             self.vol_loop(),
             self.scan_loop(),
             self._status_loop(),
+            self._refresh_balance(),
         )
 
 
