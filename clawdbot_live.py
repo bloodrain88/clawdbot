@@ -332,7 +332,7 @@ class LiveTrader:
             f"  {B}Bankroll:{RS} ${self.bankroll:.2f}  "
             f"{B}P&L:{RS} {pc}${pnl:+.2f}{RS}  "
             f"{B}Network:{RS} {NETWORK}  "
-            f"{B}Open:{RS} {len(self.pending)}\n"
+            f"{B}Open:{RS} {len(self.pending)}  {Y}Settling:{RS} {len(self.pending_redeem)}\n"
             f"  {price_str}\n"
             f"{W}{'─'*66}{RS}"
         )
@@ -365,6 +365,18 @@ class LiveTrader:
             print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
                   f"open={open_p:.2f} {src}={cur_p:.2f} {move_str} | "
                   f"bet=${size:.2f} est=${payout_est:.2f} | {mins_left:.1f}min left")
+        # Show settling (pending_redeem) positions
+        for cid, val in list(self.pending_redeem.items()):
+            if isinstance(val[0], dict):
+                m_r, t_r = val
+                asset_r = t_r.get("asset", "?")
+                side_r  = t_r.get("side", "?")
+                size_r  = t_r.get("size", 0)
+                title_r = m_r.get("question", "")[:38]
+            else:
+                side_r, asset_r = val
+                size_r = 0; title_r = ""
+            print(f"  {Y}[SETTLING]{RS} {asset_r} {side_r} | {title_r} | bet=${size_r:.2f} | waiting on-chain...")
 
     # ── RTDS ──────────────────────────────────────────────────────────────────
     async def stream_rtds(self):
@@ -1111,7 +1123,7 @@ class LiveTrader:
                 mkt = mkt_data[0] if isinstance(mkt_data, list) and mkt_data else (
                       mkt_data if isinstance(mkt_data, dict) else {})
                 end_str   = mkt.get("endDate") or mkt.get("end_date", "")
-                start_str = mkt.get("startDate") or mkt.get("start_date", "")
+                start_str = mkt.get("eventStartTime") or mkt.get("startDate") or mkt.get("start_date", "")
                 if end_str:
                     end_ts = datetime.fromisoformat(end_str.replace("Z", "+00:00")).timestamp()
                 if start_str:
