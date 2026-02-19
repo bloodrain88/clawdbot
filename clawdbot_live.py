@@ -20,6 +20,8 @@ import json
 import math
 import csv
 import os
+import time as _time
+from collections import deque
 from datetime import datetime, timezone
 from scipy.stats import norm
 from dotenv import load_dotenv
@@ -52,8 +54,9 @@ PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
 ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
-MIN_EDGE       = 0.08     # 8% min edge — 6% base + ~2% taker fee buffer (fee≈3% near 50¢)
-MIN_MOVE       = 0.002    # 0.2% min actual price move — filters pure noise
+MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
+MIN_MOVE       = 0.004    # 0.4% min actual price move — filters noise
+MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 MIN_BET        = 5.0      # $5 floor
 MAX_BET        = 25.0     # $25 ceiling (Kelly can go higher on strong edges)
 KELLY_FRAC     = 0.25     # quarter-Kelly — conservative, avoids ruin
@@ -81,6 +84,7 @@ _DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
 LOG_FILE       = os.path.join(_DATA_DIR, "clawdbot_live_trades.csv")
 PENDING_FILE   = os.path.join(_DATA_DIR, "clawdbot_pending.json")
 SEEN_FILE      = os.path.join(_DATA_DIR, "clawdbot_seen.json")
+STATS_FILE     = os.path.join(_DATA_DIR, "clawdbot_stats.json")
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
@@ -122,8 +126,13 @@ class LiveTrader:
         self.rtds_ok         = False
         self.clob            = None
         self.w3              = None   # shared Polygon RPC connection
+        # ── Adaptive strategy state ──────────────────────────────────────────
+        self.price_history   = {a: deque(maxlen=300) for a in ["BTC","ETH","SOL","XRP"]}
+        self.stats           = {}    # {asset: {side: {wins, total}}} — persisted
+        self.recent_trades   = deque(maxlen=30)   # rolling window for WR adaptation
         self._init_log()
         self._load_pending()
+        self._load_stats()
         self._init_w3()
 
     def _init_w3(self):
@@ -333,6 +342,7 @@ class LiveTrader:
                         asset = MAP.get(sym)
                         if asset:
                             self.prices[asset] = val
+                            self.price_history[asset].append((_time.time(), val))
                             now = datetime.now(timezone.utc).timestamp()
                             for cid, m in self.active_mkts.items():
                                 if m.get("asset") == asset:
@@ -525,22 +535,46 @@ class LiveTrader:
             open_price = current
             self.open_prices[cid] = open_price
 
-        # Minimum actual price move — filter pure noise (no move = no signal)
+        # Entry window: must have ≥40% of market life remaining (avoid near-expiry noise)
+        total_life    = m["end_ts"] - m["start_ts"]
+        pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
+        if pct_remaining < 0.40:
+            return
+
+        # Minimum actual price move — filter pure noise
         if open_price > 0 and abs(current - open_price) / open_price < MIN_MOVE:
             return
 
-        # ── Black-Scholes P(Up) — same model as paper bot (proven 60-65% WR) ─
-        vol       = self.vols.get(asset, 0.70)
-        true_prob = self._prob_up(current, open_price, mins_left, vol)
-        edge_up   = true_prob - up_price
+        # ── Combined probability: Black-Scholes + Momentum + Direction bias ──
+        vol      = self.vols.get(asset, 0.70)
+        bs_prob  = self._prob_up(current, open_price, mins_left, vol)
+        mom_prob = self._momentum_prob(asset, seconds=60)
+        mw       = self._adaptive_momentum_weight()
+        combined = (1 - mw) * bs_prob + mw * mom_prob
 
-        if abs(edge_up) < MIN_EDGE:
+        # Direction bias from historical WR for this asset+side
+        bias_up   = self._direction_bias(asset, "Up")
+        bias_down = self._direction_bias(asset, "Down")
+        prob_up   = max(0.05, min(0.95, combined + bias_up))
+        prob_down = max(0.05, min(0.95, (1 - combined) + bias_down))
+
+        edge_up   = prob_up   - up_price
+        edge_down = prob_down - (1 - up_price)
+
+        # Fee-adjusted edge: taker fee highest near 50¢ (~2.5%), near-zero at extremes
+        fee_est  = 0.025 * (1 - abs(up_price - 0.5) * 2)
+        min_edge = self._adaptive_min_edge()
+
+        # Pick best direction if both have edge, else reject
+        if edge_up - fee_est >= edge_down - fee_est and edge_up - fee_est >= min_edge:
+            side, edge, true_prob = "Up", edge_up, prob_up
+        elif edge_down - fee_est >= min_edge:
+            side, edge, true_prob = "Down", edge_down, prob_down
+        else:
             return
 
-        side  = "Up" if edge_up > 0 else "Down"
-        edge  = abs(edge_up)
         entry = up_price if side == "Up" else (1 - up_price)
-        size  = self._kelly_size(true_prob, entry)   # quarter-Kelly, $5-$25
+        size  = self._kelly_size(true_prob, entry)
         token_id = m["token_up"] if side == "Up" else m["token_down"]
 
         if not token_id:
@@ -549,7 +583,8 @@ class LiveTrader:
             return
 
         print(f"{B}[EDGE] {asset} {side} | move={((current-open_price)/open_price):+.3%} "
-              f"true={true_prob:.3f} mkt={up_price:.3f} edge={edge:.3f} {mins_left:.1f}min left{RS}")
+              f"bs={bs_prob:.3f} mom={mom_prob:.3f} combined={true_prob:.3f} "
+              f"mkt={up_price:.3f} edge={edge:.3f} fee~{fee_est:.3f} {mins_left:.1f}min left{RS}")
 
         # ── Place real order ──────────────────────────────────────────────────
         order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left)
@@ -687,6 +722,7 @@ class LiveTrader:
                     self.bankroll += trade["size"] / trade["entry"]
                 self.total += 1
                 if won: self.wins += 1
+                self._record_result(asset, trade["side"], won)
                 self._log(m, trade, "WIN" if won else "LOSS", pnl)
                 c  = G if won else R
                 wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
@@ -781,6 +817,7 @@ class LiveTrader:
                             self.bankroll  += payout
                             self.daily_pnl += pnl
                             self.total += 1; self.wins += 1
+                            self._record_result(asset, side, True)
                             self._log(m, trade, "WIN", pnl)
                             wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                             print(f"{G}[WIN]{RS} {asset} {side} {trade.get('duration',0)}m | "
@@ -795,6 +832,7 @@ class LiveTrader:
                             pnl = -size
                             self.daily_pnl += pnl
                             self.total += 1
+                            self._record_result(asset, side, False)
                             self._log(m, trade, "LOSS", pnl)
                             wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                             print(f"{R}[LOSS]{RS} {asset} {side} {trade.get('duration',0)}m | "
@@ -977,6 +1015,94 @@ class LiveTrader:
         T = max(mins_left, 0.1) / (252 * 24 * 60)
         d = math.log(current / open_price) / (vol * math.sqrt(T))
         return float(norm.cdf(d))
+
+    def _momentum_prob(self, asset: str, seconds: int = 60) -> float:
+        """Momentum-based P(Up) from last `seconds` of RTDS price history."""
+        hist = self.price_history.get(asset)
+        if not hist or len(hist) < 2:
+            return 0.5
+        now_ts  = _time.time()
+        cutoff  = now_ts - seconds
+        past    = [(ts, p) for ts, p in hist if ts <= cutoff]
+        if not past:
+            return 0.5
+        past_price  = past[-1][1]
+        current     = list(hist)[-1][1]
+        if past_price <= 0:
+            return 0.5
+        move = (current - past_price) / past_price
+        vol  = self.vols.get(asset, 0.70)
+        vol_t = vol * math.sqrt(seconds / (252 * 24 * 3600))
+        if vol_t == 0:
+            return 0.5
+        return float(norm.cdf(move / vol_t))
+
+    def _direction_bias(self, asset: str, side: str) -> float:
+        """Additive bias from historical win rate for this asset+direction.
+        Returns 0 until 5 trades, then scales from -0.10 to +0.10."""
+        s = self.stats.get(asset, {}).get(side, {})
+        total = s.get("total", 0)
+        if total < 5:
+            return 0.0
+        wr = s["wins"] / total
+        return (wr - 0.5) * 0.25   # max ±0.125
+
+    def _adaptive_min_edge(self) -> float:
+        """Tighten MIN_EDGE when losing, relax slightly when winning."""
+        if len(self.recent_trades) < 10:
+            return MIN_EDGE
+        recent_wr = sum(self.recent_trades) / len(self.recent_trades)
+        if recent_wr > 0.65:
+            return max(0.06, MIN_EDGE - 0.01)
+        elif recent_wr < 0.50:
+            return min(0.13, MIN_EDGE + 0.02)
+        return MIN_EDGE
+
+    def _adaptive_momentum_weight(self) -> float:
+        """Shift toward momentum when recent WR is poor."""
+        if len(self.recent_trades) < 10:
+            return MOMENTUM_WEIGHT
+        recent_wr = sum(self.recent_trades) / len(self.recent_trades)
+        if recent_wr < 0.50:
+            return min(0.65, MOMENTUM_WEIGHT + 0.15)
+        return MOMENTUM_WEIGHT
+
+    def _load_stats(self):
+        try:
+            with open(STATS_FILE) as f:
+                data = json.load(f)
+            self.stats        = data.get("stats", {})
+            self.recent_trades = deque(data.get("recent", []), maxlen=30)
+            total = sum(s.get("total",0) for a in self.stats.values() for s in a.values())
+            wins  = sum(s.get("wins",0)  for a in self.stats.values() for s in a.values())
+            if total:
+                print(f"{G}[STATS] Loaded {total} trades, WR {wins/total*100:.1f}%{RS}")
+        except Exception:
+            self.stats        = {}
+            self.recent_trades = deque(maxlen=30)
+
+    def _save_stats(self):
+        try:
+            with open(STATS_FILE, "w") as f:
+                json.dump({"stats": self.stats, "recent": list(self.recent_trades)}, f)
+        except Exception:
+            pass
+
+    def _record_result(self, asset: str, side: str, won: bool):
+        if asset not in self.stats:
+            self.stats[asset] = {}
+        if side not in self.stats[asset]:
+            self.stats[asset][side] = {"wins": 0, "total": 0}
+        self.stats[asset][side]["total"] += 1
+        if won:
+            self.stats[asset][side]["wins"] += 1
+        self.recent_trades.append(1 if won else 0)
+        self._save_stats()
+        # Print adaptive state for visibility
+        mw  = self._adaptive_momentum_weight()
+        me  = self._adaptive_min_edge()
+        rwr = sum(self.recent_trades) / len(self.recent_trades) if self.recent_trades else 0
+        print(f"{B}[ADAPT] Recent WR={rwr:.0%}  MinEdge={me:.2f}  MomWeight={mw:.2f}{RS}")
 
     # ── SCAN LOOP ─────────────────────────────────────────────────────────────
     async def scan_loop(self):
