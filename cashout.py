@@ -29,10 +29,10 @@ THRESHOLD    = 400 * 10**6   # $400 in USDC.e (6 decimals)
 KEEP         = 200 * 10**6   # $200 to keep in bot wallet
 
 POLYGON_RPCS = [
-    "https://polygon.llamarpc.com",
-    "https://rpc.ankr.com/polygon",
-    "https://polygon.drpc.org",
+    "https://polygon-bor-rpc.publicnode.com",
     "https://polygon-mainnet.public.blastapi.io",
+    "https://polygon.drpc.org",
+    "https://rpc.ankr.com/polygon",
 ]
 
 ERC20_ABI = [

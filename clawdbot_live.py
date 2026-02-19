@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from scipy.stats import norm
 from dotenv import load_dotenv
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 from eth_account import Account
 
 load_dotenv(os.path.expanduser("~/.clawdbot.env"))
@@ -36,10 +37,10 @@ from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, Ass
 from py_clob_client.config import get_contract_config
 
 POLYGON_RPCS = [
-    "https://polygon.llamarpc.com",
-    "https://rpc.ankr.com/polygon",
-    "https://polygon.drpc.org",
+    "https://polygon-bor-rpc.publicnode.com",
     "https://polygon-mainnet.public.blastapi.io",
+    "https://polygon.drpc.org",
+    "https://rpc.ankr.com/polygon",
 ]
 CTF_ABI = [
     {"inputs":[{"name":"collateralToken","type":"address"},
@@ -140,6 +141,7 @@ class LiveTrader:
         for rpc in POLYGON_RPCS:
             try:
                 _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+                _w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
                 _w3.eth.block_number
                 self.w3 = _w3
                 print(f"{G}[RPC] Connected: {rpc}{RS}")
