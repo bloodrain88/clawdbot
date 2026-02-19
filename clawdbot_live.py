@@ -54,7 +54,7 @@ PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
 ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
-MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
+MIN_EDGE       = 0.07     # 7% base min edge (auto-adapted per recent WR)
 MIN_MOVE       = 0.002    # 0.2% min actual price move
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 MIN_BET        = 5.0      # $5 floor
@@ -682,8 +682,8 @@ class LiveTrader:
                           f"Bank ${self.bankroll:.2f}")
                     return order_id
 
-                # Poll up to 45s for maker fill (asyncio: other evals run in parallel)
-                max_wait  = min(45, int(mins_left * 60 * 0.35))
+                # Poll up to 20s for maker fill — shorter wait so taker fallback is timely
+                max_wait  = min(20, int(mins_left * 60 * 0.20))
                 polls     = max(1, max_wait // 10)
                 print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
                       f"waiting up to {polls*10}s for fill...{RS}")
