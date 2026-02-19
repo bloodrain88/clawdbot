@@ -30,7 +30,7 @@ load_dotenv(os.path.expanduser("~/.clawdbot.env"))
 
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON, AMOY
-from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, AssetType, BalanceAllowanceParams
+from py_clob_client.clob_types import OrderType, MarketOrderArgs, AssetType, BalanceAllowanceParams
 from py_clob_client.config import get_contract_config
 
 POLYGON_RPCS = [
@@ -644,35 +644,34 @@ class LiveTrader:
         for attempt in range(3):
             try:
                 loop = asyncio.get_event_loop()
-                order_args = OrderArgs(
+                # MarketOrderArgs: amount in USDC, auto-price from order book, FOK default
+                mkt_args = MarketOrderArgs(
                     token_id=token_id,
-                    price=round(price, 4),
-                    size=round(size_usdc / price, 4),   # tokens, max 4 decimals
-                    side="BUY",
+                    amount=round(size_usdc, 2),
                 )
                 signed = await loop.run_in_executor(
-                    None, lambda: self.clob.create_order(order_args)
+                    None, lambda: self.clob.create_market_order(mkt_args)
                 )
                 resp = await loop.run_in_executor(
                     None, lambda: self.clob.post_order(signed, OrderType.FOK)
                 )
                 status   = resp.get("status", "")
                 order_id = resp.get("orderID") or resp.get("id", "")
-                # FOK: if not filled immediately → reject, don't track as position
+                # FOK: if not filled immediately → no liquidity, skip
                 if status in ("unmatched", "cancelled", "") or not order_id:
-                    print(f"{Y}[ORDER] FOK unmatched {asset} {side} @ {price:.3f} — no liquidity{RS}")
+                    print(f"{Y}[ORDER] FOK unmatched {asset} {side} — no liquidity at market{RS}")
                     return None
                 self.bankroll -= size_usdc
                 print(
                     f"{Y}[ORDER]{RS} {side} {asset} {duration}m | "
-                    f"${size_usdc:.2f} USDC @ {price:.3f} | order={order_id[:16]}... | Bank ${self.bankroll:.2f}"
+                    f"${size_usdc:.2f} USDC @ ~{price:.3f} | order={order_id[:16]}... | Bank ${self.bankroll:.2f}"
                 )
                 return order_id
             except Exception as e:
                 err = str(e)
                 if "429" in err or "rate limit" in err.lower():
                     wait = 10 * (attempt + 1)
-                    print(f"{Y}[ORDER] Rate limited — waiting {wait}s before retry{RS}")
+                    print(f"{Y}[ORDER] Rate limited — waiting {wait}s{RS}")
                     await asyncio.sleep(wait)
                     continue
                 print(f"{R}[ORDER FAILED] {asset} {side}: {e}{RS}")
