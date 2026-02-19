@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 WORKDIR /app
-RUN pip install --no-cache-dir aiohttp websockets scipy requests python-dotenv eth-account py-clob-client
+RUN pip install --no-cache-dir aiohttp websockets scipy requests python-dotenv eth-account web3 py-clob-client
 
 # Build-time args → runtime ENV vars
 ARG POLY_ADDRESS
