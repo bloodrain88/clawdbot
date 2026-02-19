@@ -507,7 +507,7 @@ class LiveTrader:
                     None, lambda: self.clob.create_market_order(order_args)
                 )
                 resp = await loop.run_in_executor(
-                    None, lambda: self.clob.post_order(signed, OrderType.FOK)
+                    None, lambda: self.clob.post_order(signed, OrderType.GTC)
                 )
                 order_id = resp.get("orderID") or resp.get("id") or str(resp)
                 self.bankroll -= size_usdc   # deduct immediately on fill
