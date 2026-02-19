@@ -209,10 +209,19 @@ class LiveTrader:
         try:
             with open(PENDING_FILE) as f:
                 data = json.load(f)
-            self.pending = {k: (m, t) for k, (m, t) in data.items()}
-            self.seen.update(self.pending.keys())
-            if self.pending:
-                print(f"{Y}[RESUME] Loaded {len(self.pending)} pending trades from previous run{RS}")
+            now_ts = datetime.now(timezone.utc).timestamp()
+            loaded = 0
+            for k, (m, t) in data.items():
+                end_ts = m.get("end_ts", 0)
+                # Drop entries that already expired — _sync_open_positions handles resolution
+                if end_ts > 0 and end_ts < now_ts - 300:   # expired >5min ago
+                    print(f"{Y}[RESUME] Dropped expired: {m.get('question','')[:40]}{RS}")
+                    continue
+                self.pending[k] = (m, t)
+                self.seen.add(k)
+                loaded += 1
+            if loaded:
+                print(f"{Y}[RESUME] Loaded {loaded} pending trades from previous run{RS}")
         except Exception as e:
             print(f"{Y}[RESUME] Could not load pending: {e}{RS}")
 
@@ -1047,6 +1056,31 @@ class LiveTrader:
 
         now     = datetime.now(timezone.utc).timestamp()
         synced  = 0
+        api_cids = {p.get("conditionId","") for p in positions}
+
+        # Remove from pending any position the API now shows as resolved/redeemable
+        for cid in list(self.pending.keys()):
+            pos_data = next((p for p in positions if p.get("conditionId") == cid), None)
+            if pos_data is None:
+                continue  # not in API at all — leave it, _resolve() handles expiry
+            if pos_data.get("redeemable"):
+                val = float(pos_data.get("currentValue", 0))
+                m_p, t_p = self.pending.pop(cid)
+                title_p = m_p.get("question", "")[:40]
+                side_p  = t_p.get("side", "")
+                asset_p = t_p.get("asset", "")
+                if val >= 0.01 and cid not in self.pending_redeem:
+                    self.pending_redeem[cid] = (m_p, t_p)
+                    print(f"{G}[SYNC] Resolved→redeem: {title_p} {side_p} ~${val:.2f}{RS}")
+                else:
+                    print(f"{Y}[SYNC] Resolved→loss: {title_p} {side_p} (${val:.2f}){RS}")
+                    # Record the loss
+                    size_p = t_p.get("size", 0)
+                    if size_p > 0:
+                        self.total += 1
+                        self._record_result(asset_p, side_p, False, t_p.get("structural", False))
+                self._save_pending()
+
         for pos in positions:
             cid        = pos.get("conditionId", "")
             redeemable = pos.get("redeemable", False)
