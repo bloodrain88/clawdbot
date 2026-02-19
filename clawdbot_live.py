@@ -60,13 +60,14 @@ PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
 ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
-MIN_EDGE       = 0.15     # 15% min edge (avoid coin flips)
-MIN_PRICE      = 0.62     # only bet when mkt price >62% or <38% (real asymmetry)
+MIN_EDGE       = 0.08     # 8% min market-lag edge
+MIN_MOVE       = 0.003    # 0.3% min actual crypto price move from market open
+MOM_SCALE      = 25       # momentum scale: 0.5% move → 62.5% fair prob (0.5+0.005*25)
 MIN_BET        = 5.0      # $5 min per trade
 MAX_BET        = 10.0     # $10 max per trade
 MAX_DAILY_LOSS = 0.05     # 5% hard stop
 MAX_OPEN       = 3        # max simultaneous open positions
-TIMING_FRAC    = 0.40     # only bet in first 40% of market duration
+TIMING_FRAC    = 0.50     # only bet in first 50% of market duration
 SCAN_INTERVAL  = 10
 PING_INTERVAL  = 5
 STATUS_INTERVAL= 30
@@ -489,7 +490,7 @@ class LiveTrader:
         if len(self.pending) >= MAX_OPEN:
             return
 
-        # Timing filter: only bet in first 40% of market duration
+        # Timing filter: only bet in first 50% of market duration
         elapsed_frac = 1.0 - (mins_left / duration)
         if elapsed_frac > TIMING_FRAC:
             self.seen.add(cid)   # skip and don't revisit
@@ -505,20 +506,29 @@ class LiveTrader:
             open_price = current
             self.open_prices[cid] = open_price
 
-        vol       = self.vols.get(asset, 0.70)
-        true_prob = self._prob_up(current, open_price, mins_left, vol)
-        edge_up   = true_prob - up_price
+        # ── Market-lag momentum model (replaces Black-Scholes) ────────────────
+        # Edge = difference between fair probability (from actual price move)
+        # and what Polymarket has priced in. We profit from market lag.
+        if open_price <= 0:
+            return
+        pct_move = (current - open_price) / open_price
+
+        # Require minimum actual crypto price move (real signal, not noise)
+        if abs(pct_move) < MIN_MOVE:
+            return
+
+        # Fair probability: linear momentum model
+        # 0.5% move → fair_prob = 0.5 + 0.005*25 = 0.625 (62.5%)
+        # 1.0% move → fair_prob = 0.5 + 0.010*25 = 0.75 (75%)
+        fair_prob_up = max(0.05, min(0.95, 0.5 + pct_move * MOM_SCALE))
+        edge_up = fair_prob_up - up_price
 
         if abs(edge_up) < MIN_EDGE:
             return
 
-        # Price filter: avoid near-50/50 markets (no real asymmetry)
-        mkt_price_side = up_price if edge_up > 0 else (1 - up_price)
-        if mkt_price_side > MIN_PRICE:
-            return
-
         side       = "Up" if edge_up > 0 else "Down"
         edge       = abs(edge_up)
+        print(f"{B}[EDGE] {asset} {side} | move={pct_move:+.3%} fair={fair_prob_up:.3f} mkt={up_price:.3f} lag={edge:.3f}{RS}")
         entry      = up_price if side == "Up" else (1 - up_price)
         size       = round(max(MIN_BET, min(MAX_BET, self.bankroll * 0.10)), 2)
         token_id   = m["token_up"] if side == "Up" else m["token_down"]
@@ -537,7 +547,7 @@ class LiveTrader:
             "entry":         entry,
             "open_price":    open_price,
             "current_price": current,
-            "true_prob":     true_prob,
+            "true_prob":     fair_prob_up,
             "mkt_price":     up_price,
             "edge":          round(edge, 4),
             "mins_left":     mins_left,
