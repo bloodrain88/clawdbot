@@ -528,11 +528,13 @@ class LiveTrader:
                 data = await r.json()
             events = data if isinstance(data, list) else data.get("data", [])
             for ev in events:
-                start_str = ev.get("startTime", "")
                 end_str   = ev.get("endDate", "")
                 q         = ev.get("title", "") or ev.get("question", "")
                 mkts      = ev.get("markets", [])
                 m_data    = mkts[0] if mkts else ev
+                # eventStartTime = exact window open (e.g. 5:45PM for 5:45-5:50 market)
+                # This is when Chainlink locks the "price to beat" — must match exactly
+                start_str = (m_data.get("eventStartTime") or ev.get("startTime", ""))
                 cid       = m_data.get("conditionId", "") or ev.get("conditionId", "")
                 prices    = m_data.get("outcomePrices") or ev.get("outcomePrices")
                 tokens    = m_data.get("clobTokenIds") or ev.get("clobTokenIds") or []
