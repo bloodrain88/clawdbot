@@ -605,9 +605,18 @@ class LiveTrader:
         if pct_remaining < 0.40:
             return
 
-        # Minimum actual price move — filter pure noise
+        # Require RTDS move vs open_price — filter pure noise
         if open_price > 0 and abs(current - open_price) / open_price < MIN_MOVE:
             return
+
+        # Require Chainlink to also have moved — and agree on direction with RTDS.
+        # If they diverge, Polymarket may resolve opposite to what RTDS suggests → skip.
+        cl_now = self.cl_prices.get(asset, 0)
+        if cl_now > 0 and open_price > 0:
+            rtds_up = current > open_price
+            cl_up   = cl_now  > open_price
+            if rtds_up != cl_up:
+                return  # RTDS and Chainlink disagree on direction — too risky
 
         # ── Combined probability: Black-Scholes + Momentum + Direction bias ──
         vol      = self.vols.get(asset, 0.70)
