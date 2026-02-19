@@ -138,7 +138,6 @@ class LiveTrader:
         self.stats           = {}    # {asset: {side: {wins, total}}} — persisted
         self.recent_trades   = deque(maxlen=30)   # rolling window for WR adaptation
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
-        self.structural_trades  = deque(maxlen=10)  # track structural bet outcomes
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self._init_log()
         self._load_pending()
@@ -177,7 +176,9 @@ class LiveTrader:
         if os.path.exists(SEEN_FILE):
             try:
                 with open(SEEN_FILE) as f:
-                    self.seen = set(json.load(f))
+                    loaded = json.load(f)
+                # Keep only last 200 entries — older conditionIds are from expired markets
+                self.seen = set(loaded[-200:] if len(loaded) > 200 else loaded)
                 print(f"{Y}[RESUME] Loaded {len(self.seen)} seen markets from disk{RS}")
             except Exception:
                 pass
@@ -607,8 +608,12 @@ class LiveTrader:
         up_price  = m["up_price"]
         label     = f"{asset} {duration}m | {m.get('question','')[:45]}"
 
-        if self.bankroll <= self.start_bank * (1 - MAX_DAILY_LOSS):
-            print(f"{R}[SKIP] {label} → daily loss limit hit{RS}")
+        # Stop-loss: use total effective value (USDC + locked bets not yet in API)
+        # Avoids false triggers when bankroll is temporarily low after a fill
+        locked_bets = sum(t.get("size", 0) for _, t in self.pending.items())
+        if (self.bankroll + locked_bets) <= self.start_bank * (1 - MAX_DAILY_LOSS):
+            print(f"{R}[SKIP] {label} → daily loss limit hit "
+                  f"(bank=${self.bankroll:.2f}+locked=${locked_bets:.2f} ≤ ${self.start_bank*(1-MAX_DAILY_LOSS):.2f}){RS}")
             return
 
         # Max open positions guard
@@ -659,8 +664,6 @@ class LiveTrader:
             cl_up   = cl_now  > open_price
             if rtds_up != cl_up:
                 cl_agree = False
-
-        structural = False
 
         # ── Combined probability: Black-Scholes + Momentum + Direction bias ──
         vol      = self.vols.get(asset, 0.70)
@@ -716,7 +719,7 @@ class LiveTrader:
         self._save_seen()
 
         # ── Place real order ──────────────────────────────────────────────────
-        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob, cl_agree, structural)
+        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob, cl_agree)
 
         trade = {
             "side":          side,
@@ -733,7 +736,6 @@ class LiveTrader:
             "duration":      duration,
             "token_id":      token_id,
             "order_id":      order_id or "",
-            "structural":    structural,
         }
 
         if order_id:
@@ -741,7 +743,7 @@ class LiveTrader:
             self._save_pending()
             self._log(m, trade)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, structural=False):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -776,22 +778,16 @@ class LiveTrader:
                 # structural (no move): needs 12% CLOB edge — higher bar, no directional signal
                 # oracles disagree:    needs 12% CLOB edge — higher bar, conflicting signals
                 # normal directional:  needs 7% CLOB edge
-                if structural:
-                    edge_req = MIN_EDGE + 0.05   # 12%
-                    # Structural bets use half size for safety
-                    size_usdc = round(size_usdc * 0.5, 2)
-                elif not cl_agree:
-                    edge_req = MIN_EDGE + 0.05   # 12%
-                else:
-                    edge_req = MIN_EDGE          # 7%
+                # Oracles disagree (RTDS vs Chainlink direction): require 12% edge
+                edge_req = MIN_EDGE + 0.05 if not cl_agree else MIN_EDGE
 
                 taker_edge = true_prob - best_ask
                 if taker_edge < edge_req:
-                    kind = "structural" if structural else ("disagree" if not cl_agree else "directional")
+                    kind = "disagree" if not cl_agree else "directional"
                     print(f"{Y}[SKIP] {asset} {side} [{kind}]: taker_edge={taker_edge:.3f} < {edge_req:.2f} "
                           f"(ask={best_ask:.3f} model={true_prob:.3f}){RS}")
                     return None
-                kind = "structural" if structural else ("cautious" if not cl_agree else "directional")
+                kind = "cautious" if not cl_agree else "directional"
                 print(f"{B}[{kind.upper()}]{RS} {asset} {side} edge={taker_edge:.3f} req={edge_req:.2f}")
 
                 # ── PHASE 1: Maker bid at mid ──────────────────────────────
@@ -1368,20 +1364,6 @@ class LiveTrader:
         except Exception:
             pass
 
-    def _structural_ok(self) -> bool:
-        """Safety guard: disable structural bets if they're underperforming or drawdown is excessive."""
-        # Drawdown guard: if bankroll dropped >8% from peak, pause structural bets
-        if self.bankroll < self.peak_bankroll * 0.92:
-            print(f"{Y}[GUARD] Structural bets paused — drawdown {(1-self.bankroll/self.peak_bankroll):.1%} from peak ${self.peak_bankroll:.2f}{RS}")
-            return False
-        # Win rate guard: after 5 structural bets, require ≥40% WR
-        if len(self.structural_trades) >= 5:
-            wr = sum(self.structural_trades) / len(self.structural_trades)
-            if wr < 0.40:
-                print(f"{Y}[GUARD] Structural bets paused — WR={wr:.0%} < 40% on last {len(self.structural_trades)} structural bets{RS}")
-                return False
-        return True
-
     def _record_result(self, asset: str, side: str, won: bool, structural: bool = False):
         if asset not in self.stats:
             self.stats[asset] = {}
@@ -1391,8 +1373,6 @@ class LiveTrader:
         if won:
             self.stats[asset][side]["wins"] += 1
         self.recent_trades.append(1 if won else 0)
-        if structural:
-            self.structural_trades.append(1 if won else 0)
         # Update peak bankroll
         if self.bankroll > self.peak_bankroll:
             self.peak_bankroll = self.bankroll
@@ -1546,11 +1526,16 @@ class LiveTrader:
                     "https://data-api.polymarket.com/positions",
                     params={"user": ADDRESS, "sizeThreshold": "0.01"}, timeout=10
                 ).json())
+                api_cids = {p.get("conditionId","") for p in positions}
                 open_val = sum(
                     float(p.get("currentValue", 0))
                     for p in positions
                     if not p.get("redeemable") and p.get("outcome")
                 )
+                # Add pending positions not yet visible in the API (fill→API lag ~10-30s)
+                for cid, (_, t) in self.pending.items():
+                    if cid not in api_cids:
+                        open_val += t.get("size", 0)
 
                 total = round(usdc + open_val, 2)
                 print(f"{B}[BANK] on-chain USDC=${usdc:.2f}  open_positions=${open_val:.2f}  total=${total:.2f}{RS}")
