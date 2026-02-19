@@ -898,11 +898,19 @@ class LiveTrader:
                         nonce  = await loop.run_in_executor(
                             None, lambda: self.w3.eth.get_transaction_count(acct.address)
                         )
+                        # EIP-1559 gas pricing — required by Polygon mainnet RPCs
+                        latest   = await loop.run_in_executor(None, lambda: self.w3.eth.get_block("latest"))
+                        base_fee = latest["baseFeePerGas"]
+                        pri_fee  = self.w3.to_wei(40, "gwei")
+                        max_fee  = base_fee * 2 + pri_fee
                         tx = ctf.functions.redeemPositions(
                             collat, b'\x00'*32, cid_bytes, [index_set]
                         ).build_transaction({
                             "from": acct.address, "nonce": nonce,
-                            "gas": 200_000, "gasPrice": self.w3.eth.gas_price
+                            "gas": 200_000,
+                            "maxFeePerGas": max_fee,
+                            "maxPriorityFeePerGas": pri_fee,
+                            "chainId": 137,
                         })
                         signed  = acct.sign_transaction(tx)
                         tx_hash = await loop.run_in_executor(
