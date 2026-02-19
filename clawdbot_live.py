@@ -1568,19 +1568,56 @@ class LiveTrader:
                     title = pos.get("title", "")
                     asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
                              else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
-                    end_ts = now + 30 * 60
+                    # Fetch real end_ts from Gamma API — never use fake timestamps
+                    end_ts = 0; start_ts = now - 60; duration = 15
+                    token_up = token_down = ""
+                    try:
+                        mkt_data = await loop.run_in_executor(None, lambda c=cid: _req.get(
+                            f"{GAMMA}/markets", params={"conditionId": c}, timeout=8
+                        ).json())
+                        mkt = mkt_data[0] if isinstance(mkt_data, list) and mkt_data else (
+                              mkt_data if isinstance(mkt_data, dict) else {})
+                        es = mkt.get("endDate") or mkt.get("end_date", "")
+                        ss = mkt.get("startDate") or mkt.get("start_date", "")
+                        if es: end_ts   = datetime.fromisoformat(es.replace("Z","+00:00")).timestamp()
+                        if ss: start_ts = datetime.fromisoformat(ss.replace("Z","+00:00")).timestamp()
+                        slug = mkt.get("seriesSlug") or mkt.get("series_slug", "")
+                        if slug in SERIES:
+                            duration = SERIES[slug]["duration"]
+                            asset    = SERIES[slug]["asset"]
+                        toks = mkt.get("clobTokenIds") or []
+                        if isinstance(toks, str):
+                            try: toks = json.loads(toks)
+                            except: toks = []
+                        token_up   = toks[0] if len(toks) > 0 else ""
+                        token_down = toks[1] if len(toks) > 1 else ""
+                    except Exception:
+                        pass
+                    # If already expired, queue for on-chain resolution
+                    if end_ts > 0 and end_ts <= now:
+                        if cid not in self.pending_redeem:
+                            m_s = {"conditionId": cid, "question": title}
+                            t_s = {"side": side, "asset": asset, "size": val, "entry": 0.5,
+                                   "duration": duration, "mkt_price": 0.5, "mins_left": 0,
+                                   "open_price": 0, "token_id": "", "order_id": "SYNC-EXPIRED"}
+                            self.pending_redeem[cid] = (m_s, t_s)
+                            print(f"{Y}[SYNC] Expired → queued for resolution: {title[:40]} {side}{RS}")
+                        continue
+                    mins_left = (end_ts - now) / 60 if end_ts > 0 else 999
                     m_r = {"conditionId": cid, "question": title, "asset": asset,
-                           "duration": 15, "end_ts": end_ts, "start_ts": now - 60,
-                           "up_price": 0.5, "mins_left": 30, "token_up": "", "token_down": ""}
+                           "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
+                           "up_price": 0.5, "mins_left": mins_left,
+                           "token_up": token_up, "token_down": token_down}
                     t_r = {"side": side, "size": val, "entry": 0.5,
                            "open_price": 0, "current_price": 0, "true_prob": 0.5,
-                           "mkt_price": 0.5, "edge": 0, "mins_left": 30,
-                           "end_ts": end_ts, "asset": asset, "duration": 15,
-                           "token_id": "", "order_id": "SYNC-PERIODIC"}
+                           "mkt_price": 0.5, "edge": 0, "mins_left": mins_left,
+                           "end_ts": end_ts, "asset": asset, "duration": duration,
+                           "token_id": token_up if side == "Up" else token_down,
+                           "order_id": "SYNC-PERIODIC"}
                     self.pending[cid] = (m_r, t_r)
                     self.seen.add(cid)
                     added += 1
-                    print(f"{Y}[SYNC] Recovered missed position: {title[:45]} {side} ~${val:.2f}{RS}")
+                    print(f"{Y}[SYNC] Recovered: {title[:40]} {side} ~${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
                 if added:
                     self._save_pending()
                     self._save_seen()
