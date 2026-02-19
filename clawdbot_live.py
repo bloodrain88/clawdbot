@@ -66,7 +66,7 @@ MIN_BET        = 5.0      # $5 min per trade
 MAX_BET        = 10.0     # $10 max per trade
 MAX_DAILY_LOSS = 0.05     # 5% hard stop
 MAX_OPEN       = 3        # max simultaneous open positions
-SCAN_INTERVAL  = 10
+SCAN_INTERVAL  = 5
 PING_INTERVAL  = 5
 STATUS_INTERVAL= 30
 _DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
@@ -400,76 +400,82 @@ class LiveTrader:
             await asyncio.sleep(600)
 
     # ── MARKET FETCHER ────────────────────────────────────────────────────────
+    async def _fetch_series(self, slug: str, info: dict, now: float) -> dict:
+        """Fetch one series — called in parallel for all series."""
+        result = {}
+        try:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession()
+            async with self._session.get(
+                f"{GAMMA}/events",
+                params={
+                    "series_id":  info["id"],
+                    "active":     "true",
+                    "closed":     "false",
+                    "order":      "startDate",
+                    "ascending":  "true",
+                    "limit":      "20",
+                },
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as r:
+                if r.status == 429:
+                    retry = int(r.headers.get("Retry-After", 30))
+                    print(f"{Y}[FETCH] Rate limited — waiting {retry}s{RS}")
+                    await asyncio.sleep(retry)
+                    return result
+                data = await r.json()
+            events = data if isinstance(data, list) else data.get("data", [])
+            for ev in events:
+                start_str = ev.get("startTime", "")
+                end_str   = ev.get("endDate", "")
+                q         = ev.get("title", "") or ev.get("question", "")
+                mkts      = ev.get("markets", [])
+                m_data    = mkts[0] if mkts else ev
+                cid       = m_data.get("conditionId", "") or ev.get("conditionId", "")
+                prices    = m_data.get("outcomePrices") or ev.get("outcomePrices")
+                tokens    = m_data.get("clobTokenIds") or ev.get("clobTokenIds") or []
+                if isinstance(tokens, str):
+                    try: tokens = json.loads(tokens)
+                    except: tokens = []
+                if not cid or not end_str or not start_str:
+                    continue
+                try:
+                    end_ts   = datetime.fromisoformat(end_str.replace("Z","+00:00")).timestamp()
+                    start_ts = datetime.fromisoformat(start_str.replace("Z","+00:00")).timestamp()
+                except:
+                    continue
+                if end_ts <= now or start_ts > now + 60:
+                    continue
+                try:
+                    if isinstance(prices, str): prices = json.loads(prices)
+                    up_price = float(prices[0]) if prices else 0.5
+                except:
+                    up_price = 0.5
+                result[cid] = {
+                    "conditionId": cid,
+                    "question":    q,
+                    "asset":       info["asset"],
+                    "duration":    info["duration"],
+                    "end_ts":      end_ts,
+                    "start_ts":    start_ts,
+                    "up_price":    up_price,
+                    "mins_left":   (end_ts - now) / 60,
+                    "token_up":    tokens[0] if len(tokens) > 0 else "",
+                    "token_down":  tokens[1] if len(tokens) > 1 else "",
+                }
+        except Exception as e:
+            print(f"{R}[FETCH] {slug}: {e}{RS}")
+        return result
+
     async def fetch_markets(self):
-        now   = datetime.now(timezone.utc).timestamp()
+        now = datetime.now(timezone.utc).timestamp()
+        # Fetch all 5 series IN PARALLEL — ~27ms instead of 5×27ms+2.5s stagger
+        results = await asyncio.gather(
+            *[self._fetch_series(slug, info, now) for slug, info in SERIES.items()]
+        )
         found = {}
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        for slug, info in SERIES.items():
-            try:
-                async with self._session.get(
-                    f"{GAMMA}/events",
-                    params={
-                        "series_id":  info["id"],
-                        "active":     "true",
-                        "closed":     "false",
-                        "order":      "startDate",
-                        "ascending":  "true",
-                        "limit":      "20",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as r:
-                    if r.status == 429:
-                        retry = int(r.headers.get("Retry-After", 30))
-                        print(f"{Y}[FETCH] Rate limited — waiting {retry}s{RS}")
-                        await asyncio.sleep(retry)
-                        continue
-                    data = await r.json()
-                await asyncio.sleep(0.5)   # stagger requests, avoid burst
-                events = data if isinstance(data, list) else data.get("data", [])
-                for ev in events:
-                    start_str = ev.get("startTime", "")
-                    end_str   = ev.get("endDate", "")
-                    q         = ev.get("title", "") or ev.get("question", "")
-                    mkts      = ev.get("markets", [])
-                    m_data    = mkts[0] if mkts else ev
-                    cid       = m_data.get("conditionId", "") or ev.get("conditionId", "")
-                    prices    = m_data.get("outcomePrices") or ev.get("outcomePrices")
-                    # token IDs for Up (index 0) and Down (index 1) outcomes
-                    tokens    = m_data.get("clobTokenIds") or ev.get("clobTokenIds") or []
-                    if isinstance(tokens, str):
-                        try: tokens = json.loads(tokens)
-                        except: tokens = []
-
-                    if not cid or not end_str or not start_str:
-                        continue
-                    try:
-                        end_ts   = datetime.fromisoformat(end_str.replace("Z","+00:00")).timestamp()
-                        start_ts = datetime.fromisoformat(start_str.replace("Z","+00:00")).timestamp()
-                    except:
-                        continue
-                    if end_ts <= now or start_ts > now + 60:
-                        continue
-                    try:
-                        if isinstance(prices, str): prices = json.loads(prices)
-                        up_price = float(prices[0]) if prices else 0.5
-                    except:
-                        up_price = 0.5
-
-                    found[cid] = {
-                        "conditionId": cid,
-                        "question":    q,
-                        "asset":       info["asset"],
-                        "duration":    info["duration"],
-                        "end_ts":      end_ts,
-                        "start_ts":    start_ts,
-                        "up_price":    up_price,
-                        "mins_left":   (end_ts - now) / 60,
-                        "token_up":    tokens[0] if len(tokens) > 0 else "",
-                        "token_down":  tokens[1] if len(tokens) > 1 else "",
-                    }
-            except Exception as e:
-                print(f"{R}[FETCH] {slug}: {e}{RS}")
+        for r in results:
+            found.update(r)
         self.active_mkts = found
         return found
 
