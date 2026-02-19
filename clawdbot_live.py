@@ -718,6 +718,9 @@ class LiveTrader:
 
     # ── RESOLVE ───────────────────────────────────────────────────────────────
     async def _resolve(self):
+        """Queue all expired positions for on-chain resolution.
+        Never trust local price comparison — Polymarket resolves on Chainlink
+        at the exact expiry timestamp, which may differ from current price."""
         now     = datetime.now(timezone.utc).timestamp()
         expired = [k for k, (m, t) in self.pending.items() if m["end_ts"] <= now]
 
@@ -726,62 +729,46 @@ class LiveTrader:
             self._save_pending()
             asset = trade["asset"]
 
-            # SYNCED positions: we don't know open_price → can't use price comparison.
-            # Queue for on-chain check; _redeem_loop will handle redemption if won.
-            # Bankroll is refreshed by _refresh_balance() from real CLOB balance.
-            if trade.get("order_id") == "SYNCED":
-                print(f"{B}[RESOLVE] Synced {asset} {trade['side']} {trade['duration']}m expired → queued for on-chain check{RS}")
-                if not DRY_RUN:
-                    self.pending_redeem[k] = (trade["side"], asset)
-                continue
+            if DRY_RUN:
+                # Simulation only: use current price as approximation
+                price  = self._current_price(asset) or self.prices.get(asset, trade["open_price"])
+                up_won = price >= trade["open_price"]
+                won    = (trade["side"] == "Up" and up_won) or (trade["side"] == "Down" and not up_won)
+                pnl    = trade["size"] * (1/trade["entry"] - 1) if won else -trade["size"]
+                self.daily_pnl += pnl
+                if won:
+                    self.bankroll += trade["size"] / trade["entry"]
+                self.total += 1
+                if won: self.wins += 1
+                self._log(m, trade, "WIN" if won else "LOSS", pnl)
+                c  = G if won else R
+                wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
+                print(f"{c}[{'WIN' if won else 'LOSS'}]{RS} {asset} {trade['side']} "
+                      f"{trade['duration']}m | {c}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr}")
+            else:
+                # Live: queue for on-chain check — result determined by payoutNumerators
+                self.pending_redeem[k] = (m, trade)
+                print(f"{B}[RESOLVE] {asset} {trade['side']} {trade['duration']}m → on-chain queue{RS}")
 
-            price  = self._current_price(asset) or self.prices.get(asset, trade["open_price"])
-            up_won = price >= trade["open_price"]
-            won    = (trade["side"] == "Up" and up_won) or (trade["side"] == "Down" and not up_won)
-
-            # Bet was already deducted from bankroll on order place.
-            # On WIN: add back full payout (size/entry) minus fee.
-            # On LOSS: bankroll already reduced, nothing to add.
-            # net pnl (for reporting) = payout - size = size*(1/entry - 1)
-            pnl = trade["size"] * (1/trade["entry"] - 1) if won else -trade["size"]
-            fee = trade["size"] * 0.0156 * (1 - abs(trade["mkt_price"] - 0.5) * 2)
-            pnl = pnl - fee if won else pnl
-
-            self.daily_pnl += pnl
-            if won:
-                payout = trade["size"] / trade["entry"] - fee
-                self.bankroll += payout   # add back payout (bet was already deducted)
-            self.total     += 1
-            if won: self.wins += 1
-            self._log(m, trade, "WIN" if won else "LOSS", pnl)
-
-            c  = G if won else R
-            wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
-            print(
-                f"{c}[{'WIN' if won else 'LOSS'}]{RS} "
-                f"{asset} open=${trade['open_price']:,.1f} final=${price:,.1f} | "
-                f"{trade['duration']}min | {c}${pnl:+.2f}{RS} | "
-                f"Bank ${self.bankroll:.2f} | WR {wr}"
-            )
-
-            # Queue winning tokens for instant on-chain redemption
-            if won and not DRY_RUN:
-                self.pending_redeem[k] = (trade["side"], asset)
-
-    # ── REDEEM LOOP — polls every 30s, redeems as soon as on-chain resolved ──────
+    # ── REDEEM LOOP — polls every 30s, determines win/loss on-chain ───────────
     async def _redeem_loop(self):
+        """Authoritative win/loss determination via payoutNumerators on-chain.
+        Updates bankroll/P&L only after confirmed on-chain result."""
         if DRY_RUN or self.w3 is None:
             return
-        cfg       = get_contract_config(CHAIN_ID, neg_risk=False)
-        ctf_addr  = Web3.to_checksum_address(cfg.conditional_tokens)
-        collat    = Web3.to_checksum_address(cfg.collateral)
-        acct      = Account.from_key(PRIVATE_KEY)
-        CTF_CHECK = [
+        cfg      = get_contract_config(CHAIN_ID, neg_risk=False)
+        ctf_addr = Web3.to_checksum_address(cfg.conditional_tokens)
+        collat   = Web3.to_checksum_address(cfg.collateral)
+        acct     = Account.from_key(PRIVATE_KEY)
+        CTF_ABI_FULL = CTF_ABI + [
             {"inputs":[{"name":"conditionId","type":"bytes32"}],
              "name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],
              "stateMutability":"view","type":"function"},
-        ] + CTF_ABI
-        ctf  = self.w3.eth.contract(address=ctf_addr, abi=CTF_CHECK)
+            {"inputs":[{"name":"conditionId","type":"bytes32"},{"name":"index","type":"uint256"}],
+             "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+        ]
+        ctf  = self.w3.eth.contract(address=ctf_addr, abi=CTF_ABI_FULL)
         loop = asyncio.get_event_loop()
 
         while True:
@@ -789,28 +776,83 @@ class LiveTrader:
             if not self.pending_redeem:
                 continue
             done = []
-            for cid, (side, asset) in list(self.pending_redeem.items()):
+            for cid, val in list(self.pending_redeem.items()):
+                # Support both (m, trade) from _resolve and legacy (side, asset) from _sync_redeemable
+                if isinstance(val[0], dict):
+                    m, trade = val
+                    side  = trade["side"]
+                    asset = trade["asset"]
+                else:
+                    side, asset = val
+                    m     = {"conditionId": cid, "question": ""}
+                    trade = {"side": side, "asset": asset, "size": 0, "entry": 0.5,
+                             "duration": 0, "mkt_price": 0.5, "mins_left": 0,
+                             "open_price": 0, "token_id": "", "order_id": ""}
                 try:
                     cid_bytes = bytes.fromhex(cid.lstrip("0x").zfill(64))
                     denom = await loop.run_in_executor(
                         None, lambda b=cid_bytes: ctf.functions.payoutDenominator(b).call()
                     )
                     if denom == 0:
-                        continue   # not yet resolved on-chain, try again next cycle
-                    # Resolved — send redeemPositions tx immediately
-                    index_set = 1 if side == "Up" else 2
-                    nonce  = await loop.run_in_executor(None, lambda: self.w3.eth.get_transaction_count(acct.address))
-                    tx     = ctf.functions.redeemPositions(
-                        collat, b'\x00'*32, cid_bytes, [index_set]
-                    ).build_transaction({"from": acct.address, "nonce": nonce, "gas": 200_000, "gasPrice": self.w3.eth.gas_price})
-                    signed  = acct.sign_transaction(tx)
-                    tx_hash = await loop.run_in_executor(None, lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction))
-                    receipt = await loop.run_in_executor(None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60))
-                    if receipt.status == 1:
-                        print(f"{G}[REDEEM] {asset} {side} → USDC received | tx={tx_hash.hex()[:16]}{RS}")
-                        done.append(cid)
+                        continue   # not yet resolved on-chain
+
+                    # Determine actual winner from on-chain oracle result
+                    n0 = await loop.run_in_executor(
+                        None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 0).call()
+                    )
+                    n1 = await loop.run_in_executor(
+                        None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 1).call()
+                    )
+                    winner = "Up" if n0 > 0 else "Down"
+                    won    = (winner == side)
+                    size   = trade.get("size", 0)
+                    entry  = trade.get("entry", 0.5)
+
+                    if won and size > 0:
+                        # Redeem winning CTF tokens → USDC
+                        index_set = 1 if side == "Up" else 2
+                        nonce  = await loop.run_in_executor(
+                            None, lambda: self.w3.eth.get_transaction_count(acct.address)
+                        )
+                        tx = ctf.functions.redeemPositions(
+                            collat, b'\x00'*32, cid_bytes, [index_set]
+                        ).build_transaction({
+                            "from": acct.address, "nonce": nonce,
+                            "gas": 200_000, "gasPrice": self.w3.eth.gas_price
+                        })
+                        signed  = acct.sign_transaction(tx)
+                        tx_hash = await loop.run_in_executor(
+                            None, lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction)
+                        )
+                        receipt = await loop.run_in_executor(
+                            None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60)
+                        )
+                        if receipt.status == 1:
+                            fee    = size * 0.0156 * (1 - abs(trade.get("mkt_price", 0.5) - 0.5) * 2)
+                            payout = size / entry - fee
+                            pnl    = payout - size
+                            self.bankroll  += payout
+                            self.daily_pnl += pnl
+                            self.total += 1; self.wins += 1
+                            self._log(m, trade, "WIN", pnl)
+                            wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
+                            print(f"{G}[WIN]{RS} {asset} {side} {trade.get('duration',0)}m | "
+                                  f"{G}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr} | "
+                                  f"tx={tx_hash.hex()[:16]}")
+                            done.append(cid)
+                        else:
+                            print(f"{Y}[REDEEM] {asset} {side} tx failed, retrying...{RS}")
                     else:
-                        print(f"{Y}[REDEEM] {asset} {side} tx failed, retrying...{RS}")
+                        # Lost on-chain
+                        if size > 0:
+                            pnl = -size
+                            self.daily_pnl += pnl
+                            self.total += 1
+                            self._log(m, trade, "LOSS", pnl)
+                            wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
+                            print(f"{R}[LOSS]{RS} {asset} {side} {trade.get('duration',0)}m | "
+                                  f"{R}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr}")
+                        done.append(cid)
                 except Exception as e:
                     print(f"{Y}[REDEEM] {asset}: {e}{RS}")
             for cid in done:
@@ -963,10 +1005,14 @@ class LiveTrader:
                 n1 = ctf.functions.payoutNumerators(b, 1).call()
                 winner = "Up" if n0 > 0 else "Down"
                 if winner == outcome:
-                    # Derive asset from title
                     asset = "BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title \
                         else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?"
-                    self.pending_redeem[cid] = (outcome, asset)
+                    # Use (m, trade) format so _redeem_loop can update P&L correctly
+                    m_s = {"conditionId": cid, "question": title}
+                    t_s = {"side": outcome, "asset": asset, "size": val, "entry": 0.5,
+                           "duration": 0, "mkt_price": 0.5, "mins_left": 0,
+                           "open_price": 0, "token_id": "", "order_id": "SYNC"}
+                    self.pending_redeem[cid] = (m_s, t_s)
                     queued += 1
                     print(f"{G}[SYNC] Queued for redeem: {title} {outcome} ~${val:.2f}{RS}")
             except Exception:
