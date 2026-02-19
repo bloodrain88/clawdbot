@@ -354,13 +354,20 @@ class LiveTrader:
             mins_left  = max(0, (end_ts - now_ts) / 60)
             title      = m.get("question", "")[:38]
             src        = "CL" if cl_p > 0 else "RTDS"
-            winning    = (side == "Up" and cur_p > open_p) or (side == "Down" and cur_p < open_p)
-            move_pct   = ((cur_p - open_p) / open_p * 100) if open_p > 0 else 0
-            c          = G if winning else R
-            status_str = "WIN" if winning else "LOSS"
-            payout_est = size / t.get("entry", 0.5) if winning else 0
+            if open_p > 0 and cur_p > 0:
+                winning    = (side == "Up" and cur_p > open_p) or (side == "Down" and cur_p < open_p)
+                move_pct   = (cur_p - open_p) / open_p * 100
+                c          = G if winning else R
+                status_str = "WIN" if winning else "LOSS"
+                payout_est = size / t.get("entry", 0.5) if winning else 0
+                move_str   = f"({move_pct:+.2f}%)"
+            else:
+                c          = Y
+                status_str = "?"
+                payout_est = 0
+                move_str   = "(no ref)"
             print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
-                  f"open={open_p:.2f} {src}={cur_p:.2f} ({move_pct:+.2f}%) | "
+                  f"open={open_p:.2f} {src}={cur_p:.2f} {move_str} | "
                   f"bet=${size:.2f} est=${payout_est:.2f} | {mins_left:.1f}min left")
 
     # ── RTDS ──────────────────────────────────────────────────────────────────
