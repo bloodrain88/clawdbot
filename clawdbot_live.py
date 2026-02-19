@@ -824,15 +824,17 @@ class LiveTrader:
                           f"Bank ${self.bankroll:.2f}")
                     return order_id
 
-                # Poll up to 20s for maker fill — shorter wait so taker fallback is timely
-                max_wait  = min(20, int(mins_left * 60 * 0.20))
-                polls     = max(1, max_wait // 10)
+                # 5m markets: 5s maker wait (can't waste 1/3 of market life)
+                # 15m markets: 15s maker wait
+                poll_interval = 5 if duration <= 5 else 10
+                max_wait  = min(15 if duration <= 5 else 20, int(mins_left * 60 * 0.15))
+                polls     = max(1, max_wait // poll_interval)
                 print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
-                      f"waiting up to {polls*10}s for fill...{RS}")
+                      f"waiting up to {polls*poll_interval}s for fill...{RS}")
 
                 filled = False
                 for _ in range(polls):
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(poll_interval)
                     try:
                         info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
                         if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
@@ -849,15 +851,27 @@ class LiveTrader:
                           f"Bank ${self.bankroll:.2f}")
                     return order_id
 
-                # Cancel maker, fall back to taker
+                # Cancel maker, fall back to taker with fresh book
                 try:
                     await loop.run_in_executor(None, lambda: self.clob.cancel(order_id))
                 except Exception:
                     pass
-                print(f"{Y}[MAKER] unfilled — falling back to taker @ {best_ask+tick:.3f}{RS}")
 
-                # ── PHASE 2: Taker fallback ────────────────────────────────
-                taker_price = round(min(best_ask + tick, 0.97), 4)
+                # ── PHASE 2: Taker fallback — re-fetch book for fresh ask ──
+                try:
+                    fresh    = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                    f_asks   = sorted(fresh.asks, key=lambda x: float(x.price)) if fresh.asks else asks
+                    f_tick   = float(fresh.tick_size or tick)
+                    fresh_ask = float(f_asks[0].price) if f_asks else best_ask
+                    fresh_ep  = true_prob - fresh_ask
+                    if fresh_ep < edge_req:
+                        print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_req:.2f} — no longer worth it{RS}")
+                        return None
+                    taker_price = round(min(fresh_ask + f_tick, 0.97), 4)
+                except Exception:
+                    taker_price = round(min(best_ask + tick, 0.97), 4)
+                    fresh_ask   = best_ask
+                print(f"{Y}[MAKER] unfilled — taker @ {taker_price:.3f} (fresh ask={fresh_ask:.3f}){RS}")
                 size_tok_t  = round(size_usdc / taker_price, 2)
 
                 order_args = OrderArgs(token_id=token_id, price=taker_price,
