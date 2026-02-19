@@ -61,7 +61,7 @@ MIN_BET        = 5.0      # $5 floor
 MAX_BET        = 25.0     # $25 ceiling (Kelly can go higher on strong edges)
 KELLY_FRAC     = 0.30     # 30% Kelly — still conservative, more capital on strong edge
 MAX_DAILY_LOSS = 0.05     # 5% hard stop
-MAX_OPEN       = 3        # max simultaneous open positions
+MAX_OPEN       = 8        # max simultaneous open positions
 
 # Chainlink oracle feeds on Polygon (same source Polymarket uses for resolution)
 CHAINLINK_FEEDS = {
@@ -77,7 +77,7 @@ CHAINLINK_ABI = [
         {"name":"answeredInRound","type":"uint80"}],
      "stateMutability":"view","type":"function"},
 ]
-SCAN_INTERVAL  = 5
+SCAN_INTERVAL  = 2
 PING_INTERVAL  = 5
 STATUS_INTERVAL= 30
 _DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
@@ -686,29 +686,28 @@ class LiveTrader:
                           f"${size_usdc:.2f} @ {buy_price:.3f} | FILLED | Bank ${self.bankroll:.2f}")
                     return order_id
 
-                # GTC in book — poll up to 10s for fill
-                print(f"{B}[ORDER] GTC placed {asset} {side} ${size_usdc:.2f} @ {buy_price:.3f} — waiting fill...{RS}")
-                for _ in range(2):
-                    await asyncio.sleep(5)
-                    try:
-                        info = await loop.run_in_executor(
-                            None, lambda: self.clob.get_order(order_id)
-                        )
-                        fill_status = info.get("status", "") if isinstance(info, dict) else ""
-                        if fill_status in ("matched", "filled"):
-                            self.bankroll -= size_usdc
-                            print(f"{Y}[ORDER]{RS} {side} {asset} {duration}m | "
-                                  f"${size_usdc:.2f} @ {buy_price:.3f} | FILLED | Bank ${self.bankroll:.2f}")
-                            return order_id
-                    except Exception:
-                        pass
+                # GTC in book — poll once after 3s, then cancel (fast cycle)
+                print(f"{B}[ORDER] GTC placed {asset} {side} ${size_usdc:.2f} @ {buy_price:.3f} — waiting 3s...{RS}")
+                await asyncio.sleep(3)
+                try:
+                    info = await loop.run_in_executor(
+                        None, lambda: self.clob.get_order(order_id)
+                    )
+                    fill_status = info.get("status", "") if isinstance(info, dict) else ""
+                    if fill_status in ("matched", "filled"):
+                        self.bankroll -= size_usdc
+                        print(f"{Y}[ORDER]{RS} {side} {asset} {duration}m | "
+                              f"${size_usdc:.2f} @ {buy_price:.3f} | FILLED | Bank ${self.bankroll:.2f}")
+                        return order_id
+                except Exception:
+                    pass
 
-                # 10s elapsed, still unfilled — cancel
+                # 3s elapsed, still unfilled — cancel
                 try:
                     await loop.run_in_executor(None, lambda: self.clob.cancel(order_id))
                 except Exception:
                     pass
-                print(f"{Y}[ORDER] GTC unfilled 10s, cancelled {asset} {side}{RS}")
+                print(f"{Y}[ORDER] GTC unfilled 3s, cancelled {asset} {side}{RS}")
                 return None
 
             except Exception as e:
@@ -1136,12 +1135,16 @@ class LiveTrader:
             now     = datetime.now(timezone.utc).timestamp()
             print(f"{B}[SCAN] Live markets: {len(markets)} | Open: {len(self.pending)}{RS}")
 
+            # Evaluate ALL eligible markets in parallel — no more sequential blocking
+            candidates = []
             for cid, m in markets.items():
                 if m["start_ts"] > now: continue
                 if (m["end_ts"] - now) / 60 < 1: continue
                 m["mins_left"] = (m["end_ts"] - now) / 60
                 if cid not in self.seen:
-                    await self.evaluate(m)
+                    candidates.append(m)
+            if candidates:
+                await asyncio.gather(*[self.evaluate(m) for m in candidates])
 
             await self._resolve()
             await asyncio.sleep(SCAN_INTERVAL)
