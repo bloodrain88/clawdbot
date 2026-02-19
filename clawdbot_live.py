@@ -56,7 +56,7 @@ ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.07     # 7% base min edge (auto-adapted per recent WR)
-MIN_MOVE       = 0.002    # 0.2% min actual price move
+MIN_MOVE       = 0.001    # 0.1% min actual price move
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 MIN_BET        = 5.0      # $5 floor
 MAX_BET        = 25.0     # $25 ceiling (Kelly can go higher on strong edges)
@@ -117,6 +117,7 @@ class LiveTrader:
         self.vols        = {"BTC": 0.65, "ETH": 0.80, "SOL": 1.20, "XRP": 0.90}
         self.open_prices        = {}   # cid → float price
         self.open_prices_source = {}   # cid → "CL-exact" | "CL-fallback"
+        self._mkt_log_ts        = {}   # cid → last [MKT] log time
         self.active_mkts = {}
         self.pending         = {}   # cid → (m, trade)
         self.pending_redeem  = {}   # cid → (side, asset)  — waiting on-chain resolution
@@ -644,11 +645,9 @@ class LiveTrader:
             print(f"{Y}[SKIP] {label} → too late ({pct_remaining:.0%} remaining, need ≥35%) | beat=${open_price:,.2f} {src_tag}{RS}")
             return
 
-        # Require a real directional move — threshold scaled to market duration
-        # 5m: ~0.10% (BTC 1σ in 5min ≈ 0.24%, need clear signal but not extreme)
-        # 15m: 0.20% (full MIN_MOVE, more time means clearer signal required)
+        # Require a real directional move — 0.10% for all durations
         move_pct     = abs(current - open_price) / open_price if open_price > 0 else 0
-        min_move_dur = MIN_MOVE * 0.5 if duration <= 5 else MIN_MOVE
+        min_move_dur = MIN_MOVE
         direction    = "Up" if current >= open_price else "Down"
         move_str     = f"{(current-open_price)/open_price:+.3%}"
         if move_pct < min_move_dur:
@@ -1489,11 +1488,13 @@ class LiveTrader:
                         self.open_prices_source[cid] = src
                         print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | {m['mins_left']:.1f}min left{RS}")
                 else:
-                    # Already known — log on every scan so every skip/entry is traceable
+                    # Already known — log every 30s (not every scan) to reduce noise
                     ref = self.open_prices[cid]
                     src = self.open_prices_source.get(cid, "?")
                     cur = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
-                    if cur > 0:
+                    now_ts = _time.time()
+                    if cur > 0 and now_ts - self._mkt_log_ts.get(cid, 0) >= 30:
+                        self._mkt_log_ts[cid] = now_ts
                         move = (cur - ref) / ref * 100
                         print(f"{B}[MKT] {asset} {dur}m | beat=${ref:,.2f} [{src}] | "
                               f"now=${cur:,.2f} move={move:+.3f}% | {m['mins_left']:.1f}min left{RS}")
