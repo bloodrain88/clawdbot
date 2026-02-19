@@ -615,9 +615,12 @@ class LiveTrader:
         if pct_remaining < 0.35:
             return
 
-        # Require a real directional move — no structural bets
-        move_pct  = abs(current - open_price) / open_price if open_price > 0 else 0
-        if move_pct < MIN_MOVE:
+        # Require a real directional move — threshold scaled to market duration
+        # 5m: ~0.10% (BTC 1σ in 5min ≈ 0.24%, need clear signal but not extreme)
+        # 15m: 0.20% (full MIN_MOVE, more time means clearer signal required)
+        move_pct     = abs(current - open_price) / open_price if open_price > 0 else 0
+        min_move_dur = MIN_MOVE * 0.5 if duration <= 5 else MIN_MOVE
+        if move_pct < min_move_dur:
             return
 
         # Check RTDS vs Chainlink direction agreement
