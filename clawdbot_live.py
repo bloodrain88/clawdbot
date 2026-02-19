@@ -498,13 +498,14 @@ class LiveTrader:
         for attempt in range(3):
             try:
                 loop = asyncio.get_event_loop()
-                order_args = MarketOrderArgs(
+                order_args = OrderArgs(
                     token_id=token_id,
-                    amount=size_usdc,
+                    price=round(price, 4),
+                    size=round(size_usdc / price, 4),   # tokens, max 4 decimals
                     side="BUY",
                 )
                 signed = await loop.run_in_executor(
-                    None, lambda: self.clob.create_market_order(order_args)
+                    None, lambda: self.clob.create_order(order_args)
                 )
                 resp = await loop.run_in_executor(
                     None, lambda: self.clob.post_order(signed, OrderType.GTC)
