@@ -62,10 +62,26 @@ NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.06     # 6% min edge (same as paper bot — proven 60-65% WR)
 MIN_MOVE       = 0.002    # 0.2% min actual price move — filters pure noise
-MIN_BET        = 5.0      # $5 min per trade
-MAX_BET        = 10.0     # $10 max per trade
+MIN_BET        = 5.0      # $5 floor
+MAX_BET        = 25.0     # $25 ceiling (Kelly can go higher on strong edges)
+KELLY_FRAC     = 0.25     # quarter-Kelly — conservative, avoids ruin
 MAX_DAILY_LOSS = 0.05     # 5% hard stop
 MAX_OPEN       = 3        # max simultaneous open positions
+
+# Chainlink oracle feeds on Polygon (same source Polymarket uses for resolution)
+CHAINLINK_FEEDS = {
+    "BTC": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+    "ETH": "0xF9680D99D6C9589e2a93a78A04A279e509205945",
+    "SOL": "0x10C8264C0935b3B9870013e057f330Ff3e9C56dC",
+    "XRP": "0x785ba89291f676b5386652eB12b30cF361020694",
+}
+CHAINLINK_ABI = [
+    {"inputs":[],"name":"latestRoundData","outputs":[
+        {"name":"roundId","type":"uint80"},{"name":"answer","type":"int256"},
+        {"name":"startedAt","type":"uint256"},{"name":"updatedAt","type":"uint256"},
+        {"name":"answeredInRound","type":"uint80"}],
+     "stateMutability":"view","type":"function"},
+]
 SCAN_INTERVAL  = 5
 PING_INTERVAL  = 5
 STATUS_INTERVAL= 30
@@ -103,6 +119,8 @@ class LiveTrader:
         self.pending_redeem  = {}   # cid → (side, asset)  — waiting on-chain resolution
         self.seen            = set()
         self._session        = None   # persistent aiohttp session
+        self.cl_prices       = {}    # Chainlink oracle prices (resolution source)
+        self.cl_updated      = {}    # Chainlink last update timestamp per asset
         self.bankroll        = BANKROLL
         self.start_bank      = BANKROLL
         self.daily_pnl       = 0.0
@@ -399,6 +417,62 @@ class LiveTrader:
                 except: pass
             await asyncio.sleep(600)
 
+    # ── CHAINLINK ORACLE LOOP ─────────────────────────────────────────────────
+    async def chainlink_loop(self):
+        """Poll Chainlink feeds every 5s — same source Polymarket uses for resolution."""
+        if self.w3 is None:
+            print(f"{Y}[CL] No RPC — Chainlink disabled, using RTDS fallback{RS}")
+            return
+        contracts = {}
+        for asset, addr in CHAINLINK_FEEDS.items():
+            try:
+                contracts[asset] = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(addr), abi=CHAINLINK_ABI
+                )
+            except Exception as e:
+                print(f"{Y}[CL] {asset} contract error: {e}{RS}")
+        if not contracts:
+            return
+        loop = asyncio.get_event_loop()
+        ok_assets = list(contracts.keys())
+        print(f"{G}[CL] Chainlink feeds: {', '.join(ok_assets)}{RS}")
+        while True:
+            for asset, contract in contracts.items():
+                try:
+                    data = await loop.run_in_executor(
+                        None, contract.functions.latestRoundData().call
+                    )
+                    price   = data[1] / 1e8
+                    updated = data[3]
+                    import time as _t
+                    age     = _t.time() - updated
+                    if age < 60:   # only use if fresh (<60s)
+                        self.cl_prices[asset]  = price
+                        self.cl_updated[asset] = updated
+                except Exception:
+                    pass
+            await asyncio.sleep(5)
+
+    def _current_price(self, asset: str) -> float:
+        """Best available price: Chainlink if fresh (<45s), else RTDS fallback."""
+        import time as _t
+        cl = self.cl_prices.get(asset, 0)
+        cl_age = _t.time() - self.cl_updated.get(asset, 0)
+        if cl > 0 and cl_age < 45:
+            return cl
+        return self.prices.get(asset, 0)   # RTDS fallback
+
+    def _kelly_size(self, true_prob: float, entry: float) -> float:
+        """Quarter-Kelly bet size. Floor=$5, ceil=$25."""
+        if entry <= 0 or entry >= 1:
+            return MIN_BET
+        b = (1 / entry) - 1          # net odds per dollar staked
+        q = 1 - true_prob
+        kelly_f = (true_prob * b - q) / b
+        kelly_f = max(0.0, kelly_f)
+        size = self.bankroll * kelly_f * KELLY_FRAC
+        return round(max(MIN_BET, min(MAX_BET, size)), 2)
+
     # ── MARKET FETCHER ────────────────────────────────────────────────────────
     async def _fetch_series(self, slug: str, info: dict, now: float) -> dict:
         """Fetch one series — called in parallel for all series."""
@@ -494,7 +568,8 @@ class LiveTrader:
         if len(self.pending) >= MAX_OPEN:
             return
 
-        current = self.prices.get(asset, 0)
+        # Use Chainlink price (resolution source) if fresh, else RTDS fallback
+        current = self._current_price(asset)
         if current == 0:
             return
 
@@ -518,7 +593,7 @@ class LiveTrader:
         side  = "Up" if edge_up > 0 else "Down"
         edge  = abs(edge_up)
         entry = up_price if side == "Up" else (1 - up_price)
-        size  = round(max(MIN_BET, min(MAX_BET, self.bankroll * 0.10)), 2)
+        size  = self._kelly_size(true_prob, entry)   # quarter-Kelly, $5-$25
         token_id = m["token_up"] if side == "Up" else m["token_down"]
 
         if not token_id:
@@ -929,6 +1004,7 @@ class LiveTrader:
             self._status_loop(),
             self._refresh_balance(),
             self._redeem_loop(),
+            self.chainlink_loop(),
         )
 
 
