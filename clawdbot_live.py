@@ -60,15 +60,19 @@ PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
 ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
-MIN_EDGE       = 0.06     # 6% min edge
+MIN_EDGE       = 0.15     # 15% min edge (avoid coin flips)
+MIN_PRICE      = 0.62     # only bet when mkt price >62% or <38% (real asymmetry)
 MIN_BET        = 5.0      # $5 min per trade
 MAX_BET        = 10.0     # $10 max per trade
 MAX_DAILY_LOSS = 0.05     # 5% hard stop
+MAX_OPEN       = 3        # max simultaneous open positions
+TIMING_FRAC    = 0.40     # only bet in first 40% of market duration
 SCAN_INTERVAL  = 10
 PING_INTERVAL  = 5
 STATUS_INTERVAL= 30
 LOG_FILE       = os.path.expanduser("~/clawdbot_live_trades.csv")
 PENDING_FILE   = os.path.expanduser("~/clawdbot_pending.json")
+SEEN_FILE      = os.path.expanduser("~/clawdbot_seen.json")
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
@@ -131,14 +135,43 @@ class LiveTrader:
         except Exception:
             pass
 
+    def _save_seen(self):
+        try:
+            with open(SEEN_FILE, "w") as f:
+                json.dump(list(self.seen), f)
+        except Exception:
+            pass
+
     def _load_pending(self):
+        # Load seen from disk (survive restarts → no duplicate bets)
+        if os.path.exists(SEEN_FILE):
+            try:
+                with open(SEEN_FILE) as f:
+                    self.seen = set(json.load(f))
+                print(f"{Y}[RESUME] Loaded {len(self.seen)} seen markets from disk{RS}")
+            except Exception:
+                pass
+        # Load also from Polymarket open positions (belt-and-suspenders)
+        try:
+            import requests as _req
+            r = _req.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                timeout=8
+            )
+            for p in r.json():
+                self.seen.add(p["conditionId"])
+            print(f"{Y}[RESUME] Synced seen from Polymarket positions ({len(self.seen)} total){RS}")
+        except Exception:
+            pass
+        # Load pending trades
         if not os.path.exists(PENDING_FILE):
             return
         try:
             with open(PENDING_FILE) as f:
                 data = json.load(f)
             self.pending = {k: (m, t) for k, (m, t) in data.items()}
-            self.seen    = set(self.pending.keys())
+            self.seen.update(self.pending.keys())
             if self.pending:
                 print(f"{Y}[RESUME] Loaded {len(self.pending)} pending trades from previous run{RS}")
         except Exception as e:
@@ -432,6 +465,17 @@ class LiveTrader:
         if self.daily_pnl <= -(self.bankroll * MAX_DAILY_LOSS):
             return
 
+        # Max open positions guard
+        if len(self.pending) >= MAX_OPEN:
+            return
+
+        # Timing filter: only bet in first 40% of market duration
+        elapsed_frac = 1.0 - (mins_left / duration)
+        if elapsed_frac > TIMING_FRAC:
+            self.seen.add(cid)   # skip and don't revisit
+            self._save_seen()
+            return
+
         current = self.prices.get(asset, 0)
         if current == 0:
             return
@@ -446,6 +490,11 @@ class LiveTrader:
         edge_up   = true_prob - up_price
 
         if abs(edge_up) < MIN_EDGE:
+            return
+
+        # Price filter: avoid near-50/50 markets (no real asymmetry)
+        mkt_price_side = up_price if edge_up > 0 else (1 - up_price)
+        if mkt_price_side > MIN_PRICE:
             return
 
         side       = "Up" if edge_up > 0 else "Down"
@@ -480,6 +529,7 @@ class LiveTrader:
         }
 
         self.seen.add(cid)
+        self._save_seen()
         if order_id:
             self.pending[cid] = (m, trade)
             self._save_pending()
