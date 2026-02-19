@@ -98,17 +98,15 @@ class LiveTrader:
             print(f"{R}[CLOB] Creds error: {e}{RS}")
             raise
 
-        # Approve USDC + token allowances (one-time on-chain tx per contract)
+        # Approve USDC allowance for Polymarket contracts (one-time on-chain tx)
         if not DRY_RUN:
-            for label, atype in [("USDC collateral", AssetType.COLLATERAL),
-                                  ("CTF tokens", AssetType.CONDITIONAL_TOKEN)]:
-                try:
-                    resp = self.clob.update_balance_allowance(
-                        BalanceAllowanceParams(asset_type=atype)
-                    )
-                    print(f"{G}[CLOB] Allowance approved ({label}): {resp}{RS}")
-                except Exception as e:
-                    print(f"{Y}[CLOB] Allowance ({label}): {e}{RS}")
+            try:
+                resp = self.clob.update_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                )
+                print(f"{G}[CLOB] USDC allowance approved: {resp}{RS}")
+            except Exception as e:
+                print(f"{Y}[CLOB] Allowance: {e}{RS}")
 
         # Check USDC balance
         try:
