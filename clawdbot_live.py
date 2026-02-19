@@ -98,6 +98,7 @@ class LiveTrader:
         self.pending         = {}   # cid → (m, trade)
         self.pending_redeem  = {}   # cid → (side, asset)  — waiting on-chain resolution
         self.seen            = set()
+        self._session        = None   # persistent aiohttp session
         self.bankroll        = BANKROLL
         self.start_bank      = BANKROLL
         self.daily_pnl       = 0.0
@@ -350,22 +351,29 @@ class LiveTrader:
     async def fetch_markets(self):
         now   = datetime.now(timezone.utc).timestamp()
         found = {}
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
         for slug, info in SERIES.items():
             try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(
-                        f"{GAMMA}/events",
-                        params={
-                            "series_id":  info["id"],
-                            "active":     "true",
-                            "closed":     "false",
-                            "order":      "startDate",
-                            "ascending":  "true",
-                            "limit":      "20",
-                        },
-                        timeout=aiohttp.ClientTimeout(total=8)
-                    ) as r:
-                        data = await r.json()
+                async with self._session.get(
+                    f"{GAMMA}/events",
+                    params={
+                        "series_id":  info["id"],
+                        "active":     "true",
+                        "closed":     "false",
+                        "order":      "startDate",
+                        "ascending":  "true",
+                        "limit":      "20",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as r:
+                    if r.status == 429:
+                        retry = int(r.headers.get("Retry-After", 30))
+                        print(f"{Y}[FETCH] Rate limited — waiting {retry}s{RS}")
+                        await asyncio.sleep(retry)
+                        continue
+                    data = await r.json()
+                await asyncio.sleep(0.5)   # stagger requests, avoid burst
                 events = data if isinstance(data, list) else data.get("data", [])
                 for ev in events:
                     start_str = ev.get("startTime", "")
@@ -487,29 +495,37 @@ class LiveTrader:
             )
             return fake_id
 
-        try:
-            loop = asyncio.get_event_loop()
-            order_args = MarketOrderArgs(
-                token_id=token_id,
-                amount=size_usdc,
-                side="BUY",
-            )
-            signed = await loop.run_in_executor(
-                None, lambda: self.clob.create_market_order(order_args)
-            )
-            resp = await loop.run_in_executor(
-                None, lambda: self.clob.post_order(signed, OrderType.FOK)
-            )
-            order_id = resp.get("orderID") or resp.get("id") or str(resp)
-            self.bankroll -= size_usdc   # deduct immediately on fill
-            print(
-                f"{Y}[ORDER]{RS} {side} {asset} {duration}m | "
-                f"${size_usdc:.2f} USDC @ {price:.3f} | order={order_id[:16]}... | Bank ${self.bankroll:.2f}"
-            )
-            return order_id
-        except Exception as e:
-            print(f"{R}[ORDER FAILED] {asset} {side}: {e}{RS}")
-            return None
+        for attempt in range(3):
+            try:
+                loop = asyncio.get_event_loop()
+                order_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=size_usdc,
+                    side="BUY",
+                )
+                signed = await loop.run_in_executor(
+                    None, lambda: self.clob.create_market_order(order_args)
+                )
+                resp = await loop.run_in_executor(
+                    None, lambda: self.clob.post_order(signed, OrderType.FOK)
+                )
+                order_id = resp.get("orderID") or resp.get("id") or str(resp)
+                self.bankroll -= size_usdc   # deduct immediately on fill
+                print(
+                    f"{Y}[ORDER]{RS} {side} {asset} {duration}m | "
+                    f"${size_usdc:.2f} USDC @ {price:.3f} | order={order_id[:16]}... | Bank ${self.bankroll:.2f}"
+                )
+                return order_id
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "rate limit" in err.lower():
+                    wait = 10 * (attempt + 1)
+                    print(f"{Y}[ORDER] Rate limited — waiting {wait}s before retry{RS}")
+                    await asyncio.sleep(wait)
+                    continue
+                print(f"{R}[ORDER FAILED] {asset} {side}: {e}{RS}")
+                return None
+        return None
 
     # ── RESOLVE ───────────────────────────────────────────────────────────────
     async def _resolve(self):
