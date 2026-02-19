@@ -77,6 +77,11 @@ CHAINLINK_ABI = [
         {"name":"startedAt","type":"uint256"},{"name":"updatedAt","type":"uint256"},
         {"name":"answeredInRound","type":"uint80"}],
      "stateMutability":"view","type":"function"},
+    {"inputs":[{"name":"_roundId","type":"uint80"}],"name":"getRoundData","outputs":[
+        {"name":"roundId","type":"uint80"},{"name":"answer","type":"int256"},
+        {"name":"startedAt","type":"uint256"},{"name":"updatedAt","type":"uint256"},
+        {"name":"answeredInRound","type":"uint80"}],
+     "stateMutability":"view","type":"function"},
 ]
 SCAN_INTERVAL  = 5   # market slot discovery only — real-time eval via RTDS ticks
 PING_INTERVAL  = 5
@@ -1312,6 +1317,57 @@ class LiveTrader:
         rwr = sum(self.recent_trades) / len(self.recent_trades) if self.recent_trades else 0
         print(f"{B}[ADAPT] Recent WR={rwr:.0%}  MinEdge={me:.2f}  MomWeight={mw:.2f}{RS}")
 
+    # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
+    async def _get_chainlink_at(self, asset: str, start_ts: float) -> float:
+        """Return Chainlink price at or just before start_ts.
+        Walks backwards through rounds to find the last update <= start_ts,
+        matching the exact reference price Polymarket uses for resolution."""
+        if self.w3 is None or asset not in CHAINLINK_FEEDS:
+            return 0.0
+        loop = asyncio.get_event_loop()
+        try:
+            contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(CHAINLINK_FEEDS[asset]),
+                abi=CHAINLINK_ABI
+            )
+            latest = await loop.run_in_executor(None, contract.functions.latestRoundData().call)
+            round_id   = latest[0]
+            updated_at = latest[3]
+            price      = latest[1]
+
+            # Already at or before start: use current round
+            if updated_at <= start_ts:
+                return price / 1e8
+
+            # Walk backward — BTC updates ~27s, 30 rounds ≈ 13 min max lookback
+            phase_id = round_id >> 64
+            agg_id   = round_id & ((1 << 64) - 1)
+            for i in range(1, 31):
+                prev_agg = agg_id - i
+                if prev_agg <= 0:
+                    break
+                prev_id = (phase_id << 64) | prev_agg
+                try:
+                    data = await loop.run_in_executor(
+                        None, lambda rid=prev_id: contract.functions.getRoundData(rid).call()
+                    )
+                    prev_updated = data[3]
+                    prev_price   = data[1]
+                    if prev_price <= 0:
+                        continue
+                    if prev_updated <= start_ts:
+                        print(f"{B}[OPEN] {asset} historical CL round -{i}: "
+                              f"price={prev_price/1e8:.4f} updatedAt={prev_updated} start_ts={start_ts:.0f}{RS}")
+                        return prev_price / 1e8
+                except Exception:
+                    break
+
+            # Fallback to latest if walk fails
+            return price / 1e8
+        except Exception as e:
+            print(f"{Y}[CL] _get_chainlink_at {asset}: {e}{RS}")
+            return 0.0
+
     # ── SCAN LOOP ─────────────────────────────────────────────────────────────
     async def scan_loop(self):
         await asyncio.sleep(6)
@@ -1326,15 +1382,17 @@ class LiveTrader:
                 if m["start_ts"] > now: continue
                 if (m["end_ts"] - now) / 60 < 1: continue
                 m["mins_left"] = (m["end_ts"] - now) / 60
-                # Set open_price from Chainlink the first time we see this market.
-                # Chainlink is the SAME source Polymarket uses for resolution.
-                # Must happen before evaluate() so direction comparison is correct.
+                # Set open_price from Chainlink at exact market start time.
+                # Must match Polymarket's resolution reference ("price to beat").
                 if cid not in self.open_prices:
-                    asset = m.get("asset")
-                    ref = self.cl_prices.get(asset, 0) or self.prices.get(asset, 0)
+                    asset    = m.get("asset")
+                    start_ts = m.get("start_ts", now)
+                    ref = await self._get_chainlink_at(asset, start_ts)
+                    if ref <= 0:
+                        ref = self.cl_prices.get(asset, 0) or self.prices.get(asset, 0)
                     if ref > 0:
                         self.open_prices[cid] = ref
-                        print(f"{B}[OPEN] {asset} ref={ref:.4f} (Chainlink){RS}")
+                        print(f"{B}[OPEN] {asset} ref={ref:.4f} (CL@start_ts){RS}")
                 if cid not in self.seen:
                     candidates.append(m)
             if candidates:
