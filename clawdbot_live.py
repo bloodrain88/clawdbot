@@ -588,10 +588,10 @@ class LiveTrader:
         if len(self.pending) >= MAX_OPEN:
             return
 
-        # Use Chainlink as current price — same source Polymarket resolves on.
-        # Comparing Chainlink-now vs Chainlink-open gives the true direction signal.
-        # Fall back to RTDS only if Chainlink is unavailable.
-        current = self.cl_prices.get(asset, 0) or self.prices.get(asset, 0)
+        # Use RTDS (Binance) as current price for direction analysis — real-time, sub-second.
+        # open_price is Chainlink (resolution source), current is RTDS (fastest signal).
+        # Momentum and BS use RTDS to detect where price is heading right now.
+        current = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
         if current == 0:
             return
 
