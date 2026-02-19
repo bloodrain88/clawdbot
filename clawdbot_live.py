@@ -621,11 +621,15 @@ class LiveTrader:
             self._log(m, trade)
 
     async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5):
-        """GTC limit order — checks CLOB price vs AMM price before placing.
-        Skips if CLOB asks more than 12¢ above AMM (illiquid spread destroys edge).
+        """Maker-first order strategy:
+        1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
+        2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
+        3. If unfilled, cancel and fall back to taker at best_ask+tick
+        4. If taker unfilled after 3s, cancel and return None.
         Returns order_id or None."""
         if DRY_RUN:
             fake_id = f"DRY-{asset[:3]}-{int(datetime.now(timezone.utc).timestamp())}"
+            # Simulate at AMM price (approximates maker fill quality)
             print(f"{Y}[DRY-RUN]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {price:.3f} | id={fake_id}")
             return fake_id
 
@@ -633,84 +637,131 @@ class LiveTrader:
             try:
                 loop = asyncio.get_event_loop()
 
-                # Fetch live order book → find real best ask
-                book = await loop.run_in_executor(
-                    None, lambda: self.clob.get_order_book(token_id)
-                )
-                tick = float(book.tick_size or "0.01")
-                asks = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
-                best_ask = float(asks[0].price) if asks else price
+                # Fetch order book
+                book     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                tick     = float(book.tick_size or "0.01")
+                asks     = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
+                bids     = sorted(book.bids, key=lambda x: float(x.price), reverse=True) if book.bids else []
 
-                # Use CLOB price as actual reference — AMM and CLOB diverge structurally
-                # for short-duration binary markets, gap check is wrong
-                clob_edge = true_prob - best_ask
-                if clob_edge < MIN_EDGE:
-                    print(f"{Y}[SKIP] {asset} {side}: CLOB_ask={best_ask:.3f} "
-                          f"real_edge={clob_edge:.3f} < {MIN_EDGE}{RS}")
+                if not asks:
+                    print(f"{Y}[SKIP] {asset} {side}: empty order book{RS}")
                     return None
 
-                # Buy at best_ask + tick to ensure fill
-                buy_price = round(min(best_ask + tick, 0.97), 4)
-                size_tok  = round(size_usdc / buy_price, 2)
-                print(f"{B}[CLOB] {asset} {side}: model={true_prob:.3f} CLOB_ask={best_ask:.3f} "
-                      f"real_edge={clob_edge:.3f} buying@{buy_price:.3f}{RS}")
+                best_ask = float(asks[0].price)
+                best_bid = float(bids[0].price) if bids else best_ask - 0.10
+                spread   = best_ask - best_bid
 
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=buy_price,
-                    size=size_tok,
-                    side="BUY",
-                )
-                signed = await loop.run_in_executor(
-                    None, lambda: self.clob.create_order(order_args)
-                )
-                resp = await loop.run_in_executor(
-                    None, lambda: self.clob.post_order(signed, OrderType.GTC)
-                )
+                # Taker edge check (minimum bar — maker will be better)
+                taker_edge = true_prob - best_ask
+                if taker_edge < MIN_EDGE:
+                    print(f"{Y}[SKIP] {asset} {side}: taker_edge={taker_edge:.3f} < {MIN_EDGE} "
+                          f"(ask={best_ask:.3f} model={true_prob:.3f}){RS}")
+                    return None
+
+                # ── PHASE 1: Maker bid at mid ──────────────────────────────
+                mid          = (best_bid + best_ask) / 2
+                maker_price  = round(min(mid + tick, best_ask - tick), 4)
+                maker_price  = max(maker_price, tick)
+                maker_edge   = true_prob - maker_price
+                size_tok_m   = round(size_usdc / maker_price, 2)
+
+                print(f"{G}[MAKER] {asset} {side}: bid={maker_price:.3f} "
+                      f"ask={best_ask:.3f} spread={spread:.3f} "
+                      f"maker_edge={maker_edge:.3f} taker_edge={taker_edge:.3f}{RS}")
+
+                order_args = OrderArgs(token_id=token_id, price=maker_price,
+                                       size=size_tok_m, side="BUY")
+                signed  = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
+                resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.GTC))
                 order_id = resp.get("orderID") or resp.get("id", "")
                 status   = resp.get("status", "")
 
                 if not order_id:
-                    print(f"{Y}[ORDER] No order_id {asset} {side}{RS}")
+                    print(f"{Y}[MAKER] No order_id — skipping{RS}")
                     return None
 
-                # Immediate fill (status == "matched") — done
                 if status == "matched":
                     self.bankroll -= size_usdc
-                    print(f"{Y}[ORDER]{RS} {side} {asset} {duration}m | "
-                          f"${size_usdc:.2f} @ {buy_price:.3f} | FILLED | Bank ${self.bankroll:.2f}")
+                    payout = size_usdc / maker_price
+                    print(f"{G}[MAKER FILL]{RS} {side} {asset} {duration}m | "
+                          f"${size_usdc:.2f} @ {maker_price:.3f} | payout=${payout:.2f} | "
+                          f"Bank ${self.bankroll:.2f}")
                     return order_id
 
-                # GTC in book — poll once after 3s, then cancel (fast cycle)
-                print(f"{B}[ORDER] GTC placed {asset} {side} ${size_usdc:.2f} @ {buy_price:.3f} — waiting 3s...{RS}")
-                await asyncio.sleep(3)
-                try:
-                    info = await loop.run_in_executor(
-                        None, lambda: self.clob.get_order(order_id)
-                    )
-                    fill_status = info.get("status", "") if isinstance(info, dict) else ""
-                    if fill_status in ("matched", "filled"):
-                        self.bankroll -= size_usdc
-                        print(f"{Y}[ORDER]{RS} {side} {asset} {duration}m | "
-                              f"${size_usdc:.2f} @ {buy_price:.3f} | FILLED | Bank ${self.bankroll:.2f}")
-                        return order_id
-                except Exception:
-                    pass
+                # Poll up to 45s for maker fill (asyncio: other evals run in parallel)
+                max_wait  = min(45, int(mins_left * 60 * 0.35))
+                polls     = max(1, max_wait // 10)
+                print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
+                      f"waiting up to {polls*10}s for fill...{RS}")
 
-                # 3s elapsed, still unfilled — cancel
+                filled = False
+                for _ in range(polls):
+                    await asyncio.sleep(10)
+                    try:
+                        info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                        if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
+                            filled = True
+                            break
+                    except Exception:
+                        pass
+
+                if filled:
+                    self.bankroll -= size_usdc
+                    payout = size_usdc / maker_price
+                    print(f"{G}[MAKER FILL]{RS} {side} {asset} {duration}m | "
+                          f"${size_usdc:.2f} @ {maker_price:.3f} | payout=${payout:.2f} | "
+                          f"Bank ${self.bankroll:.2f}")
+                    return order_id
+
+                # Cancel maker, fall back to taker
                 try:
                     await loop.run_in_executor(None, lambda: self.clob.cancel(order_id))
                 except Exception:
                     pass
-                print(f"{Y}[ORDER] GTC unfilled 3s, cancelled {asset} {side}{RS}")
+                print(f"{Y}[MAKER] unfilled — falling back to taker @ {best_ask+tick:.3f}{RS}")
+
+                # ── PHASE 2: Taker fallback ────────────────────────────────
+                taker_price = round(min(best_ask + tick, 0.97), 4)
+                size_tok_t  = round(size_usdc / taker_price, 2)
+
+                order_args = OrderArgs(token_id=token_id, price=taker_price,
+                                       size=size_tok_t, side="BUY")
+                signed  = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
+                resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.GTC))
+                order_id = resp.get("orderID") or resp.get("id", "")
+                status   = resp.get("status", "")
+
+                if not order_id:
+                    return None
+
+                if status == "matched":
+                    self.bankroll -= size_usdc
+                    print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
+                          f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                    return order_id
+
+                await asyncio.sleep(3)
+                try:
+                    info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                    if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
+                        self.bankroll -= size_usdc
+                        print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
+                              f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                        return order_id
+                except Exception:
+                    pass
+
+                try:
+                    await loop.run_in_executor(None, lambda: self.clob.cancel(order_id))
+                except Exception:
+                    pass
+                print(f"{Y}[ORDER] Both maker and taker unfilled — cancelled{RS}")
                 return None
 
             except Exception as e:
                 err = str(e)
                 if "429" in err or "rate limit" in err.lower():
-                    wait = 10 * (attempt + 1)
-                    print(f"{Y}[ORDER] Rate limited — waiting {wait}s{RS}")
-                    await asyncio.sleep(wait)
+                    await asyncio.sleep(10 * (attempt + 1))
                     continue
                 print(f"{R}[ORDER FAILED] {asset} {side}: {e}{RS}")
                 return None
