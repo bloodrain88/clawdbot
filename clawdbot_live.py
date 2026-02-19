@@ -59,7 +59,7 @@ MIN_MOVE       = 0.004    # 0.4% min actual price move — filters noise
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 MIN_BET        = 5.0      # $5 floor
 MAX_BET        = 25.0     # $25 ceiling (Kelly can go higher on strong edges)
-KELLY_FRAC     = 0.25     # quarter-Kelly — conservative, avoids ruin
+KELLY_FRAC     = 0.30     # 30% Kelly — still conservative, more capital on strong edge
 MAX_DAILY_LOSS = 0.05     # 5% hard stop
 MAX_OPEN       = 3        # max simultaneous open positions
 
@@ -418,16 +418,23 @@ class LiveTrader:
             return cl
         return self.prices.get(asset, 0)   # RTDS fallback
 
-    def _kelly_size(self, true_prob: float, entry: float) -> float:
-        """Quarter-Kelly bet size. Floor=$5, ceil=$25."""
+    def _kelly_size(self, true_prob: float, entry: float, edge: float = 0.0) -> float:
+        """Kelly bet size with dynamic ceiling scaled by edge strength.
+        Floor=$5. Ceiling: edge<15%→$25, edge 15-30%→$50, edge>30%→$80 (or 35% bankroll)."""
         if entry <= 0 or entry >= 1:
             return MIN_BET
-        b = (1 / entry) - 1          # net odds per dollar staked
+        b = (1 / entry) - 1
         q = 1 - true_prob
         kelly_f = (true_prob * b - q) / b
         kelly_f = max(0.0, kelly_f)
         size = self.bankroll * kelly_f * KELLY_FRAC
-        return round(max(MIN_BET, min(MAX_BET, size)), 2)
+        if edge >= 0.30:
+            max_bet = min(80.0, self.bankroll * 0.35)
+        elif edge >= 0.15:
+            max_bet = min(50.0, self.bankroll * 0.30)
+        else:
+            max_bet = MAX_BET
+        return round(max(MIN_BET, min(max_bet, size)), 2)
 
     # ── MARKET FETCHER ────────────────────────────────────────────────────────
     async def _fetch_series(self, slug: str, info: dict, now: float) -> dict:
@@ -573,7 +580,7 @@ class LiveTrader:
             return
 
         entry = up_price if side == "Up" else (1 - up_price)
-        size  = self._kelly_size(true_prob, entry)
+        size  = self._kelly_size(true_prob, entry, edge)
         token_id = m["token_up"] if side == "Up" else m["token_down"]
 
         if not token_id:
@@ -584,6 +591,10 @@ class LiveTrader:
         print(f"{B}[EDGE] {asset} {side} | move={((current-open_price)/open_price):+.3%} "
               f"bs={bs_prob:.3f} mom={mom_prob:.3f} combined={true_prob:.3f} "
               f"mkt={up_price:.3f} edge={edge:.3f} fee~{fee_est:.3f} {mins_left:.1f}min left{RS}")
+
+        # Mark seen before placing — prevents double-bet if evaluate called concurrently
+        self.seen.add(cid)
+        self._save_seen()
 
         # ── Place real order ──────────────────────────────────────────────────
         order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left)
@@ -605,8 +616,6 @@ class LiveTrader:
             "order_id":      order_id or "",
         }
 
-        self.seen.add(cid)
-        self._save_seen()
         if order_id:
             self.pending[cid] = (m, trade)
             self._save_pending()
