@@ -115,7 +115,8 @@ class LiveTrader:
     def __init__(self):
         self.prices      = {}
         self.vols        = {"BTC": 0.65, "ETH": 0.80, "SOL": 1.20, "XRP": 0.90}
-        self.open_prices = {}
+        self.open_prices        = {}   # cid → float price
+        self.open_prices_source = {}   # cid → "CL-exact" | "CL-fallback"
         self.active_mkts = {}
         self.pending         = {}   # cid → (m, trade)
         self.pending_redeem  = {}   # cid → (side, asset)  — waiting on-chain resolution
@@ -628,11 +629,14 @@ class LiveTrader:
             print(f"{Y}[WAIT] {label} → fetching open price (CL){RS}")
             return  # wait until scan_loop sets Chainlink-based open_price
 
+        src = self.open_prices_source.get(cid, "?")
+        src_tag = f"[{src}]"
+
         # Only enter in first 35% of market life — need time for price to move further our way
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
         if pct_remaining < 0.35:
-            print(f"{Y}[SKIP] {label} → too late ({pct_remaining:.0%} remaining, need ≥35%){RS}")
+            print(f"{Y}[SKIP] {label} → too late ({pct_remaining:.0%} remaining, need ≥35%) | beat=${open_price:,.2f} {src_tag}{RS}")
             return
 
         # Require a real directional move — threshold scaled to market duration
@@ -643,7 +647,8 @@ class LiveTrader:
         direction    = "Up" if current >= open_price else "Down"
         move_str     = f"{(current-open_price)/open_price:+.3%}"
         if move_pct < min_move_dur:
-            print(f"{Y}[SKIP] {label} → move {move_str} < {min_move_dur:.2%} needed | ref={open_price:.2f} now={current:.2f}{RS}")
+            print(f"{Y}[SKIP] {label} → move {move_str} < {min_move_dur:.2%} needed | "
+                  f"beat=${open_price:,.2f} {src_tag} now=${current:,.2f}{RS}")
             return
 
         # Check RTDS vs Chainlink direction agreement
@@ -688,7 +693,8 @@ class LiveTrader:
             best_edge = max(edge_up, edge_down)
             best_side = "Up" if edge_up >= edge_down else "Down"
             print(f"{Y}[SKIP] {label} → no edge | {best_side} edge={best_edge:.3f} < {pre_filter:.3f} | "
-                  f"move={move_str} bs={bs_prob:.3f} mom={mom_prob:.3f} agree={'Y' if cl_agree else 'N'}{RS}")
+                  f"beat=${open_price:,.2f} {src_tag} move={move_str} "
+                  f"bs={bs_prob:.3f} mom={mom_prob:.3f} agree={'Y' if cl_agree else 'N'}{RS}")
             return
 
         entry = up_price if side == "Up" else (1 - up_price)
@@ -700,8 +706,8 @@ class LiveTrader:
             self.seen.add(cid)
             return
 
-        agree_str = "" if cl_agree else f" {Y}CL-disagree{RS}"
-        print(f"{B}[EDGE] {label} → {side} | move={move_str} ref={open_price:.2f} "
+        agree_str = "" if cl_agree else f" {Y}[CL-disagree]{RS}"
+        print(f"{G}[EDGE] {label} → {side} | beat=${open_price:,.2f} {src_tag} now=${current:,.2f} move={move_str} | "
               f"bs={bs_prob:.3f} mom={mom_prob:.3f} prob={true_prob:.3f} "
               f"mkt={up_price:.3f} edge={edge:.3f} ${size:.2f}{agree_str}{RS}")
 
@@ -1384,12 +1390,13 @@ class LiveTrader:
         print(f"{B}[ADAPT] Recent WR={rwr:.0%}  MinEdge={me:.2f}  MomWeight={mw:.2f}{RS}")
 
     # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
-    async def _get_chainlink_at(self, asset: str, start_ts: float) -> float:
-        """Return Chainlink price at or just before start_ts.
-        Walks backwards through rounds to find the last update <= start_ts,
-        matching the exact reference price Polymarket uses for resolution."""
+    async def _get_chainlink_at(self, asset: str, start_ts: float) -> tuple:
+        """Return (price, source) where source is 'CL-exact' or 'CL-fallback'.
+        Walks backwards through Chainlink rounds to find the last update <= start_ts,
+        matching the exact reference price Polymarket uses for resolution.
+        BTC/ETH update every ~27s → 60 rounds covers ~27 minutes lookback."""
         if self.w3 is None or asset not in CHAINLINK_FEEDS:
-            return 0.0
+            return 0.0, "no-w3"
         loop = asyncio.get_event_loop()
         try:
             contract = self.w3.eth.contract(
@@ -1401,15 +1408,14 @@ class LiveTrader:
             updated_at = latest[3]
             price      = latest[1]
 
-            # Already at or before start: use current round
+            # Latest round is already at or before start: this IS the reference price
             if updated_at <= start_ts:
-                return price / 1e8
+                return price / 1e8, "CL-exact"
 
-            # Walk backward — BTC updates ~27s, 30 rounds ≈ 13 min max lookback
+            # Walk backward — 60 rounds covers ~27 minutes (BTC updates ~27s)
             phase_id = round_id >> 64
             agg_id   = round_id & ((1 << 64) - 1)
-            print(f"{B}[OPEN] {asset} walking CL rounds: latest={round_id} updated={updated_at:.0f} start_ts={start_ts:.0f} phase={phase_id} agg={agg_id}{RS}")
-            for i in range(1, 31):
+            for i in range(1, 61):
                 prev_agg = agg_id - i
                 if prev_agg <= 0:
                     break
@@ -1423,19 +1429,21 @@ class LiveTrader:
                     if prev_price <= 0:
                         continue
                     if prev_updated <= start_ts:
-                        print(f"{B}[OPEN] {asset} CL round -{i}: price={prev_price/1e8:.2f} updatedAt={prev_updated:.0f} ✓{RS}")
-                        return prev_price / 1e8
-                except Exception as e:
-                    print(f"{Y}[OPEN] {asset} getRoundData({prev_id}) failed: {e}{RS}")
+                        secs_off = start_ts - prev_updated
+                        print(f"{B}[CL] {asset} exact round -{i}: ${prev_price/1e8:,.2f} "
+                              f"(~{secs_off:.0f}s before window start){RS}")
+                        return prev_price / 1e8, "CL-exact"
+                except Exception:
                     continue   # try next round, don't abort
 
-            # Fallback: use chainlink snapshot cached at poll time
+            # Fallback: use the cached Chainlink snapshot (polled every ~30s)
             cached = self.cl_prices.get(asset, 0)
-            print(f"{Y}[OPEN] {asset} walk failed — using cached CL ${cached:.2f} or latest ${price/1e8:.2f}{RS}")
-            return cached if cached > 0 else price / 1e8
+            fallback = cached if cached > 0 else price / 1e8
+            print(f"{Y}[CL] {asset} walk failed — using cached ${fallback:,.2f} as fallback{RS}")
+            return fallback, "CL-fallback"
         except Exception as e:
             print(f"{Y}[CL] _get_chainlink_at {asset}: {e}{RS}")
-            return 0.0
+            return 0.0, "error"
 
     # ── SCAN LOOP ─────────────────────────────────────────────────────────────
     async def scan_loop(self):
@@ -1453,17 +1461,30 @@ class LiveTrader:
                 m["mins_left"] = (m["end_ts"] - now) / 60
                 # Set open_price from Chainlink at exact market start time.
                 # Must match Polymarket's resolution reference ("price to beat").
+                asset    = m.get("asset")
+                dur      = m.get("duration", 0)
+                title_s  = m.get("question", "")[:50]
                 if cid not in self.open_prices:
-                    asset    = m.get("asset")
                     start_ts = m.get("start_ts", now)
-                    title_s  = m.get("question", "")[:45]
-                    print(f"{W}[NEW MARKET] {asset} {m.get('duration',0)}m | {title_s} | {m['mins_left']:.1f}min left{RS}")
-                    ref = await self._get_chainlink_at(asset, start_ts)
+                    print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | {m['mins_left']:.1f}min left{RS}")
+                    ref, src = await self._get_chainlink_at(asset, start_ts)
                     if ref <= 0:
                         ref = self.cl_prices.get(asset, 0) or self.prices.get(asset, 0)
+                        src = "CL-fallback"
                     if ref > 0:
-                        self.open_prices[cid] = ref
-                        print(f"{B}[OPEN] {asset} price to beat: ${ref:,.2f} (CL@start){RS}")
+                        self.open_prices[cid]        = ref
+                        self.open_prices_source[cid] = src
+                        src_c = G if src == "CL-exact" else Y
+                        print(f"{src_c}[BEAT] {asset} {dur}m price to beat: ${ref:,.2f} [{src}]{RS}")
+                else:
+                    # Already known — log on every scan so every skip/entry is traceable
+                    ref = self.open_prices[cid]
+                    src = self.open_prices_source.get(cid, "?")
+                    cur = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
+                    if cur > 0:
+                        move = (cur - ref) / ref * 100
+                        print(f"{B}[MKT] {asset} {dur}m | beat=${ref:,.2f} [{src}] | "
+                              f"now=${cur:,.2f} move={move:+.3f}% | {m['mins_left']:.1f}min left{RS}")
                 if cid not in self.seen:
                     candidates.append(m)
             if candidates:
@@ -1574,7 +1595,7 @@ class LiveTrader:
                             print(f"{Y}[RECOVER] Expired → redeem queue: {title[:40]} {side} ${val:.2f}{RS}")
                         continue
                     mins_left = (end_ts - now_ts) / 60 if end_ts > 0 else 999
-                    open_p = await self._get_chainlink_at(asset, start_ts) if start_ts > 0 else 0
+                    open_p, _ = await self._get_chainlink_at(asset, start_ts) if start_ts > 0 else (0, "")
                     m_r = {"conditionId": cid, "question": title, "asset": asset,
                            "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
                            "up_price": 0.5, "mins_left": mins_left,
@@ -1710,7 +1731,7 @@ class LiveTrader:
                         mkt = mkt_data[0] if isinstance(mkt_data, list) and mkt_data else (
                               mkt_data if isinstance(mkt_data, dict) else {})
                         es = mkt.get("endDate") or mkt.get("end_date", "")
-                        ss = mkt.get("startDate") or mkt.get("start_date", "")
+                        ss = mkt.get("eventStartTime") or mkt.get("startDate") or mkt.get("start_date", "")
                         if es: end_ts   = datetime.fromisoformat(es.replace("Z","+00:00")).timestamp()
                         if ss: start_ts = datetime.fromisoformat(ss.replace("Z","+00:00")).timestamp()
                         slug = mkt.get("seriesSlug") or mkt.get("series_slug", "")
