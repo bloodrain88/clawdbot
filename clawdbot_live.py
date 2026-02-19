@@ -56,7 +56,7 @@ ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.07     # 7% base min edge (auto-adapted per recent WR)
-MIN_MOVE       = 0.001    # 0.1% min actual price move
+MIN_MOVE       = 0.0005   # 0.05% min actual price move
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 MIN_BET        = 5.0      # $5 floor
 MAX_BET        = 25.0     # $25 ceiling (Kelly can go higher on strong edges)
@@ -638,6 +638,11 @@ class LiveTrader:
         src = self.open_prices_source.get(cid, "?")
         src_tag = f"[{src}]"
 
+        # Require exact Chainlink reference — fallback uses wrong price (Polymarket resolves via CL)
+        if src == "CL-fallback":
+            print(f"{Y}[SKIP] {label} → CL-fallback ref (not Polymarket-exact) — skipping{RS}")
+            return
+
         # Only enter in first 35% of market life — need time for price to move further our way
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
@@ -667,7 +672,7 @@ class LiveTrader:
         # ── Combined probability: Black-Scholes + Momentum + Direction bias ──
         vol      = self.vols.get(asset, 0.70)
         bs_prob  = self._prob_up(current, open_price, mins_left, vol)
-        mom_prob = self._momentum_prob(asset, seconds=60)
+        mom_prob = self._momentum_prob(asset, seconds=90)
         mw       = self._adaptive_momentum_weight()
         combined = (1 - mw) * bs_prob + mw * mom_prob
 
