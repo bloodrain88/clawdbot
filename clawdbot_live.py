@@ -107,6 +107,8 @@ class LiveTrader:
             host=CLOB_HOST,
             key=PRIVATE_KEY,
             chain_id=CHAIN_ID,
+            signature_type=0,   # EOA (direct wallet, not proxy)
+            funder=ADDRESS,     # address holding the USDC
         )
         # Derive/create API credentials (signed from private key — no external account needed)
         try:
