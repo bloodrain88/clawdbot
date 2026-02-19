@@ -601,13 +601,16 @@ class LiveTrader:
         edge_up   = prob_up   - up_price
         edge_down = prob_down - (1 - up_price)
 
-        # AMM-based pre-filter (loose) — real edge checked vs CLOB price in _place_order
-        fee_est  = 0.025 * (1 - abs(up_price - 0.5) * 2)
-        min_edge = self._adaptive_min_edge()
+        # AMM-based pre-filter — loose (real edge checked vs CLOB ask in _place_order).
+        # Use low threshold (0.02) here: CLOB asks can be far cheaper than AMM mid,
+        # so we don't want to block opportunities where AMM edge is small but CLOB edge is large.
+        fee_est      = 0.025 * (1 - abs(up_price - 0.5) * 2)
+        min_edge     = self._adaptive_min_edge()
+        pre_filter   = max(0.02, min_edge * 0.30)   # loose pre-filter vs AMM
 
-        if edge_up >= edge_down and edge_up >= min_edge:
+        if edge_up >= edge_down and edge_up >= pre_filter:
             side, edge, true_prob = "Up", edge_up, prob_up
-        elif edge_down >= min_edge:
+        elif edge_down >= pre_filter:
             side, edge, true_prob = "Down", edge_down, prob_down
         else:
             return
