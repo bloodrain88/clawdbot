@@ -1496,7 +1496,73 @@ class LiveTrader:
                     if total > self.peak_bankroll:
                         self.peak_bankroll = total
 
-                # 3. Sync trades + win rate from Polymarket activity API (every 5 ticks ~2.5min)
+                # 3. Recover any on-chain positions not tracked in pending (every tick = 30s)
+                now_ts = datetime.now(timezone.utc).timestamp()
+                for p in positions:
+                    cid  = p.get("conditionId", "")
+                    rdm  = p.get("redeemable", False)
+                    val  = float(p.get("currentValue", 0))
+                    side = p.get("outcome", "")
+                    title = p.get("title", "")
+                    if rdm or not side or not cid or val < MIN_BET * 0.5:
+                        continue
+                    if cid in self.pending or cid in self.pending_redeem:
+                        continue
+                    # Position exists on-chain but bot has no record — recover it
+                    asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                             else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+                    # Fetch real end_ts from Gamma API
+                    end_ts = 0; start_ts = now_ts - 60; duration = 15
+                    token_up = token_down = ""
+                    try:
+                        mkt_data = await loop.run_in_executor(None, lambda c=cid: _req.get(
+                            f"{GAMMA}/markets", params={"conditionId": c}, timeout=8
+                        ).json())
+                        mkt = mkt_data[0] if isinstance(mkt_data, list) and mkt_data else (
+                              mkt_data if isinstance(mkt_data, dict) else {})
+                        es = mkt.get("endDate") or mkt.get("end_date", "")
+                        ss = mkt.get("eventStartTime") or mkt.get("startDate", "")
+                        if es: end_ts   = datetime.fromisoformat(es.replace("Z","+00:00")).timestamp()
+                        if ss: start_ts = datetime.fromisoformat(ss.replace("Z","+00:00")).timestamp()
+                        slug = mkt.get("seriesSlug") or mkt.get("series_slug", "")
+                        if slug in SERIES:
+                            duration = SERIES[slug]["duration"]
+                            asset    = SERIES[slug]["asset"]
+                        toks = mkt.get("clobTokenIds") or []
+                        if isinstance(toks, str):
+                            try: toks = json.loads(toks)
+                            except: toks = []
+                        token_up   = toks[0] if len(toks) > 0 else ""
+                        token_down = toks[1] if len(toks) > 1 else ""
+                    except Exception:
+                        pass
+                    if end_ts > 0 and end_ts <= now_ts:
+                        if cid not in self.pending_redeem:
+                            m_s = {"conditionId": cid, "question": title}
+                            t_s = {"side": side, "asset": asset, "size": val, "entry": 0.5,
+                                   "duration": duration, "mkt_price": 0.5, "mins_left": 0,
+                                   "open_price": 0, "token_id": "", "order_id": "RECOVERED"}
+                            self.pending_redeem[cid] = (m_s, t_s)
+                            print(f"{Y}[RECOVER] Expired → redeem queue: {title[:40]} {side} ${val:.2f}{RS}")
+                        continue
+                    mins_left = (end_ts - now_ts) / 60 if end_ts > 0 else 999
+                    open_p = await self._get_chainlink_at(asset, start_ts) if start_ts > 0 else 0
+                    m_r = {"conditionId": cid, "question": title, "asset": asset,
+                           "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
+                           "up_price": 0.5, "mins_left": mins_left,
+                           "token_up": token_up, "token_down": token_down}
+                    t_r = {"side": side, "size": val, "entry": 0.5,
+                           "open_price": open_p, "current_price": 0, "true_prob": 0.5,
+                           "mkt_price": 0.5, "edge": 0, "mins_left": mins_left,
+                           "end_ts": end_ts, "asset": asset, "duration": duration,
+                           "token_id": token_up if side == "Up" else token_down,
+                           "order_id": "RECOVERED"}
+                    self.pending[cid] = (m_r, t_r)
+                    self.seen.add(cid)
+                    self._save_pending()
+                    print(f"{G}[RECOVER] Added to pending: {title[:40]} {side} ${val:.2f} | open={open_p:.2f} | {mins_left:.1f}min left{RS}")
+
+                # 4. Sync trades + win rate from Polymarket activity API (every 5 ticks ~2.5min)
                 if tick % 5 == 1:
                     await self._sync_stats_from_api(loop, _req)
 
