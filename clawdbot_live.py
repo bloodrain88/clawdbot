@@ -200,7 +200,10 @@ class LiveTrader:
             except Exception as e:
                 self.rtds_ok = False
                 print(f"{R}[RTDS] Reconnect: {e}{RS}")
-                await asyncio.sleep(3)
+                await asyncio.sleep(min(60, 5 * 2 ** getattr(self, "_rtds_fails", 0)))
+                self._rtds_fails = getattr(self, "_rtds_fails", 0) + 1
+            else:
+                self._rtds_fails = 0
 
     # ── VOL LOOP ──────────────────────────────────────────────────────────────
     async def vol_loop(self):
@@ -365,6 +368,7 @@ class LiveTrader:
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=size_usdc,
+                side="BUY",
             )
             signed = await loop.run_in_executor(
                 None, lambda: self.clob.create_market_order(order_args)
