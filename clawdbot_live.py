@@ -1380,6 +1380,7 @@ class LiveTrader:
             # Walk backward — BTC updates ~27s, 30 rounds ≈ 13 min max lookback
             phase_id = round_id >> 64
             agg_id   = round_id & ((1 << 64) - 1)
+            print(f"{B}[OPEN] {asset} walking CL rounds: latest={round_id} updated={updated_at:.0f} start_ts={start_ts:.0f} phase={phase_id} agg={agg_id}{RS}")
             for i in range(1, 31):
                 prev_agg = agg_id - i
                 if prev_agg <= 0:
@@ -1394,14 +1395,16 @@ class LiveTrader:
                     if prev_price <= 0:
                         continue
                     if prev_updated <= start_ts:
-                        print(f"{B}[OPEN] {asset} historical CL round -{i}: "
-                              f"price={prev_price/1e8:.4f} updatedAt={prev_updated} start_ts={start_ts:.0f}{RS}")
+                        print(f"{B}[OPEN] {asset} CL round -{i}: price={prev_price/1e8:.2f} updatedAt={prev_updated:.0f} ✓{RS}")
                         return prev_price / 1e8
-                except Exception:
-                    break
+                except Exception as e:
+                    print(f"{Y}[OPEN] {asset} getRoundData({prev_id}) failed: {e}{RS}")
+                    continue   # try next round, don't abort
 
-            # Fallback to latest if walk fails
-            return price / 1e8
+            # Fallback: use chainlink snapshot cached at poll time
+            cached = self.cl_prices.get(asset, 0)
+            print(f"{Y}[OPEN] {asset} walk failed — using cached CL ${cached:.2f} or latest ${price/1e8:.2f}{RS}")
+            return cached if cached > 0 else price / 1e8
         except Exception as e:
             print(f"{Y}[CL] _get_chainlink_at {asset}: {e}{RS}")
             return 0.0
