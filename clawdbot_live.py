@@ -200,17 +200,24 @@ class LiveTrader:
         if not DRY_RUN:
             self._approve_usdc()
 
-        # Check USDC balance (raw value has 6 decimals)
+        # Sync real USDC balance → override bankroll with actual on-chain value
         try:
             bal  = self.clob.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
             usdc = float(bal.get("balance", 0)) / 1e6
             allowances = bal.get("allowances", {})
             allow = max((float(v) for v in allowances.values()), default=0) / 1e6
-            print(f"{G}[CLOB] USDC balance: ${usdc:.2f}  allowance: ${allow:.2f}{RS}")
+            if usdc > 0:
+                self.bankroll   = usdc
+                self.start_bank = usdc
+            print(f"{G}[CLOB] USDC balance: ${usdc:.2f}  allowance: ${allow:.2f}  → bankroll set to ${self.bankroll:.2f}{RS}")
             if usdc < 10 and not DRY_RUN:
                 print(f"{R}[WARN] Saldo basso! Fondi il wallet prima di fare trading live.{RS}")
         except Exception as e:
             print(f"{Y}[CLOB] Balance check: {e}{RS}")
+
+        # Sync open positions from Polymarket → rebuild pending for active markets
+        if not DRY_RUN:
+            self._sync_open_positions()
 
     def _approve_usdc(self):
         """ERC20 approve USDC.e on-chain for both Polymarket exchange contracts,
@@ -667,6 +674,67 @@ class LiveTrader:
                     print(f"{Y}[REDEEM] {asset}: {e}{RS}")
             for cid in done:
                 self.pending_redeem.pop(cid, None)
+
+    # ── STARTUP OPEN POSITIONS SYNC ───────────────────────────────────────────
+    def _sync_open_positions(self):
+        """Rebuild self.pending from Polymarket API for any active (non-resolved) positions."""
+        try:
+            import requests as _req
+            positions = _req.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                timeout=10
+            ).json()
+        except Exception as e:
+            print(f"{Y}[SYNC] Could not fetch positions: {e}{RS}")
+            return
+
+        now     = datetime.now(timezone.utc).timestamp()
+        synced  = 0
+        for pos in positions:
+            cid        = pos.get("conditionId", "")
+            redeemable = pos.get("redeemable", False)
+            outcome    = pos.get("outcome", "")   # "Up" or "Down"
+            val        = float(pos.get("currentValue", 0))
+            size_tok   = float(pos.get("size", 0))
+            title      = pos.get("title", "")
+
+            # Only active (not yet resolved) positions not already tracked
+            if redeemable or not outcome or not cid:
+                continue
+            if cid in self.pending:
+                continue
+
+            self.seen.add(cid)
+
+            # Derive asset from title
+            asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                     else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+
+            # Estimate end_ts: current value / size_tok = price → end soon
+            # We don't have exact end_ts but set 30min from now as safe upper bound
+            # _resolve() checks price movement, not exact end_ts for win/loss
+            entry  = (val / size_tok) if size_tok > 0 else 0.5
+            end_ts = now + 30 * 60   # conservative; will be replaced on next scan
+
+            m = {"conditionId": cid, "question": title, "asset": asset,
+                 "duration": 15, "end_ts": end_ts, "start_ts": now - 60,
+                 "up_price": entry if outcome == "Up" else 1 - entry,
+                 "mins_left": 30, "token_up": "", "token_down": ""}
+            trade = {"side": outcome, "size": val, "entry": entry,
+                     "open_price": 0, "current_price": 0, "true_prob": 0.5,
+                     "mkt_price": entry, "edge": 0, "mins_left": 30,
+                     "end_ts": end_ts, "asset": asset, "duration": 15,
+                     "token_id": "", "order_id": "SYNCED"}
+
+            self.pending[cid] = (m, trade)
+            synced += 1
+            print(f"{Y}[SYNC] Open position restored: {title[:45]} {outcome} ~${val:.2f}{RS}")
+
+        if synced:
+            self._save_pending()
+            self._save_seen()
+            print(f"{Y}[SYNC] {synced} open position(s) restored to pending{RS}")
 
     # ── STARTUP REDEEM SYNC ───────────────────────────────────────────────────
     def _sync_redeemable(self):
