@@ -792,6 +792,16 @@ class LiveTrader:
                     await loop.run_in_executor(None, lambda: self.clob.cancel(order_id))
                 except Exception:
                     pass
+                # Final check: cancel might have raced with a fill — verify before giving up
+                try:
+                    info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                    if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
+                        self.bankroll -= size_usdc
+                        print(f"{Y}[TAKER FILL (late)]{RS} {side} {asset} {duration}m | "
+                              f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                        return order_id
+                except Exception:
+                    pass
                 print(f"{Y}[ORDER] Both maker and taker unfilled — cancelled{RS}")
                 return None
 
@@ -1311,6 +1321,52 @@ class LiveTrader:
             except Exception as e:
                 print(f"{Y}[SCAN-REDEEM] Error: {e}{RS}")
 
+    async def _position_sync_loop(self):
+        """Every 5 min: sync on-chain positions to pending — catches any fills the bot missed."""
+        if DRY_RUN:
+            return
+        while True:
+            await asyncio.sleep(300)
+            try:
+                import requests as _req
+                loop = asyncio.get_event_loop()
+                positions = await loop.run_in_executor(None, lambda: _req.get(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01"}, timeout=10
+                ).json())
+                now = datetime.now(timezone.utc).timestamp()
+                added = 0
+                for pos in positions:
+                    cid  = pos.get("conditionId", "")
+                    rdm  = pos.get("redeemable", False)
+                    val  = float(pos.get("currentValue", 0))
+                    side = pos.get("outcome", "")
+                    if rdm or val < 0.01 or not side or not cid:
+                        continue
+                    if cid in self.pending or cid in self.pending_redeem:
+                        continue
+                    title = pos.get("title", "")
+                    asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                             else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+                    end_ts = now + 30 * 60
+                    m_r = {"conditionId": cid, "question": title, "asset": asset,
+                           "duration": 15, "end_ts": end_ts, "start_ts": now - 60,
+                           "up_price": 0.5, "mins_left": 30, "token_up": "", "token_down": ""}
+                    t_r = {"side": side, "size": val, "entry": 0.5,
+                           "open_price": 0, "current_price": 0, "true_prob": 0.5,
+                           "mkt_price": 0.5, "edge": 0, "mins_left": 30,
+                           "end_ts": end_ts, "asset": asset, "duration": 15,
+                           "token_id": "", "order_id": "SYNC-PERIODIC"}
+                    self.pending[cid] = (m_r, t_r)
+                    self.seen.add(cid)
+                    added += 1
+                    print(f"{Y}[SYNC] Recovered missed position: {title[:45]} {side} ~${val:.2f}{RS}")
+                if added:
+                    self._save_pending()
+                    self._save_seen()
+            except Exception as e:
+                print(f"{Y}[SYNC] position_sync_loop error: {e}{RS}")
+
     async def _status_loop(self):
         while True:
             await asyncio.sleep(STATUS_INTERVAL)
@@ -1337,6 +1393,7 @@ class LiveTrader:
             self._redeem_loop(),
             self.chainlink_loop(),
             self._redeemable_scan(),
+            self._position_sync_loop(),
         )
 
 
