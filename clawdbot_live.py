@@ -1402,28 +1402,56 @@ class LiveTrader:
             await asyncio.sleep(SCAN_INTERVAL)
 
     async def _refresh_balance(self):
-        """Sync bankroll from real CLOB USDC balance every STATUS_INTERVAL.
-        Skips when positions are active — mid-trade CLOB balance is unreliable
-        (bet USDC is locked in CTF, not reflected until redeemed)."""
-        while True:
-            await asyncio.sleep(STATUS_INTERVAL)
-            if DRY_RUN or self.clob is None:
-                continue
-            if self.pending or self.pending_redeem:
-                continue   # don't override local tracking mid-trade
+        """Always sync bankroll from on-chain truth: USDC.e balance + open position values.
+        Never skips — no assumptions about local accounting."""
+        USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        ERC20_ABI = [{"inputs":[{"name":"account","type":"address"}],
+                      "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
+                      "stateMutability":"view","type":"function"}]
+        usdc_contract = None
+        if self.w3 is not None:
             try:
-                loop = asyncio.get_event_loop()
-                bal  = await loop.run_in_executor(
-                    None, lambda: self.clob.get_balance_allowance(
-                        BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-                    )
+                usdc_contract = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(USDC_E), abi=ERC20_ABI
                 )
-                usdc = float(bal.get("balance", 0)) / 1e6
-                if usdc > 0 and usdc != self.bankroll:
-                    print(f"{B}[BANK] Synced from CLOB: ${usdc:.2f} (was ${self.bankroll:.2f}){RS}")
-                    self.bankroll = usdc
             except Exception:
                 pass
+
+        while True:
+            await asyncio.sleep(STATUS_INTERVAL)
+            if DRY_RUN or self.w3 is None:
+                continue
+            try:
+                loop = asyncio.get_event_loop()
+                import requests as _req
+
+                # 1. On-chain USDC.e balance
+                usdc_raw = await loop.run_in_executor(
+                    None, lambda: usdc_contract.functions.balanceOf(
+                        Web3.to_checksum_address(ADDRESS)
+                    ).call()
+                ) if usdc_contract else 0
+                usdc = usdc_raw / 1e6
+
+                # 2. Current value of open CTF positions (locked in CTF, not in wallet)
+                positions = await loop.run_in_executor(None, lambda: _req.get(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01"}, timeout=10
+                ).json())
+                open_val = sum(
+                    float(p.get("currentValue", 0))
+                    for p in positions
+                    if not p.get("redeemable") and p.get("outcome")
+                )
+
+                total = round(usdc + open_val, 2)
+                print(f"{B}[BANK] on-chain USDC=${usdc:.2f}  open_positions=${open_val:.2f}  total=${total:.2f}{RS}")
+                if total > 0:
+                    self.bankroll = total
+                    if total > self.peak_bankroll:
+                        self.peak_bankroll = total
+            except Exception as e:
+                print(f"{Y}[BANK] refresh error: {e}{RS}")
 
     async def _redeemable_scan(self):
         """Every 60s, re-scan Polymarket API for redeemable positions not yet queued.
