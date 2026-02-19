@@ -23,31 +23,12 @@ import os
 from datetime import datetime, timezone
 from scipy.stats import norm
 from dotenv import load_dotenv
-from web3 import Web3
-from eth_account import Account
 
 load_dotenv(os.path.expanduser("~/.clawdbot.env"))
 
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON, AMOY
 from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, AssetType, BalanceAllowanceParams
-
-# Polygon mainnet contracts
-POLYGON_RPCS      = [
-    "https://polygon.llamarpc.com",
-    "https://rpc.ankr.com/polygon",
-    "https://polygon.drpc.org",
-    "https://polygon-mainnet.public.blastapi.io",
-]
-USDC_E            = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-CTF_EXCHANGE      = Web3.to_checksum_address("0x4bfb41d5b3570DeDd8C86929FbADB1cB455D2B1E")
-NEG_RISK_EXCHANGE = Web3.to_checksum_address("0xC5d563A36AE78145C45a50134d48A1215220f80a")
-ERC20_APPROVE_ABI = [{"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],
-                       "name":"approve","outputs":[{"name":"","type":"bool"}],
-                       "stateMutability":"nonpayable","type":"function"},
-                      {"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],
-                       "name":"allowance","outputs":[{"name":"","type":"uint256"}],
-                       "stateMutability":"view","type":"function"}]
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
@@ -119,9 +100,17 @@ class LiveTrader:
             print(f"{R}[CLOB] Creds error: {e}{RS}")
             raise
 
-        # Approve USDC.e for Polymarket CTF contracts via direct web3 tx
+        # Set allowances via Polymarket relayer (no gas needed)
         if not DRY_RUN:
-            self._approve_usdc()
+            for label, atype in [("COLLATERAL", AssetType.COLLATERAL),
+                                  ("CONDITIONAL", AssetType.CONDITIONAL)]:
+                try:
+                    resp = self.clob.update_balance_allowance(
+                        BalanceAllowanceParams(asset_type=atype)
+                    )
+                    print(f"{G}[CLOB] Allowance set ({label}): {resp}{RS}")
+                except Exception as e:
+                    print(f"{Y}[CLOB] Allowance ({label}): {e}{RS}")
 
         # Check USDC balance (raw value has 6 decimals)
         try:
@@ -133,45 +122,6 @@ class LiveTrader:
                 print(f"{R}[WARN] Saldo basso! Fondi il wallet prima di fare trading live.{RS}")
         except Exception as e:
             print(f"{Y}[CLOB] Balance check: {e}{RS}")
-
-    def _approve_usdc(self):
-        """Send ERC20 approve tx to both Polymarket exchange contracts."""
-        try:
-            w3 = None
-            for rpc in POLYGON_RPCS:
-                try:
-                    _w3 = Web3(Web3.HTTPProvider(rpc))
-                    _w3.eth.block_number  # test connection
-                    w3 = _w3
-                    print(f"{G}[APPROVE] RPC: {rpc}{RS}")
-                    break
-                except Exception:
-                    continue
-            if w3 is None:
-                print(f"{R}[APPROVE] No working Polygon RPC found{RS}")
-                return
-            acct    = Account.from_key(PRIVATE_KEY)
-            usdc    = w3.eth.contract(address=USDC_E, abi=ERC20_APPROVE_ABI)
-            max_int = 2**256 - 1
-            for spender in [CTF_EXCHANGE, NEG_RISK_EXCHANGE]:
-                current = usdc.functions.allowance(acct.address, spender).call()
-                if current > 10**24:   # already approved (> 1e18 USDC)
-                    print(f"{G}[APPROVE] {spender[:10]}... already approved{RS}")
-                    continue
-                nonce = w3.eth.get_transaction_count(acct.address)
-                tx    = usdc.functions.approve(spender, max_int).build_transaction({
-                    "from":     acct.address,
-                    "nonce":    nonce,
-                    "gas":      100_000,
-                    "gasPrice": w3.eth.gas_price,
-                })
-                signed   = acct.sign_transaction(tx)
-                tx_hash  = w3.eth.send_raw_transaction(signed.raw_transaction)
-                receipt  = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-                status   = "OK" if receipt.status == 1 else "FAILED"
-                print(f"{G}[APPROVE] {spender[:10]}... {status} tx={tx_hash.hex()[:16]}{RS}")
-        except Exception as e:
-            print(f"{Y}[APPROVE] {e}{RS}")
 
     # ── LOG ───────────────────────────────────────────────────────────────────
     def _init_log(self):
