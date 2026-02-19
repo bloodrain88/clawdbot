@@ -215,17 +215,16 @@ class LiveTrader:
             print(f"{R}[CLOB] Creds error: {e}{RS}")
             raise
 
-        # Sync Polymarket backend allowances (signed API call — relayer handles on-chain)
+        # Sync USDC (COLLATERAL) allowance with Polymarket backend
+        # CONDITIONAL not needed — bot only places BUY orders (USDC→tokens)
         if not DRY_RUN:
-            for label, atype in [("COLLATERAL", AssetType.COLLATERAL),
-                                  ("CONDITIONAL", AssetType.CONDITIONAL)]:
-                try:
-                    resp = self.clob.update_balance_allowance(
-                        BalanceAllowanceParams(asset_type=atype)
-                    )
-                    print(f"{G}[CLOB] Allowance set ({label}): {resp}{RS}")
-                except Exception as e:
-                    print(f"{Y}[CLOB] Allowance ({label}): {e}{RS}")
+            try:
+                resp = self.clob.update_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                )
+                print(f"{G}[CLOB] Allowance synced (COLLATERAL): {resp or 'OK'}{RS}")
+            except Exception as e:
+                print(f"{Y}[CLOB] Allowance sync: {e}{RS}")
 
         # Sync real USDC balance → override bankroll with actual on-chain value
         try:
