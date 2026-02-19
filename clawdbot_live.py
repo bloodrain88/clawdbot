@@ -588,8 +588,10 @@ class LiveTrader:
         if len(self.pending) >= MAX_OPEN:
             return
 
-        # Use Chainlink price (resolution source) if fresh, else RTDS fallback
-        current = self._current_price(asset)
+        # Use Chainlink as current price — same source Polymarket resolves on.
+        # Comparing Chainlink-now vs Chainlink-open gives the true direction signal.
+        # Fall back to RTDS only if Chainlink is unavailable.
+        current = self.cl_prices.get(asset, 0) or self.prices.get(asset, 0)
         if current == 0:
             return
 
