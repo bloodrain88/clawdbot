@@ -33,7 +33,12 @@ from py_clob_client.constants import POLYGON, AMOY
 from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, AssetType, BalanceAllowanceParams
 
 # Polygon mainnet contracts
-POLYGON_RPC       = "https://polygon-rpc.com"
+POLYGON_RPCS      = [
+    "https://polygon.llamarpc.com",
+    "https://rpc.ankr.com/polygon",
+    "https://polygon.drpc.org",
+    "https://polygon-mainnet.public.blastapi.io",
+]
 USDC_E            = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 CTF_EXCHANGE      = Web3.to_checksum_address("0x4bfb41d5b3570DeDd8C86929FbADB1cB455D2B1E")
 NEG_RISK_EXCHANGE = Web3.to_checksum_address("0xC5d563A36AE78145C45a50134d48A1215220f80a")
@@ -130,7 +135,19 @@ class LiveTrader:
     def _approve_usdc(self):
         """Send ERC20 approve tx to both Polymarket exchange contracts."""
         try:
-            w3      = Web3(Web3.HTTPProvider(POLYGON_RPC))
+            w3 = None
+            for rpc in POLYGON_RPCS:
+                try:
+                    _w3 = Web3(Web3.HTTPProvider(rpc))
+                    _w3.eth.block_number  # test connection
+                    w3 = _w3
+                    print(f"{G}[APPROVE] RPC: {rpc}{RS}")
+                    break
+                except Exception:
+                    continue
+            if w3 is None:
+                print(f"{R}[APPROVE] No working Polygon RPC found{RS}")
+                return
             acct    = Account.from_key(PRIVATE_KEY)
             usdc    = w3.eth.contract(address=USDC_E, abi=ERC20_APPROVE_ABI)
             max_int = 2**256 - 1
