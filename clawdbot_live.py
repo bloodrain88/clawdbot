@@ -77,7 +77,7 @@ CHAINLINK_ABI = [
         {"name":"answeredInRound","type":"uint80"}],
      "stateMutability":"view","type":"function"},
 ]
-SCAN_INTERVAL  = 2
+SCAN_INTERVAL  = 5   # market slot discovery only — real-time eval via RTDS ticks
 PING_INTERVAL  = 5
 STATUS_INTERVAL= 30
 _DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
@@ -130,6 +130,8 @@ class LiveTrader:
         self.price_history   = {a: deque(maxlen=300) for a in ["BTC","ETH","SOL","XRP"]}
         self.stats           = {}    # {asset: {side: {wins, total}}} — persisted
         self.recent_trades   = deque(maxlen=30)   # rolling window for WR adaptation
+        self._last_eval_time = {}    # cid → last RTDS-triggered evaluate() timestamp
+        self.book_cache      = {}    # token_id → (timestamp, book) — pre-fetched books
         self._init_log()
         self._load_pending()
         self._load_stats()
@@ -342,6 +344,18 @@ class LiveTrader:
                         if asset:
                             self.prices[asset] = val
                             self.price_history[asset].append((_time.time(), val))
+                            # Event-driven: evaluate unseen markets immediately on price tick
+                            now_t = _time.time()
+                            for cid, m in list(self.active_mkts.items()):
+                                if m.get("asset") != asset: continue
+                                if cid in self.seen: continue
+                                if cid not in self.open_prices: continue
+                                if now_t - self._last_eval_time.get(cid, 0) < 1.0: continue
+                                mins = (m["end_ts"] - now_t) / 60
+                                if mins < 1: continue
+                                self._last_eval_time[cid] = now_t
+                                m_rt = dict(m); m_rt["mins_left"] = mins
+                                asyncio.create_task(self.evaluate(m_rt))
             except Exception as e:
                 self.rtds_ok = False
                 print(f"{R}[RTDS] Reconnect: {e}{RS}")
@@ -514,6 +528,8 @@ class LiveTrader:
     # ── EVALUATE + PLACE ORDER ────────────────────────────────────────────────
     async def evaluate(self, m: dict):
         cid       = m["conditionId"]
+        if cid in self.seen:
+            return
         asset     = m["asset"]
         duration  = m["duration"]
         mins_left = m["mins_left"]
@@ -631,8 +647,13 @@ class LiveTrader:
             try:
                 loop = asyncio.get_event_loop()
 
-                # Fetch order book
-                book     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                # Use pre-fetched book if fresh (<3s), else fetch now
+                _cached = self.book_cache.get(token_id)
+                if _cached and (_time.time() - _cached[0]) < 3:
+                    book = _cached[1]
+                else:
+                    book = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                    self.book_cache[token_id] = (_time.time(), book)
                 tick     = float(book.tick_size or "0.01")
                 asks     = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
                 bids     = sorted(book.bids, key=lambda x: float(x.price), reverse=True) if book.bids else []
@@ -1222,6 +1243,29 @@ class LiveTrader:
             except Exception:
                 pass
 
+    async def _book_loop(self):
+        """Pre-fetch order books every 2s for all active token IDs.
+        Eliminates the inline ~36ms fetch latency when placing orders."""
+        if DRY_RUN or self.clob is None:
+            return
+        while True:
+            await asyncio.sleep(2)
+            token_ids = []
+            for m in self.active_mkts.values():
+                if m.get("token_up"):   token_ids.append(m["token_up"])
+                if m.get("token_down"): token_ids.append(m["token_down"])
+            if not token_ids:
+                continue
+            loop = asyncio.get_event_loop()
+            for tid in token_ids:
+                try:
+                    book = await loop.run_in_executor(
+                        None, lambda t=tid: self.clob.get_order_book(t)
+                    )
+                    self.book_cache[tid] = (_time.time(), book)
+                except Exception:
+                    pass
+
     async def _redeemable_scan(self):
         """Every 60s, re-scan Polymarket API for redeemable positions not yet queued.
         Catches winners that weren't on-chain resolved when _sync_redeemable ran at startup."""
@@ -1286,6 +1330,7 @@ class LiveTrader:
             self._redeem_loop(),
             self.chainlink_loop(),
             self._redeemable_scan(),
+            self._book_loop(),
         )
 
 
