@@ -55,7 +55,7 @@ ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
-MIN_MOVE       = 0.004    # 0.4% min actual price move — filters noise
+MIN_MOVE       = 0.002    # 0.2% min actual price move
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 MIN_BET        = 5.0      # $5 floor
 MAX_BET        = 25.0     # $25 ceiling (Kelly can go higher on strong edges)
@@ -350,7 +350,7 @@ class LiveTrader:
             except Exception as e:
                 self.rtds_ok = False
                 print(f"{R}[RTDS] Reconnect: {e}{RS}")
-                await asyncio.sleep(min(60, 5 * 2 ** getattr(self, "_rtds_fails", 0)))
+                await asyncio.sleep(min(15, 2 * 2 ** getattr(self, "_rtds_fails", 0)))
                 self._rtds_fails = getattr(self, "_rtds_fails", 0) + 1
             else:
                 self._rtds_fails = 0
