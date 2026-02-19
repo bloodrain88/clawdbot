@@ -180,7 +180,9 @@ class LiveTrader:
                 print(f"{Y}[RESUME] Loaded {len(self.seen)} seen markets from disk{RS}")
             except Exception:
                 pass
-        # Load also from Polymarket open positions (belt-and-suspenders)
+        # Load seen cids from Polymarket positions — suppress duplicate bets on restart.
+        # DO NOT add to self.pending here; _sync_open_positions (called in init_clob)
+        # fetches real end_ts from Gamma API and adds them properly.
         try:
             import requests as _req
             positions = _req.get(
@@ -188,33 +190,17 @@ class LiveTrader:
                 params={"user": ADDRESS, "sizeThreshold": "0.01"},
                 timeout=8
             ).json()
-            now_ts = datetime.now(timezone.utc).timestamp()
-            restored = 0
             for p in positions:
                 cid        = p.get("conditionId", "")
                 redeemable = p.get("redeemable", False)
                 outcome    = p.get("outcome", "")
                 val        = float(p.get("currentValue", 0))
-                size       = float(p.get("size", 0))
                 title      = p.get("title", "")
-                self.seen.add(cid)
-                # Restore active (unresolved) positions to pending so Open count is correct
-                if not redeemable and outcome and cid and cid not in self.pending:
-                    asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
-                             else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
-                    end_ts = now_ts + 2 * 3600  # conservative 2h; _redeemable_scan handles real resolution
-                    m_r = {"conditionId": cid, "question": title, "asset": asset,
-                           "duration": 15, "end_ts": end_ts, "start_ts": now_ts - 60,
-                           "up_price": 0.5, "mins_left": 120, "token_up": "", "token_down": ""}
-                    t_r = {"side": outcome, "size": val, "entry": 0.5,
-                           "open_price": 0, "current_price": 0, "true_prob": 0.5,
-                           "mkt_price": 0.5, "edge": 0, "mins_left": 120,
-                           "end_ts": end_ts, "asset": asset, "duration": 15,
-                           "token_id": "", "order_id": "SYNCED"}
-                    self.pending[cid] = (m_r, t_r)
-                    restored += 1
-                    print(f"{Y}[RESUME] Active: {title[:45]} {outcome} ~${val:.2f}{RS}")
-            print(f"{Y}[RESUME] Synced {len(self.seen)} seen, {restored} active restored{RS}")
+                if cid:
+                    self.seen.add(cid)
+                if not redeemable and outcome and cid:
+                    print(f"{Y}[RESUME] Position: {title[:45]} {outcome} ~${val:.2f}{RS}")
+            print(f"{Y}[RESUME] Seen {len(self.seen)} markets from API{RS}")
         except Exception:
             pass
         # Load pending trades
@@ -322,8 +308,9 @@ class LiveTrader:
         el   = datetime.now(timezone.utc) - self.start_time
         h, m = int(el.total_seconds()//3600), int(el.total_seconds()%3600//60)
         wr   = f"{self.wins/self.total*100:.1f}%" if self.total else "–"
-        roi  = (self.bankroll - self.start_bank) / self.start_bank * 100
-        pc   = G if self.daily_pnl >= 0 else R
+        pnl  = self.bankroll - self.start_bank
+        roi  = pnl / self.start_bank * 100 if self.start_bank > 0 else 0
+        pc   = G if pnl >= 0 else R
         rs   = G if self.rtds_ok else R
         price_str = "  ".join(
             f"{B}{a}:{RS} ${p:,.2f}" for a, p in self.prices.items() if p > 0
@@ -334,7 +321,7 @@ class LiveTrader:
             f"{B}Trades:{RS} {self.total}  {B}Win:{RS} {wr}  "
             f"{B}ROI:{RS} {pc}{roi:+.1f}%{RS}\n"
             f"  {B}Bankroll:{RS} ${self.bankroll:.2f}  "
-            f"{B}P&L:{RS} {pc}${self.daily_pnl:+.2f}{RS}  "
+            f"{B}P&L:{RS} {pc}${pnl:+.2f}{RS}  "
             f"{B}Network:{RS} {NETWORK}  "
             f"{B}Open:{RS} {len(self.pending)}\n"
             f"  {price_str}\n"
@@ -595,7 +582,7 @@ class LiveTrader:
         mins_left = m["mins_left"]
         up_price  = m["up_price"]
 
-        if self.daily_pnl <= -(self.bankroll * MAX_DAILY_LOSS):
+        if self.bankroll <= self.start_bank * (1 - MAX_DAILY_LOSS):
             return
 
         # Max open positions guard
@@ -1068,23 +1055,20 @@ class LiveTrader:
             size_tok   = float(pos.get("size", 0))
             title      = pos.get("title", "")
 
-            # Only active (not yet resolved) positions not already tracked
+            # Skip resolved/redeemable or incomplete
             if redeemable or not outcome or not cid:
-                continue
-            if cid in self.pending:
                 continue
 
             self.seen.add(cid)
 
-            # Defaults
+            # Fetch real market data from Gamma API — always, even if already in pending
+            # (to fix wrong end_ts set by _load_pending or _position_sync_loop)
             asset    = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
                         else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
-            end_ts   = now + 30 * 60
+            end_ts   = 0
             start_ts = now - 60
             duration = 15
             token_up = token_down = ""
-
-            # Fetch real market data from Gamma API using conditionId
             try:
                 import requests as _req
                 mkt_data = _req.get(
@@ -1113,27 +1097,44 @@ class LiveTrader:
             except Exception as e:
                 print(f"{Y}[SYNC] Gamma lookup failed for {cid[:10]}: {e}{RS}")
 
-            # Skip if already expired
-            if end_ts <= now:
+            # Skip if already expired — queue for on-chain resolution instead
+            if end_ts > 0 and end_ts <= now:
+                if cid not in self.pending_redeem:
+                    m_s = {"conditionId": cid, "question": title}
+                    t_s = {"side": outcome, "asset": asset, "size": val, "entry": 0.5,
+                           "duration": duration, "mkt_price": 0.5, "mins_left": 0,
+                           "open_price": 0, "token_id": "", "order_id": "SYNC-EXPIRED"}
+                    self.pending_redeem[cid] = (m_s, t_s)
+                    print(f"{Y}[SYNC] Expired position queued for resolution: {title[:40]} {outcome}{RS}")
+                self.pending.pop(cid, None)
                 continue
 
             entry     = (val / size_tok) if size_tok > 0 else 0.5
-            mins_left = (end_ts - now) / 60
+            mins_left = (end_ts - now) / 60 if end_ts > 0 else 999
 
             m = {"conditionId": cid, "question": title, "asset": asset,
                  "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
                  "up_price": entry if outcome == "Up" else 1 - entry,
                  "mins_left": mins_left, "token_up": token_up, "token_down": token_down}
-            trade = {"side": outcome, "size": val, "entry": entry,
-                     "open_price": 0, "current_price": 0, "true_prob": 0.5,
-                     "mkt_price": entry, "edge": 0, "mins_left": mins_left,
-                     "end_ts": end_ts, "asset": asset, "duration": duration,
-                     "token_id": token_up if outcome == "Up" else token_down,
-                     "order_id": "SYNCED"}
 
-            self.pending[cid] = (m, trade)
-            synced += 1
-            print(f"{Y}[SYNC] Restored: {title[:45]} {outcome} ~${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
+            if cid in self.pending:
+                # Update end_ts and market data on existing pending entry
+                old_m, old_t = self.pending[cid]
+                old_m.update({"end_ts": end_ts, "start_ts": start_ts, "duration": duration,
+                               "asset": asset, "token_up": token_up, "token_down": token_down})
+                old_t.update({"end_ts": end_ts, "asset": asset, "duration": duration,
+                               "token_id": token_up if outcome == "Up" else token_down})
+                print(f"{Y}[SYNC] Updated: {title[:40]} {outcome} | {duration}m ends in {mins_left:.1f}min{RS}")
+            else:
+                trade = {"side": outcome, "size": val, "entry": entry,
+                         "open_price": 0, "current_price": 0, "true_prob": 0.5,
+                         "mkt_price": entry, "edge": 0, "mins_left": mins_left,
+                         "end_ts": end_ts, "asset": asset, "duration": duration,
+                         "token_id": token_up if outcome == "Up" else token_down,
+                         "order_id": "SYNCED"}
+                self.pending[cid] = (m, trade)
+                synced += 1
+                print(f"{Y}[SYNC] Restored: {title[:40]} {outcome} ~${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
 
         if synced:
             self._save_pending()
@@ -1603,6 +1604,10 @@ class LiveTrader:
 """)
         self.init_clob()
         self._sync_redeemable()   # redeem any wins from previous runs
+        # Sync stats from API immediately so first status print shows real data
+        import requests as _req
+        loop = asyncio.get_event_loop()
+        await self._sync_stats_from_api(loop, _req)
         await asyncio.gather(
             self.stream_rtds(),
             self.vol_loop(),
