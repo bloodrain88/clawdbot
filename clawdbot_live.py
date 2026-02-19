@@ -609,20 +609,16 @@ class LiveTrader:
         if not open_price:
             return  # wait until scan_loop sets Chainlink-based open_price
 
-        # Entry window — per-duration minimum life remaining:
-        # 5m markets: 20% (enter within first 4 min), 15m markets: 35% (enter within first ~10 min)
+        # Only enter in first 35% of market life — need time for price to move further our way
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
-        pct_min       = 0.20 if duration <= 5 else 0.35
-        if pct_remaining < pct_min:
+        if pct_remaining < 0.35:
             return
 
-        # Per-duration MIN_MOVE: 5m markets need less move (BTC barely moves 0.2% in 5min)
-        min_move_dur = 0.0007 if duration <= 5 else MIN_MOVE   # 0.07% for 5m, 0.2% for 15m
-
-        # Check directional move
-        move_pct      = abs(current - open_price) / open_price if open_price > 0 else 0
-        directional   = move_pct >= min_move_dur
+        # Require a real directional move — no structural bets
+        move_pct  = abs(current - open_price) / open_price if open_price > 0 else 0
+        if move_pct < MIN_MOVE:
+            return
 
         # Check RTDS vs Chainlink direction agreement
         cl_now   = self.cl_prices.get(asset, 0)
@@ -633,14 +629,7 @@ class LiveTrader:
             if rtds_up != cl_up:
                 cl_agree = False
 
-        # Structural bet: no directional move but check for CLOB structural mispricing.
-        # Only allowed when safety guard is green (no excessive losses).
         structural = False
-        if not directional:
-            if self._structural_ok():
-                structural = True   # pass to _place_order which requires 12% CLOB edge
-            else:
-                return  # safety guard disabled structural bets
 
         # ── Combined probability: Black-Scholes + Momentum + Direction bias ──
         vol      = self.vols.get(asset, 0.70)
