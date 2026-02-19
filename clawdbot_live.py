@@ -23,12 +23,30 @@ import os
 from datetime import datetime, timezone
 from scipy.stats import norm
 from dotenv import load_dotenv
+from web3 import Web3
+from eth_account import Account
 
 load_dotenv(os.path.expanduser("~/.clawdbot.env"))
 
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON, AMOY
 from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, AssetType, BalanceAllowanceParams
+from py_clob_client.config import get_contract_config
+
+POLYGON_RPCS = [
+    "https://polygon.llamarpc.com",
+    "https://rpc.ankr.com/polygon",
+    "https://polygon.drpc.org",
+    "https://polygon-mainnet.public.blastapi.io",
+]
+ERC20_ABI = [
+    {"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],
+     "name":"approve","outputs":[{"name":"","type":"bool"}],
+     "stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],
+     "name":"allowance","outputs":[{"name":"","type":"uint256"}],
+     "stateMutability":"view","type":"function"},
+]
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
@@ -100,28 +118,74 @@ class LiveTrader:
             print(f"{R}[CLOB] Creds error: {e}{RS}")
             raise
 
-        # Set allowances via Polymarket relayer (no gas needed)
+        # Approve USDC.e on-chain + sync Polymarket backend
         if not DRY_RUN:
-            for label, atype in [("COLLATERAL", AssetType.COLLATERAL),
-                                  ("CONDITIONAL", AssetType.CONDITIONAL)]:
-                try:
-                    resp = self.clob.update_balance_allowance(
-                        BalanceAllowanceParams(asset_type=atype)
-                    )
-                    print(f"{G}[CLOB] Allowance set ({label}): {resp}{RS}")
-                except Exception as e:
-                    print(f"{Y}[CLOB] Allowance ({label}): {e}{RS}")
+            self._approve_usdc()
 
         # Check USDC balance (raw value has 6 decimals)
         try:
             bal  = self.clob.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
             usdc = float(bal.get("balance", 0)) / 1e6
-            allow= float(bal.get("allowance", 0)) / 1e6
+            allowances = bal.get("allowances", {})
+            allow = max((float(v) for v in allowances.values()), default=0) / 1e6
             print(f"{G}[CLOB] USDC balance: ${usdc:.2f}  allowance: ${allow:.2f}{RS}")
             if usdc < 10 and not DRY_RUN:
                 print(f"{R}[WARN] Saldo basso! Fondi il wallet prima di fare trading live.{RS}")
         except Exception as e:
             print(f"{Y}[CLOB] Balance check: {e}{RS}")
+
+    def _approve_usdc(self):
+        """ERC20 approve USDC.e on-chain for both Polymarket exchange contracts,
+        then call update_balance_allowance so the CLOB backend syncs."""
+        cfg      = get_contract_config(CHAIN_ID, neg_risk=False)
+        cfg_neg  = get_contract_config(CHAIN_ID, neg_risk=True)
+        collateral = Web3.to_checksum_address(cfg.collateral)
+        spenders   = [
+            Web3.to_checksum_address(cfg.exchange),
+            Web3.to_checksum_address(cfg_neg.exchange),
+        ]
+        w3 = None
+        for rpc in POLYGON_RPCS:
+            try:
+                _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+                _w3.eth.block_number
+                w3 = _w3
+                print(f"{G}[APPROVE] RPC OK: {rpc}{RS}")
+                break
+            except Exception:
+                continue
+        if w3 is None:
+            print(f"{R}[APPROVE] No working Polygon RPC — skipping on-chain approve{RS}")
+        else:
+            acct    = Account.from_key(PRIVATE_KEY)
+            usdc    = w3.eth.contract(address=collateral, abi=ERC20_ABI)
+            max_int = 2**256 - 1
+            for spender in spenders:
+                try:
+                    current = usdc.functions.allowance(acct.address, spender).call()
+                    if current > 10**24:
+                        print(f"{G}[APPROVE] {spender[:10]}… already approved{RS}")
+                        continue
+                    nonce  = w3.eth.get_transaction_count(acct.address)
+                    tx     = usdc.functions.approve(spender, max_int).build_transaction({
+                        "from": acct.address, "nonce": nonce,
+                        "gas": 100_000, "gasPrice": w3.eth.gas_price,
+                    })
+                    signed  = acct.sign_transaction(tx)
+                    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                    status  = "OK" if receipt.status == 1 else "FAILED"
+                    print(f"{G}[APPROVE] {spender[:10]}… {status} tx={tx_hash.hex()[:16]}{RS}")
+                except Exception as e:
+                    print(f"{Y}[APPROVE] {spender[:10]}… {e}{RS}")
+        # Sync Polymarket backend
+        try:
+            resp = self.clob.update_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            print(f"{G}[CLOB] Backend allowance synced: {resp or 'OK'}{RS}")
+        except Exception as e:
+            print(f"{Y}[CLOB] Backend sync: {e}{RS}")
 
     # ── LOG ───────────────────────────────────────────────────────────────────
     def _init_log(self):
