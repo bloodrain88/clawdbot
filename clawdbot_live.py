@@ -668,6 +668,71 @@ class LiveTrader:
             for cid in done:
                 self.pending_redeem.pop(cid, None)
 
+    # ── STARTUP REDEEM SYNC ───────────────────────────────────────────────────
+    def _sync_redeemable(self):
+        """At startup, find any winning positions not yet redeemed and queue them."""
+        if DRY_RUN or self.w3 is None:
+            return
+        try:
+            import requests as _req
+            r = _req.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                timeout=10
+            )
+            positions = r.json()
+        except Exception as e:
+            print(f"{Y}[SYNC] Could not fetch positions: {e}{RS}")
+            return
+
+        cfg      = get_contract_config(CHAIN_ID, neg_risk=False)
+        ctf_addr = Web3.to_checksum_address(cfg.conditional_tokens)
+        ctf      = self.w3.eth.contract(address=ctf_addr, abi=[
+            {"inputs":[{"name":"conditionId","type":"bytes32"}],
+             "name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"conditionId","type":"bytes32"},{"name":"index","type":"uint256"}],
+             "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+        ])
+
+        queued = 0
+        for pos in positions:
+            cid       = pos.get("conditionId", "")
+            redeemable= pos.get("redeemable", False)
+            val       = float(pos.get("currentValue", 0))
+            outcome   = pos.get("outcome", "")   # "Up" or "Down" — what we bet on
+            size      = float(pos.get("size", 0))
+            title     = pos.get("title", "")[:40]
+
+            if not redeemable or val < 0.01 or not outcome or not cid:
+                continue
+            if cid in self.pending_redeem:
+                continue
+
+            try:
+                b     = bytes.fromhex(cid[2:])
+                denom = ctf.functions.payoutDenominator(b).call()
+                if denom == 0:
+                    continue
+                n0 = ctf.functions.payoutNumerators(b, 0).call()
+                n1 = ctf.functions.payoutNumerators(b, 1).call()
+                winner = "Up" if n0 > 0 else "Down"
+                if winner == outcome:
+                    # Derive asset from title
+                    asset = "BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title \
+                        else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?"
+                    self.pending_redeem[cid] = (outcome, asset)
+                    queued += 1
+                    print(f"{G}[SYNC] Queued for redeem: {title} {outcome} ~${val:.2f}{RS}")
+            except Exception:
+                continue
+
+        if queued:
+            print(f"{G}[SYNC] {queued} winning position(s) queued for redemption{RS}")
+        else:
+            print(f"{B}[SYNC] No unredeemed wins found{RS}")
+
     # ── MATH ──────────────────────────────────────────────────────────────────
     def _prob_up(self, current, open_price, mins_left, vol):
         if open_price <= 0 or vol <= 0 or mins_left <= 0:
@@ -729,6 +794,7 @@ class LiveTrader:
 ╚══════════════════════════════════════════════════════════════╝{RS}
 """)
         self.init_clob()
+        self._sync_redeemable()   # redeem any wins from previous runs
         await asyncio.gather(
             self.stream_rtds(),
             self.vol_loop(),
