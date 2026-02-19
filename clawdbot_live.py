@@ -70,9 +70,10 @@ TIMING_FRAC    = 0.40     # only bet in first 40% of market duration
 SCAN_INTERVAL  = 10
 PING_INTERVAL  = 5
 STATUS_INTERVAL= 30
-LOG_FILE       = os.path.expanduser("~/clawdbot_live_trades.csv")
-PENDING_FILE   = os.path.expanduser("~/clawdbot_pending.json")
-SEEN_FILE      = os.path.expanduser("~/clawdbot_seen.json")
+_DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
+LOG_FILE       = os.path.join(_DATA_DIR, "clawdbot_live_trades.csv")
+PENDING_FILE   = os.path.join(_DATA_DIR, "clawdbot_pending.json")
+SEEN_FILE      = os.path.join(_DATA_DIR, "clawdbot_seen.json")
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
@@ -215,6 +216,10 @@ class LiveTrader:
         except Exception as e:
             print(f"{Y}[CLOB] Balance check: {e}{RS}")
 
+        # Cancel any stale GTC orders (from previous run) before syncing positions
+        if not DRY_RUN:
+            self._cancel_open_orders()
+
         # Sync open positions from Polymarket → rebuild pending for active markets
         if not DRY_RUN:
             self._sync_open_positions()
@@ -271,6 +276,14 @@ class LiveTrader:
             print(f"{G}[CLOB] Backend allowance synced: {resp or 'OK'}{RS}")
         except Exception as e:
             print(f"{Y}[CLOB] Backend sync: {e}{RS}")
+
+    def _cancel_open_orders(self):
+        """Cancel all open GTC orders from previous runs to prevent duplicate fills."""
+        try:
+            resp = self.clob.cancel_all()
+            print(f"{Y}[CLOB] Cancelled stale open orders: {resp or 'OK'}{RS}")
+        except Exception as e:
+            print(f"{Y}[CLOB] Cancel orders: {e}{RS}")
 
     # ── LOG ───────────────────────────────────────────────────────────────────
     def _init_log(self):
