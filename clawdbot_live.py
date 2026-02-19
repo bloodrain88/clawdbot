@@ -567,14 +567,13 @@ class LiveTrader:
         edge_up   = prob_up   - up_price
         edge_down = prob_down - (1 - up_price)
 
-        # Fee-adjusted edge: taker fee highest near 50¢ (~2.5%), near-zero at extremes
+        # AMM-based pre-filter (loose) — real edge checked vs CLOB price in _place_order
         fee_est  = 0.025 * (1 - abs(up_price - 0.5) * 2)
         min_edge = self._adaptive_min_edge()
 
-        # Pick best direction if both have edge, else reject
-        if edge_up - fee_est >= edge_down - fee_est and edge_up - fee_est >= min_edge:
+        if edge_up >= edge_down and edge_up >= min_edge:
             side, edge, true_prob = "Up", edge_up, prob_up
-        elif edge_down - fee_est >= min_edge:
+        elif edge_down >= min_edge:
             side, edge, true_prob = "Down", edge_down, prob_down
         else:
             return
@@ -642,22 +641,18 @@ class LiveTrader:
                 asks = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
                 best_ask = float(asks[0].price) if asks else price
 
-                # Sanity check: CLOB price must be close to AMM price
-                # Large gap = illiquid market, real edge is far lower than calculated
+                # Use CLOB price as actual reference — AMM and CLOB diverge structurally
+                # for short-duration binary markets, gap check is wrong
                 clob_edge = true_prob - best_ask
-                gap = best_ask - price
-                if gap > 0.12 or best_ask > 0.92:
-                    print(f"{Y}[SKIP] {asset} {side}: CLOB={best_ask:.3f} >> AMM={price:.3f} "
-                          f"(gap={gap:.3f}) — illiquid, real edge={clob_edge:.3f}, skipping{RS}")
-                    return None
                 if clob_edge < MIN_EDGE:
-                    print(f"{Y}[SKIP] {asset} {side}: real CLOB edge={clob_edge:.3f} < {MIN_EDGE} after spread{RS}")
+                    print(f"{Y}[SKIP] {asset} {side}: CLOB_ask={best_ask:.3f} "
+                          f"real_edge={clob_edge:.3f} < {MIN_EDGE}{RS}")
                     return None
 
                 # Buy at best_ask + tick to ensure fill
                 buy_price = round(min(best_ask + tick, 0.97), 4)
                 size_tok  = round(size_usdc / buy_price, 2)
-                print(f"{B}[CLOB] {asset} {side}: AMM={price:.3f} CLOB_ask={best_ask:.3f} "
+                print(f"{B}[CLOB] {asset} {side}: model={true_prob:.3f} CLOB_ask={best_ask:.3f} "
                       f"real_edge={clob_edge:.3f} buying@{buy_price:.3f}{RS}")
 
                 order_args = OrderArgs(
