@@ -1385,9 +1385,10 @@ class LiveTrader:
 
     # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
     async def _get_chainlink_at(self, asset: str, start_ts: float) -> tuple:
-        """Return (price, source) where source is 'CL-exact' or 'CL-fallback'.
-        Walks backwards through Chainlink rounds to find the last update <= start_ts,
-        matching the exact reference price Polymarket uses for resolution.
+        """Return (price, source) matching Polymarket's 'price to beat'.
+        Polymarket uses the FIRST Chainlink round posted AT OR AFTER eventStartTime.
+        Walk backward to find where we cross start_ts, then return the round just before that
+        (i.e. the first one that's >= start_ts as seen walking forward).
         BTC/ETH update every ~27s → 60 rounds covers ~27 minutes lookback."""
         if self.w3 is None or asset not in CHAINLINK_FEEDS:
             return 0.0, "no-w3"
@@ -1402,11 +1403,16 @@ class LiveTrader:
             updated_at = latest[3]
             price      = latest[1]
 
-            # Latest round is already at or before start: this IS the reference price
-            if updated_at <= start_ts:
-                return price / 1e8, "CL-exact"
+            # Latest round is before start_ts: no post-start round exists yet → wait
+            if updated_at < start_ts:
+                return 0.0, "not-ready"
 
-            # Walk backward — 60 rounds covers ~27 minutes (BTC updates ~27s)
+            # Latest round is at or after start — walk backward to find the FIRST round
+            # that is >= start_ts (i.e. the first Chainlink update after window opened).
+            # As we walk back, track the most recent round still >= start_ts.
+            first_after_price = price
+            first_after_ts    = updated_at
+
             phase_id = round_id >> 64
             agg_id   = round_id & ((1 << 64) - 1)
             for i in range(1, 61):
@@ -1422,19 +1428,25 @@ class LiveTrader:
                     prev_price   = data[1]
                     if prev_price <= 0:
                         continue
-                    if prev_updated <= start_ts:
-                        secs_off = start_ts - prev_updated
-                        print(f"{B}[CL] {asset} exact round -{i}: ${prev_price/1e8:,.2f} "
-                              f"(~{secs_off:.0f}s before window start){RS}")
-                        return prev_price / 1e8, "CL-exact"
+                    if prev_updated >= start_ts:
+                        # Still at or after window start — this is now the earliest candidate
+                        first_after_price = prev_price
+                        first_after_ts    = prev_updated
+                    else:
+                        # Crossed into pre-window territory — first_after is our answer
+                        secs_after = first_after_ts - start_ts
+                        print(f"{G}[CL] {asset} price to beat: ${first_after_price/1e8:,.2f} "
+                              f"(first CL round +{secs_after:.0f}s after window open){RS}")
+                        return first_after_price / 1e8, "CL-exact"
                 except Exception:
-                    continue   # try next round, don't abort
+                    continue
 
-            # Fallback: use the cached Chainlink snapshot (polled every ~30s)
-            cached = self.cl_prices.get(asset, 0)
-            fallback = cached if cached > 0 else price / 1e8
-            print(f"{Y}[CL] {asset} walk failed — using cached ${fallback:,.2f} as fallback{RS}")
-            return fallback, "CL-fallback"
+            # All 60 rounds were >= start_ts (market started very recently or long window)
+            # first_after_price is the oldest available round after start
+            secs_after = first_after_ts - start_ts
+            print(f"{G}[CL] {asset} price to beat: ${first_after_price/1e8:,.2f} "
+                  f"(oldest round in window, +{secs_after:.0f}s){RS}")
+            return first_after_price / 1e8, "CL-exact"
         except Exception as e:
             print(f"{Y}[CL] _get_chainlink_at {asset}: {e}{RS}")
             return 0.0, "error"
@@ -1460,16 +1472,22 @@ class LiveTrader:
                 title_s  = m.get("question", "")[:50]
                 if cid not in self.open_prices:
                     start_ts = m.get("start_ts", now)
-                    print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | {m['mins_left']:.1f}min left{RS}")
                     ref, src = await self._get_chainlink_at(asset, start_ts)
-                    if ref <= 0:
+                    if src == "not-ready":
+                        # Window just opened — no CL round yet. Wait for next scan.
+                        print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | waiting for first CL round...{RS}")
+                    elif ref <= 0:
+                        # CL error — fallback to cached price
                         ref = self.cl_prices.get(asset, 0) or self.prices.get(asset, 0)
                         src = "CL-fallback"
-                    if ref > 0:
+                        if ref > 0:
+                            self.open_prices[cid]        = ref
+                            self.open_prices_source[cid] = src
+                            print(f"{Y}[NEW MARKET] {asset} {dur}m | {title_s} | beat=${ref:,.2f} [fallback]{RS}")
+                    else:
                         self.open_prices[cid]        = ref
                         self.open_prices_source[cid] = src
-                        src_c = G if src == "CL-exact" else Y
-                        print(f"{src_c}[BEAT] {asset} {dur}m price to beat: ${ref:,.2f} [{src}]{RS}")
+                        print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | {m['mins_left']:.1f}min left{RS}")
                 else:
                     # Already known — log on every scan so every skip/entry is traceable
                     ref = self.open_prices[cid]
