@@ -1061,6 +1061,10 @@ class LiveTrader:
 
             self.seen.add(cid)
 
+            # Skip dust positions — too small to be a real bot bet
+            if val < MIN_BET * 0.5:
+                continue
+
             # Fetch real market data from Gamma API — always, even if already in pending
             # (to fix wrong end_ts set by _load_pending or _position_sync_loop)
             asset    = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
@@ -1561,7 +1565,10 @@ class LiveTrader:
                     rdm  = pos.get("redeemable", False)
                     val  = float(pos.get("currentValue", 0))
                     side = pos.get("outcome", "")
-                    if rdm or val < 0.01 or not side or not cid:
+                    if rdm or not side or not cid:
+                        continue
+                    self.seen.add(cid)
+                    if val < MIN_BET * 0.5:   # dust — mark seen only, don't track
                         continue
                     if cid in self.pending or cid in self.pending_redeem:
                         continue
