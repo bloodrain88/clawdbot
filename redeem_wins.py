@@ -17,7 +17,6 @@ ADDRESS     = os.environ["POLY_ADDRESS"]
 CHAIN_ID    = POLYGON
 
 POLYGON_RPCS = [
-    "https://polygon-rpc.com",
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon-mainnet.public.blastapi.io",
     "https://polygon.drpc.org",
