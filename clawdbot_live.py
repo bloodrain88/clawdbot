@@ -98,15 +98,28 @@ class LiveTrader:
             print(f"{R}[CLOB] Creds error: {e}{RS}")
             raise
 
+        # Approve USDC + token allowances (one-time on-chain tx per contract)
+        if not DRY_RUN:
+            for label, atype in [("USDC collateral", AssetType.COLLATERAL),
+                                  ("CTF tokens", AssetType.CONDITIONAL_TOKEN)]:
+                try:
+                    resp = self.clob.update_balance_allowance(
+                        BalanceAllowanceParams(asset_type=atype)
+                    )
+                    print(f"{G}[CLOB] Allowance approved ({label}): {resp}{RS}")
+                except Exception as e:
+                    print(f"{Y}[CLOB] Allowance ({label}): {e}{RS}")
+
         # Check USDC balance
         try:
             bal = self.clob.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
             usdc = float(bal.get("balance", 0))
-            print(f"{G}[CLOB] USDC balance: ${usdc:.2f}{RS}")
+            allow = float(bal.get("allowance", 0))
+            print(f"{G}[CLOB] USDC balance: ${usdc:.2f}  allowance: ${allow:.2f}{RS}")
             if usdc < 10 and not DRY_RUN:
                 print(f"{R}[WARN] Saldo basso! Fondi il wallet prima di fare trading live.{RS}")
         except Exception as e:
-            print(f"{Y}[CLOB] Balance: {e}{RS}")
+            print(f"{Y}[CLOB] Balance check failed (need USDC on Polygon): {e}{RS}")
 
     # ── LOG ───────────────────────────────────────────────────────────────────
     def _init_log(self):
