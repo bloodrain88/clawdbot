@@ -604,12 +604,15 @@ class LiveTrader:
         duration  = m["duration"]
         mins_left = m["mins_left"]
         up_price  = m["up_price"]
+        label     = f"{asset} {duration}m | {m.get('question','')[:45]}"
 
         if self.bankroll <= self.start_bank * (1 - MAX_DAILY_LOSS):
+            print(f"{R}[SKIP] {label} → daily loss limit hit{RS}")
             return
 
         # Max open positions guard
         if len(self.pending) >= MAX_OPEN:
+            print(f"{Y}[SKIP] {label} → max open positions ({MAX_OPEN}){RS}")
             return
 
         # Use RTDS (Binance) as current price for direction analysis — real-time, sub-second.
@@ -617,16 +620,19 @@ class LiveTrader:
         # Momentum and BS use RTDS to detect where price is heading right now.
         current = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
         if current == 0:
+            print(f"{Y}[SKIP] {label} → no price feed{RS}")
             return
 
         open_price = self.open_prices.get(cid)
         if not open_price:
+            print(f"{Y}[WAIT] {label} → fetching open price (CL){RS}")
             return  # wait until scan_loop sets Chainlink-based open_price
 
         # Only enter in first 35% of market life — need time for price to move further our way
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
         if pct_remaining < 0.35:
+            print(f"{Y}[SKIP] {label} → too late ({pct_remaining:.0%} remaining, need ≥35%){RS}")
             return
 
         # Require a real directional move — threshold scaled to market duration
@@ -634,7 +640,10 @@ class LiveTrader:
         # 15m: 0.20% (full MIN_MOVE, more time means clearer signal required)
         move_pct     = abs(current - open_price) / open_price if open_price > 0 else 0
         min_move_dur = MIN_MOVE * 0.5 if duration <= 5 else MIN_MOVE
+        direction    = "Up" if current >= open_price else "Down"
+        move_str     = f"{(current-open_price)/open_price:+.3%}"
         if move_pct < min_move_dur:
+            print(f"{Y}[SKIP] {label} → move {move_str} < {min_move_dur:.2%} needed | ref={open_price:.2f} now={current:.2f}{RS}")
             return
 
         # Check RTDS vs Chainlink direction agreement
@@ -676,6 +685,10 @@ class LiveTrader:
         elif edge_down >= pre_filter:
             side, edge, true_prob = "Down", edge_down, prob_down
         else:
+            best_edge = max(edge_up, edge_down)
+            best_side = "Up" if edge_up >= edge_down else "Down"
+            print(f"{Y}[SKIP] {label} → no edge | {best_side} edge={best_edge:.3f} < {pre_filter:.3f} | "
+                  f"move={move_str} bs={bs_prob:.3f} mom={mom_prob:.3f} agree={'Y' if cl_agree else 'N'}{RS}")
             return
 
         entry = up_price if side == "Up" else (1 - up_price)
@@ -683,13 +696,14 @@ class LiveTrader:
         token_id = m["token_up"] if side == "Up" else m["token_down"]
 
         if not token_id:
-            print(f"{Y}[SKIP] No token_id for {asset} {side} — market data incomplete{RS}")
+            print(f"{Y}[SKIP] {label} → no token_id for {side} (market data incomplete){RS}")
             self.seen.add(cid)
             return
 
-        print(f"{B}[EDGE] {asset} {side} | move={((current-open_price)/open_price):+.3%} "
-              f"bs={bs_prob:.3f} mom={mom_prob:.3f} combined={true_prob:.3f} "
-              f"mkt={up_price:.3f} edge={edge:.3f} fee~{fee_est:.3f} {mins_left:.1f}min left{RS}")
+        agree_str = "" if cl_agree else f" {Y}CL-disagree{RS}"
+        print(f"{B}[EDGE] {label} → {side} | move={move_str} ref={open_price:.2f} "
+              f"bs={bs_prob:.3f} mom={mom_prob:.3f} prob={true_prob:.3f} "
+              f"mkt={up_price:.3f} edge={edge:.3f} ${size:.2f}{agree_str}{RS}")
 
         # Mark seen before placing — prevents double-bet if evaluate called concurrently
         self.seen.add(cid)
@@ -1442,12 +1456,14 @@ class LiveTrader:
                 if cid not in self.open_prices:
                     asset    = m.get("asset")
                     start_ts = m.get("start_ts", now)
+                    title_s  = m.get("question", "")[:45]
+                    print(f"{W}[NEW MARKET] {asset} {m.get('duration',0)}m | {title_s} | {m['mins_left']:.1f}min left{RS}")
                     ref = await self._get_chainlink_at(asset, start_ts)
                     if ref <= 0:
                         ref = self.cl_prices.get(asset, 0) or self.prices.get(asset, 0)
                     if ref > 0:
                         self.open_prices[cid] = ref
-                        print(f"{B}[OPEN] {asset} ref={ref:.4f} (CL@start_ts){RS}")
+                        print(f"{B}[OPEN] {asset} price to beat: ${ref:,.2f} (CL@start){RS}")
                 if cid not in self.seen:
                     candidates.append(m)
             if candidates:
