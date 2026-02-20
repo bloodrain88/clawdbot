@@ -1178,17 +1178,24 @@ class LiveTrader:
             except Exception as e:
                 print(f"{Y}[SYNC] Gamma lookup failed for {cid[:10]}: {e}{RS}")
 
-            # Skip if already expired — queue for on-chain resolution instead
+            # Gamma /markets sometimes returns date-only endDate (e.g. "2026-02-20") which
+            # parses to midnight UTC — falsely appears expired. If we have a stored end_ts
+            # from _load_pending that is still in the future, trust it over Gamma's bad parse.
             if end_ts > 0 and end_ts <= now:
-                if cid not in self.pending_redeem:
-                    m_s = {"conditionId": cid, "question": title}
-                    t_s = {"side": outcome, "asset": asset, "size": val, "entry": 0.5,
-                           "duration": duration, "mkt_price": 0.5, "mins_left": 0,
-                           "open_price": 0, "token_id": "", "order_id": "SYNC-EXPIRED"}
-                    self.pending_redeem[cid] = (m_s, t_s)
-                    print(f"{Y}[SYNC] Expired position queued for resolution: {title[:40]} {outcome}{RS}")
-                self.pending.pop(cid, None)
-                continue
+                stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
+                if stored_end > now:
+                    print(f"{Y}[SYNC] {title[:40]} — Gamma end_ts in past but stored says {(stored_end-now)/60:.1f}min left, trusting stored{RS}")
+                    end_ts = stored_end
+                else:
+                    if cid not in self.pending_redeem:
+                        m_s = {"conditionId": cid, "question": title}
+                        t_s = {"side": outcome, "asset": asset, "size": val, "entry": 0.5,
+                               "duration": duration, "mkt_price": 0.5, "mins_left": 0,
+                               "open_price": 0, "token_id": "", "order_id": "SYNC-EXPIRED"}
+                        self.pending_redeem[cid] = (m_s, t_s)
+                        print(f"{Y}[SYNC] Expired position queued for resolution: {title[:40]} {outcome}{RS}")
+                    self.pending.pop(cid, None)
+                    continue
 
             if end_ts == 0:
                 print(f"{Y}[SYNC] {title[:40]} — no end_ts from Gamma, skipping{RS}")
@@ -1775,16 +1782,22 @@ class LiveTrader:
                         token_down = toks[1] if len(toks) > 1 else ""
                     except Exception:
                         pass
-                    # If already expired, queue for on-chain resolution
+                    # If already expired, queue for on-chain resolution.
+                    # Guard: Gamma sometimes returns date-only endDate → midnight UTC → false expiry.
+                    # Trust stored end_ts from pending if it's still in the future.
                     if end_ts > 0 and end_ts <= now:
-                        if cid not in self.pending_redeem:
-                            m_s = {"conditionId": cid, "question": title}
-                            t_s = {"side": side, "asset": asset, "size": val, "entry": 0.5,
-                                   "duration": duration, "mkt_price": 0.5, "mins_left": 0,
-                                   "open_price": 0, "token_id": "", "order_id": "SYNC-EXPIRED"}
-                            self.pending_redeem[cid] = (m_s, t_s)
-                            print(f"{Y}[SYNC] Expired → queued for resolution: {title[:40]} {side}{RS}")
-                        continue
+                        stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
+                        if stored_end > now:
+                            end_ts = stored_end  # Gamma gave date-only, use stored value
+                        else:
+                            if cid not in self.pending_redeem:
+                                m_s = {"conditionId": cid, "question": title}
+                                t_s = {"side": side, "asset": asset, "size": val, "entry": 0.5,
+                                       "duration": duration, "mkt_price": 0.5, "mins_left": 0,
+                                       "open_price": 0, "token_id": "", "order_id": "SYNC-EXPIRED"}
+                                self.pending_redeem[cid] = (m_s, t_s)
+                                print(f"{Y}[SYNC] Expired → queued for resolution: {title[:40]} {side}{RS}")
+                            continue
                     if end_ts == 0:
                         print(f"{Y}[SYNC] {title[:40]} — no end_ts from Gamma, skipping{RS}")
                         continue
