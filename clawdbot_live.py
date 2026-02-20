@@ -1464,7 +1464,7 @@ class LiveTrader:
         while True:
             markets = await self.fetch_markets()
             now     = datetime.now(timezone.utc).timestamp()
-            print(f"{B}[SCAN] Live markets: {len(markets)} | Open: {len(self.pending)}{RS}")
+            print(f"{B}[SCAN] Live markets: {len(markets)} | Open: {len(self.pending)} | Settling: {len(self.pending_redeem)}{RS}")
 
             # Evaluate ALL eligible markets in parallel — no more sequential blocking
             candidates = []
