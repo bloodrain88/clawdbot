@@ -58,7 +58,7 @@ BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
 MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to determine direction
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
-DUST_BET       = 2.0      # $2 absolute floor (dust prevention only)
+DUST_BET       = 5.0      # $5 absolute floor (Polymarket minimum order size)
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
 MAX_OPEN       = 2        # max 2 simultaneous positions — prevent 3 correlated losses
 MAX_SAME_DIR   = 1        # max 1 position per direction (no 2x Up or 2x Down)
@@ -857,7 +857,8 @@ class LiveTrader:
             sig["token_id"], sig["side"], sig["entry"], sig["size"],
             sig["asset"], sig["duration"], sig["mins_left"],
             sig["true_prob"], sig["cl_agree"],
-            min_edge_req=sig["min_edge"], force_taker=sig["force_taker"]
+            min_edge_req=sig["min_edge"], force_taker=sig["force_taker"],
+            score=sig["score"]
         )
         m = sig["m"]
         trade = {
@@ -879,7 +880,7 @@ class LiveTrader:
         if sig and sig["score"] >= 4:
             await self._execute_trade(sig)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -910,19 +911,29 @@ class LiveTrader:
                 best_bid = float(bids[0].price) if bids else best_ask - 0.10
                 spread   = best_ask - best_bid
 
-                # CLOB sanity check: taker_edge must be positive (model > ask).
-                # The adaptive floor (3-6%) prevents obviously bad fills.
-                # CL disagreement adds 2% penalty but never blocks high-conviction signals.
-                edge_floor = min_edge_req if min_edge_req is not None else 0.04
-                if not cl_agree: edge_floor += 0.02
-
                 taker_edge = true_prob - best_ask
-                if taker_edge < edge_floor:
-                    kind = "disagree" if not cl_agree else "directional"
-                    print(f"{Y}[SKIP] {asset} {side} [{kind}]: taker_edge={taker_edge:.3f} < {edge_floor:.2f} "
-                          f"(ask={best_ask:.3f} model={true_prob:.3f}){RS}")
-                    return None
-                print(f"{B}[FILL]{RS} {asset} {side} edge={taker_edge:.3f} floor={edge_floor:.2f}")
+                best_bid_p = float(bids[0].price) if bids else best_ask - 0.10
+                mid_est    = (best_bid_p + best_ask) / 2
+                maker_edge_est = true_prob - mid_est
+
+                if score >= 10:
+                    # High conviction: gate on maker edge (mid price), not taker (ask)
+                    # Maker posts at mid → much better fill than ask even with wide spread
+                    if maker_edge_est < 0:
+                        print(f"{Y}[SKIP] {asset} {side} [high-conv]: maker_edge={maker_edge_est:.3f} < 0 "
+                              f"(mid={mid_est:.3f} model={true_prob:.3f}){RS}")
+                        return None
+                    print(f"{B}[FILL]{RS} {asset} {side} score={score} maker_edge={maker_edge_est:.3f} taker_edge={taker_edge:.3f}")
+                else:
+                    # Normal conviction: taker edge gate applies
+                    edge_floor = min_edge_req if min_edge_req is not None else 0.04
+                    if not cl_agree: edge_floor += 0.02
+                    if taker_edge < edge_floor:
+                        kind = "disagree" if not cl_agree else "directional"
+                        print(f"{Y}[SKIP] {asset} {side} [{kind}]: taker_edge={taker_edge:.3f} < {edge_floor:.2f} "
+                              f"(ask={best_ask:.3f} model={true_prob:.3f}){RS}")
+                        return None
+                    print(f"{B}[FILL]{RS} {asset} {side} edge={taker_edge:.3f} floor={edge_floor:.2f}")
 
                 # High conviction: skip maker, go straight to taker for instant fill
                 if force_taker:
