@@ -356,13 +356,36 @@ class LiveTrader:
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
             # NOT the bot's trade entry price — market determines outcome from its own start
             open_p     = self.open_prices.get(cid, 0)
+            src        = self.open_prices_source.get(cid, "?")
+            # If no open price yet, try Polymarket API inline (best effort)
+            if open_p <= 0:
+                start_ts_m = m.get("start_ts", 0)
+                end_ts_m   = m.get("end_ts", 0)
+                if start_ts_m > 0 and end_ts_m > 0:
+                    try:
+                        import requests as _rq
+                        from datetime import datetime as _dt, timezone as _tz
+                        st = _dt.fromtimestamp(start_ts_m, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        et = _dt.fromtimestamp(end_ts_m,   tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        _r = _rq.get("https://polymarket.com/api/crypto/crypto-price",
+                                     params={"symbol": asset, "eventStartTime": st,
+                                             "variant": "fifteen", "endDate": et}, timeout=3)
+                        _p = _r.json().get("openPrice") or 0
+                        if _p:
+                            open_p = float(_p)
+                            self.open_prices[cid]        = open_p
+                            self.open_prices_source[cid] = "PM"
+                            src = "PM"
+                    except Exception:
+                        pass
             # Use Chainlink (resolution source) for win/loss; fall back to RTDS if unavailable
             cl_p       = self.cl_prices.get(asset, 0)
             cur_p      = cl_p if cl_p > 0 else self.prices.get(asset, 0)
             end_ts     = t.get("end_ts", 0)
             mins_left  = max(0, (end_ts - now_ts) / 60)
             title      = m.get("question", "")[:38]
-            src        = "CL" if cl_p > 0 else "RTDS"
+            if open_p > 0 and src == "?":
+                src = "CL" if cl_p > 0 else "RTDS"
             if open_p > 0 and cur_p > 0:
                 winning    = (side == "Up" and cur_p > open_p) or (side == "Down" and cur_p < open_p)
                 move_pct   = (cur_p - open_p) / open_p * 100
