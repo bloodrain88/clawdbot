@@ -643,11 +643,13 @@ class LiveTrader:
 
         src_tag = f"[{src}]"
 
-        # Timing gate: only enter in first 40% of market life (≥60% remaining)
+        # Timing gate: hard block only in last 6 min (need ≥40% remaining).
+        # 40-60% remaining: allowed but earns no timing bonus — only high-edge markets pass.
+        # >60% remaining: timing bonus scored (+1 or +2 pts) — preferred entry window.
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
-        if pct_remaining < 0.60:
-            return None   # too late — silent (logged in scan_loop summary)
+        if pct_remaining < 0.40:
+            return None   # last 6 min — AMM fully priced, no edge left
 
         move_pct = abs(current - open_price) / open_price if open_price > 0 else 0
         move_str = f"{(current-open_price)/open_price:+.3%}"
@@ -1737,7 +1739,12 @@ class LiveTrader:
                 placed = 0
                 for sig in valid:
                     if placed >= slots: break
-                    # Always take best market if score ≥ 4; 2nd trade only at score ≥ 8
+                    # Late entry (40-60% remaining, no timing bonus): require score ≥ 8
+                    # — only high-edge/high-conviction late trades are worth it
+                    is_late = sig["pct_remaining"] < 0.60
+                    min_score = 8 if is_late else 4
+                    if sig["score"] < min_score: break
+                    # 2nd trade: only at score ≥ 8
                     if placed >= 1 and sig["score"] < 8: break
                     await self._execute_trade(sig)
                     placed += 1
