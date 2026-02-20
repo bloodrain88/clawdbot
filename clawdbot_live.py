@@ -859,28 +859,29 @@ class LiveTrader:
                 return None   # AMM massively overpriced our direction — no edge
             side, edge, true_prob = direction, max(0.01, dir_edge), dir_prob
 
-        # Kelly fraction scales with conviction score (replaces hardcoded MIN/MAX_BET)
-        # Higher score → larger fraction of Kelly → bigger bet automatically
-        if   score >= 12: kelly_frac = 0.55
-        elif score >= 10: kelly_frac = 0.45
-        elif score >=  8: kelly_frac = 0.35
-        elif score >=  6: kelly_frac = 0.22
-        else:             kelly_frac = 0.12   # score 4-5: probe entry only
+        # Skip low-conviction signals — only trade when score is strong
+        if score < 8:
+            return None
 
-        entry    = up_price if side == "Up" else (1 - up_price)
-        # Early continuation: AMM still near 50/50, true prob ~75% → allow up to 55¢
-        # Mid/late window: require genuinely cheap side (<40¢) for real edge
+        # Score-tiered Kelly fraction + bankroll cap: high conviction → bet more
+        if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.20
+        elif score >= 10: kelly_frac, bankroll_pct = 0.45, 0.15
+        else:             kelly_frac, bankroll_pct = 0.35, 0.10   # score 8-9
+
+        entry     = up_price if side == "Up" else (1 - up_price)
+        # Early continuation: AMM near 50/50 but true prob ~75% → allow up to 55¢
+        # Mid/late window: require cheap side (<40¢) for real edge
         max_entry = 0.55 if (is_early_continuation and score >= 8) else 0.40
         if entry > max_entry:
             return None   # expensive side — no edge
-        wr_scale = self._wr_bet_scale()
-        raw_size = self._kelly_size(true_prob, entry, kelly_frac)
-        # Dynamic cap: scales with bankroll (10%), min $5, max $100; 2× for strong continuations
-        max_single = max(DUST_BET, min(100.0, self.bankroll * 0.10))
+
+        wr_scale   = self._wr_bet_scale()
+        raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
+        max_single = min(100.0, self.bankroll * bankroll_pct)
         abs_cap    = max_single * 2 if is_early_continuation and score >= 10 else max_single
-        size       = round(min(abs_cap,
-                               self.bankroll * 0.15,
-                               raw_size * vol_mult * wr_scale), 2)
+        size       = round(min(abs_cap, raw_size * vol_mult * wr_scale), 2)
+        if size < DUST_BET:
+            return None   # Kelly says edge too small to justify minimum bet — skip
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
             return None
