@@ -1343,10 +1343,9 @@ class LiveTrader:
                 # FOK = Fill-or-Kill: fills completely at price or cancels instantly — no waiting
                 if force_taker:
                     taker_price = round(min(best_ask + tick, 0.97), 4)
-                    size_tok_t  = round(size_usdc / taker_price, 2)
                     print(f"{G}[FAST-TAKER]{RS} {asset} {side} HIGH-CONV @ {taker_price:.3f} | ${size_usdc:.2f}")
-                    order_args = OrderArgs(token_id=token_id, price=taker_price, size=size_tok_t, side="BUY")
-                    signed  = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
+                    order_args = MarketOrderArgs(token_id=token_id, amount=round(size_usdc, 2), side="BUY")
+                    signed  = await loop.run_in_executor(None, lambda: self.clob.create_market_order(order_args))
                     resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
                     order_id = resp.get("orderID") or resp.get("id", "")
                     if resp.get("status") in ("matched", "filled"):
@@ -1437,11 +1436,8 @@ class LiveTrader:
                     taker_price = round(min(best_ask + tick, 0.97), 4)
                     fresh_ask   = best_ask
                 print(f"{Y}[MAKER] unfilled — FAK taker @ {taker_price:.3f} (fresh ask={fresh_ask:.3f}){RS}")
-                size_tok_t = round(size_usdc / taker_price, 2)
-
-                order_args = OrderArgs(token_id=token_id, price=taker_price,
-                                       size=size_tok_t, side="BUY")
-                signed   = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
+                order_args = MarketOrderArgs(token_id=token_id, amount=round(size_usdc, 2), side="BUY")
+                signed   = await loop.run_in_executor(None, lambda: self.clob.create_market_order(order_args))
                 resp     = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FAK))
                 order_id = resp.get("orderID") or resp.get("id", "")
                 status   = resp.get("status", "")
