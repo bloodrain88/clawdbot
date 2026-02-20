@@ -63,8 +63,8 @@ MAX_BET        = 12.0     # $12 ceiling — protect bankroll
 KELLY_FRAC     = 0.18     # 18% Kelly — conservative, reduce loss rate
 MAX_OPEN       = 2        # max 2 simultaneous positions — prevent 3 correlated losses
 MAX_SAME_DIR   = 1        # max 1 position per direction (no 2x Up or 2x Down)
-LOSS_STREAK_PAUSE = 3     # pause evaluation after N consecutive losses
-LOSS_STREAK_WAIT  = 25 * 60  # pause duration in seconds (25 min)
+LOSS_STREAK_PAUSE = 4     # pause evaluation after N consecutive losses
+LOSS_STREAK_WAIT  = 5 * 60   # pause duration in seconds (5 min)
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
