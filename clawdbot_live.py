@@ -56,7 +56,7 @@ ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
-MIN_MOVE       = 0.0005   # 0.05% hard floor (noise filter) — direction signals carry more weight
+MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to determine direction
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 MIN_BET        = 3.0      # $3 floor (small bankroll recovery mode)
 MAX_BET        = 12.0     # $12 ceiling — protect bankroll
@@ -649,39 +649,50 @@ class LiveTrader:
         if pct_remaining < 0.60:
             return None   # too late — silent (logged in scan_loop summary)
 
-        move_pct  = abs(current - open_price) / open_price if open_price > 0 else 0
-        direction = "Up" if current >= open_price else "Down"
-        move_str  = f"{(current-open_price)/open_price:+.3%}"
-        if move_pct < MIN_MOVE:
-            return None   # below noise floor — silent
+        move_pct = abs(current - open_price) / open_price if open_price > 0 else 0
+        move_str = f"{(current-open_price)/open_price:+.3%}"
 
         # ── Multi-signal Score ────────────────────────────────────────────────
+        # Resolution rule: ANY price above open = Up wins (even $0.001).
+        # Direction from price if moved; from momentum consensus if flat.
         # Max possible: 2+3+4+1+3+3+2+1 = 19 pts
-        # score ≥ 4 → take trade (sized by conviction)
-        # score 4-5 → 0.4x Kelly (probe); 6-7 → 0.6x; 8-9 → 1.0x; ≥10 → 1.3x + fast taker
         score = 0
-        is_up = (direction == "Up")
+
+        # Compute momentum first — needed to determine direction when price is flat
+        mom_30s  = self._momentum_prob(asset, seconds=30)
+        mom_90s  = self._momentum_prob(asset, seconds=90)
+        mom_180s = self._momentum_prob(asset, seconds=180)
+        th_up, th_dn = 0.53, 0.47
+        tf_up_votes = sum([mom_30s > th_up, mom_90s > th_up, mom_180s > th_up])
+        tf_dn_votes = sum([mom_30s < th_dn, mom_90s < th_dn, mom_180s < th_dn])
+
+        # Direction: price if it has moved; momentum consensus if flat
+        if move_pct >= 0.0003:
+            direction = "Up" if current > open_price else "Down"
+        elif tf_up_votes > tf_dn_votes:
+            direction = "Up"
+        elif tf_dn_votes > tf_up_votes:
+            direction = "Down"
+        else:
+            return None   # price flat AND momentum flat — no signal, skip
+
+        is_up    = (direction == "Up")
+        tf_votes = tf_up_votes if is_up else tf_dn_votes
+        very_strong_mom = (tf_votes == 3)
 
         # Entry timing (0-2 pts) — earlier = AMM hasn't repriced yet = better odds
         if   pct_remaining >= 0.85: score += 2   # first 2.25 min of 15-min market
         elif pct_remaining >= 0.70: score += 1   # first 4.5 min
 
-        # Move size (0-3 pts)
+        # Move size (0-3 pts) — price confirmation bonus; not a gate
         if   move_pct >= 0.0020: score += 3
         elif move_pct >= 0.0012: score += 2
-        elif move_pct >= 0.0008: score += 1
+        elif move_pct >= 0.0005: score += 1
+        # flat/tiny move → +0 pts (still tradeable if momentum/taker confirm)
 
         # Multi-timeframe momentum (0-4 pts)
-        mom_30s  = self._momentum_prob(asset, seconds=30)
-        mom_90s  = self._momentum_prob(asset, seconds=90)
-        mom_180s = self._momentum_prob(asset, seconds=180)
-        th_up, th_dn = 0.53, 0.47
-        tf_up_votes  = sum([mom_30s > th_up, mom_90s > th_up, mom_180s > th_up])
-        tf_dn_votes  = sum([mom_30s < th_dn, mom_90s < th_dn, mom_180s < th_dn])
-        tf_votes     = tf_up_votes if is_up else tf_dn_votes
         if   tf_votes == 3: score += 4
         elif tf_votes == 2: score += 2
-        very_strong_mom = (tf_votes == 3)
 
         # Chainlink direction agreement (+1 pt)
         cl_now   = self.cl_prices.get(asset, 0)
