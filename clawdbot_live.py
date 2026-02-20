@@ -883,30 +883,38 @@ class LiveTrader:
                 return None   # AMM massively overpriced our direction — no edge
             side, edge, true_prob = direction, max(0.01, dir_edge), dir_prob
 
-        # Score-tiered sizing — always bet, scale with conviction
-        if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.20
-        elif score >= 10: kelly_frac, bankroll_pct = 0.45, 0.15
-        elif score >=  8: kelly_frac, bankroll_pct = 0.35, 0.10
-        elif score >=  6: kelly_frac, bankroll_pct = 0.25, 0.07
-        else:             kelly_frac, bankroll_pct = 0.15, 0.05   # score 4-5: small probe
-
+        # Always take the cheaper side — higher payout, better edge
         entry = up_price if side == "Up" else (1 - up_price)
-
-        # Low conviction: always take the cheaper side regardless of signal direction
-        if score < 8 and entry > 0.50:
+        if entry > 0.50:
             side  = "Down" if side == "Up" else "Up"
             entry = up_price if side == "Up" else (1 - up_price)
 
-        # High conviction: require entry < 55¢ (early) or < 40¢ (mid/late)
-        if score >= 8:
-            max_entry = 0.55 if (is_early_continuation and score >= 8) else 0.40
-            if entry > max_entry:
-                return None   # strong signal but AMM overpriced our side — skip
+        # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
+        # Tier 1: entry ≤ 35¢ → 3x+ payout — price already moved, strong signal
+        #         Bet big: this is where EV is highest
+        # Tier 2: entry 35–45¢ → 2.2–2.86x — moderate move, smaller bet
+        # Skip:   entry > 45¢ → < 2.2x payout — not enough edge vs market
+        # ── Score gate: require ≥ 8 in all tiers ─────────────────────────────
+        if score < 8:
+            return None   # no low-conviction bets — protect capital
+
+        if entry <= 0.35:
+            # HIGH PAYOUT TIER: 3x+ payout, strong momentum already confirmed
+            if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.25
+            elif score >= 10: kelly_frac, bankroll_pct = 0.45, 0.20
+            else:             kelly_frac, bankroll_pct = 0.35, 0.15
+        elif entry <= 0.45:
+            # MODERATE TIER: 2.2–2.86x payout
+            if   score >= 12: kelly_frac, bankroll_pct = 0.45, 0.15
+            elif score >= 10: kelly_frac, bankroll_pct = 0.35, 0.12
+            else:             kelly_frac, bankroll_pct = 0.25, 0.08
+        else:
+            return None   # entry > 45¢ — payout too low, skip
 
         wr_scale   = self._wr_bet_scale()
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
-        max_single = min(10.0, self.bankroll * bankroll_pct)   # TEST CAP $10 — preserve bankroll while collecting data
-        abs_cap    = max_single * 2 if is_early_continuation and score >= 10 else max_single
+        max_single = min(100.0, self.bankroll * bankroll_pct)
+        abs_cap    = max_single * 1.5 if score >= 12 and entry <= 0.35 else max_single
         size       = max(DUST_BET, round(min(abs_cap, raw_size * vol_mult * wr_scale), 2))
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
