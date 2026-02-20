@@ -657,9 +657,20 @@ class LiveTrader:
         tf_up_votes = sum([mom_30s > th_up, mom_90s > th_up, mom_180s > th_up])
         tf_dn_votes = sum([mom_30s < th_dn, mom_90s < th_dn, mom_180s < th_dn])
 
-        # Direction: price if it has moved; momentum consensus if flat
+        # Chainlink current — the resolution oracle
+        cl_now = self.cl_prices.get(asset, 0)
+        cl_move_pct = abs(cl_now - open_price) / open_price if cl_now > 0 and open_price > 0 else 0
+        cl_direction = ("Up" if cl_now > open_price else "Down") if cl_move_pct >= 0.0002 else None
+
+        # Direction: Chainlink is authoritative (it resolves the market)
+        # Use Binance RTDS only when it's clearly moving; fall back to CL then momentum
         if move_pct >= 0.0003:
             direction = "Up" if current > open_price else "Down"
+            # Binance small move + Chainlink clearly opposite → skip (conflicting oracles)
+            if cl_direction and cl_direction != direction and move_pct < 0.0010:
+                return None
+        elif cl_direction:
+            direction = cl_direction   # Binance flat → trust Chainlink direction
         elif tf_up_votes > tf_dn_votes:
             direction = "Up"
         elif tf_dn_votes > tf_up_votes:
@@ -670,6 +681,10 @@ class LiveTrader:
         is_up    = (direction == "Up")
         tf_votes = tf_up_votes if is_up else tf_dn_votes
         very_strong_mom = (tf_votes == 3)
+
+        # Require ≥2 momentum TFs when price/CL are flat — 1/3 is a coin flip
+        if move_pct < 0.0003 and cl_move_pct < 0.0002 and tf_votes < 2:
+            return None
 
         # Entry timing (0-2 pts) — earlier = AMM hasn't repriced yet = better odds
         if   pct_remaining >= 0.85: score += 2   # first 2.25 min of 15-min market
@@ -685,13 +700,14 @@ class LiveTrader:
         if   tf_votes == 3: score += 4
         elif tf_votes == 2: score += 2
 
-        # Chainlink direction agreement (+1 pt)
-        cl_now   = self.cl_prices.get(asset, 0)
+        # Chainlink direction agreement (+1 agree / −3 disagree)
+        # CL is the resolution oracle — disagreement is a major red flag
         cl_agree = True
         if cl_now > 0 and open_price > 0:
-            if (current > open_price) != (cl_now > open_price):
+            if (is_up) != (cl_now > open_price):
                 cl_agree = False
-        if cl_agree: score += 1
+        if cl_agree:  score += 1
+        else:         score -= 3
 
         # ── Fetch all Binance signals IN PARALLEL (~30-80ms total) ──────────────
         (ob_imbalance,
