@@ -963,7 +963,7 @@ class LiveTrader:
                 # Live: queue for on-chain check — result determined by payoutNumerators
                 self.pending_redeem[k] = (m, trade)
                 self._redeem_queued_ts[k] = _time.time()
-                print(f"{B}[RESOLVE] {asset} {trade['side']} {trade['duration']}m → on-chain queue{RS}")
+                print(f"{B}[RESOLVE] {asset} {trade['side']} {trade['duration']}m → on-chain queue (checking in 5s){RS}")
 
     # ── REDEEM LOOP — polls every 30s, determines win/loss on-chain ───────────
     async def _redeem_loop(self):
@@ -987,7 +987,7 @@ class LiveTrader:
         loop = asyncio.get_event_loop()
 
         while True:
-            await asyncio.sleep(15)
+            await asyncio.sleep(5)
             if not self.pending_redeem:
                 continue
             done = []
@@ -1688,7 +1688,7 @@ class LiveTrader:
         if DRY_RUN or self.w3 is None:
             return
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(20)
             try:
                 loop = asyncio.get_event_loop()
                 import requests as _req
