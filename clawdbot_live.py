@@ -63,8 +63,6 @@ MAX_BET        = 12.0     # $12 ceiling — protect bankroll
 KELLY_FRAC     = 0.18     # 18% Kelly — conservative, reduce loss rate
 MAX_OPEN       = 2        # max 2 simultaneous positions — prevent 3 correlated losses
 MAX_SAME_DIR   = 1        # max 1 position per direction (no 2x Up or 2x Down)
-LOSS_STREAK_PAUSE = 4     # pause evaluation after N consecutive losses
-LOSS_STREAK_WAIT  = 5 * 60   # pause duration in seconds (5 min)
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
@@ -149,8 +147,6 @@ class LiveTrader:
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
-        self.cooldown_until     = 0.0                # epoch: pause evaluate() until this time
-        self._pause_log_ts      = {}                 # cid → last pause log time (reduce spam)
         self._init_log()
         self._load_pending()
         self._load_stats()
@@ -620,14 +616,6 @@ class LiveTrader:
         mins_left = m["mins_left"]
         up_price  = m["up_price"]
         label     = f"{asset} {duration}m | {m.get('question','')[:45]}"
-
-        # Circuit breaker
-        if _time.time() < self.cooldown_until:
-            remaining_pause = (self.cooldown_until - _time.time()) / 60
-            if _time.time() - self._pause_log_ts.get(cid, 0) > 120:
-                self._pause_log_ts[cid] = _time.time()
-                print(f"{Y}[PAUSE] {label} → {self.consec_losses} losses, cooling {remaining_pause:.0f}min{RS}")
-            return None
 
         current = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
         if current == 0:
@@ -1676,7 +1664,6 @@ class LiveTrader:
 
     def _adaptive_min_edge(self) -> float:
         """CLOB edge sanity floor — keeps us from buying at obviously bad prices.
-        Circuit breaker (cooldown_until) already handles cold-streak pauses.
         Range: 3-8% only. Never blocks trading on its own."""
         wr5 = self._last5_wr()
         if   wr5 < 0:        return 0.04   # no history: moderate
@@ -1724,14 +1711,11 @@ class LiveTrader:
         if won:
             self.stats[asset][side]["wins"] += 1
         self.recent_trades.append(1 if won else 0)
-        # Consecutive loss circuit breaker
+        # Track consecutive losses for adaptive signals (no pause — trade every cycle)
         if won:
             self.consec_losses = 0
         else:
             self.consec_losses += 1
-            if self.consec_losses >= LOSS_STREAK_PAUSE:
-                self.cooldown_until = _time.time() + LOSS_STREAK_WAIT
-                print(f"{R}[CIRCUIT] {self.consec_losses} consecutive losses — pausing evaluation {LOSS_STREAK_WAIT//60}min{RS}")
         # Update peak bankroll
         if self.bankroll > self.peak_bankroll:
             self.peak_bankroll = self.bankroll
@@ -1743,8 +1727,7 @@ class LiveTrader:
         last5 = list(self.recent_trades)[-5:] if len(self.recent_trades) >= 5 else list(self.recent_trades)
         streak = "".join("W" if x else "L" for x in last5)
         label  = f"{wr5:.0%}" if wr5 >= 0 else "–"
-        cl_str = f"  {R}PAUSED{RS}" if _time.time() < self.cooldown_until else ""
-        print(f"{B}[ADAPT] Last5={streak} WR={label}  MinEdge={me:.2f}  Streak={self.consec_losses}L  DrawdownScale={self._kelly_drawdown_scale():.0%}{cl_str}{RS}")
+        print(f"{B}[ADAPT] Last5={streak} WR={label}  MinEdge={me:.2f}  Streak={self.consec_losses}L  DrawdownScale={self._kelly_drawdown_scale():.0%}{RS}")
 
     # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
     async def _get_chainlink_at(self, asset: str, start_ts: float) -> tuple:
