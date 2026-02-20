@@ -127,6 +127,8 @@ class LiveTrader:
         self.pending         = {}   # cid → (m, trade)
         self.pending_redeem  = {}   # cid → (side, asset)  — waiting on-chain resolution
         self.redeemed_cids   = set()  # cids already processed — prevents _redeemable_scan re-queueing
+        self.token_prices    = {}     # token_id → real-time price from RTDS market stream
+        self._rtds_ws        = None   # live WebSocket handle for dynamic subscriptions
         self._redeem_queued_ts = {}  # cid → timestamp when queued for redeem
         self.seen            = set()
         self._session        = None   # persistent aiohttp session
@@ -429,7 +431,20 @@ class LiveTrader:
                         "subscriptions": [{"topic": "crypto_prices", "type": "update"}]
                     }))
                     self.rtds_ok = True
+                    self._rtds_ws = ws   # expose for dynamic market subscriptions
                     print(f"{G}[RTDS] Live — streaming BTC/ETH/SOL/XRP{RS}")
+
+                    # Subscribe to active market token prices for instant up_price updates
+                    for cid, m in list(self.active_mkts.items()):
+                        for tid in [m.get("token_up",""), m.get("token_down","")]:
+                            if tid:
+                                try:
+                                    await ws.send(json.dumps({
+                                        "action": "subscribe",
+                                        "subscriptions": [{"asset_id": tid, "type": "market"}]
+                                    }))
+                                except Exception:
+                                    pass
 
                     async def pinger():
                         while True:
@@ -442,6 +457,21 @@ class LiveTrader:
                         if not raw: continue
                         try: msg = json.loads(raw)
                         except: continue
+
+                        # ── Market token price update (instant up_price refresh) ──
+                        if msg.get("event_type") == "price_change" or msg.get("topic") == "market":
+                            pl = msg.get("payload", {}) or msg
+                            tid   = pl.get("asset_id") or pl.get("token_id","")
+                            price = float(pl.get("price") or pl.get("mid_price") or 0)
+                            if tid and price > 0:
+                                self.token_prices[tid] = price
+                                # Update active_mkts up_price in real time
+                                for cid, m in list(self.active_mkts.items()):
+                                    if m.get("token_up") == tid:
+                                        m["up_price"] = price
+                                    elif m.get("token_down") == tid:
+                                        m["up_price"] = 1 - price
+
                         if msg.get("topic") != "crypto_prices": continue
                         p   = msg.get("payload", {})
                         sym = p.get("symbol", "").lower()
@@ -458,7 +488,7 @@ class LiveTrader:
                                 if m.get("asset") != asset: continue
                                 if cid in self.seen: continue
                                 if cid not in self.open_prices: continue
-                                if now_t - self._last_eval_time.get(cid, 0) < 1.0: continue
+                                if now_t - self._last_eval_time.get(cid, 0) < 0.5: continue
                                 mins = (m["end_ts"] - now_t) / 60
                                 if mins < 1: continue
                                 self._last_eval_time[cid] = now_t
@@ -1977,6 +2007,20 @@ class LiveTrader:
             markets = await self.fetch_markets()
             now     = datetime.now(timezone.utc).timestamp()
             print(f"{B}[SCAN] Live markets: {len(markets)} | Open: {len(self.pending)} | Settling: {len(self.pending_redeem)}{RS}")
+
+            # Subscribe new markets to RTDS token price stream
+            if self._rtds_ws:
+                for cid, m in markets.items():
+                    if cid not in self.active_mkts:
+                        for tid in [m.get("token_up",""), m.get("token_down","")]:
+                            if tid:
+                                try:
+                                    await self._rtds_ws.send(json.dumps({
+                                        "action": "subscribe",
+                                        "subscriptions": [{"asset_id": tid, "type": "market"}]
+                                    }))
+                                except Exception:
+                                    pass
 
             # Evaluate ALL eligible markets in parallel — no more sequential blocking
             candidates = []
