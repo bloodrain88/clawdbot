@@ -103,8 +103,8 @@ SERIES = {
     # AMM on 5-min adjusts too fast — no edge window by the time bot detects a move
     "btc-up-or-down-15m": {"asset": "BTC", "duration": 15, "id": "10192"},
     "eth-up-or-down-15m": {"asset": "ETH", "duration": 15, "id": "10191"},
-    "sol-up-or-down-15m": {"asset": "SOL", "duration": 15, "id": "10423"},
-    "xrp-up-or-down-15m": {"asset": "XRP", "duration": 15, "id": "10422"},
+    # SOL/XRP removed: today 35%/47% WR, -$49/-$46 P&L — negative EV
+
 }
 
 GAMMA = "https://gamma-api.polymarket.com"
