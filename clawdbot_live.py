@@ -1840,6 +1840,27 @@ class LiveTrader:
         print(f"{B}[ADAPT] Last5={streak} WR={label}  MinEdge={me:.2f}  Streak={self.consec_losses}L  DrawdownScale={self._kelly_drawdown_scale():.0%}{wr_str}{RS}")
 
     # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
+    async def _get_polymarket_open_price(self, asset: str, start_ts: float, end_ts: float) -> float:
+        """Call Polymarket's own price API to get the authoritative 'price to beat'.
+        Returns openPrice float or 0.0 on any error."""
+        try:
+            from datetime import datetime, timezone as _tz
+            sym  = asset  # BTC, ETH, SOL, XRP
+            st   = datetime.fromtimestamp(start_ts, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            et   = datetime.fromtimestamp(end_ts,   tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            url  = "https://polymarket.com/api/crypto/crypto-price"
+            loop = asyncio.get_event_loop()
+            import requests as _req
+            r = await loop.run_in_executor(None, lambda: _req.get(
+                url, params={"symbol": sym, "eventStartTime": st, "variant": "fifteen", "endDate": et},
+                timeout=6
+            ))
+            data = r.json()
+            price = data.get("openPrice") or 0.0
+            return float(price) if price else 0.0
+        except Exception:
+            return 0.0
+
     async def _get_chainlink_at(self, asset: str, start_ts: float) -> tuple:
         """Return (price, source) matching Polymarket's 'price to beat'.
         Polymarket uses the FIRST Chainlink round posted AT OR AFTER eventStartTime.
@@ -1929,22 +1950,25 @@ class LiveTrader:
                 title_s  = m.get("question", "")[:50]
                 if cid not in self.open_prices:
                     start_ts = m.get("start_ts", now)
-                    ref, src = await self._get_chainlink_at(asset, start_ts)
-                    if src == "not-ready":
-                        # Window just opened — no CL round yet. Wait for next scan.
-                        print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | waiting for first CL round...{RS}")
-                    elif ref <= 0:
-                        # CL error — don't store fallback price; retry next scan cycle
-                        # (evaluate() rejects CL-fallback anyway, so storing it wastes cycles)
-                            print(f"{Y}[NEW MARKET] {asset} {dur}m | {title_s} | beat=${ref:,.2f} [fallback]{RS}")
+                    end_ts_m = m.get("end_ts", now + dur * 60)
+                    # Authoritative reference: Polymarket's own price API
+                    ref = await self._get_polymarket_open_price(asset, start_ts, end_ts_m)
+                    if ref > 0:
+                        src = "PM"
                     else:
-                        # Track inter-market continuity: prev market close = this market open
+                        # Fallback to Chainlink
+                        ref, src = await self._get_chainlink_at(asset, start_ts)
+                    if src == "not-ready":
+                        print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | waiting for first round...{RS}")
+                    elif ref <= 0:
+                        print(f"{Y}[NEW MARKET] {asset} {dur}m | {title_s} | no open price yet — retry{RS}")
+                    else:
                         if asset in self.asset_cur_open:
                             self.asset_prev_open[asset] = self.asset_cur_open[asset]
                         self.asset_cur_open[asset]   = ref
                         self.open_prices[cid]        = ref
                         self.open_prices_source[cid] = src
-                        print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | {m['mins_left']:.1f}min left{RS}")
+                        print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | beat=${ref:,.4f} [{src}] | {m['mins_left']:.1f}min left{RS}")
                 else:
                     # Already known — log every 30s (not every scan) to reduce noise
                     ref = self.open_prices[cid]
