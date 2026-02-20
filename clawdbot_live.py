@@ -1301,8 +1301,13 @@ class LiveTrader:
                         done.append(cid)
                 except Exception as e:
                     print(f"{Y}[REDEEM] {asset}: {e}{RS}")
+            changed_pending = False
             for cid in done:
                 self.pending_redeem.pop(cid, None)
+                if self.pending.pop(cid, None) is not None:
+                    changed_pending = True
+            if changed_pending:
+                self._save_pending()
 
     # ── STARTUP OPEN POSITIONS SYNC ───────────────────────────────────────────
     def _sync_open_positions(self):
@@ -1471,52 +1476,31 @@ class LiveTrader:
             print(f"{Y}[SYNC] Could not fetch positions: {e}{RS}")
             return
 
-        cfg      = get_contract_config(CHAIN_ID, neg_risk=False)
-        ctf_addr = Web3.to_checksum_address(cfg.conditional_tokens)
-        ctf      = self.w3.eth.contract(address=ctf_addr, abi=[
-            {"inputs":[{"name":"conditionId","type":"bytes32"}],
-             "name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],
-             "stateMutability":"view","type":"function"},
-            {"inputs":[{"name":"conditionId","type":"bytes32"},{"name":"index","type":"uint256"}],
-             "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],
-             "stateMutability":"view","type":"function"},
-        ])
-
+        # No on-chain checks at startup — _redeem_loop handles payoutDenominator/winner
+        # determination. Just queue all API-confirmed redeemable positions immediately.
         queued = 0
         for pos in positions:
-            cid       = pos.get("conditionId", "")
-            redeemable= pos.get("redeemable", False)
-            val       = float(pos.get("currentValue", 0))
-            outcome   = pos.get("outcome", "")   # "Up" or "Down" — what we bet on
-            size      = float(pos.get("size", 0))
-            title     = pos.get("title", "")[:40]
+            cid        = pos.get("conditionId", "")
+            redeemable = pos.get("redeemable", False)
+            val        = float(pos.get("currentValue", 0))
+            outcome    = pos.get("outcome", "")
+            title      = pos.get("title", "")[:40]
 
             if not redeemable or val < 0.01 or not outcome or not cid:
                 continue
             if cid in self.pending_redeem:
                 continue
 
-            try:
-                b     = bytes.fromhex(cid[2:])
-                denom = ctf.functions.payoutDenominator(b).call()
-                if denom == 0:
-                    continue
-                n0 = ctf.functions.payoutNumerators(b, 0).call()
-                n1 = ctf.functions.payoutNumerators(b, 1).call()
-                winner = "Up" if n0 > 0 else "Down"
-                if winner == outcome:
-                    asset = "BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title \
-                        else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?"
-                    # Use (m, trade) format so _redeem_loop can update P&L correctly
-                    m_s = {"conditionId": cid, "question": title}
-                    t_s = {"side": outcome, "asset": asset, "size": val, "entry": 0.5,
-                           "duration": 0, "mkt_price": 0.5, "mins_left": 0,
-                           "open_price": 0, "token_id": "", "order_id": "SYNC"}
-                    self.pending_redeem[cid] = (m_s, t_s)
-                    queued += 1
-                    print(f"{G}[SYNC] Queued for redeem: {title} {outcome} ~${val:.2f}{RS}")
-            except Exception:
-                continue
+            asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                     else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+            m_s = {"conditionId": cid, "question": title}
+            t_s = {"side": outcome, "asset": asset, "size": val, "entry": 0.5,
+                   "duration": 0, "mkt_price": 0.5, "mins_left": 0,
+                   "open_price": 0, "token_id": "", "order_id": "SYNC"}
+            self.pending.pop(cid, None)   # remove from pending — _redeem_loop now owns it
+            self.pending_redeem[cid] = (m_s, t_s)
+            queued += 1
+            print(f"{G}[SYNC] Queued for redeem: {title} {outcome} ~${val:.2f}{RS}")
 
         if queued:
             print(f"{G}[SYNC] {queued} winning position(s) queued for redemption{RS}")
@@ -2171,6 +2155,7 @@ class LiveTrader:
                     t_s = {"side": outcome, "asset": asset, "size": val, "entry": 0.5,
                            "duration": 0, "mkt_price": 0.5, "mins_left": 0,
                            "open_price": 0, "token_id": "", "order_id": "SCAN"}
+                    self.pending.pop(cid, None)   # remove from pending — _redeem_loop now owns it
                     self.pending_redeem[cid] = (m_s, t_s)
                     print(f"{G}[SCAN-REDEEM] Queued: {title} {outcome} ~${val:.2f}{RS}")
             except Exception as e:
