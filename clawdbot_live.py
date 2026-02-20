@@ -1161,55 +1161,66 @@ class LiveTrader:
         if score < 1:
             return None
 
-        # ── ENTRY PRICE TIERS ────────────────────────────────────────────────
-        # Always bet signal direction. Size scales with cheapness (payout).
-        # Never bet >55¢ — payout < 1.82x doesn't justify unproven accuracy.
+        token_id = m["token_up"] if side == "Up" else m["token_down"]
+        if not token_id:
+            return None
+        pm_book_data = _pm_book if token_id == prefetch_token else None
+
+        # ── Live CLOB price (more accurate than Gamma up_price) ──────────────
+        live_entry = entry
+        if pm_book_data is not None:
+            _, clob_ask, _ = pm_book_data
+            live_entry = clob_ask
+
+        # ── Entry strategy: immediate fill vs GTC limit order ────────────────
+        # Core insight: we know the direction before betting.
+        # If the market has already priced it in (expensive token), don't skip —
+        # place a GTC limit at our TARGET price (45¢ = 2.22x payout).
+        # The order fills only when the market pulls back to give us cheap entry.
+        # This way we ALWAYS trade every market AND always get high payout.
+        #
+        # Immediate: live_entry ≤ 55¢  → FOK/market at current price
+        # Limit:     live_entry > 55¢   → GTC limit at 45¢, wait for pullback
+        # Skip:      expensive + <55% window left → not enough time for limit
+        use_limit = False
+        if live_entry <= 0.55:
+            entry = live_entry                # take current market price
+        elif pct_remaining > 0.55:
+            entry = 0.45                      # GTC limit at 45¢ — wait for pullback
+            use_limit = True
+        else:
+            return None                       # expensive + window >45% elapsed — skip
+
+        # ── ENTRY PRICE TIERS (based on actual fill price) ────────────────────
+        # Payout = 1/entry. Bigger bet when payout is higher.
         if entry <= 0.30:
-            # ≤30¢ = 3.3x+ payout — biggest bets
             if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.25
             elif score >= 8:  kelly_frac, bankroll_pct = 0.40, 0.18
             elif score >= 4:  kelly_frac, bankroll_pct = 0.25, 0.12
             else:             kelly_frac, bankroll_pct = 0.15, 0.07
         elif entry <= 0.40:
-            # 30-40¢ = 2.5x+ payout — solid bets
             if   score >= 12: kelly_frac, bankroll_pct = 0.45, 0.18
             elif score >= 8:  kelly_frac, bankroll_pct = 0.30, 0.12
             elif score >= 4:  kelly_frac, bankroll_pct = 0.18, 0.08
             else:             kelly_frac, bankroll_pct = 0.10, 0.05
         elif entry <= 0.50:
-            # 40-50¢ = 2.0x+ payout — moderate bets
             if   score >= 12: kelly_frac, bankroll_pct = 0.30, 0.12
             elif score >= 8:  kelly_frac, bankroll_pct = 0.20, 0.08
             elif score >= 4:  kelly_frac, bankroll_pct = 0.12, 0.05
             else:             kelly_frac, bankroll_pct = 0.08, 0.03
-        elif entry <= 0.55:
-            # 50-55¢ = 1.82x+ payout — small bets only, marginal edge
+        else:  # 0.50–0.55
             if   score >= 8:  kelly_frac, bankroll_pct = 0.15, 0.06
             else:             kelly_frac, bankroll_pct = 0.08, 0.03
-        else:
-            return None   # >55¢ = payout < 1.82x, not worth betting without proven accuracy
 
         wr_scale   = self._wr_bet_scale()
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
         max_single = min(100.0, self.bankroll * bankroll_pct)
         abs_cap    = max_single * 1.5 if score >= 12 and entry <= 0.35 else max_single
         size       = max(DUST_BET, round(min(abs_cap, raw_size * vol_mult * wr_scale), 2))
-        token_id = m["token_up"] if side == "Up" else m["token_down"]
-        if not token_id:
-            return None
-        # Use pre-fetched book if it matches the bet token; else it will be re-fetched in _place_order
-        pm_book_data = _pm_book if token_id == prefetch_token else None
 
-        # Re-check entry against LIVE CLOB ask (Gamma up_price can differ from actual orderbook)
-        # This prevents entering at e.g. 64¢ when Gamma shows 45¢
-        if pm_book_data is not None:
-            _, clob_ask, _ = pm_book_data
-            if clob_ask > 0.55:
-                return None   # actual CLOB price > 55¢ — payout too low
-            entry = clob_ask  # use real fill price for sizing and display
-
-        # Force taker for strong momentum — fill immediately before AMM reprices
-        force_taker = (
+        # Immediate fills: FOK on strong signal, GTC limit otherwise
+        # Limit orders (use_limit=True) are always GTC — force_taker stays False
+        force_taker = (not use_limit) and (
             (score >= 12 and very_strong_mom and imbalance_confirms and move_pct > 0.0015) or
             (score >= 12 and is_early_continuation)
         )
