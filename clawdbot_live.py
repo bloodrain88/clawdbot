@@ -101,7 +101,8 @@ CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
 CLOB_HOST = "https://clob.polymarket.com"
 
 SERIES = {
-    "btc-up-or-down-5m":  {"asset": "BTC", "duration": 5,  "id": "10684"},
+    # 5-min markets EXCLUDED: negative EV (36% WR vs 38% breakeven, payout ~1.6x)
+    # AMM on 5-min adjusts too fast — no edge window by the time bot detects a move
     "btc-up-or-down-15m": {"asset": "BTC", "duration": 15, "id": "10192"},
     "eth-up-or-down-15m": {"asset": "ETH", "duration": 15, "id": "10191"},
     "sol-up-or-down-15m": {"asset": "SOL", "duration": 15, "id": "10423"},
@@ -650,12 +651,13 @@ class LiveTrader:
             print(f"{Y}[SKIP] {label} → CL-fallback ref (not Polymarket-exact) — skipping{RS}")
             return
 
-        # Only enter in first 45% of market life — need enough time for momentum to play out
-        # Entering too late = move already happened, reversal risk high
+        # Only enter in first 40% of market life (need ≥60% remaining).
+        # For 15-min: enter in first 6 min. AMM prices uncertainty most in early window.
+        # After 40% elapsed, AMM has already priced the directional move — no edge left.
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
-        if pct_remaining < 0.55:
-            print(f"{Y}[SKIP] {label} → too late ({pct_remaining:.0%} remaining, need ≥55%) | beat=${open_price:,.2f} {src_tag}{RS}")
+        if pct_remaining < 0.60:
+            print(f"{Y}[SKIP] {label} → too late ({pct_remaining:.0%} remaining, need ≥60%) | beat=${open_price:,.2f} {src_tag}{RS}")
             return
 
         # Require a real directional move — 0.10% for all durations
