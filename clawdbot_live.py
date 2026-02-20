@@ -56,7 +56,7 @@ ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
-MIN_MOVE       = 0.0012   # 0.12% min actual price move — require real momentum, not noise
+MIN_MOVE       = 0.0005   # 0.05% hard floor (noise filter) — direction signals carry more weight
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 MIN_BET        = 3.0      # $3 floor (small bankroll recovery mode)
 MAX_BET        = 12.0     # $12 ceiling — protect bankroll
@@ -122,6 +122,8 @@ class LiveTrader:
         self.open_prices        = {}   # cid → float price
         self.open_prices_source = {}   # cid → "CL-exact" | "CL-fallback"
         self._mkt_log_ts        = {}   # cid → last [MKT] log time
+        self.asset_cur_open     = {}   # asset → current market open price (for inter-market continuity)
+        self.asset_prev_open    = {}   # asset → previous market open price
         self.active_mkts = {}
         self.pending         = {}   # cid → (m, trade)
         self.pending_redeem  = {}   # cid → (side, asset)  — waiting on-chain resolution
@@ -669,42 +671,83 @@ class LiveTrader:
                   f"beat=${open_price:,.2f} {src_tag} now=${current:,.2f}{RS}")
             return
 
-        # ── Multi-timeframe momentum agreement check ─────────────────────────
-        # Require 2/3 timeframes agree with direction. Prevents betting when
-        # short-term reversal contradicts the detected move (false signal filter).
-        is_up    = (direction == "Up")
+        # ── Multi-signal Score System ─────────────────────────────────────────
+        # Replaces binary pass/fail with a conviction score (0–13 pts).
+        # Weak signals reduce score; only extreme OB (>40% imbalance) hard-blocks.
+        # Score <5 → skip; 5-6 → 0.6x Kelly; 7-8 → 1.0x; ≥9 → 1.3x + fast taker.
+        score = 0
+        is_up = (direction == "Up")
+
+        # Move size (0-3 pts — gated ≥MIN_MOVE above, but small moves OK if signals strong)
+        if   move_pct >= 0.0020: score += 3
+        elif move_pct >= 0.0012: score += 2
+        elif move_pct >= 0.0008: score += 1
+        # <0.08% → +0 (passes gate at 0.05%, but weak signal — need other signals to compensate)
+
+        # Multi-timeframe momentum (0-4 pts)
         mom_30s  = self._momentum_prob(asset, seconds=30)
         mom_90s  = self._momentum_prob(asset, seconds=90)
         mom_180s = self._momentum_prob(asset, seconds=180)
-        th_up, th_dn = 0.53, 0.47  # thresholds for "agreeing" signal
+        th_up, th_dn = 0.53, 0.47
         tf_up_votes  = sum([mom_30s > th_up, mom_90s > th_up, mom_180s > th_up])
         tf_dn_votes  = sum([mom_30s < th_dn, mom_90s < th_dn, mom_180s < th_dn])
         tf_votes     = tf_up_votes if is_up else tf_dn_votes
-        if tf_votes < 2:
-            print(f"{Y}[SKIP] {label} → TF divergence | "
-                  f"m30={mom_30s:.2f} m90={mom_90s:.2f} m180={mom_180s:.2f} "
-                  f"votes={tf_votes}/3 dir={direction}{RS}")
-            return
+        if   tf_votes == 3: score += 4
+        elif tf_votes == 2: score += 2
+        # tf_votes 0-1 → +0 (weak, still tradeable if other signals strong)
         very_strong_mom = (tf_votes == 3)
 
-        # ── Check RTDS vs Chainlink direction agreement ──────────────────────
+        # Chainlink direction agreement (+1 pt)
         cl_now   = self.cl_prices.get(asset, 0)
         cl_agree = True
         if cl_now > 0 and open_price > 0:
-            rtds_up = current > open_price
-            cl_up   = cl_now  > open_price
-            if rtds_up != cl_up:
+            if (current > open_price) != (cl_now > open_price):
                 cl_agree = False
+        if cl_agree: score += 1
 
-        # ── Binance order book imbalance (non-price confirmation, ~30ms) ────
+        # Binance order book imbalance (−1 to +3 pts; >40% imbalance contra = hard block)
         ob_imbalance = await self._binance_imbalance(asset)
-        # Allow neutral; only block strong counter-signal (e.g., price Up but heavy selling)
-        imbalance_contra = (is_up and ob_imbalance < -0.25) or (not is_up and ob_imbalance > 0.25)
-        if imbalance_contra:
-            print(f"{Y}[SKIP] {label} → order book contradicts {direction} "
+        extreme_contra = (is_up and ob_imbalance < -0.40) or (not is_up and ob_imbalance > 0.40)
+        if extreme_contra:
+            print(f"{Y}[SKIP] {label} → extreme OB contra {direction} "
                   f"(imbalance={ob_imbalance:+.2f}){RS}")
             return
-        imbalance_confirms = (is_up and ob_imbalance > 0.15) or (not is_up and ob_imbalance < -0.15)
+        if   (is_up and ob_imbalance > 0.25) or (not is_up and ob_imbalance < -0.25): score += 3
+        elif (is_up and ob_imbalance > 0.10) or (not is_up and ob_imbalance < -0.10): score += 2
+        elif abs(ob_imbalance) <= 0.10: score += 1   # neutral
+        else:                           score -= 1   # moderate contra
+        imbalance_confirms = (is_up and ob_imbalance > 0.10) or (not is_up and ob_imbalance < -0.10)
+
+        # Binance taker buy/sell flow + volume vs 30-min avg (0-5 pts)
+        taker_ratio, vol_ratio = await self._binance_taker_flow(asset)
+        if   (is_up and taker_ratio > 0.62) or (not is_up and taker_ratio < 0.38): score += 3
+        elif (is_up and taker_ratio > 0.55) or (not is_up and taker_ratio < 0.45): score += 2
+        elif abs(taker_ratio - 0.50) < 0.05: score += 1   # neutral
+        else:                                score -= 1   # contra taker flow
+        if   vol_ratio > 2.0: score += 2
+        elif vol_ratio > 1.3: score += 1
+
+        # Inter-market continuity signal (+1 pt)
+        # Previous 15-min market close = this market's open_price (same Chainlink round).
+        # If prev market moved UP and current also moving UP → momentum continuation.
+        # If prev market moved UP and current moving DOWN → potential mean-reversion (neutral/+0).
+        prev_open = self.asset_prev_open.get(asset, 0)
+        if prev_open > 0 and open_price > 0:
+            prev_market_was_up = open_price > prev_open   # previous market closed up
+            if (is_up and prev_market_was_up) or (not is_up and not prev_market_was_up):
+                score += 1   # momentum continuation — same direction as prev market
+
+        # Hard gate: minimum viable signal (raised to 6 since move gate was lowered)
+        if score < 6:
+            print(f"{Y}[SKIP] {label} → score={score}<6 | "
+                  f"TF={tf_votes}/3 ob={ob_imbalance:+.2f} tk={taker_ratio:.2f} "
+                  f"vol={vol_ratio:.1f}x move={move_str}{RS}")
+            return
+
+        # Size multiplier — scale bet by conviction
+        if   score >= 10: size_mult = 1.3
+        elif score >=  8: size_mult = 1.0
+        else:             size_mult = 0.6   # score 6-7: reduced half-conviction entry
 
         # ── Combined probability: Black-Scholes + Momentum + Direction bias ──
         vol      = self.vols.get(asset, 0.70)
@@ -741,8 +784,9 @@ class LiveTrader:
                   f"bs={bs_prob:.3f} mom={mom_prob:.3f} agree={'Y' if cl_agree else 'N'}{RS}")
             return
 
-        entry = up_price if side == "Up" else (1 - up_price)
-        size  = self._kelly_size(true_prob, entry, edge)
+        entry    = up_price if side == "Up" else (1 - up_price)
+        raw_size = self._kelly_size(true_prob, entry, edge)
+        size     = round(max(MIN_BET, min(min(MAX_BET, self.bankroll * 0.25), raw_size * size_mult)), 2)
         token_id = m["token_up"] if side == "Up" else m["token_down"]
 
         if not token_id:
@@ -750,13 +794,17 @@ class LiveTrader:
             self.seen.add(cid)
             return
 
-        agree_str = "" if cl_agree else f" {Y}[CL!]{RS}"
-        ob_str    = f" ob={ob_imbalance:+.2f}" + ("✓" if imbalance_confirms else "")
-        tf_str    = f" TF={tf_votes}/3" + ("★" if very_strong_mom else "")
-        conv_str  = f" {G}★HIGH-CONV★{RS}" if (very_strong_mom and imbalance_confirms) else ""
-        print(f"{G}[EDGE] {label} → {side} | beat=${open_price:,.2f} {src_tag} now=${current:,.2f} move={move_str} | "
+        agree_str  = "" if cl_agree else f" {Y}[CL!]{RS}"
+        ob_str     = f" ob={ob_imbalance:+.2f}" + ("✓" if imbalance_confirms else "")
+        tf_str     = f" TF={tf_votes}/3" + ("★" if very_strong_mom else "")
+        score_stars = f"{G}★★★{RS}" if score >= 10 else (f"{G}★★{RS}" if score >= 8 else "★")
+        prev_open  = self.asset_prev_open.get(asset, 0)
+        prev_str   = f" prev={((open_price-prev_open)/prev_open*100):+.2f}%" if prev_open > 0 else ""
+        print(f"{G}[EDGE] {label} → {side} | score={score} {score_stars} | "
+              f"beat=${open_price:,.2f} {src_tag} now=${current:,.2f} move={move_str}{prev_str} | "
               f"bs={bs_prob:.3f} mom={mom_prob:.3f} prob={true_prob:.3f} "
-              f"mkt={up_price:.3f} edge={edge:.3f} ${size:.2f}{agree_str}{ob_str}{tf_str}{conv_str}{RS}")
+              f"mkt={up_price:.3f} edge={edge:.3f} ${size:.2f}{agree_str}{ob_str}{tf_str} "
+              f"tk={taker_ratio:.2f} vol={vol_ratio:.1f}x{RS}")
 
         # Mark seen before placing — prevents double-bet if evaluate called concurrently
         self.seen.add(cid)
@@ -764,7 +812,7 @@ class LiveTrader:
 
         # ── Place real order ──────────────────────────────────────────────────
         # High conviction: all 3 TFs agree + order book confirms → skip maker wait, fill instantly
-        force_taker = very_strong_mom and imbalance_confirms and move_pct > 0.0020
+        force_taker = score >= 10 and very_strong_mom and imbalance_confirms and move_pct > 0.0015
         order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob, cl_agree, min_edge_req=min_edge, force_taker=force_taker)
 
         trade = {
@@ -1439,6 +1487,33 @@ class LiveTrader:
         except Exception:
             return 0.0  # neutral on error — don't block trade
 
+    async def _binance_taker_flow(self, asset: str) -> tuple:
+        """Fetch last 3 Binance 1m candles → (taker_buy_ratio, vol_vs_30min_avg).
+        taker_buy_ratio: fraction of volume from aggressive market-buy orders (0-1).
+        vol_ratio: recent 3-candle avg vol vs prior 30-candle avg (1.0 = normal).
+        Returns (0.5, 1.0) on error (neutral, don't block)."""
+        try:
+            import requests as _req
+            sym  = asset + "USDT"
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, lambda: _req.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": sym, "interval": "1m", "limit": 33},
+                timeout=3
+            ).json())
+            if not isinstance(data, list) or len(data) < 4:
+                return 0.5, 1.0
+            recent = data[-3:]           # last 3 complete 1m candles
+            hist   = data[:-3]           # prior 30 candles for baseline avg
+            rec_vol   = sum(float(k[5]) for k in recent)
+            rec_taker = sum(float(k[9]) for k in recent)
+            hist_avg  = (sum(float(k[5]) for k in hist) / len(hist)) if hist else rec_vol
+            taker_ratio = rec_taker / rec_vol if rec_vol > 0 else 0.5
+            vol_ratio   = (rec_vol / 3) / hist_avg if hist_avg > 0 else 1.0
+            return round(taker_ratio, 3), round(vol_ratio, 2)
+        except Exception:
+            return 0.5, 1.0   # neutral on error
+
     def _direction_bias(self, asset: str, side: str) -> float:
         """Additive bias from historical win rate for this asset+direction.
         Returns 0 until 5 trades, then scales from -0.10 to +0.10."""
@@ -1649,6 +1724,10 @@ class LiveTrader:
                         # (evaluate() rejects CL-fallback anyway, so storing it wastes cycles)
                             print(f"{Y}[NEW MARKET] {asset} {dur}m | {title_s} | beat=${ref:,.2f} [fallback]{RS}")
                     else:
+                        # Track inter-market continuity: prev market close = this market open
+                        if asset in self.asset_cur_open:
+                            self.asset_prev_open[asset] = self.asset_cur_open[asset]
+                        self.asset_cur_open[asset]   = ref
                         self.open_prices[cid]        = ref
                         self.open_prices_source[cid] = src
                         print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | {m['mins_left']:.1f}min left{RS}")
