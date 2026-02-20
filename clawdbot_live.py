@@ -55,14 +55,16 @@ PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
 ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
-MIN_EDGE       = 0.07     # 7% base min edge (auto-adapted per recent WR)
-MIN_MOVE       = 0.0005   # 0.05% min actual price move
+MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
+MIN_MOVE       = 0.0012   # 0.12% min actual price move — require real momentum, not noise
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
-MIN_BET        = 5.0      # $5 floor
-MAX_BET        = 25.0     # $25 ceiling (Kelly can go higher on strong edges)
-KELLY_FRAC     = 0.30     # 30% Kelly — still conservative, more capital on strong edge
+MIN_BET        = 3.0      # $3 floor (small bankroll recovery mode)
+MAX_BET        = 12.0     # $12 ceiling — protect bankroll
+KELLY_FRAC     = 0.18     # 18% Kelly — conservative, reduce loss rate
 MAX_DAILY_LOSS = 0.40     # 40% hard stop (session recovery mode)
-MAX_OPEN       = 8        # max simultaneous open positions
+MAX_OPEN       = 3        # max 3 simultaneous positions — quality over quantity
+LOSS_STREAK_PAUSE = 3     # pause evaluation after N consecutive losses
+LOSS_STREAK_WAIT  = 25 * 60  # pause duration in seconds (25 min)
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
@@ -143,6 +145,8 @@ class LiveTrader:
         self.recent_trades   = deque(maxlen=30)   # rolling window for WR adaptation
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
+        self.consec_losses      = 0                  # consecutive resolved losses counter
+        self.cooldown_until     = 0.0                # epoch: pause evaluate() until this time
         self._init_log()
         self._load_pending()
         self._load_stats()
@@ -505,8 +509,8 @@ class LiveTrader:
         return self.cl_prices.get(asset, 0)
 
     def _kelly_size(self, true_prob: float, entry: float, edge: float = 0.0) -> float:
-        """Kelly bet size with dynamic ceiling scaled by edge strength.
-        Floor=$5. Ceiling: edge<15%→$25, edge 15-30%→$50, edge>30%→$80 (or 35% bankroll)."""
+        """Kelly bet size — conservative, capped at MAX_BET regardless of edge.
+        With small bankroll, protect capital above all else."""
         if entry <= 0 or entry >= 1:
             return MIN_BET
         b = (1 / entry) - 1
@@ -514,12 +518,8 @@ class LiveTrader:
         kelly_f = (true_prob * b - q) / b
         kelly_f = max(0.0, kelly_f)
         size = self.bankroll * kelly_f * KELLY_FRAC * self._kelly_drawdown_scale()
-        if edge >= 0.30:
-            max_bet = min(80.0, self.bankroll * 0.35)
-        elif edge >= 0.15:
-            max_bet = min(50.0, self.bankroll * 0.30)
-        else:
-            max_bet = MAX_BET
+        # Hard cap at MAX_BET — no exceptions for "strong edge"
+        max_bet = min(MAX_BET, self.bankroll * 0.25)  # never risk >25% bankroll per bet
         return round(max(MIN_BET, min(max_bet, size)), 2)
 
     # ── MARKET FETCHER ────────────────────────────────────────────────────────
@@ -615,8 +615,14 @@ class LiveTrader:
         up_price  = m["up_price"]
         label     = f"{asset} {duration}m | {m.get('question','')[:45]}"
 
-        # No hard daily stop — bot always keeps trading but scales down size on drawdown
-        # (see _kelly_drawdown_scale): -10% → 60% size, -20% → 35%, -30% → 20%
+        # Consecutive loss circuit breaker — pause after N losses to avoid cascading losses
+        if _time.time() < self.cooldown_until:
+            remaining_pause = (self.cooldown_until - _time.time()) / 60
+            if not hasattr(self, '_pause_log_ts') or _time.time() - self._pause_log_ts.get(cid, 0) > 120:
+                if not hasattr(self, '_pause_log_ts'): self._pause_log_ts = {}
+                self._pause_log_ts[cid] = _time.time()
+                print(f"{Y}[PAUSE] {label} → {self.consec_losses} consecutive losses, cooling {remaining_pause:.0f}min{RS}")
+            return
 
         # Max open positions guard
         if len(self.pending) >= MAX_OPEN:
@@ -644,11 +650,12 @@ class LiveTrader:
             print(f"{Y}[SKIP] {label} → CL-fallback ref (not Polymarket-exact) — skipping{RS}")
             return
 
-        # Only enter in first 35% of market life — need time for price to move further our way
+        # Only enter in first 45% of market life — need enough time for momentum to play out
+        # Entering too late = move already happened, reversal risk high
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
-        if pct_remaining < 0.35:
-            print(f"{Y}[SKIP] {label} → too late ({pct_remaining:.0%} remaining, need ≥35%) | beat=${open_price:,.2f} {src_tag}{RS}")
+        if pct_remaining < 0.55:
+            print(f"{Y}[SKIP] {label} → too late ({pct_remaining:.0%} remaining, need ≥55%) | beat=${open_price:,.2f} {src_tag}{RS}")
             return
 
         # Require a real directional move — 0.10% for all durations
@@ -724,7 +731,7 @@ class LiveTrader:
         self._save_seen()
 
         # ── Place real order ──────────────────────────────────────────────────
-        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob, cl_agree)
+        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob, cl_agree, min_edge_req=min_edge)
 
         trade = {
             "side":          side,
@@ -748,7 +755,7 @@ class LiveTrader:
             self._save_pending()
             self._log(m, trade)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -779,12 +786,10 @@ class LiveTrader:
                 best_bid = float(bids[0].price) if bids else best_ask - 0.10
                 spread   = best_ask - best_bid
 
-                # Edge requirement varies by trade type:
-                # structural (no move): needs 12% CLOB edge — higher bar, no directional signal
-                # oracles disagree:    needs 12% CLOB edge — higher bar, conflicting signals
-                # normal directional:  needs 7% CLOB edge
-                # Oracles disagree (RTDS vs Chainlink direction): require 12% edge
-                edge_req = MIN_EDGE + 0.05 if not cl_agree else MIN_EDGE
+                # Edge requirement: use adaptive min_edge (based on recent WR / loss streak)
+                # Extra penalty if oracles disagree. Always >= MIN_EDGE.
+                base_req = min_edge_req if min_edge_req is not None else MIN_EDGE
+                edge_req = base_req + 0.05 if not cl_agree else base_req
 
                 taker_edge = true_prob - best_ask
                 if taker_edge < edge_req:
@@ -1396,18 +1401,23 @@ class LiveTrader:
         return sum(list(self.recent_trades)[-5:]) / 5
 
     def _adaptive_min_edge(self) -> float:
-        """Gate on last-5 WR: hot streak → relax, cold streak → require much higher edge."""
+        """Gate on last-5 WR AND consecutive losses.
+        Hot streak → normal. Cold streak → much higher bar.
+        Consecutive loss boost: each loss above 1 adds 3% extra requirement."""
         wr5 = self._last5_wr()
         if wr5 < 0:           # not enough history yet
-            return MIN_EDGE
-        if wr5 >= 0.80:       # 4-5/5 wins: hot streak — stay aggressive
-            return max(0.06, MIN_EDGE - 0.01)
+            base = MIN_EDGE
+        elif wr5 >= 0.80:     # 4-5/5 wins: hot streak
+            base = max(0.06, MIN_EDGE - 0.01)
         elif wr5 >= 0.60:     # 3/5: normal
-            return MIN_EDGE
-        elif wr5 >= 0.40:     # 2/5: tighten significantly
-            return MIN_EDGE + 0.05
+            base = MIN_EDGE
+        elif wr5 >= 0.40:     # 2/5: tighten
+            base = MIN_EDGE + 0.04
         else:                 # 0-1/5: cold streak — only exceptional setups
-            return MIN_EDGE + 0.10
+            base = MIN_EDGE + 0.09
+        # Consecutive loss surcharge (on top of WR-based gate)
+        consec_boost = max(0, self.consec_losses - 1) * 0.03
+        return min(base + consec_boost, 0.30)  # cap at 30%
 
     def _adaptive_momentum_weight(self) -> float:
         """Shift toward momentum when recent WR is poor."""
@@ -1448,6 +1458,14 @@ class LiveTrader:
         if won:
             self.stats[asset][side]["wins"] += 1
         self.recent_trades.append(1 if won else 0)
+        # Consecutive loss circuit breaker
+        if won:
+            self.consec_losses = 0
+        else:
+            self.consec_losses += 1
+            if self.consec_losses >= LOSS_STREAK_PAUSE:
+                self.cooldown_until = _time.time() + LOSS_STREAK_WAIT
+                print(f"{R}[CIRCUIT] {self.consec_losses} consecutive losses — pausing evaluation {LOSS_STREAK_WAIT//60}min{RS}")
         # Update peak bankroll
         if self.bankroll > self.peak_bankroll:
             self.peak_bankroll = self.bankroll
@@ -1459,7 +1477,8 @@ class LiveTrader:
         last5 = list(self.recent_trades)[-5:] if len(self.recent_trades) >= 5 else list(self.recent_trades)
         streak = "".join("W" if x else "L" for x in last5)
         label  = f"{wr5:.0%}" if wr5 >= 0 else "–"
-        print(f"{B}[ADAPT] Last5={streak} WR={label}  MinEdge={me:.2f}  DrawdownScale={self._kelly_drawdown_scale():.0%}{RS}")
+        cl_str = f"  {R}PAUSED{RS}" if _time.time() < self.cooldown_until else ""
+        print(f"{B}[ADAPT] Last5={streak} WR={label}  MinEdge={me:.2f}  Streak={self.consec_losses}L  DrawdownScale={self._kelly_drawdown_scale():.0%}{cl_str}{RS}")
 
     # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
     async def _get_chainlink_at(self, asset: str, start_ts: float) -> tuple:
