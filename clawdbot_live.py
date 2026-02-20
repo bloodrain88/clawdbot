@@ -59,6 +59,7 @@ MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
 MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to determine direction
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 DUST_BET       = 5.0      # $5 absolute floor (Polymarket minimum order size)
+MAX_ABS_BET    = 20.0     # $20 hard ceiling regardless of bankroll/WR/Kelly — prevents runaway sizing
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
 MAX_OPEN       = 2        # max 2 simultaneous positions — prevent 3 correlated losses
 MAX_SAME_DIR   = 1        # max 1 position per direction (no 2x Up or 2x Down)
@@ -820,7 +821,8 @@ class LiveTrader:
         entry    = up_price if side == "Up" else (1 - up_price)
         wr_scale = self._wr_bet_scale()
         raw_size = self._kelly_size(true_prob, entry, kelly_frac)
-        size     = round(min(self.bankroll * MAX_BANKROLL_PCT,
+        size     = round(min(MAX_ABS_BET,
+                             self.bankroll * MAX_BANKROLL_PCT,
                              raw_size * vol_mult * wr_scale), 2)
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
