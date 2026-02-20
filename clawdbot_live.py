@@ -110,6 +110,10 @@ SERIES = {
 GAMMA = "https://gamma-api.polymarket.com"
 RTDS  = "wss://ws-live-data.polymarket.com"
 
+# Binance symbols per asset (spot + futures share same symbol)
+BNB_SYM = {info["asset"]: info["asset"].lower() + "usdt" for info in SERIES.values()}
+# e.g. {"BTC": "btcusdt", "ETH": "ethusdt", ...}
+
 G="\033[92m"; R="\033[91m"; Y="\033[93m"; B="\033[94m"; W="\033[97m"; RS="\033[0m"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,6 +122,12 @@ class LiveTrader:
     def __init__(self):
         self.prices      = {}
         self.vols        = {"BTC": 0.65, "ETH": 0.80, "SOL": 1.20, "XRP": 0.90}
+        # Binance WS cache — populated by _stream_binance_* loops, read by _binance_* helpers
+        self.binance_cache = {
+            a: {"depth_bids": [], "depth_asks": [], "klines": [],
+                "mark": 0.0, "index": 0.0, "funding": 0.0}
+            for a in BNB_SYM
+        }
         self.open_prices        = {}   # cid → float price
         self.open_prices_source = {}   # cid → "CL-exact" | "CL-fallback"
         self._mkt_log_ts        = {}   # cid → last [MKT] log time
@@ -803,18 +813,12 @@ class LiveTrader:
         if cl_agree:  score += 1
         else:         score -= 3
 
-        # ── Fetch all Binance signals + PM orderbook IN PARALLEL (~30-80ms total) ─
-        (ob_imbalance,
-         (taker_ratio, vol_ratio),
-         (perp_basis, funding_rate),
-         (vwap_dev, vol_mult),
-         _pm_book) = await asyncio.gather(
-            self._binance_imbalance(asset),
-            self._binance_taker_flow(asset),
-            self._binance_perp_signals(asset),
-            self._binance_window_stats(asset, m["start_ts"]),
-            self._fetch_pm_book_safe(prefetch_token),  # free — hides inside Binance latency
-        )
+        # ── Binance signals from WS cache (instant) + PM book fetch (async ~36ms) ─
+        ob_imbalance               = self._binance_imbalance(asset)
+        (taker_ratio, vol_ratio)   = self._binance_taker_flow(asset)
+        (perp_basis, funding_rate) = self._binance_perp_signals(asset)
+        (vwap_dev, vol_mult)       = self._binance_window_stats(asset, m["start_ts"])
+        _pm_book = await self._fetch_pm_book_safe(prefetch_token)
 
         # Order book imbalance (−1 to +3; >40% contra = hard block)
         if (is_up and ob_imbalance < -0.40) or (not is_up and ob_imbalance > 0.40):
@@ -1683,111 +1687,163 @@ class LiveTrader:
             return 0.5
         return float(norm.cdf(move / vol_t))
 
-    async def _binance_imbalance(self, asset: str) -> float:
-        """Fetch Binance top-10 order book imbalance for asset.
-        Returns +1.0 (all bids, buying pressure) to -1.0 (all asks, selling pressure).
-        Fast ~30ms call — use as non-price directional confirmation."""
-        try:
-            import requests as _req
-            sym  = asset + "USDT"
-            loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: _req.get(
-                "https://api.binance.com/api/v3/depth",
-                params={"symbol": sym, "limit": 10}, timeout=2
-            ).json())
-            bid_vol = sum(float(b[1]) for b in data.get("bids", []))
-            ask_vol = sum(float(a[1]) for a in data.get("asks", []))
-            if bid_vol + ask_vol == 0:
-                return 0.0
-            return (bid_vol - ask_vol) / (bid_vol + ask_vol)
-        except Exception:
-            return 0.0  # neutral on error — don't block trade
+    # ── Binance helpers — read from WS cache (instant, no network) ───────────
 
-    async def _binance_taker_flow(self, asset: str) -> tuple:
-        """Fetch last 3 Binance 1m candles → (taker_buy_ratio, vol_vs_30min_avg).
-        taker_buy_ratio: fraction of volume from aggressive market-buy orders (0-1).
-        vol_ratio: recent 3-candle avg vol vs prior 30-candle avg (1.0 = normal).
-        Returns (0.5, 1.0) on error (neutral, don't block)."""
-        try:
-            import requests as _req
-            sym  = asset + "USDT"
-            loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: _req.get(
-                "https://api.binance.com/api/v3/klines",
-                params={"symbol": sym, "interval": "1m", "limit": 33},
-                timeout=3
-            ).json())
-            if not isinstance(data, list) or len(data) < 4:
-                return 0.5, 1.0
-            recent = data[-3:]           # last 3 complete 1m candles
-            hist   = data[:-3]           # prior 30 candles for baseline avg
-            rec_vol   = sum(float(k[5]) for k in recent)
-            rec_taker = sum(float(k[9]) for k in recent)
-            hist_avg  = (sum(float(k[5]) for k in hist) / len(hist)) if hist else rec_vol
-            taker_ratio = rec_taker / rec_vol if rec_vol > 0 else 0.5
-            vol_ratio   = (rec_vol / 3) / hist_avg if hist_avg > 0 else 1.0
-            return round(taker_ratio, 3), round(vol_ratio, 2)
-        except Exception:
-            return 0.5, 1.0   # neutral on error
+    def _binance_imbalance(self, asset: str) -> float:
+        c = self.binance_cache.get(asset, {})
+        bids = c.get("depth_bids", [])
+        asks = c.get("depth_asks", [])
+        bid_vol = sum(float(b[1]) for b in bids[:10])
+        ask_vol = sum(float(a[1]) for a in asks[:10])
+        if bid_vol + ask_vol == 0:
+            return 0.0
+        return (bid_vol - ask_vol) / (bid_vol + ask_vol)
 
-    async def _binance_perp_signals(self, asset: str) -> tuple:
-        """Perp futures basis + funding rate in one API call.
-        basis: (markPrice - indexPrice) / indexPrice  (+ve = perp premium = bullish)
-        funding: lastFundingRate (+ve = longs crowded, -ve = shorts crowded)
-        Returns (0.0, 0.0) on error."""
-        try:
-            import requests as _req
-            sym  = asset + "USDT"
-            loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: _req.get(
-                "https://fapi.binance.com/fapi/v1/premiumIndex",
-                params={"symbol": sym}, timeout=3
-            ).json())
-            mark    = float(data.get("markPrice", 0))
-            index   = float(data.get("indexPrice", 0))
-            funding = float(data.get("lastFundingRate", 0))
-            basis   = (mark - index) / index if index > 0 else 0.0
-            return round(basis, 7), round(funding, 7)
-        except Exception:
-            return 0.0, 0.0
+    def _binance_taker_flow(self, asset: str) -> tuple:
+        klines = self.binance_cache.get(asset, {}).get("klines", [])
+        if len(klines) < 4:
+            return 0.5, 1.0
+        recent = klines[-3:]
+        hist   = klines[:-3]
+        rec_vol   = sum(float(k[5]) for k in recent)
+        rec_taker = sum(float(k[9]) for k in recent)
+        hist_avg  = (sum(float(k[5]) for k in hist) / len(hist)) if hist else rec_vol
+        taker_ratio = rec_taker / rec_vol if rec_vol > 0 else 0.5
+        vol_ratio   = (rec_vol / 3) / hist_avg if hist_avg > 0 else 1.0
+        return round(taker_ratio, 3), round(vol_ratio, 2)
 
-    async def _binance_window_stats(self, asset: str, window_start_ts: float) -> tuple:
-        """VWAP deviation and vol regime from 1-min klines.
-        vwap_dev: (current - window_vwap) / vwap  (+ve = above VWAP = overbought)
-        vol_mult: realized vol regime multiplier (0.7=low, 1.0=normal, 1.2=high, 1.4=spike)
-        Returns (0.0, 1.0) on error."""
-        try:
-            import requests as _req, statistics as _stats
-            sym  = asset + "USDT"
-            loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: _req.get(
-                "https://api.binance.com/api/v3/klines",
-                params={"symbol": sym, "interval": "1m", "limit": 20}, timeout=3
-            ).json())
-            if not data or len(data) < 3:
-                return 0.0, 1.0
-            start_ms = int(window_start_ts * 1000)
-            window_k = [k for k in data if int(k[0]) >= start_ms] or data[-3:]
-            # VWAP from window candles (typical price × volume)
-            sum_tv = sum((float(k[2])+float(k[3])+float(k[4]))/3 * float(k[5]) for k in window_k)
-            sum_v  = sum(float(k[5]) for k in window_k)
-            vwap   = sum_tv / sum_v if sum_v > 0 else float(window_k[-1][4])
-            cur    = float(window_k[-1][4])
-            vwap_dev = (cur - vwap) / vwap if vwap > 0 else 0.0
-            # Realized vol from all 20 candles
-            closes = [float(k[4]) for k in data]
-            pct_ch = [abs(closes[i]/closes[i-1]-1) for i in range(1, len(closes)) if closes[i-1] > 0]
-            if pct_ch:
-                ann = _stats.mean(pct_ch) * (252 * 24 * 60) ** 0.5
-                if   ann < 0.40: vol_mult = 0.7
-                elif ann < 0.80: vol_mult = 1.0
-                elif ann < 1.50: vol_mult = 1.2
-                else:            vol_mult = 1.4
-            else:
-                vol_mult = 1.0
-            return round(vwap_dev, 6), vol_mult
-        except Exception:
+    def _binance_perp_signals(self, asset: str) -> tuple:
+        c = self.binance_cache.get(asset, {})
+        mark    = c.get("mark", 0.0)
+        index   = c.get("index", 0.0)
+        funding = c.get("funding", 0.0)
+        basis   = (mark - index) / index if index > 0 else 0.0
+        return round(basis, 7), round(funding, 7)
+
+    def _binance_window_stats(self, asset: str, window_start_ts: float) -> tuple:
+        import statistics as _stats
+        klines = self.binance_cache.get(asset, {}).get("klines", [])
+        if not klines or len(klines) < 3:
             return 0.0, 1.0
+        start_ms = int(window_start_ts * 1000)
+        window_k = [k for k in klines if int(k[0]) >= start_ms] or klines[-3:]
+        sum_tv = sum((float(k[2])+float(k[3])+float(k[4]))/3 * float(k[5]) for k in window_k)
+        sum_v  = sum(float(k[5]) for k in window_k)
+        vwap   = sum_tv / sum_v if sum_v > 0 else float(window_k[-1][4])
+        cur    = float(klines[-1][4])
+        vwap_dev = (cur - vwap) / vwap if vwap > 0 else 0.0
+        closes = [float(k[4]) for k in klines]
+        pct_ch = [abs(closes[i]/closes[i-1]-1) for i in range(1, len(closes)) if closes[i-1] > 0]
+        if pct_ch:
+            ann = _stats.mean(pct_ch) * (252 * 24 * 60) ** 0.5
+            if   ann < 0.40: vol_mult = 0.7
+            elif ann < 0.80: vol_mult = 1.0
+            elif ann < 1.50: vol_mult = 1.2
+            else:            vol_mult = 1.4
+        else:
+            vol_mult = 1.0
+        return round(vwap_dev, 6), vol_mult
+
+    # ── Binance WebSocket streams ─────────────────────────────────────────────
+
+    async def _seed_binance_cache(self):
+        """One-time REST seed so cache is ready before WS streams connect."""
+        import requests as _req
+        loop = asyncio.get_event_loop()
+        for asset, sym in BNB_SYM.items():
+            sym_api = sym.upper()
+            try:
+                depth = await loop.run_in_executor(None, lambda s=sym_api: _req.get(
+                    "https://api.binance.com/api/v3/depth",
+                    params={"symbol": s, "limit": 20}, timeout=5).json())
+                self.binance_cache[asset]["depth_bids"] = depth.get("bids", [])
+                self.binance_cache[asset]["depth_asks"] = depth.get("asks", [])
+            except Exception: pass
+            try:
+                klines = await loop.run_in_executor(None, lambda s=sym_api: _req.get(
+                    "https://api.binance.com/api/v3/klines",
+                    params={"symbol": s, "interval": "1m", "limit": 33}, timeout=5).json())
+                if isinstance(klines, list):
+                    self.binance_cache[asset]["klines"] = klines
+            except Exception: pass
+            try:
+                mark = await loop.run_in_executor(None, lambda s=sym_api: _req.get(
+                    "https://fapi.binance.com/fapi/v1/premiumIndex",
+                    params={"symbol": s}, timeout=5).json())
+                self.binance_cache[asset]["mark"]    = float(mark.get("markPrice", 0))
+                self.binance_cache[asset]["index"]   = float(mark.get("indexPrice", 0))
+                self.binance_cache[asset]["funding"] = float(mark.get("lastFundingRate", 0))
+            except Exception: pass
+        print(f"{G}[BNB-SEED] Binance cache seeded for {list(BNB_SYM)}{RS}")
+
+    async def _stream_binance_spot(self):
+        """Persistent WS: depth20 + kline_1m for all assets → binance_cache."""
+        import websockets as _ws, json as _j
+        sym_map = {v: k for k, v in BNB_SYM.items()}  # "btcusdt" → "BTC"
+        streams = [f"{s}@depth20@100ms/{s}@kline_1m" for s in BNB_SYM.values()]
+        url = "wss://stream.binance.com/stream?streams=" + "/".join(streams)
+        delay = 5
+        while True:
+            try:
+                async with _ws.connect(url, ping_interval=20, ping_timeout=30) as ws:
+                    print(f"{G}[BNB-SPOT] WS connected{RS}")
+                    delay = 5
+                    async for raw in ws:
+                        msg    = _j.loads(raw)
+                        stream = msg.get("stream", "")
+                        data   = msg.get("data", {})
+                        sym    = stream.split("@")[0]
+                        asset  = sym_map.get(sym)
+                        if not asset:
+                            continue
+                        c = self.binance_cache[asset]
+                        if "@depth20" in stream:
+                            c["depth_bids"] = data.get("bids", [])
+                            c["depth_asks"] = data.get("asks", [])
+                        elif "@kline_1m" in stream:
+                            k = data.get("k", {})
+                            kline = [k.get("t",0), k.get("o","0"), k.get("h","0"),
+                                     k.get("l","0"), k.get("c","0"), k.get("v","0"),
+                                     0, 0, 0, k.get("V","0"), 0, 0]
+                            klines = c["klines"]
+                            if klines and klines[-1][0] == kline[0]:
+                                klines[-1] = kline
+                            else:
+                                klines.append(kline)
+                                if len(klines) > 33:
+                                    klines.pop(0)
+            except Exception as e:
+                print(f"{Y}[BNB-SPOT] {e} — reconnect in {delay}s{RS}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
+    async def _stream_binance_futures(self):
+        """Persistent WS: markPrice for all assets → binance_cache mark/index/funding."""
+        import websockets as _ws, json as _j
+        sym_map = {v: k for k, v in BNB_SYM.items()}
+        streams = [f"{s}@markPrice" for s in BNB_SYM.values()]
+        url = "wss://fstream.binance.com/stream?streams=" + "/".join(streams)
+        delay = 5
+        while True:
+            try:
+                async with _ws.connect(url, ping_interval=20, ping_timeout=30) as ws:
+                    print(f"{G}[BNB-PERP] WS connected{RS}")
+                    delay = 5
+                    async for raw in ws:
+                        msg   = _j.loads(raw)
+                        data  = msg.get("data", {})
+                        s     = data.get("s", "").lower()
+                        asset = sym_map.get(s)
+                        if not asset:
+                            continue
+                        c = self.binance_cache[asset]
+                        c["mark"]    = float(data.get("p", 0) or 0)
+                        c["index"]   = float(data.get("i", 0) or 0)
+                        c["funding"] = float(data.get("r", 0) or 0)
+            except Exception as e:
+                print(f"{Y}[BNB-PERP] {e} — reconnect in {delay}s{RS}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
 
     def _cross_asset_direction(self, asset: str, direction: str) -> int:
         """Count how many OTHER assets are trending in the same direction right now.
@@ -2493,6 +2549,7 @@ class LiveTrader:
         import requests as _req
         loop = asyncio.get_event_loop()
         await self._sync_stats_from_api(loop, _req)
+        await self._seed_binance_cache()   # populate Binance cache before WS streams start
         async def _guard(name, method):
             """Restart a loop if it crashes — one failure can't kill all loops."""
             while True:
@@ -2504,15 +2561,17 @@ class LiveTrader:
                     await asyncio.sleep(10)
 
         await asyncio.gather(
-            _guard("stream_rtds",         self.stream_rtds),
-            _guard("vol_loop",            self.vol_loop),
-            _guard("scan_loop",           self.scan_loop),
-            _guard("_status_loop",        self._status_loop),
-            _guard("_refresh_balance",    self._refresh_balance),
-            _guard("_redeem_loop",        self._redeem_loop),
-            _guard("chainlink_loop",      self.chainlink_loop),
-            _guard("_redeemable_scan",    self._redeemable_scan),
-            _guard("_position_sync_loop", self._position_sync_loop),
+            _guard("stream_rtds",           self.stream_rtds),
+            _guard("_stream_binance_spot",  self._stream_binance_spot),
+            _guard("_stream_binance_futures", self._stream_binance_futures),
+            _guard("vol_loop",              self.vol_loop),
+            _guard("scan_loop",             self.scan_loop),
+            _guard("_status_loop",          self._status_loop),
+            _guard("_refresh_balance",      self._refresh_balance),
+            _guard("_redeem_loop",          self._redeem_loop),
+            _guard("chainlink_loop",        self.chainlink_loop),
+            _guard("_redeemable_scan",      self._redeemable_scan),
+            _guard("_position_sync_loop",   self._position_sync_loop),
         )
 
 
