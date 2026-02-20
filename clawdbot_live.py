@@ -58,9 +58,8 @@ BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
 MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to determine direction
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
-MIN_BET        = 3.0      # $3 floor (small bankroll recovery mode)
-MAX_BET        = 12.0     # $12 ceiling — protect bankroll
-KELLY_FRAC     = 0.18     # 18% Kelly — conservative, reduce loss rate
+DUST_BET       = 2.0      # $2 absolute floor (dust prevention only)
+MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
 MAX_OPEN       = 2        # max 2 simultaneous positions — prevent 3 correlated losses
 MAX_SAME_DIR   = 1        # max 1 position per direction (no 2x Up or 2x Down)
 
@@ -508,19 +507,20 @@ class LiveTrader:
             return rtds
         return self.cl_prices.get(asset, 0)
 
-    def _kelly_size(self, true_prob: float, entry: float, edge: float = 0.0) -> float:
-        """Kelly bet size — conservative, capped at MAX_BET regardless of edge.
-        With small bankroll, protect capital above all else."""
+    def _kelly_size(self, true_prob: float, entry: float, kelly_frac: float) -> float:
+        """Fully dynamic Kelly bet — no hardcoded dollar caps.
+        kelly_frac: conviction-based fraction (0.12–0.55), driven by score.
+        Absolute cap: MAX_BANKROLL_PCT of current bankroll.
+        Floor: max($2, 2% of bankroll)."""
         if entry <= 0 or entry >= 1:
-            return MIN_BET
+            return max(DUST_BET, self.bankroll * 0.02)
         b = (1 / entry) - 1
         q = 1 - true_prob
-        kelly_f = (true_prob * b - q) / b
-        kelly_f = max(0.0, kelly_f)
-        size = self.bankroll * kelly_f * KELLY_FRAC * self._kelly_drawdown_scale()
-        # Hard cap at MAX_BET — no exceptions for "strong edge"
-        max_bet = min(MAX_BET, self.bankroll * 0.25)  # never risk >25% bankroll per bet
-        return round(max(MIN_BET, min(max_bet, size)), 2)
+        kelly_f = max(0.0, (true_prob * b - q) / b)
+        size  = self.bankroll * kelly_f * kelly_frac * self._kelly_drawdown_scale()
+        floor = max(DUST_BET, self.bankroll * 0.02)
+        cap   = self.bankroll * MAX_BANKROLL_PCT
+        return round(max(floor, min(cap, size)), 2)
 
     # ── MARKET FETCHER ────────────────────────────────────────────────────────
     async def _fetch_series(self, slug: str, info: dict, now: float) -> dict:
@@ -793,18 +793,19 @@ class LiveTrader:
         else:
             return None   # no AMM edge — skip
 
-        # Bet size: conviction score × volatility regime multiplier
-        if   score >= 12: base_mult = 1.3
-        elif score >= 10: base_mult = 1.1
-        elif score >=  8: base_mult = 1.0
-        elif score >=  6: base_mult = 0.6
-        else:             base_mult = 0.4   # score 4-5: minimum probe entry
-        size_mult = base_mult * vol_mult   # scale by market vol regime
+        # Kelly fraction scales with conviction score (replaces hardcoded MIN/MAX_BET)
+        # Higher score → larger fraction of Kelly → bigger bet automatically
+        if   score >= 12: kelly_frac = 0.55
+        elif score >= 10: kelly_frac = 0.45
+        elif score >=  8: kelly_frac = 0.35
+        elif score >=  6: kelly_frac = 0.22
+        else:             kelly_frac = 0.12   # score 4-5: probe entry only
 
         entry    = up_price if side == "Up" else (1 - up_price)
-        raw_size = self._kelly_size(true_prob, entry, edge)
-        dyn_max  = min(MAX_BET * self._wr_bet_scale(), self.bankroll * 0.30)
-        size     = round(max(MIN_BET, min(dyn_max, raw_size * size_mult)), 2)
+        wr_scale = self._wr_bet_scale()
+        raw_size = self._kelly_size(true_prob, entry, kelly_frac)
+        size     = round(min(self.bankroll * MAX_BANKROLL_PCT,
+                             raw_size * vol_mult * wr_scale), 2)
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
             return None
@@ -1316,7 +1317,7 @@ class LiveTrader:
             self.seen.add(cid)
 
             # Skip dust positions — too small to be a real bot bet
-            if val < MIN_BET * 0.5:
+            if val < DUST_BET:
                 continue
 
             # Fetch real market data from Gamma API — always, even if already in pending
@@ -1664,9 +1665,9 @@ class LiveTrader:
         return sum(list(self.recent_trades)[-5:]) / 5
 
     def _wr_bet_scale(self) -> float:
-        """Scale MAX_BET up when win rate is consistently high (last 10 trades).
+        """Scale bet size up when win rate is consistently high (last 10 trades).
         Needs ≥10 resolved trades to activate — avoids overconfidence on small samples.
-        Returns multiplier applied to MAX_BET cap:
+        Returns multiplier applied to raw Kelly size:
           WR ≥ 80%  → 2.0x (hot streak, push hard)
           WR ≥ 70%  → 1.5x
           WR ≥ 60%  → 1.2x
@@ -1970,7 +1971,7 @@ class LiveTrader:
                     val  = float(p.get("currentValue", 0))
                     side = p.get("outcome", "")
                     title = p.get("title", "")
-                    if rdm or not side or not cid or val < MIN_BET * 0.5:
+                    if rdm or not side or not cid or val < DUST_BET:
                         continue
                     if cid in self.pending or cid in self.pending_redeem:
                         continue
@@ -2155,7 +2156,7 @@ class LiveTrader:
                     if rdm or not side or not cid:
                         continue
                     self.seen.add(cid)
-                    if val < MIN_BET * 0.5:   # dust — mark seen only, don't track
+                    if val < DUST_BET:   # dust — mark seen only, don't track
                         continue
                     if cid in self.pending or cid in self.pending_redeem:
                         continue
