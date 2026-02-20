@@ -1262,9 +1262,9 @@ class LiveTrader:
                                 None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60)
                             )
                             if receipt.status != 1:
-                                print(f"{Y}[REDEEM] {asset} {side} tx failed, retrying...{RS}")
-                                continue
-                            suffix = f"tx={tx_hash.hex()[:16]}"
+                                suffix = f"auto-redeemed (reverted)"
+                            else:
+                                suffix = f"tx={tx_hash.hex()[:16]}"
                         except Exception as _redeem_err:
                             # Tx reverted = already auto-redeemed by Polymarket (USDC already in wallet)
                             suffix = f"auto-redeemed (err={str(_redeem_err)[:40]})"
