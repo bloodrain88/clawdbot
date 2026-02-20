@@ -857,19 +857,19 @@ class LiveTrader:
                 best_bid = float(bids[0].price) if bids else best_ask - 0.10
                 spread   = best_ask - best_bid
 
-                # Edge requirement: use adaptive min_edge (based on recent WR / loss streak)
-                # Extra penalty if oracles disagree. Always >= MIN_EDGE.
-                base_req = min_edge_req if min_edge_req is not None else MIN_EDGE
-                edge_req = base_req + 0.05 if not cl_agree else base_req
+                # CLOB sanity check: taker_edge must be positive (model > ask).
+                # The adaptive floor (3-6%) prevents obviously bad fills.
+                # CL disagreement adds 2% penalty but never blocks high-conviction signals.
+                edge_floor = min_edge_req if min_edge_req is not None else 0.04
+                if not cl_agree: edge_floor += 0.02
 
                 taker_edge = true_prob - best_ask
-                if taker_edge < edge_req:
+                if taker_edge < edge_floor:
                     kind = "disagree" if not cl_agree else "directional"
-                    print(f"{Y}[SKIP] {asset} {side} [{kind}]: taker_edge={taker_edge:.3f} < {edge_req:.2f} "
+                    print(f"{Y}[SKIP] {asset} {side} [{kind}]: taker_edge={taker_edge:.3f} < {edge_floor:.2f} "
                           f"(ask={best_ask:.3f} model={true_prob:.3f}){RS}")
                     return None
-                kind = "cautious" if not cl_agree else "directional"
-                print(f"{B}[{kind.upper()}]{RS} {asset} {side} edge={taker_edge:.3f} req={edge_req:.2f}")
+                print(f"{B}[FILL]{RS} {asset} {side} edge={taker_edge:.3f} floor={edge_floor:.2f}")
 
                 # High conviction: skip maker, go straight to taker for instant fill
                 if force_taker:
@@ -957,8 +957,8 @@ class LiveTrader:
                     f_tick   = float(fresh.tick_size or tick)
                     fresh_ask = float(f_asks[0].price) if f_asks else best_ask
                     fresh_ep  = true_prob - fresh_ask
-                    if fresh_ep < edge_req:
-                        print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_req:.2f} — no longer worth it{RS}")
+                    if fresh_ep < edge_floor:
+                        print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_floor:.2f} — price moved against us{RS}")
                         return None
                     taker_price = round(min(fresh_ask + f_tick, 0.97), 4)
                 except Exception:
@@ -1535,23 +1535,15 @@ class LiveTrader:
         return sum(list(self.recent_trades)[-5:]) / 5
 
     def _adaptive_min_edge(self) -> float:
-        """Gate on last-5 WR AND consecutive losses.
-        Hot streak → normal. Cold streak → much higher bar.
-        Consecutive loss boost: each loss above 1 adds 3% extra requirement."""
+        """CLOB edge sanity floor — keeps us from buying at obviously bad prices.
+        Circuit breaker (cooldown_until) already handles cold-streak pauses.
+        Range: 3-8% only. Never blocks trading on its own."""
         wr5 = self._last5_wr()
-        if wr5 < 0:           # not enough history yet
-            base = MIN_EDGE
-        elif wr5 >= 0.80:     # 4-5/5 wins: hot streak
-            base = max(0.06, MIN_EDGE - 0.01)
-        elif wr5 >= 0.60:     # 3/5: normal
-            base = MIN_EDGE
-        elif wr5 >= 0.40:     # 2/5: tighten
-            base = MIN_EDGE + 0.04
-        else:                 # 0-1/5: cold streak — only exceptional setups
-            base = MIN_EDGE + 0.09
-        # Consecutive loss surcharge (on top of WR-based gate)
-        consec_boost = max(0, self.consec_losses - 1) * 0.03
-        return min(base + consec_boost, 0.30)  # cap at 30%
+        if   wr5 < 0:        return 0.04   # no history: moderate
+        elif wr5 >= 0.80:    return 0.03   # hot streak: very permissive
+        elif wr5 >= 0.60:    return 0.04   # normal
+        elif wr5 >= 0.40:    return 0.05   # slightly cold
+        else:                return 0.06   # cold: 6% — circuit breaker handles the rest
 
     def _adaptive_momentum_weight(self) -> float:
         """Shift toward momentum when recent WR is poor."""
