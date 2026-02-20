@@ -641,6 +641,17 @@ class LiveTrader:
         if pct_remaining < 0.40:
             return None   # last 6 min — AMM fully priced, no edge left
 
+        # Previous window direction from CL prices — the mapleghost signal.
+        # At window open AMM applies mean-reversion discount (prices 8-40¢ for continuation)
+        # but on-chain data shows 87.7% continuation. Exploiting this is the key edge.
+        prev_open     = self.asset_prev_open.get(asset, 0)
+        prev_win_move = abs((open_price - prev_open) / prev_open) if prev_open > 0 and open_price > 0 else 0.0
+        prev_win_dir  = None
+        if prev_open > 0 and open_price > 0:
+            diff = (open_price - prev_open) / prev_open
+            if   diff >  0.0002: prev_win_dir = "Up"
+            elif diff < -0.0002: prev_win_dir = "Down"
+
         move_pct = abs(current - open_price) / open_price if open_price > 0 else 0
         move_str = f"{(current-open_price)/open_price:+.3%}"
 
@@ -676,6 +687,8 @@ class LiveTrader:
             direction = "Up"
         elif tf_dn_votes > tf_up_votes:
             direction = "Down"
+        elif prev_win_dir and pct_remaining > 0.80:
+            direction = prev_win_dir  # window just opened — use continuation prior
         else:
             return None   # price flat AND momentum flat — no signal, skip
 
@@ -684,8 +697,11 @@ class LiveTrader:
         very_strong_mom = (tf_votes == 3)
 
         # Require ≥2 momentum TFs when price/CL are flat — 1/3 is a coin flip
+        # Exception: early continuation entry is allowed even with flat price
+        is_early_continuation = (prev_win_dir == direction and pct_remaining > 0.85)
         if move_pct < 0.0003 and cl_move_pct < 0.0002 and tf_votes < 2:
-            return None
+            if not is_early_continuation:
+                return None
 
         # Entry timing (0-2 pts) — earlier = AMM hasn't repriced yet = better odds
         if   pct_remaining >= 0.85: score += 2   # first 2.25 min of 15-min market
@@ -780,12 +796,17 @@ class LiveTrader:
         if   cross_count == 3: score += 2   # all other assets confirm → strong macro signal
         elif cross_count >= 2: score += 1   # majority confirm
 
-        # Inter-market continuity: previous 15-min market direction (+1 pt)
-        prev_open = self.asset_prev_open.get(asset, 0)
-        if prev_open > 0 and open_price > 0:
-            prev_was_up = open_price > prev_open
-            if (is_up and prev_was_up) or (not is_up and not prev_was_up):
-                score += 1
+        # Previous window continuation — mapleghost strategy (0–5 pts or −2 pts)
+        # AMM prices continuation at 8–40¢ (mean-reversion model) but true rate is 87.7%.
+        # Early entry (first 3 min of window) exploits the biggest mispricing.
+        if prev_win_dir is not None:
+            if prev_win_dir == direction:
+                if   pct_remaining > 0.85: score += 5  # first ~90s: AMM hasn't repriced yet
+                elif pct_remaining > 0.80: score += 4  # still very early
+                elif pct_remaining > 0.70: score += 2  # early but some repricing happened
+                else:                      score += 1  # later: normal continuation bonus
+            else:
+                score -= 2  # betting against continuation direction — risky
 
         # AMM edge check — still required even at score ≥ 4
         vol      = self.vols.get(asset, 0.70)
@@ -797,6 +818,19 @@ class LiveTrader:
         bias_down = self._direction_bias(asset, "Down")
         prob_up   = max(0.05, min(0.95, combined + bias_up))
         prob_down = max(0.05, min(0.95, (1 - combined) + bias_down))
+
+        # Early continuation prior: at window open BS/momentum ≈ 0.50 (no current-window move yet).
+        # Apply 87.7% continuation prior: prior scales 70–80% with prev move size.
+        # This is why mapleghost can buy at 15¢ — true prob is 75%, not 50%.
+        if prev_win_dir == direction and pct_remaining > 0.80:
+            prior = min(0.80, 0.70 + prev_win_move * 20)   # 70–80% depending on prev move size
+            if direction == "Up":
+                prob_up   = max(prob_up, prior)
+                prob_down = 1 - prob_up
+            else:
+                prob_down = max(prob_down, prior)
+                prob_up   = 1 - prob_down
+
         edge_up   = prob_up   - up_price
         edge_down = prob_down - (1 - up_price)
         min_edge   = self._adaptive_min_edge()
@@ -835,14 +869,20 @@ class LiveTrader:
         entry    = up_price if side == "Up" else (1 - up_price)
         wr_scale = self._wr_bet_scale()
         raw_size = self._kelly_size(true_prob, entry, kelly_frac)
-        size     = round(min(MAX_ABS_BET,
+        # Early continuation bets: 3× higher cap — AMM mispricing at 8–40¢ is the best edge
+        abs_cap  = MAX_ABS_BET * 3 if is_early_continuation and score >= 10 else MAX_ABS_BET
+        size     = round(min(abs_cap,
                              self.bankroll * MAX_BANKROLL_PCT,
                              raw_size * vol_mult * wr_scale), 2)
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
             return None
 
-        force_taker = score >= 12 and very_strong_mom and imbalance_confirms and move_pct > 0.0015
+        # Force taker for high-score early continuation — fill immediately before AMM reprices
+        force_taker = (
+            (score >= 12 and very_strong_mom and imbalance_confirms and move_pct > 0.0015) or
+            (score >= 12 and is_early_continuation)
+        )
 
         return {
             "cid": cid, "m": m, "score": score,
@@ -858,6 +898,8 @@ class LiveTrader:
             "vol_ratio": vol_ratio, "pct_remaining": pct_remaining, "mins_left": mins_left,
             "perp_basis": perp_basis, "funding_rate": funding_rate,
             "vwap_dev": vwap_dev, "vol_mult": vol_mult, "cross_count": cross_count,
+            "prev_win_dir": prev_win_dir, "prev_win_move": prev_win_move,
+            "is_early_continuation": is_early_continuation,
         }
 
     async def _execute_trade(self, sig: dict):
@@ -875,13 +917,16 @@ class LiveTrader:
         perp_str    = f" perp={sig.get('perp_basis',0)*100:+.3f}%"
         vwap_str    = f" vwap={sig.get('vwap_dev',0)*100:+.3f}%"
         cross_str   = f" cross={sig.get('cross_count',0)}/3"
-        print(f"{G}[EDGE] {sig['label']} → {sig['side']} | score={score} {score_stars} | "
+        cont_str    = (f" {G}[CONT {sig['prev_win_dir']} {sig['prev_win_move']*100:.2f}%]{RS}"
+                       if sig.get("is_early_continuation") else "")
+        tag = f"{G}[CONT-ENTRY]{RS}" if sig.get("is_early_continuation") else f"{G}[EDGE]{RS}"
+        print(f"{tag} {sig['label']} → {sig['side']} | score={score} {score_stars} | "
               f"beat=${sig['open_price']:,.2f} {sig['src_tag']} now=${sig['current']:,.2f} "
               f"move={sig['move_str']}{prev_str} pct={sig['pct_remaining']:.0%} | "
               f"bs={sig['bs_prob']:.3f} mom={sig['mom_prob']:.3f} prob={sig['true_prob']:.3f} "
               f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} ${sig['size']:.2f}"
               f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x"
-              f"{perp_str}{vwap_str}{cross_str}{RS}")
+              f"{perp_str}{vwap_str}{cross_str}{cont_str}{RS}")
 
         self.seen.add(cid)
         self._save_seen()
