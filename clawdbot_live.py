@@ -814,12 +814,15 @@ class LiveTrader:
                 return None   # AMM has massively overpriced this direction — no edge at all
             else:
                 side, edge, true_prob = forced_side, max(0.01, forced_edge), forced_prob
-        elif edge_up >= edge_down and edge_up >= pre_filter:
-            side, edge, true_prob = "Up", edge_up, prob_up
-        elif edge_down >= pre_filter:
-            side, edge, true_prob = "Down", edge_down, prob_down
         else:
-            return None   # flat price + no AMM edge — skip
+            # Flat price: side MUST match direction (CL/momentum consensus).
+            # AMM edge only used to reject extreme mispricing (< -15%).
+            # 86% continuation means momentum direction >> AMM edge comparison.
+            dir_edge = edge_up if direction == "Up" else edge_down
+            dir_prob = prob_up if direction == "Up" else prob_down
+            if dir_edge < -0.15:
+                return None   # AMM massively overpriced our direction — no edge
+            side, edge, true_prob = direction, max(0.01, dir_edge), dir_prob
 
         # Kelly fraction scales with conviction score (replaces hardcoded MIN/MAX_BET)
         # Higher score → larger fraction of Kelly → bigger bet automatically
