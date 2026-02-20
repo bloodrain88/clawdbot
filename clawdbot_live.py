@@ -354,7 +354,7 @@ class LiveTrader:
             size       = t.get("size", 0)
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
             # NOT the bot's trade entry price — market determines outcome from its own start
-            open_p     = self.open_prices.get(cid) or t.get("open_price", 0)
+            open_p     = self.open_prices.get(cid, 0)
             # Use Chainlink (resolution source) for win/loss; fall back to RTDS if unavailable
             cl_p       = self.cl_prices.get(asset, 0)
             cur_p      = cl_p if cl_p > 0 else self.prices.get(asset, 0)
@@ -1959,6 +1959,9 @@ class LiveTrader:
                     pending_dn = sum(1 for _, t in self.pending.values() if t.get("side") == "Down")
                     if sig["side"] == "Up"   and pending_up >= MAX_SAME_DIR: continue
                     if sig["side"] == "Down" and pending_dn >= MAX_SAME_DIR: continue
+                    # Unified direction: correlated assets move together — never hold Up + Down simultaneously
+                    if pending_dn > 0 and sig["side"] == "Up":   continue
+                    if pending_up > 0 and sig["side"] == "Down":  continue
                     # Late entry (40-60% remaining, no timing bonus): require score ≥ 8
                     is_late = sig["pct_remaining"] < 0.60
                     min_score = 8 if is_late else 4
