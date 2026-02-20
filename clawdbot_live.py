@@ -2096,7 +2096,11 @@ class LiveTrader:
                         pass
                     if end_ts > 0 and end_ts <= now_ts:
                         stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
-                        end_ts = stored_end if stored_end > now_ts else now_ts + duration * 60
+                        if stored_end > now_ts:
+                            end_ts = stored_end  # trust stored real end_ts
+                        elif end_ts % 86400 < 3600:  # midnight UTC — Gamma sent date-only, false expiry
+                            end_ts = now_ts + duration * 60
+                        # else: genuinely expired — keep real end_ts; _resolve() queues immediately
                     if end_ts == 0:
                         end_ts = now_ts + duration * 60
                     mins_left = (end_ts - now_ts) / 60
@@ -2282,14 +2286,14 @@ class LiveTrader:
                         token_down = toks[1] if len(toks) > 1 else ""
                     except Exception:
                         pass
-                    # If already expired, queue for on-chain resolution.
-                    # Guard: Gamma date-only endDate → midnight UTC → false expiry.
+                    # If already expired: check if it's a Gamma date-only midnight UTC false alarm.
                     if end_ts > 0 and end_ts <= now:
                         stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
                         if stored_end > now:
-                            end_ts = stored_end  # trust stored
-                        else:
-                            end_ts = now + duration * 60  # estimate; _resolve handles real expiry
+                            end_ts = stored_end  # trust stored real end_ts
+                        elif end_ts % 86400 < 3600:  # midnight UTC — date-only field, false expiry
+                            end_ts = now + duration * 60
+                        # else: genuinely expired — keep real end_ts; _resolve() queues immediately
                     if end_ts == 0:
                         print(f"{Y}[SYNC] {title[:40]} — no end_ts from Gamma, skipping{RS}")
                         continue
