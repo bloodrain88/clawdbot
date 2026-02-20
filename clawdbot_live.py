@@ -878,18 +878,13 @@ class LiveTrader:
             return None
 
         src = self.open_prices_source.get(cid, "?")
-        if src == "CL-fallback":
-            return None
-
         src_tag = f"[{src}]"
 
-        # Timing gate: hard block only in last 6 min (need ≥40% remaining).
-        # 40-60% remaining: allowed but earns no timing bonus — only high-edge markets pass.
-        # >60% remaining: timing bonus scored (+1 or +2 pts) — preferred entry window.
+        # Timing gate: only block final 2 min (price already moved fully, no edge).
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
-        if pct_remaining < 0.40:
-            return None   # last 6 min — AMM fully priced, no edge left
+        if pct_remaining < 0.15:
+            return None   # last ~2 min — too late to fill at good price
 
         # Previous window direction from CL prices — the mapleghost signal.
         # At window open AMM applies mean-reversion discount (prices 8-40¢ for continuation)
@@ -948,12 +943,7 @@ class LiveTrader:
         tf_votes = tf_up_votes if is_up else tf_dn_votes
         very_strong_mom = (tf_votes >= 3)
 
-        # Require ≥2 momentum TFs when price/CL are flat — 1/3 is a coin flip
-        # Exception: early continuation entry is allowed even with flat price
         is_early_continuation = (prev_win_dir == direction and pct_remaining > 0.85)
-        if move_pct < 0.0003 and cl_move_pct < 0.0002 and tf_votes < 2:
-            if not is_early_continuation:
-                return None
 
         # Entry timing (0-2 pts) — earlier = AMM hasn't repriced yet = better odds
         if   pct_remaining >= 0.85: score += 2   # first 2.25 min of 15-min market
@@ -1170,27 +1160,26 @@ class LiveTrader:
             side  = "Down" if side == "Up" else "Up"
             entry = up_price if side == "Up" else (1 - up_price)
 
-        # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
-        # Tier 1: entry ≤ 35¢ → 3x+ payout — price already moved, strong signal
-        #         Bet big: this is where EV is highest
-        # Tier 2: entry 35–45¢ → 2.2–2.86x — moderate move, smaller bet
-        # Skip:   entry > 45¢ → < 2.2x payout — not enough edge vs market
-        # ── Score gate: require ≥ 8 in all tiers ─────────────────────────────
-        if score < 8:
-            return None   # no low-conviction bets — protect capital
-
+        # ── ENTRY PRICE TIERS — always trade, size by score ──────────────────
+        # Tier 1: ≤35¢ → 3x+ payout   Tier 2: ≤45¢ → 2.2x+   Tier 3: ≤50¢ → 2x
+        # Score drives kelly/bankroll fraction; score=0 still bets minimum
         if entry <= 0.35:
-            # HIGH PAYOUT TIER: 3x+ payout, strong momentum already confirmed
             if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.25
-            elif score >= 10: kelly_frac, bankroll_pct = 0.45, 0.20
-            else:             kelly_frac, bankroll_pct = 0.35, 0.15
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.40, 0.18
+            elif score >= 4:  kelly_frac, bankroll_pct = 0.25, 0.12
+            else:             kelly_frac, bankroll_pct = 0.15, 0.07
         elif entry <= 0.45:
-            # MODERATE TIER: 2.2–2.86x payout
             if   score >= 12: kelly_frac, bankroll_pct = 0.45, 0.15
-            elif score >= 10: kelly_frac, bankroll_pct = 0.35, 0.12
-            else:             kelly_frac, bankroll_pct = 0.25, 0.08
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.30, 0.10
+            elif score >= 4:  kelly_frac, bankroll_pct = 0.18, 0.06
+            else:             kelly_frac, bankroll_pct = 0.10, 0.04
+        elif entry <= 0.50:
+            if   score >= 12: kelly_frac, bankroll_pct = 0.30, 0.10
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.20, 0.07
+            elif score >= 4:  kelly_frac, bankroll_pct = 0.12, 0.04
+            else:             kelly_frac, bankroll_pct = 0.07, 0.03
         else:
-            return None   # entry > 45¢ — payout too low, skip
+            return None   # entry > 50¢ — no positive-EV bet possible
 
         wr_scale   = self._wr_bet_scale()
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
@@ -1207,8 +1196,8 @@ class LiveTrader:
         # This prevents entering at e.g. 64¢ when Gamma shows 45¢
         if pm_book_data is not None:
             _, clob_ask, _ = pm_book_data
-            if clob_ask > 0.45:
-                return None   # actual CLOB price > tier limit — skip
+            if clob_ask > 0.50:
+                return None   # actual CLOB price > 50¢ — no positive-EV bet
             entry = clob_ask  # use real fill price for sizing and display
 
         # Force taker for high-score early continuation — fill immediately before AMM reprices
@@ -1224,7 +1213,7 @@ class LiveTrader:
             "force_taker": force_taker, "edge": edge,
             "label": label, "asset": asset, "duration": duration,
             "open_price": open_price, "current": current, "move_str": move_str,
-            "src_tag": src_tag, "bs_prob": bs_prob, "mom_prob": mom_prob,
+            "src_tag": src_tag, "bs_prob": true_prob, "mom_prob": true_prob,
             "up_price": up_price, "ob_imbalance": ob_imbalance,
             "imbalance_confirms": imbalance_confirms, "tf_votes": tf_votes,
             "very_strong_mom": very_strong_mom, "taker_ratio": taker_ratio,
