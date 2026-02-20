@@ -704,18 +704,27 @@ class LiveTrader:
                 cl_agree = False
         if cl_agree: score += 1
 
-        # Binance order book imbalance (−1 to +3; >40% contra = hard block)
-        ob_imbalance = await self._binance_imbalance(asset)
+        # ── Fetch all Binance signals IN PARALLEL (~30-80ms total) ──────────────
+        (ob_imbalance,
+         (taker_ratio, vol_ratio),
+         (perp_basis, funding_rate),
+         (vwap_dev, vol_mult)) = await asyncio.gather(
+            self._binance_imbalance(asset),
+            self._binance_taker_flow(asset),
+            self._binance_perp_signals(asset),
+            self._binance_window_stats(asset, m["start_ts"]),
+        )
+
+        # Order book imbalance (−1 to +3; >40% contra = hard block)
         if (is_up and ob_imbalance < -0.40) or (not is_up and ob_imbalance > 0.40):
             return None   # extreme OB contra — hard block
         if   (is_up and ob_imbalance > 0.25) or (not is_up and ob_imbalance < -0.25): score += 3
         elif (is_up and ob_imbalance > 0.10) or (not is_up and ob_imbalance < -0.10): score += 2
-        elif abs(ob_imbalance) <= 0.10: score += 1   # neutral
-        else:                           score -= 1   # moderate contra
+        elif abs(ob_imbalance) <= 0.10: score += 1
+        else:                           score -= 1
         imbalance_confirms = (is_up and ob_imbalance > 0.10) or (not is_up and ob_imbalance < -0.10)
 
-        # Binance taker flow + volume vs 30-min avg (−1 to +5 pts)
-        taker_ratio, vol_ratio = await self._binance_taker_flow(asset)
+        # Taker buy/sell flow + volume vs 30-min avg (−1 to +5 pts)
         if   (is_up and taker_ratio > 0.62) or (not is_up and taker_ratio < 0.38): score += 3
         elif (is_up and taker_ratio > 0.55) or (not is_up and taker_ratio < 0.45): score += 2
         elif abs(taker_ratio - 0.50) < 0.05: score += 1
@@ -723,12 +732,42 @@ class LiveTrader:
         if   vol_ratio > 2.0: score += 2
         elif vol_ratio > 1.3: score += 1
 
+        # Perp futures basis: premium = leveraged longs crowding in = bullish (−1 to +2 pts)
+        perp_confirms = (is_up and perp_basis > 0.0002) or (not is_up and perp_basis < -0.0002)
+        perp_strong   = (is_up and perp_basis > 0.0005) or (not is_up and perp_basis < -0.0005)
+        perp_contra   = (is_up and perp_basis < -0.0002) or (not is_up and perp_basis > 0.0002)
+        if   perp_strong:   score += 2
+        elif perp_confirms: score += 1
+        elif perp_contra:   score -= 1
+
+        # Funding rate: extreme = crowded = contrarian (−1 to +1 pts)
+        # High positive funding + Down bet = contrarian confirms shorts
+        # Very high positive funding + Up bet = overcrowded longs = risky
+        if   (not is_up and funding_rate >  0.0005): score += 1  # crowded longs → contrarian short
+        elif (is_up     and funding_rate < -0.0002): score += 1  # crowded shorts → contrarian long
+        elif (is_up     and funding_rate >  0.0010): score -= 1  # extremely crowded long + bet Up
+        elif (not is_up and funding_rate < -0.0005): score -= 1  # crowded shorts + bet Down risky
+
+        # VWAP deviation: mean reversion signal (−2 to +2 pts)
+        # Price above window VWAP = overbought = bad for continuation bets
+        # Price below window VWAP = oversold = reversion opportunity
+        vwap_net = vwap_dev if is_up else -vwap_dev   # positive = overextended in our direction
+        if   vwap_net >  0.0015: score -= 2   # strongly overbought → likely partial reversion
+        elif vwap_net >  0.0008: score -= 1   # mildly overbought
+        elif vwap_net < -0.0015: score += 2   # strongly oversold → reversion confirms our bet
+        elif vwap_net < -0.0008: score += 1   # mildly oversold
+
+        # Cross-asset confirmation: how many other assets trending same direction? (0-2 pts)
+        cross_count = self._cross_asset_direction(asset, direction)
+        if   cross_count == 3: score += 2   # all other assets confirm → strong macro signal
+        elif cross_count >= 2: score += 1   # majority confirm
+
         # Inter-market continuity: previous 15-min market direction (+1 pt)
         prev_open = self.asset_prev_open.get(asset, 0)
         if prev_open > 0 and open_price > 0:
             prev_was_up = open_price > prev_open
             if (is_up and prev_was_up) or (not is_up and not prev_was_up):
-                score += 1   # momentum continuation
+                score += 1
 
         # AMM edge check — still required even at score ≥ 4
         vol      = self.vols.get(asset, 0.70)
@@ -752,11 +791,13 @@ class LiveTrader:
         else:
             return None   # no AMM edge — skip
 
-        # Bet size by conviction score
-        if   score >= 10: size_mult = 1.3
-        elif score >=  8: size_mult = 1.0
-        elif score >=  6: size_mult = 0.6
-        else:             size_mult = 0.4   # score 4-5: minimum probe entry
+        # Bet size: conviction score × volatility regime multiplier
+        if   score >= 12: base_mult = 1.3
+        elif score >= 10: base_mult = 1.1
+        elif score >=  8: base_mult = 1.0
+        elif score >=  6: base_mult = 0.6
+        else:             base_mult = 0.4   # score 4-5: minimum probe entry
+        size_mult = base_mult * vol_mult   # scale by market vol regime
 
         entry    = up_price if side == "Up" else (1 - up_price)
         raw_size = self._kelly_size(true_prob, entry, edge)
@@ -765,7 +806,7 @@ class LiveTrader:
         if not token_id:
             return None
 
-        force_taker = score >= 10 and very_strong_mom and imbalance_confirms and move_pct > 0.0015
+        force_taker = score >= 12 and very_strong_mom and imbalance_confirms and move_pct > 0.0015
 
         return {
             "cid": cid, "m": m, "score": score,
@@ -779,6 +820,8 @@ class LiveTrader:
             "imbalance_confirms": imbalance_confirms, "tf_votes": tf_votes,
             "very_strong_mom": very_strong_mom, "taker_ratio": taker_ratio,
             "vol_ratio": vol_ratio, "pct_remaining": pct_remaining, "mins_left": mins_left,
+            "perp_basis": perp_basis, "funding_rate": funding_rate,
+            "vwap_dev": vwap_dev, "vol_mult": vol_mult, "cross_count": cross_count,
         }
 
     async def _execute_trade(self, sig: dict):
@@ -787,18 +830,22 @@ class LiveTrader:
         if cid in self.seen or len(self.pending) >= MAX_OPEN:
             return
         score       = sig["score"]
-        score_stars = f"{G}★★★{RS}" if score >= 10 else (f"{G}★★{RS}" if score >= 8 else "★")
+        score_stars = f"{G}★★★{RS}" if score >= 12 else (f"{G}★★{RS}" if score >= 9 else "★")
         agree_str   = "" if sig["cl_agree"] else f" {Y}[CL!]{RS}"
         ob_str      = f" ob={sig['ob_imbalance']:+.2f}" + ("✓" if sig["imbalance_confirms"] else "")
         tf_str      = f" TF={sig['tf_votes']}/3" + ("★" if sig["very_strong_mom"] else "")
         prev_open   = self.asset_prev_open.get(sig["asset"], 0)
         prev_str    = f" prev={((sig['open_price']-prev_open)/prev_open*100):+.2f}%" if prev_open > 0 else ""
+        perp_str    = f" perp={sig.get('perp_basis',0)*100:+.3f}%"
+        vwap_str    = f" vwap={sig.get('vwap_dev',0)*100:+.3f}%"
+        cross_str   = f" cross={sig.get('cross_count',0)}/3"
         print(f"{G}[EDGE] {sig['label']} → {sig['side']} | score={score} {score_stars} | "
               f"beat=${sig['open_price']:,.2f} {sig['src_tag']} now=${sig['current']:,.2f} "
               f"move={sig['move_str']}{prev_str} pct={sig['pct_remaining']:.0%} | "
               f"bs={sig['bs_prob']:.3f} mom={sig['mom_prob']:.3f} prob={sig['true_prob']:.3f} "
               f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} ${sig['size']:.2f}"
-              f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x{RS}")
+              f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x"
+              f"{perp_str}{vwap_str}{cross_str}{RS}")
 
         self.seen.add(cid)
         self._save_seen()
@@ -1504,6 +1551,83 @@ class LiveTrader:
             return round(taker_ratio, 3), round(vol_ratio, 2)
         except Exception:
             return 0.5, 1.0   # neutral on error
+
+    async def _binance_perp_signals(self, asset: str) -> tuple:
+        """Perp futures basis + funding rate in one API call.
+        basis: (markPrice - indexPrice) / indexPrice  (+ve = perp premium = bullish)
+        funding: lastFundingRate (+ve = longs crowded, -ve = shorts crowded)
+        Returns (0.0, 0.0) on error."""
+        try:
+            import requests as _req
+            sym  = asset + "USDT"
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, lambda: _req.get(
+                "https://fapi.binance.com/fapi/v1/premiumIndex",
+                params={"symbol": sym}, timeout=3
+            ).json())
+            mark    = float(data.get("markPrice", 0))
+            index   = float(data.get("indexPrice", 0))
+            funding = float(data.get("lastFundingRate", 0))
+            basis   = (mark - index) / index if index > 0 else 0.0
+            return round(basis, 7), round(funding, 7)
+        except Exception:
+            return 0.0, 0.0
+
+    async def _binance_window_stats(self, asset: str, window_start_ts: float) -> tuple:
+        """VWAP deviation and vol regime from 1-min klines.
+        vwap_dev: (current - window_vwap) / vwap  (+ve = above VWAP = overbought)
+        vol_mult: realized vol regime multiplier (0.7=low, 1.0=normal, 1.2=high, 1.4=spike)
+        Returns (0.0, 1.0) on error."""
+        try:
+            import requests as _req, statistics as _stats
+            sym  = asset + "USDT"
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, lambda: _req.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": sym, "interval": "1m", "limit": 20}, timeout=3
+            ).json())
+            if not data or len(data) < 3:
+                return 0.0, 1.0
+            start_ms = int(window_start_ts * 1000)
+            window_k = [k for k in data if int(k[0]) >= start_ms] or data[-3:]
+            # VWAP from window candles (typical price × volume)
+            sum_tv = sum((float(k[2])+float(k[3])+float(k[4]))/3 * float(k[5]) for k in window_k)
+            sum_v  = sum(float(k[5]) for k in window_k)
+            vwap   = sum_tv / sum_v if sum_v > 0 else float(window_k[-1][4])
+            cur    = float(window_k[-1][4])
+            vwap_dev = (cur - vwap) / vwap if vwap > 0 else 0.0
+            # Realized vol from all 20 candles
+            closes = [float(k[4]) for k in data]
+            pct_ch = [abs(closes[i]/closes[i-1]-1) for i in range(1, len(closes)) if closes[i-1] > 0]
+            if pct_ch:
+                ann = _stats.mean(pct_ch) * (252 * 24 * 60) ** 0.5
+                if   ann < 0.40: vol_mult = 0.7
+                elif ann < 0.80: vol_mult = 1.0
+                elif ann < 1.50: vol_mult = 1.2
+                else:            vol_mult = 1.4
+            else:
+                vol_mult = 1.0
+            return round(vwap_dev, 6), vol_mult
+        except Exception:
+            return 0.0, 1.0
+
+    def _cross_asset_direction(self, asset: str, direction: str) -> int:
+        """Count how many OTHER assets are trending in the same direction right now.
+        Uses current Binance RTDS price vs each market's Chainlink open_price.
+        Returns 0-3."""
+        is_up = (direction == "Up")
+        count = 0
+        for cid, m in self.active_mkts.items():
+            a = m.get("asset", "")
+            if a == asset:
+                continue
+            op  = self.open_prices.get(cid, 0)
+            cur = self.prices.get(a, 0) or self.cl_prices.get(a, 0)
+            if op <= 0 or cur <= 0:
+                continue
+            if (cur > op) == is_up:
+                count += 1
+        return count
 
     def _direction_bias(self, asset: str, side: str) -> float:
         """Additive bias from historical win rate for this asset+direction.
