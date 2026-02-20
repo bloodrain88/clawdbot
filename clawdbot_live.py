@@ -160,6 +160,13 @@ class LiveTrader:
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
+        # ── Mathematical signal state (EMA + Kalman) ──────────────────────────
+        _EMA_HLS = (5, 15, 30, 60, 120)
+        self.emas    = {a: {hl: 0.0 for hl in _EMA_HLS} for a in ["BTC","ETH","SOL","XRP"]}
+        self._ema_ts = {a: 0.0 for a in ["BTC","ETH","SOL","XRP"]}
+        # Kalman: constant-velocity model; state = [price, velocity]; P = 2×2 cov
+        self.kalman  = {a: {"pos":0.0,"vel":0.0,"p00":1.0,"p01":0.0,"p11":1.0,"rdy":False}
+                        for a in ["BTC","ETH","SOL","XRP"]}
         self._init_log()
         self._load_pending()
         self._load_stats()
@@ -177,6 +184,156 @@ class LiveTrader:
             except Exception:
                 continue
         print(f"{Y}[RPC] No working Polygon RPC — on-chain redemption disabled{RS}")
+
+    # ── Mathematical signal helpers ───────────────────────────────────────────
+
+    def _tick_update(self, asset: str, price: float, ts: float) -> None:
+        """Called on every RTDS price tick — updates time-based EMAs and Kalman filter."""
+        import math as _m
+        ema_dict = self.emas.get(asset)
+        if ema_dict is None:
+            return
+        dt = ts - self._ema_ts.get(asset, ts)
+        self._ema_ts[asset] = ts
+        for hl, prev in list(ema_dict.items()):
+            if prev == 0.0:
+                ema_dict[hl] = price   # seed on first tick
+            else:
+                alpha = 1.0 - _m.exp(-dt / hl) if dt > 0 else 0.0
+                ema_dict[hl] = prev + alpha * (price - prev)
+        # Constant-velocity Kalman filter (predict + update)
+        k = self.kalman.get(asset)
+        if k is None:
+            return
+        if not k["rdy"]:
+            k["pos"] = price; k["vel"] = 0.0
+            k["p00"] = 1.0;   k["p01"] = 0.0; k["p11"] = 0.01
+            k["rdy"] = True
+            return
+        # Process noise (tune to asset volatility)
+        q_pos = (self.vols.get(asset, 0.7) * price / _m.sqrt(252*24*3600)) ** 2
+        q_vel = q_pos * 0.01
+        r_obs = (self.vols.get(asset, 0.7) * price * 0.001) ** 2
+        # Predict
+        pos_p = k["pos"] + k["vel"] * dt
+        vel_p = k["vel"]
+        p00_p = k["p00"] + dt*(k["p01"]+k["p10"] if "p10" in k else k["p01"]) + dt*dt*k["p11"] + q_pos
+        p01_p = k["p01"] + dt * k["p11"]
+        p11_p = k["p11"] + q_vel
+        # Update
+        innov  = price - pos_p
+        s_inv  = 1.0 / (p00_p + r_obs)
+        k0     = p00_p * s_inv
+        k1     = p01_p * s_inv
+        k["pos"] = pos_p + k0 * innov
+        k["vel"] = vel_p + k1 * innov
+        k["p00"] = (1.0 - k0) * p00_p
+        k["p01"] = (1.0 - k0) * p01_p
+        k["p11"] = p11_p - k1 * p01_p
+
+    def _kalman_vel_prob(self, asset: str) -> float:
+        """P(Up) from Kalman-estimated velocity; 0.5 if filter not yet ready."""
+        import math as _m
+        k = self.kalman.get(asset, {})
+        if not k.get("rdy") or k.get("pos", 0) == 0:
+            return 0.5
+        price   = k["pos"]
+        vel     = k["vel"]
+        per_sec = max(self.vols.get(asset, 0.7) * price / _m.sqrt(252*24*3600), 1e-10)
+        z       = vel / per_sec
+        return float(norm.cdf(z * 10))
+
+    def _ob_depth_weighted(self, asset: str) -> float:
+        """Depth-weighted OB imbalance: 1/rank weighting on top-20 levels."""
+        c    = self.binance_cache.get(asset, {})
+        bids = c.get("depth_bids", [])
+        asks = c.get("depth_asks", [])
+        bid_w = sum(float(b[1]) / (i + 1) for i, b in enumerate(bids[:20]))
+        ask_w = sum(float(a[1]) / (i + 1) for i, a in enumerate(asks[:20]))
+        if bid_w + ask_w == 0:
+            return 0.0
+        return (bid_w - ask_w) / (bid_w + ask_w)
+
+    def _autocorr_regime(self, asset: str, lags: int = 1) -> float:
+        """Lag-1 autocorrelation of 1m returns from klines cache.
+        Positive = trending; negative = mean-reverting."""
+        klines = self.binance_cache.get(asset, {}).get("klines", [])
+        closes = [float(k[4]) for k in klines[-32:] if float(k[4]) > 0]
+        if len(closes) < 5:
+            return 0.0
+        rets = [closes[i] / closes[i-1] - 1 for i in range(1, len(closes))]
+        if len(rets) < 4:
+            return 0.0
+        mu   = sum(rets) / len(rets)
+        dev  = [r - mu for r in rets]
+        num  = sum(dev[i] * dev[i - lags] for i in range(lags, len(dev)))
+        den  = sum(d * d for d in dev)
+        return num / den if den > 0 else 0.0
+
+    def _variance_ratio(self, asset: str, q: int = 5) -> float:
+        """Lo-MacKinlay variance ratio test (q=5). VR>1=trending, VR<1=mean-reverting."""
+        klines = self.binance_cache.get(asset, {}).get("klines", [])
+        closes = [float(k[4]) for k in klines if float(k[4]) > 0]
+        n      = len(closes)
+        if n < q * 4 + 2:
+            return 1.0
+        log_p = [math.log(closes[i] / closes[i-1]) for i in range(1, n)]
+        mu    = sum(log_p) / len(log_p)
+        var1  = sum((r - mu) ** 2 for r in log_p) / (len(log_p) - 1)
+        if var1 == 0:
+            return 1.0
+        # q-period returns
+        q_rets = [math.log(closes[i] / closes[i-q]) for i in range(q, n)]
+        varq   = sum((r - q * mu) ** 2 for r in q_rets) / ((len(q_rets) - 1) * q)
+        return varq / var1
+
+    def _jump_detect(self, asset: str) -> tuple:
+        """Z-score of last 10s move vs baseline tick vol.
+        Returns (is_jump: bool, direction: str|None, z_score: float)."""
+        hist = self.price_history.get(asset)
+        if not hist or len(hist) < 5:
+            return False, None, 0.0
+        now    = _time.time()
+        recent = [(ts, p) for ts, p in hist if ts >= now - 10]
+        base   = [(ts, p) for ts, p in hist if now - 60 <= ts < now - 10]
+        if len(recent) < 2 or len(base) < 5:
+            return False, None, 0.0
+        p0, p1 = recent[0][1], recent[-1][1]
+        move_10s = (p1 - p0) / p0 if p0 > 0 else 0.0
+        # baseline vol from tick-to-tick moves
+        bt = list(base)
+        tick_moves = [abs(bt[i][1]/bt[i-1][1]-1) for i in range(1, len(bt)) if bt[i-1][1] > 0]
+        if not tick_moves:
+            return False, None, 0.0
+        sigma = (sum(m*m for m in tick_moves) / len(tick_moves)) ** 0.5
+        if sigma == 0:
+            return False, None, 0.0
+        z = move_10s / sigma
+        if abs(z) > 3.5:
+            return True, "Up" if z > 0 else "Down", z
+        return False, None, z
+
+    def _btc_lead_signal(self, asset: str) -> float:
+        """P(Up) for `asset` based on BTC's 30-60s lagged move.
+        For BTC itself returns 0.5 (no self-lead)."""
+        if asset == "BTC":
+            return 0.5
+        hist_btc = self.price_history.get("BTC")
+        if not hist_btc or len(hist_btc) < 5:
+            return 0.5
+        now = _time.time()
+        # BTC move from 60s ago to 30s ago (lagged window)
+        p60  = [(ts, p) for ts, p in hist_btc if now - 65 <= ts <= now - 55]
+        p30  = [(ts, p) for ts, p in hist_btc if now - 35 <= ts <= now - 25]
+        if not p60 or not p30:
+            return 0.5
+        btc_lag_move = (p30[-1][1] - p60[-1][1]) / p60[-1][1] if p60[-1][1] > 0 else 0.0
+        vol_btc = self.vols.get("BTC", 0.65)
+        vol_t   = vol_btc * math.sqrt(30 / (252 * 24 * 3600))
+        if vol_t == 0:
+            return 0.5
+        corr = 0.75   # empirical BTC→altcoin lag correlation
+        return float(norm.cdf(btc_lag_move / vol_t * corr))
 
     def _save_pending(self):
         try:
@@ -491,7 +648,9 @@ class LiveTrader:
                         asset = MAP.get(sym)
                         if asset:
                             self.prices[asset] = val
-                            self.price_history[asset].append((_time.time(), val))
+                            _now_ts = _time.time()
+                            self.price_history[asset].append((_now_ts, val))
+                            self._tick_update(asset, val, _now_ts)
                             # Event-driven: evaluate unseen markets immediately on price tick
                             now_t = _time.time()
                             for cid, m in list(self.active_mkts.items()):
@@ -514,21 +673,26 @@ class LiveTrader:
 
     # ── VOL LOOP ──────────────────────────────────────────────────────────────
     async def vol_loop(self):
+        """Parkinson OHLC vol from WS klines cache — no HTTP, updated every 60s."""
         while True:
-            for sym, asset in [("BTCUSDT","BTC"),("ETHUSDT","ETH"),("SOLUSDT","SOL")]:
+            for asset in list(BNB_SYM.keys()):
+                klines = self.binance_cache.get(asset, {}).get("klines", [])
+                if len(klines) < 5:
+                    continue
                 try:
-                    async with aiohttp.ClientSession() as s:
-                        async with s.get(
-                            "https://api.binance.com/api/v3/klines",
-                            params={"symbol":sym,"interval":"1m","limit":"30"}
-                        ) as r:
-                            candles = await r.json()
-                    closes = [float(c[4]) for c in candles]
-                    rets   = [math.log(closes[i]/closes[i-1]) for i in range(1,len(closes))]
-                    std    = (sum(x**2 for x in rets)/len(rets))**0.5
-                    self.vols[asset] = std * math.sqrt(252*24*60)
-                except: pass
-            await asyncio.sleep(600)
+                    recent = klines[-30:]
+                    log_hl_sq = [
+                        math.log(float(k[2]) / float(k[3])) ** 2
+                        for k in recent
+                        if float(k[3]) > 0 and float(k[2]) > float(k[3])
+                    ]
+                    if log_hl_sq:
+                        park_var = sum(log_hl_sq) / (4.0 * math.log(2) * len(log_hl_sq))
+                        ann_vol  = math.sqrt(park_var * 252 * 24 * 60)
+                        self.vols[asset] = max(0.10, min(5.0, ann_vol))
+                except Exception:
+                    pass
+            await asyncio.sleep(60)
 
     # ── CHAINLINK ORACLE LOOP ─────────────────────────────────────────────────
     async def chainlink_loop(self):
@@ -747,13 +911,14 @@ class LiveTrader:
         # Max possible: 2+3+4+1+3+3+2+1 = 19 pts
         score = 0
 
-        # Compute momentum first — needed to determine direction when price is flat
+        # Compute momentum — EMA-based (O(1) from cache) + Kalman velocity signal
+        mom_5s   = self._momentum_prob(asset, seconds=5)
         mom_30s  = self._momentum_prob(asset, seconds=30)
-        mom_90s  = self._momentum_prob(asset, seconds=90)
         mom_180s = self._momentum_prob(asset, seconds=180)
+        mom_kal  = self._kalman_vel_prob(asset)
         th_up, th_dn = 0.53, 0.47
-        tf_up_votes = sum([mom_30s > th_up, mom_90s > th_up, mom_180s > th_up])
-        tf_dn_votes = sum([mom_30s < th_dn, mom_90s < th_dn, mom_180s < th_dn])
+        tf_up_votes = sum([mom_5s > th_up, mom_30s > th_up, mom_180s > th_up, mom_kal > th_up])
+        tf_dn_votes = sum([mom_5s < th_dn, mom_30s < th_dn, mom_180s < th_dn, mom_kal < th_dn])
 
         # Chainlink current — the resolution oracle
         cl_now = self.cl_prices.get(asset, 0)
@@ -781,7 +946,7 @@ class LiveTrader:
 
         is_up    = (direction == "Up")
         tf_votes = tf_up_votes if is_up else tf_dn_votes
-        very_strong_mom = (tf_votes == 3)
+        very_strong_mom = (tf_votes >= 3)
 
         # Require ≥2 momentum TFs when price/CL are flat — 1/3 is a coin flip
         # Exception: early continuation entry is allowed even with flat price
@@ -800,8 +965,9 @@ class LiveTrader:
         elif move_pct >= 0.0005: score += 1
         # flat/tiny move → +0 pts (still tradeable if momentum/taker confirm)
 
-        # Multi-timeframe momentum (0-4 pts)
-        if   tf_votes == 3: score += 4
+        # Multi-TF momentum + Kalman (0-5 pts; signals: 5s/30s/180s EMA + Kalman velocity)
+        if   tf_votes == 4: score += 5
+        elif tf_votes == 3: score += 4
         elif tf_votes == 2: score += 2
 
         # Chainlink direction agreement (+1 agree / −3 disagree)
@@ -820,14 +986,28 @@ class LiveTrader:
         (vwap_dev, vol_mult)       = self._binance_window_stats(asset, m["start_ts"])
         _pm_book = await self._fetch_pm_book_safe(prefetch_token)
 
-        # Order book imbalance (−1 to +3; >40% contra = hard block)
-        if (is_up and ob_imbalance < -0.40) or (not is_up and ob_imbalance > 0.40):
-            return None   # extreme OB contra — hard block
-        if   (is_up and ob_imbalance > 0.25) or (not is_up and ob_imbalance < -0.25): score += 3
-        elif (is_up and ob_imbalance > 0.10) or (not is_up and ob_imbalance < -0.10): score += 2
-        elif abs(ob_imbalance) <= 0.10: score += 1
-        else:                           score -= 1
-        imbalance_confirms = (is_up and ob_imbalance > 0.10) or (not is_up and ob_imbalance < -0.10)
+        # Additional instant signals from Binance cache (zero latency)
+        dw_ob     = self._ob_depth_weighted(asset)
+        autocorr  = self._autocorr_regime(asset)
+        vr_ratio  = self._variance_ratio(asset)
+        is_jump, jump_dir, jump_z = self._jump_detect(asset)
+        btc_lead_p = self._btc_lead_signal(asset)
+
+        # Jump detection: sudden move against our direction = hard abort
+        if is_jump and jump_dir is not None and jump_dir != direction:
+            return None
+        if is_jump and jump_dir == direction:
+            score += 2   # jump confirms direction — strong momentum signal
+
+        # Order book imbalance — depth-weighted 1/rank (more reliable than flat sum)
+        ob_sig = dw_ob if is_up else -dw_ob    # positive = OB confirms direction
+        if ob_sig < -0.40:
+            return None    # extreme contra OB — hard block
+        if   ob_sig > 0.25: score += 3
+        elif ob_sig > 0.10: score += 2
+        elif ob_sig > -0.10: score += 1
+        else:               score -= 1
+        imbalance_confirms = ob_sig > 0.10
 
         # Taker buy/sell flow + volume vs 30-min avg (−1 to +5 pts)
         if   (is_up and taker_ratio > 0.62) or (not is_up and taker_ratio < 0.38): score += 3
@@ -879,6 +1059,12 @@ class LiveTrader:
         if   cross_count == 3: score += 2   # all other assets confirm → strong macro signal
         elif cross_count >= 2: score += 1   # majority confirm
 
+        # BTC lead signal for non-BTC assets — BTC lagged move predicts altcoins (0–2 pts)
+        if asset != "BTC":
+            if   (is_up and btc_lead_p > 0.60) or (not is_up and btc_lead_p < 0.40): score += 2
+            elif (is_up and btc_lead_p > 0.55) or (not is_up and btc_lead_p < 0.45): score += 1
+            elif (is_up and btc_lead_p < 0.40) or (not is_up and btc_lead_p > 0.60): score -= 1
+
         # Previous window continuation — mapleghost strategy (0–5 pts or −2 pts)
         # AMM prices continuation at 8–40¢ (mean-reversion model) but true rate is 87.7%.
         # Early entry (first 3 min of window) exploits the biggest mispricing.
@@ -891,16 +1077,53 @@ class LiveTrader:
             else:
                 score -= 2  # betting against continuation direction — risky
 
-        # AMM edge check — still required even at score ≥ 4
-        vol      = self.vols.get(asset, 0.70)
-        bs_prob  = self._prob_up(current, open_price, mins_left, vol)
-        mom_prob = mom_90s
-        mw       = self._adaptive_momentum_weight()
-        combined = (1 - mw) * bs_prob + mw * mom_prob
+        # Autocorr + Variance Ratio regime: trending boosts momentum confidence
+        if vr_ratio > 1.05 and autocorr > 0.05:
+            score += 1       # trending regime — momentum more reliable
+            regime_mult = 1.15
+        elif vr_ratio < 0.95 and autocorr < -0.05:
+            score -= 1       # mean-reverting — momentum less reliable
+            regime_mult = 0.85
+        else:
+            regime_mult = 1.0
+
+        # Log-likelihood true_prob — Bayesian combination of independent signals
+        sigma_15m = self.vols.get(asset, 0.70) * (15 / (252 * 390)) ** 0.5
+        llr = 0.0
+        # 1. Price displacement z-score
+        if open_price > 0 and sigma_15m > 0:
+            llr += (current - open_price) / open_price / sigma_15m * 1.5
+        # 2. Short vs long EMA cross
+        ema5  = self.emas.get(asset, {}).get(5, current)
+        ema60 = self.emas.get(asset, {}).get(60, current)
+        if ema60 > 0:
+            llr += (ema5 / ema60 - 1.0) * 300.0
+        # 3. Kalman velocity
+        k = self.kalman.get(asset, {})
+        if k.get("rdy"):
+            per_sec_vol = max(self.vols.get(asset, 0.7) / math.sqrt(252 * 24 * 3600), 1e-8)
+            llr += k["vel"] / per_sec_vol * 0.4
+        # 4. Depth-weighted OB imbalance
+        llr += dw_ob * 2.5
+        # 5. Taker buy/sell flow
+        llr += (taker_ratio - 0.5) * 5.0
+        # 6. Perp basis
+        if abs(perp_basis) > 1e-7:
+            llr += math.copysign(min(abs(perp_basis) * 1000.0, 1.5), perp_basis)
+        # 7. Chainlink oracle agreement
+        if cl_agree:  llr += 0.4
+        else:         llr -= 1.0
+        # 8. BTC lead for altcoins
+        if asset != "BTC":
+            llr += (btc_lead_p - 0.5) * 3.0
+        # 9. Regime scale
+        llr *= regime_mult
+        # Sigmoid → prob_up
+        p_up_ll   = 1.0 / (1.0 + math.exp(-max(-6.0, min(6.0, llr))))
         bias_up   = self._direction_bias(asset, "Up")
         bias_down = self._direction_bias(asset, "Down")
-        prob_up   = max(0.05, min(0.95, combined + bias_up))
-        prob_down = max(0.05, min(0.95, (1 - combined) + bias_down))
+        prob_up   = max(0.05, min(0.95, p_up_ll + bias_up))
+        prob_down = max(0.05, min(0.95, 1.0 - p_up_ll + bias_down))
 
         # Early continuation prior: at window open BS/momentum ≈ 0.50 (no current-window move yet).
         # Apply 87.7% continuation prior: prior scales 70–80% with prev move size.
@@ -1675,22 +1898,18 @@ class LiveTrader:
         return float(norm.cdf(d))
 
     def _momentum_prob(self, asset: str, seconds: int = 60) -> float:
-        """Momentum-based P(Up) from last `seconds` of RTDS price history."""
-        hist = self.price_history.get(asset)
-        if not hist or len(hist) < 2:
+        """P(Up) from time-based EMA at the closest cached half-life; O(1) from cache."""
+        ema_dict = self.emas.get(asset)
+        if not ema_dict:
             return 0.5
-        now_ts  = _time.time()
-        cutoff  = now_ts - seconds
-        past    = [(ts, p) for ts, p in hist if ts <= cutoff]
-        if not past:
+        hl    = min(ema_dict.keys(), key=lambda h: abs(h - seconds))
+        price = self.prices.get(asset, 0.0)
+        ema   = ema_dict.get(hl, 0.0)
+        if price == 0 or ema == 0:
             return 0.5
-        past_price  = past[-1][1]
-        current     = list(hist)[-1][1]
-        if past_price <= 0:
-            return 0.5
-        move = (current - past_price) / past_price
-        vol  = self.vols.get(asset, 0.70)
-        vol_t = vol * math.sqrt(seconds / (252 * 24 * 3600))
+        move  = (price - ema) / ema
+        vol   = self.vols.get(asset, 0.70)
+        vol_t = vol * math.sqrt(hl / (252 * 24 * 3600))
         if vol_t == 0:
             return 0.5
         return float(norm.cdf(move / vol_t))
