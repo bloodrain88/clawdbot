@@ -662,6 +662,24 @@ class LiveTrader:
         return found
 
     # ── SCORE + EXECUTE ───────────────────────────────────────────────────────
+    async def _fetch_pm_book_safe(self, token_id: str):
+        """Fetch Polymarket CLOB book; return (best_bid, best_ask, tick) or None."""
+        if not token_id:
+            return None
+        loop = asyncio.get_event_loop()
+        try:
+            book     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+            tick     = float(book.tick_size or "0.01")
+            asks     = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
+            bids     = sorted(book.bids, key=lambda x: float(x.price), reverse=True) if book.bids else []
+            if not asks:
+                return None
+            best_ask = float(asks[0].price)
+            best_bid = float(bids[0].price) if bids else best_ask - 0.10
+            return (best_bid, best_ask, tick)
+        except Exception:
+            return None
+
     async def _score_market(self, m: dict) -> dict | None:
         """Score a market opportunity. Returns signal dict or None if hard-blocked.
         Pure analysis — no side effects, no order placement."""
@@ -673,6 +691,8 @@ class LiveTrader:
         mins_left = m["mins_left"]
         up_price  = m["up_price"]
         label     = f"{asset} {duration}m | {m.get('question','')[:45]}"
+        # Pre-fetch likely token book (cheap-side = token_up iff up_price≤0.50)
+        prefetch_token = m.get("token_up", "") if up_price <= 0.50 else m.get("token_down", "")
 
         current = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
         if current == 0:
@@ -783,15 +803,17 @@ class LiveTrader:
         if cl_agree:  score += 1
         else:         score -= 3
 
-        # ── Fetch all Binance signals IN PARALLEL (~30-80ms total) ──────────────
+        # ── Fetch all Binance signals + PM orderbook IN PARALLEL (~30-80ms total) ─
         (ob_imbalance,
          (taker_ratio, vol_ratio),
          (perp_basis, funding_rate),
-         (vwap_dev, vol_mult)) = await asyncio.gather(
+         (vwap_dev, vol_mult),
+         _pm_book) = await asyncio.gather(
             self._binance_imbalance(asset),
             self._binance_taker_flow(asset),
             self._binance_perp_signals(asset),
             self._binance_window_stats(asset, m["start_ts"]),
+            self._fetch_pm_book_safe(prefetch_token),  # free — hides inside Binance latency
         )
 
         # Order book imbalance (−1 to +3; >40% contra = hard block)
@@ -951,6 +973,8 @@ class LiveTrader:
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
             return None
+        # Use pre-fetched book if it matches the bet token; else it will be re-fetched in _place_order
+        pm_book_data = _pm_book if token_id == prefetch_token else None
 
         # Force taker for high-score early continuation — fill immediately before AMM reprices
         force_taker = (
@@ -974,6 +998,7 @@ class LiveTrader:
             "vwap_dev": vwap_dev, "vol_mult": vol_mult, "cross_count": cross_count,
             "prev_win_dir": prev_win_dir, "prev_win_move": prev_win_move,
             "is_early_continuation": is_early_continuation,
+            "pm_book_data": pm_book_data,
         }
 
     async def _execute_trade(self, sig: dict):
@@ -1010,7 +1035,7 @@ class LiveTrader:
             sig["asset"], sig["duration"], sig["mins_left"],
             sig["true_prob"], sig["cl_agree"],
             min_edge_req=sig["min_edge"], force_taker=sig["force_taker"],
-            score=sig["score"]
+            score=sig["score"], pm_book_data=sig.get("pm_book_data")
         )
         m = sig["m"]
         trade = {
@@ -1032,7 +1057,7 @@ class LiveTrader:
         if sig and sig["score"] >= 4:
             await self._execute_trade(sig)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -1049,23 +1074,26 @@ class LiveTrader:
             try:
                 loop = asyncio.get_event_loop()
 
-                # Fetch live order book — always fresh, ~36ms, worth it for accurate edge
-                book     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
-                tick     = float(book.tick_size or "0.01")
-                asks     = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
-                bids     = sorted(book.bids, key=lambda x: float(x.price), reverse=True) if book.bids else []
+                # Use pre-fetched book from scoring phase (free — ran in parallel with Binance signals)
+                # or fetch fresh if not cached (~36ms)
+                if pm_book_data is not None:
+                    best_bid, best_ask, tick = pm_book_data
+                    spread = best_ask - best_bid
+                    pm_book_data = None   # consume once; retries fetch fresh
+                else:
+                    book     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                    tick     = float(book.tick_size or "0.01")
+                    asks     = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
+                    bids     = sorted(book.bids, key=lambda x: float(x.price), reverse=True) if book.bids else []
+                    if not asks:
+                        print(f"{Y}[SKIP] {asset} {side}: empty order book{RS}")
+                        return None
+                    best_ask = float(asks[0].price)
+                    best_bid = float(bids[0].price) if bids else best_ask - 0.10
+                    spread   = best_ask - best_bid
 
-                if not asks:
-                    print(f"{Y}[SKIP] {asset} {side}: empty order book{RS}")
-                    return None
-
-                best_ask = float(asks[0].price)
-                best_bid = float(bids[0].price) if bids else best_ask - 0.10
-                spread   = best_ask - best_bid
-
-                taker_edge = true_prob - best_ask
-                best_bid_p = float(bids[0].price) if bids else best_ask - 0.10
-                mid_est    = (best_bid_p + best_ask) / 2
+                taker_edge     = true_prob - best_ask
+                mid_est        = (best_bid + best_ask) / 2
                 maker_edge_est = true_prob - mid_est
 
                 if score >= 10:
@@ -1087,20 +1115,22 @@ class LiveTrader:
                         return None
                     print(f"{B}[FILL]{RS} {asset} {side} edge={taker_edge:.3f} floor={edge_floor:.2f}")
 
-                # High conviction: skip maker, go straight to taker for instant fill
+                # High conviction: skip maker, go straight to FOK taker for instant fill
+                # FOK = Fill-or-Kill: fills completely at price or cancels instantly — no waiting
                 if force_taker:
                     taker_price = round(min(best_ask + tick, 0.97), 4)
                     size_tok_t  = round(size_usdc / taker_price, 2)
                     print(f"{G}[FAST-TAKER]{RS} {asset} {side} HIGH-CONV @ {taker_price:.3f} | ${size_usdc:.2f}")
                     order_args = OrderArgs(token_id=token_id, price=taker_price, size=size_tok_t, side="BUY")
                     signed  = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
-                    resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.GTC))
+                    resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
                     order_id = resp.get("orderID") or resp.get("id", "")
-                    if order_id and resp.get("status") in ("matched", "filled", ""):
+                    if resp.get("status") in ("matched", "filled"):
                         self.bankroll -= size_usdc
                         print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
                         return order_id
-                    # If not filled immediately, fall through to normal maker/taker flow
+                    # FOK not filled (thin liquidity) — fall through to normal maker/taker flow
+                    print(f"{Y}[FOK] unfilled — falling back to maker{RS}")
                     force_taker = False  # reset so we don't loop
 
                 # ── PHASE 1: Maker bid at mid ──────────────────────────────
@@ -1133,10 +1163,10 @@ class LiveTrader:
                           f"Bank ${self.bankroll:.2f}")
                     return order_id
 
-                # 5m markets: 5s maker wait (can't waste 1/3 of market life)
-                # 15m markets: 15s maker wait
-                poll_interval = 5 if duration <= 5 else 10
-                max_wait  = min(15 if duration <= 5 else 20, int(mins_left * 60 * 0.15))
+                # 5m markets: 3s maker wait  | 15m markets: 10s maker wait
+                # Reduced from 5/20s — faster fallback to taker improves fill rate
+                poll_interval = 3 if duration <= 5 else 5
+                max_wait  = min(6 if duration <= 5 else 10, int(mins_left * 60 * 0.10))
                 polls     = max(1, max_wait // poll_interval)
                 print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
                       f"waiting up to {polls*poll_interval}s for fill...{RS}")
@@ -1166,11 +1196,13 @@ class LiveTrader:
                 except Exception:
                     pass
 
-                # ── PHASE 2: Taker fallback — re-fetch book for fresh ask ──
+                # ── PHASE 2: FAK taker fallback — re-fetch book for fresh ask ──
+                # FAK = Fill-and-Kill (IOC): fills what's available instantly, cancels remainder
+                # No sleep needed — response is immediate
                 try:
-                    fresh    = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
-                    f_asks   = sorted(fresh.asks, key=lambda x: float(x.price)) if fresh.asks else asks
-                    f_tick   = float(fresh.tick_size or tick)
+                    fresh     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                    f_asks    = sorted(fresh.asks, key=lambda x: float(x.price)) if fresh.asks else []
+                    f_tick    = float(fresh.tick_size or tick)
                     fresh_ask = float(f_asks[0].price) if f_asks else best_ask
                     fresh_ep  = true_prob - fresh_ask
                     if fresh_ep < edge_floor:
@@ -1180,51 +1212,34 @@ class LiveTrader:
                 except Exception:
                     taker_price = round(min(best_ask + tick, 0.97), 4)
                     fresh_ask   = best_ask
-                print(f"{Y}[MAKER] unfilled — taker @ {taker_price:.3f} (fresh ask={fresh_ask:.3f}){RS}")
-                size_tok_t  = round(size_usdc / taker_price, 2)
+                print(f"{Y}[MAKER] unfilled — FAK taker @ {taker_price:.3f} (fresh ask={fresh_ask:.3f}){RS}")
+                size_tok_t = round(size_usdc / taker_price, 2)
 
                 order_args = OrderArgs(token_id=token_id, price=taker_price,
                                        size=size_tok_t, side="BUY")
-                signed  = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
-                resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.GTC))
+                signed   = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
+                resp     = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FAK))
                 order_id = resp.get("orderID") or resp.get("id", "")
                 status   = resp.get("status", "")
 
-                if not order_id:
-                    return None
-
-                if status == "matched":
+                if order_id and status in ("matched", "filled"):
                     self.bankroll -= size_usdc
                     print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
                           f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
                     return order_id
 
-                await asyncio.sleep(3)
-                try:
-                    info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
-                    if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
-                        self.bankroll -= size_usdc
-                        print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
-                              f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                        return order_id
-                except Exception:
-                    pass
-
-                try:
-                    await loop.run_in_executor(None, lambda: self.clob.cancel(order_id))
-                except Exception:
-                    pass
-                # Final check: cancel might have raced with a fill — verify before giving up
-                try:
-                    info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
-                    if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
-                        self.bankroll -= size_usdc
-                        print(f"{Y}[TAKER FILL (late)]{RS} {side} {asset} {duration}m | "
-                              f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                        return order_id
-                except Exception:
-                    pass
-                print(f"{Y}[ORDER] Both maker and taker unfilled — cancelled{RS}")
+                # FAK may partially fill — check order state once
+                if order_id:
+                    try:
+                        info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                        if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
+                            self.bankroll -= size_usdc
+                            print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
+                                  f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                            return order_id
+                    except Exception:
+                        pass
+                print(f"{Y}[ORDER] Both maker and FAK taker unfilled — cancelled{RS}")
                 return None
 
             except Exception as e:
