@@ -1234,7 +1234,7 @@ class LiveTrader:
             "vwap_dev": vwap_dev, "vol_mult": vol_mult, "cross_count": cross_count,
             "prev_win_dir": prev_win_dir, "prev_win_move": prev_win_move,
             "is_early_continuation": is_early_continuation,
-            "pm_book_data": pm_book_data,
+            "pm_book_data": pm_book_data, "use_limit": use_limit,
         }
 
     async def _execute_trade(self, sig: dict):
@@ -1271,7 +1271,8 @@ class LiveTrader:
             sig["asset"], sig["duration"], sig["mins_left"],
             sig["true_prob"], sig["cl_agree"],
             min_edge_req=sig["min_edge"], force_taker=sig["force_taker"],
-            score=sig["score"], pm_book_data=sig.get("pm_book_data")
+            score=sig["score"], pm_book_data=sig.get("pm_book_data"),
+            use_limit=sig.get("use_limit", False)
         )
         m = sig["m"]
         trade = {
@@ -1293,7 +1294,7 @@ class LiveTrader:
         if sig and sig["score"] >= 4:
             await self._execute_trade(sig)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -1332,9 +1333,13 @@ class LiveTrader:
                 mid_est        = (best_bid + best_ask) / 2
                 maker_edge_est = true_prob - mid_est
 
-                if score >= 10:
+                if use_limit:
+                    # GTC limit at target price (price << market) — skip market-based edge gate
+                    # Edge is computed vs target, not current ask
+                    limit_edge = true_prob - price
+                    print(f"{B}[LIMIT]{RS} {asset} {side} target={price:.3f} limit_edge={limit_edge:.3f} ask={best_ask:.3f}")
+                elif score >= 10:
                     # High conviction: gate on maker edge (mid price), not taker (ask)
-                    # Maker posts at mid → much better fill than ask even with wide spread
                     if maker_edge_est < 0:
                         print(f"{Y}[SKIP] {asset} {side} [high-conv]: maker_edge={maker_edge_est:.3f} < 0 "
                               f"(mid={mid_est:.3f} model={true_prob:.3f}){RS}")
@@ -1368,10 +1373,14 @@ class LiveTrader:
                     print(f"{Y}[FOK] unfilled — falling back to maker{RS}")
                     force_taker = False  # reset so we don't loop
 
-                # ── PHASE 1: Maker bid at mid ──────────────────────────────
+                # ── PHASE 1: Maker bid ────────────────────────────────────
                 mid          = (best_bid + best_ask) / 2
-                maker_price  = round(min(mid + tick, best_ask - tick), 4)
-                maker_price  = max(maker_price, tick)
+                if use_limit:
+                    # True GTC limit at target price — will fill only on pullback
+                    maker_price = round(max(price, tick), 4)
+                else:
+                    maker_price = round(min(mid + tick, best_ask - tick), 4)
+                    maker_price = max(maker_price, tick)
                 maker_edge   = true_prob - maker_price
                 size_tok_m   = round(size_usdc / maker_price, 2)
 
