@@ -376,7 +376,7 @@ class LiveTrader:
                 payout_est = 0
                 move_str   = "(no ref)"
             print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
-                  f"open={open_p:.2f} {src}={cur_p:.2f} {move_str} | "
+                  f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
                   f"bet=${size:.2f} est=${payout_est:.2f} | {mins_left:.1f}min left")
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
@@ -1970,9 +1970,17 @@ class LiveTrader:
                         self.open_prices_source[cid] = src
                         print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | beat=${ref:,.4f} [{src}] | {m['mins_left']:.1f}min left{RS}")
                 else:
-                    # Already known — log every 30s (not every scan) to reduce noise
-                    ref = self.open_prices[cid]
+                    # Already known — but if source isn't PM yet, retry authoritative API
                     src = self.open_prices_source.get(cid, "?")
+                    if src != "PM":
+                        start_ts = m.get("start_ts", now)
+                        end_ts_m = m.get("end_ts", now + dur * 60)
+                        pm_ref = await self._get_polymarket_open_price(asset, start_ts, end_ts_m)
+                        if pm_ref > 0:
+                            self.open_prices[cid]        = pm_ref
+                            self.open_prices_source[cid] = "PM"
+                            src = "PM"
+                    ref = self.open_prices[cid]
                     cur = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
                     now_ts = _time.time()
                     if cur > 0 and now_ts - self._mkt_log_ts.get(cid, 0) >= 30:
