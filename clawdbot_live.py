@@ -61,7 +61,6 @@ MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momen
 MIN_BET        = 3.0      # $3 floor (small bankroll recovery mode)
 MAX_BET        = 12.0     # $12 ceiling — protect bankroll
 KELLY_FRAC     = 0.18     # 18% Kelly — conservative, reduce loss rate
-MAX_DAILY_LOSS = 0.40     # 40% hard stop (session recovery mode)
 MAX_OPEN       = 3        # max 3 simultaneous positions — quality over quantity
 LOSS_STREAK_PAUSE = 3     # pause evaluation after N consecutive losses
 LOSS_STREAK_WAIT  = 25 * 60  # pause duration in seconds (25 min)
@@ -148,6 +147,7 @@ class LiveTrader:
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
         self.cooldown_until     = 0.0                # epoch: pause evaluate() until this time
+        self._pause_log_ts      = {}                 # cid → last pause log time (reduce spam)
         self._init_log()
         self._load_pending()
         self._load_stats()
@@ -619,8 +619,7 @@ class LiveTrader:
         # Consecutive loss circuit breaker — pause after N losses to avoid cascading losses
         if _time.time() < self.cooldown_until:
             remaining_pause = (self.cooldown_until - _time.time()) / 60
-            if not hasattr(self, '_pause_log_ts') or _time.time() - self._pause_log_ts.get(cid, 0) > 120:
-                if not hasattr(self, '_pause_log_ts'): self._pause_log_ts = {}
+            if _time.time() - self._pause_log_ts.get(cid, 0) > 120:
                 self._pause_log_ts[cid] = _time.time()
                 print(f"{Y}[PAUSE] {label} → {self.consec_losses} consecutive losses, cooling {remaining_pause:.0f}min{RS}")
             return
@@ -1646,12 +1645,8 @@ class LiveTrader:
                         # Window just opened — no CL round yet. Wait for next scan.
                         print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | waiting for first CL round...{RS}")
                     elif ref <= 0:
-                        # CL error — fallback to cached price
-                        ref = self.cl_prices.get(asset, 0) or self.prices.get(asset, 0)
-                        src = "CL-fallback"
-                        if ref > 0:
-                            self.open_prices[cid]        = ref
-                            self.open_prices_source[cid] = src
+                        # CL error — don't store fallback price; retry next scan cycle
+                        # (evaluate() rejects CL-fallback anyway, so storing it wastes cycles)
                             print(f"{Y}[NEW MARKET] {asset} {dur}m | {title_s} | beat=${ref:,.2f} [fallback]{RS}")
                     else:
                         self.open_prices[cid]        = ref
