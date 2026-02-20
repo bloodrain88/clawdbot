@@ -1753,6 +1753,82 @@ class LiveTrader:
             except Exception as e:
                 print(f"{Y}[SCAN-REDEEM] Error: {e}{RS}")
 
+    async def _verify_pending_onchain(self):
+        """Cross-check every position in self.pending against on-chain CTF token balance.
+        Removes ghost positions (balance=0, unresolved) and moves resolved wins/losses
+        to pending_redeem. Called at startup and every 5 min from _position_sync_loop."""
+        if DRY_RUN or self.w3 is None or not self.pending:
+            return
+        from eth_utils import keccak as _keccak
+        cfg      = get_contract_config(CHAIN_ID, neg_risk=False)
+        ctf_addr = Web3.to_checksum_address(cfg.conditional_tokens)
+        VABI = [
+            {"inputs":[{"name":"owner","type":"address"},{"name":"id","type":"uint256"}],
+             "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"conditionId","type":"bytes32"}],
+             "name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"conditionId","type":"bytes32"},{"name":"index","type":"uint256"}],
+             "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+        ]
+        ctf  = self.w3.eth.contract(address=ctf_addr, abi=VABI)
+        loop = asyncio.get_event_loop()
+        addr = Web3.to_checksum_address(ADDRESS)
+
+        for cid in list(self.pending.keys()):
+            if cid not in self.pending:
+                continue
+            m, trade = self.pending[cid]
+            side     = trade.get("side", "Up")
+            asset    = trade.get("asset", "?")
+            title    = m.get("question", "")[:35]
+            try:
+                # Resolve token_id: prefer stored, fallback to compute from conditionId+indexSet
+                token_id_str = trade.get("token_id") or ""
+                if token_id_str:
+                    token_id = int(token_id_str)
+                else:
+                    cid_bytes = bytes.fromhex(cid.lstrip("0x").zfill(64))
+                    idx       = 1 if side == "Up" else 2
+                    coll_id   = _keccak(b'\x00'*32 + cid_bytes + idx.to_bytes(32, 'big'))
+                    token_id  = int.from_bytes(coll_id, 'big')
+
+                bal = await loop.run_in_executor(
+                    None, lambda ti=token_id: ctf.functions.balanceOf(addr, ti).call()
+                )
+
+                if bal > 0:
+                    print(f"{B}[VERIFY] {asset} {side} | {title} | on-chain bal={bal} ✓{RS}")
+                    continue  # confirmed — real position
+
+                # Balance = 0: market still open or already resolved?
+                cid_bytes = bytes.fromhex(cid.lstrip("0x").zfill(64))
+                denom = await loop.run_in_executor(
+                    None, lambda b=cid_bytes: ctf.functions.payoutDenominator(b).call()
+                )
+                if denom == 0:
+                    # Market unresolved AND balance=0 → ghost position, remove
+                    self.pending.pop(cid, None)
+                    self._save_pending()
+                    print(f"{R}[VERIFY] {asset} {side} | {title} | bal=0 + unresolved → removed ghost{RS}")
+                else:
+                    # Market resolved, balance=0 → Polymarket already redeemed or it was a loss
+                    n0 = await loop.run_in_executor(
+                        None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 0).call()
+                    )
+                    winner = "Up" if n0 > 0 else "Down"
+                    won    = (winner == side)
+                    self.pending.pop(cid, None)
+                    self._save_pending()
+                    if won and cid not in self.pending_redeem:
+                        # Move to pending_redeem so _redeem_loop can record the win
+                        self.pending_redeem[cid] = (m, trade)
+                        self._redeem_queued_ts[cid] = _time.time()
+                        print(f"{G}[VERIFY] {asset} {side} | {title} | resolved WIN → redeem queue{RS}")
+                    else:
+                        print(f"{Y}[VERIFY] {asset} {side} | {title} | resolved LOSS, bal=0 → removed{RS}")
+            except Exception as e:
+                print(f"{Y}[VERIFY] {asset} {side} check error: {e}{RS}")
+
     async def _position_sync_loop(self):
         """Every 5 min: sync on-chain positions to pending — catches any fills the bot missed."""
         if DRY_RUN:
@@ -1830,6 +1906,24 @@ class LiveTrader:
                            "end_ts": end_ts, "asset": asset, "duration": duration,
                            "token_id": token_up if side == "Up" else token_down,
                            "order_id": "SYNC-PERIODIC"}
+                    # Verify on-chain before adding — don't trust API alone
+                    _token_id_str = token_up if side == "Up" else token_down
+                    _onchain_bal  = 0
+                    if _token_id_str and self.w3:
+                        try:
+                            _BABI = [{"inputs":[{"name":"owner","type":"address"},{"name":"id","type":"uint256"}],
+                                      "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+                            _ctf_v = self.w3.eth.contract(
+                                address=Web3.to_checksum_address(get_contract_config(CHAIN_ID, neg_risk=False).conditional_tokens),
+                                abi=_BABI)
+                            _onchain_bal = await loop.run_in_executor(
+                                None, lambda ti=int(_token_id_str): _ctf_v.functions.balanceOf(
+                                    Web3.to_checksum_address(ADDRESS), ti).call())
+                        except Exception:
+                            _onchain_bal = -1  # unknown — allow, _verify will catch it
+                    if _onchain_bal == 0 and _token_id_str:
+                        print(f"{Y}[SYNC] Skip recovery (bal=0 on-chain): {title[:35]} {side}{RS}")
+                        continue
                     self.pending[cid] = (m_r, t_r)
                     self.seen.add(cid)
                     added += 1
@@ -1837,6 +1931,8 @@ class LiveTrader:
                 if added:
                     self._save_pending()
                     self._save_seen()
+                # After sync: audit all pending against on-chain to purge ghosts
+                await self._verify_pending_onchain()
             except Exception as e:
                 print(f"{Y}[SYNC] position_sync_loop error: {e}{RS}")
 
@@ -1857,6 +1953,7 @@ class LiveTrader:
 """)
         self.init_clob()
         self._sync_redeemable()   # redeem any wins from previous runs
+        await self._verify_pending_onchain()  # purge ghost positions, move resolved to redeem queue
         # Sync stats from API immediately so first status print shows real data
         import requests as _req
         loop = asyncio.get_event_loop()
