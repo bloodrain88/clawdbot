@@ -613,7 +613,7 @@ class LiveTrader:
 
         # Stop-loss: use total effective value (USDC + locked bets not yet in API)
         # Avoids false triggers when bankroll is temporarily low after a fill
-        locked_bets = sum(t.get("size", 0) for _, t in self.pending.items())
+        locked_bets = sum(t.get("size", 0) for _, (_, t) in self.pending.items())
         if (self.bankroll + locked_bets) <= self.start_bank * (1 - MAX_DAILY_LOSS):
             print(f"{R}[SKIP] {label} → daily loss limit hit "
                   f"(bank=${self.bankroll:.2f}+locked=${locked_bets:.2f} ≤ ${self.start_bank*(1-MAX_DAILY_LOSS):.2f}){RS}")
