@@ -1157,8 +1157,8 @@ class LiveTrader:
         # Bet the signal direction — win rate drives P&L, not just payout
         entry = up_price if side == "Up" else (1 - up_price)
 
-        # ── Score gate: only confident signals ───────────────────────────────
-        if score < 6:
+        # ── Score gate: trade all markets ────────────────────────────────────
+        if score < 1:
             return None
 
         token_id = m["token_up"] if side == "Up" else m["token_down"]
