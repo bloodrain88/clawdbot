@@ -61,7 +61,7 @@ MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momen
 DUST_BET       = 5.0      # $5 absolute floor (Polymarket minimum order size)
 MAX_ABS_BET    = 20.0     # $20 hard ceiling regardless of bankroll/WR/Kelly — prevents runaway sizing
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
-MAX_OPEN       = 2        # max 2 simultaneous positions — prevent 3 correlated losses
+MAX_OPEN       = 1        # 1 position at a time — BTC+ETH are correlated, no point doubling
 MAX_SAME_DIR   = 1        # max 1 position per direction (no 2x Up or 2x Down)
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
