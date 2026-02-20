@@ -58,7 +58,7 @@ BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
 MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to determine direction
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
-DUST_BET       = 5.0      # $5 absolute floor (Polymarket minimum order size)
+DUST_BET       = 10.0     # $10 absolute floor — no dust bets
 MAX_ABS_BET    = 20.0     # $20 hard ceiling regardless of bankroll/WR/Kelly — prevents runaway sizing
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
 MAX_OPEN       = 2        # 2 simultaneous — max data collection across 4 assets
@@ -1157,8 +1157,8 @@ class LiveTrader:
         # Bet the signal direction — win rate drives P&L, not just payout
         entry = up_price if side == "Up" else (1 - up_price)
 
-        # ── Score gate: trade every market (any score ≥ 1) ──────────────────
-        if score < 1:
+        # ── Score gate: only confident signals ───────────────────────────────
+        if score < 6:
             return None
 
         token_id = m["token_up"] if side == "Up" else m["token_down"]
@@ -1172,50 +1172,43 @@ class LiveTrader:
             _, clob_ask, _ = pm_book_data
             live_entry = clob_ask
 
-        # ── Entry strategy: immediate fill vs GTC limit order ────────────────
-        # Core insight: we know the direction before betting.
-        # If the market has already priced it in (expensive token), don't skip —
-        # place a GTC limit at our TARGET price (45¢ = 2.22x payout).
-        # The order fills only when the market pulls back to give us cheap entry.
-        # This way we ALWAYS trade every market AND always get high payout.
-        #
-        # Immediate: live_entry ≤ 55¢  → FOK/market at current price
-        # Limit:     live_entry > 55¢   → GTC limit at 45¢, wait for pullback
-        # Skip:      expensive + <55% window left → not enough time for limit
+        # ── Entry strategy ────────────────────────────────────────────────────
+        # Data shows 21% WR → profitable only at ≤22¢ (4.5x+).
+        # If market currently expensive, place GTC limit at 22¢ (wait for pullback).
+        # Skip if <55% window left and token still expensive (won't fill in time).
         use_limit = False
-        if live_entry <= 0.55:
-            entry = live_entry                # take current market price
+        if live_entry <= 0.22:
+            entry = live_entry                # immediate — already cheap enough
+        elif live_entry <= 0.40:
+            entry = live_entry                # take it — decent payout, above break-even
+            use_limit = False
         elif pct_remaining > 0.55:
-            entry = 0.45                      # GTC limit at 45¢ — wait for pullback
+            entry = 0.22                      # GTC limit at 22¢ (4.5x), wait for pullback
             use_limit = True
         else:
-            return None                       # expensive + window >45% elapsed — skip
+            return None                       # expensive + >45% elapsed — skip
 
-        # ── ENTRY PRICE TIERS (based on actual fill price) ────────────────────
-        # Payout = 1/entry. Bigger bet when payout is higher.
-        if entry <= 0.30:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.25
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.40, 0.18
-            elif score >= 4:  kelly_frac, bankroll_pct = 0.25, 0.12
-            else:             kelly_frac, bankroll_pct = 0.15, 0.07
-        elif entry <= 0.40:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.45, 0.18
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.30, 0.12
-            elif score >= 4:  kelly_frac, bankroll_pct = 0.18, 0.08
+        # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
+        # ≤22¢ = 4.5x+ payout. At 21% WR: EV = 0.21×4.5−1 = −0.055 (near break-even)
+        # ≤20¢ = 5x+.         At 21% WR: EV = 0.21×5.0−1 = +0.05  (profitable)
+        # Max bet on cheapest tokens where edge is real.
+        if entry <= 0.20:
+            if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.30
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.45, 0.22
+            else:             kelly_frac, bankroll_pct = 0.30, 0.15
+        elif entry <= 0.30:
+            if   score >= 12: kelly_frac, bankroll_pct = 0.40, 0.20
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.28, 0.14
+            else:             kelly_frac, bankroll_pct = 0.18, 0.09
+        else:  # 0.30–0.40
+            if   score >= 12: kelly_frac, bankroll_pct = 0.25, 0.12
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.15, 0.08
             else:             kelly_frac, bankroll_pct = 0.10, 0.05
-        elif entry <= 0.50:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.30, 0.12
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.20, 0.08
-            elif score >= 4:  kelly_frac, bankroll_pct = 0.12, 0.05
-            else:             kelly_frac, bankroll_pct = 0.08, 0.03
-        else:  # 0.50–0.55
-            if   score >= 8:  kelly_frac, bankroll_pct = 0.15, 0.06
-            else:             kelly_frac, bankroll_pct = 0.08, 0.03
 
         wr_scale   = self._wr_bet_scale()
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
         max_single = min(100.0, self.bankroll * bankroll_pct)
-        abs_cap    = max_single * 1.5 if score >= 12 and entry <= 0.35 else max_single
+        abs_cap    = max_single * 1.5 if score >= 12 and entry <= 0.20 else max_single
         size       = max(DUST_BET, round(min(abs_cap, raw_size * vol_mult * wr_scale), 2))
 
         # Immediate fills: FOK on strong signal, GTC limit otherwise
