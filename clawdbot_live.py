@@ -1160,26 +1160,23 @@ class LiveTrader:
             side  = "Down" if side == "Up" else "Up"
             entry = up_price if side == "Up" else (1 - up_price)
 
-        # ── ENTRY PRICE TIERS — always trade, size by score ──────────────────
-        # Tier 1: ≤35¢ → 3x+ payout   Tier 2: ≤45¢ → 2.2x+   Tier 3: ≤50¢ → 2x
-        # Score drives kelly/bankroll fraction; score=0 still bets minimum
+        # ── Score gate: skip low-conviction markets (were causing 41% min-bet spam) ──
+        if score < 4:
+            return None
+
+        # ── ENTRY PRICE TIERS ────────────────────────────────────────────────
+        # Tier 1: ≤35¢ → 3x+ payout (best EV — all wins concentrated here)
+        # Tier 2: ≤45¢ → 2.2x+
         if entry <= 0.35:
             if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.25
             elif score >= 8:  kelly_frac, bankroll_pct = 0.40, 0.18
-            elif score >= 4:  kelly_frac, bankroll_pct = 0.25, 0.12
-            else:             kelly_frac, bankroll_pct = 0.15, 0.07
+            else:             kelly_frac, bankroll_pct = 0.25, 0.12
         elif entry <= 0.45:
             if   score >= 12: kelly_frac, bankroll_pct = 0.45, 0.15
             elif score >= 8:  kelly_frac, bankroll_pct = 0.30, 0.10
-            elif score >= 4:  kelly_frac, bankroll_pct = 0.18, 0.06
-            else:             kelly_frac, bankroll_pct = 0.10, 0.04
-        elif entry <= 0.50:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.30, 0.10
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.20, 0.07
-            elif score >= 4:  kelly_frac, bankroll_pct = 0.12, 0.04
-            else:             kelly_frac, bankroll_pct = 0.07, 0.03
+            else:             kelly_frac, bankroll_pct = 0.18, 0.06
         else:
-            return None   # entry > 50¢ — no positive-EV bet possible
+            return None   # entry > 45¢ — payout too low
 
         wr_scale   = self._wr_bet_scale()
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
