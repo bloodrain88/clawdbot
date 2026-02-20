@@ -935,7 +935,7 @@ class LiveTrader:
         Never trust local price comparison — Polymarket resolves on Chainlink
         at the exact expiry timestamp, which may differ from current price."""
         now     = datetime.now(timezone.utc).timestamp()
-        expired = [k for k, (m, t) in self.pending.items() if m["end_ts"] <= now]
+        expired = [k for k, (m, t) in self.pending.items() if m.get("end_ts", 0) > 0 and m["end_ts"] <= now]
 
         for k in expired:
             m, trade = self.pending.pop(k)
@@ -1190,8 +1190,11 @@ class LiveTrader:
                 self.pending.pop(cid, None)
                 continue
 
+            if end_ts == 0:
+                print(f"{Y}[SYNC] {title[:40]} — no end_ts from Gamma, skipping{RS}")
+                continue
             entry     = (val / size_tok) if size_tok > 0 else 0.5
-            mins_left = (end_ts - now) / 60 if end_ts > 0 else 999
+            mins_left = (end_ts - now) / 60
 
             m = {"conditionId": cid, "question": title, "asset": asset,
                  "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
@@ -1782,7 +1785,10 @@ class LiveTrader:
                             self.pending_redeem[cid] = (m_s, t_s)
                             print(f"{Y}[SYNC] Expired → queued for resolution: {title[:40]} {side}{RS}")
                         continue
-                    mins_left = (end_ts - now) / 60 if end_ts > 0 else 999
+                    if end_ts == 0:
+                        print(f"{Y}[SYNC] {title[:40]} — no end_ts from Gamma, skipping{RS}")
+                        continue
+                    mins_left = (end_ts - now) / 60
                     m_r = {"conditionId": cid, "question": title, "asset": asset,
                            "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
                            "up_price": 0.5, "mins_left": mins_left,
