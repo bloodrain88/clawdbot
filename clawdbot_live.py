@@ -1154,19 +1154,18 @@ class LiveTrader:
                 return None   # AMM massively overpriced our direction — no edge
             side, edge, true_prob = direction, max(0.01, dir_edge), dir_prob
 
-        # Always take the cheaper side — higher payout, better edge
+        # Bet the signal direction — win rate drives P&L, not just payout
         entry = up_price if side == "Up" else (1 - up_price)
-        if entry > 0.50:
-            side  = "Down" if side == "Up" else "Up"
-            entry = up_price if side == "Up" else (1 - up_price)
 
-        # ── Score gate: skip low-conviction markets (were causing 41% min-bet spam) ──
+        # ── Score gate ────────────────────────────────────────────────────────
         if score < 4:
             return None
 
+        is_continuation = (prev_win_dir == direction)
+
         # ── ENTRY PRICE TIERS ────────────────────────────────────────────────
-        # Tier 1: ≤35¢ → 3x+ payout (best EV — all wins concentrated here)
-        # Tier 2: ≤45¢ → 2.2x+
+        # Cheap  ≤45¢: any confirmed direction, 2.2x+ payout
+        # Favored 45-85¢: continuation ONLY + early entry → ~80% win rate
         if entry <= 0.35:
             if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.25
             elif score >= 8:  kelly_frac, bankroll_pct = 0.40, 0.18
@@ -1175,8 +1174,12 @@ class LiveTrader:
             if   score >= 12: kelly_frac, bankroll_pct = 0.45, 0.15
             elif score >= 8:  kelly_frac, bankroll_pct = 0.30, 0.10
             else:             kelly_frac, bankroll_pct = 0.18, 0.06
+        elif entry <= 0.85 and is_continuation and pct_remaining > 0.75 and score >= 8:
+            # Favored continuation: market + signal agree = ~80%+ win rate
+            if   score >= 12: kelly_frac, bankroll_pct = 0.35, 0.15
+            else:             kelly_frac, bankroll_pct = 0.20, 0.10
         else:
-            return None   # entry > 45¢ — payout too low
+            return None   # unknown direction on expensive token — skip
 
         wr_scale   = self._wr_bet_scale()
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
@@ -1193,14 +1196,16 @@ class LiveTrader:
         # This prevents entering at e.g. 64¢ when Gamma shows 45¢
         if pm_book_data is not None:
             _, clob_ask, _ = pm_book_data
-            if clob_ask > 0.50:
-                return None   # actual CLOB price > 50¢ — no positive-EV bet
+            max_ask = 0.85 if (is_continuation and pct_remaining > 0.75) else 0.45
+            if clob_ask > max_ask:
+                return None   # actual CLOB price exceeds tier limit
             entry = clob_ask  # use real fill price for sizing and display
 
         # Force taker for high-score early continuation — fill immediately before AMM reprices
         force_taker = (
             (score >= 12 and very_strong_mom and imbalance_confirms and move_pct > 0.0015) or
-            (score >= 12 and is_early_continuation)
+            (score >= 12 and is_early_continuation) or
+            (entry > 0.50 and is_continuation and pct_remaining > 0.80)
         )
 
         return {
