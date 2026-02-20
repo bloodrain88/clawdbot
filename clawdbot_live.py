@@ -607,82 +607,69 @@ class LiveTrader:
         self.active_mkts = found
         return found
 
-    # ── EVALUATE + PLACE ORDER ────────────────────────────────────────────────
-    async def evaluate(self, m: dict):
+    # ── SCORE + EXECUTE ───────────────────────────────────────────────────────
+    async def _score_market(self, m: dict) -> dict | None:
+        """Score a market opportunity. Returns signal dict or None if hard-blocked.
+        Pure analysis — no side effects, no order placement."""
         cid       = m["conditionId"]
         if cid in self.seen:
-            return
+            return None
         asset     = m["asset"]
         duration  = m["duration"]
         mins_left = m["mins_left"]
         up_price  = m["up_price"]
         label     = f"{asset} {duration}m | {m.get('question','')[:45]}"
 
-        # Consecutive loss circuit breaker — pause after N losses to avoid cascading losses
+        # Circuit breaker
         if _time.time() < self.cooldown_until:
             remaining_pause = (self.cooldown_until - _time.time()) / 60
             if _time.time() - self._pause_log_ts.get(cid, 0) > 120:
                 self._pause_log_ts[cid] = _time.time()
-                print(f"{Y}[PAUSE] {label} → {self.consec_losses} consecutive losses, cooling {remaining_pause:.0f}min{RS}")
-            return
+                print(f"{Y}[PAUSE] {label} → {self.consec_losses} losses, cooling {remaining_pause:.0f}min{RS}")
+            return None
 
-        # Max open positions guard
-        if len(self.pending) >= MAX_OPEN:
-            print(f"{Y}[SKIP] {label} → max open positions ({MAX_OPEN}){RS}")
-            return
-
-        # Use RTDS (Binance) as current price for direction analysis — real-time, sub-second.
-        # open_price is Chainlink (resolution source), current is RTDS (fastest signal).
-        # Momentum and BS use RTDS to detect where price is heading right now.
         current = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
         if current == 0:
-            print(f"{Y}[SKIP] {label} → no price feed{RS}")
-            return
+            return None
 
         open_price = self.open_prices.get(cid)
         if not open_price:
-            print(f"{Y}[WAIT] {label} → fetching open price (CL){RS}")
-            return  # wait until scan_loop sets Chainlink-based open_price
+            print(f"{Y}[WAIT] {label} → waiting for first CL round{RS}")
+            return None
 
         src = self.open_prices_source.get(cid, "?")
+        if src == "CL-fallback":
+            return None
+
         src_tag = f"[{src}]"
 
-        # Require exact Chainlink reference — fallback uses wrong price (Polymarket resolves via CL)
-        if src == "CL-fallback":
-            print(f"{Y}[SKIP] {label} → CL-fallback ref (not Polymarket-exact) — skipping{RS}")
-            return
-
-        # Only enter in first 40% of market life (need ≥60% remaining).
-        # For 15-min: enter in first 6 min. AMM prices uncertainty most in early window.
-        # After 40% elapsed, AMM has already priced the directional move — no edge left.
+        # Timing gate: only enter in first 40% of market life (≥60% remaining)
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
         if pct_remaining < 0.60:
-            print(f"{Y}[SKIP] {label} → too late ({pct_remaining:.0%} remaining, need ≥60%) | beat=${open_price:,.2f} {src_tag}{RS}")
-            return
+            return None   # too late — silent (logged in scan_loop summary)
 
-        # Require a real directional move — 0.10% for all durations
-        move_pct     = abs(current - open_price) / open_price if open_price > 0 else 0
-        min_move_dur = MIN_MOVE
-        direction    = "Up" if current >= open_price else "Down"
-        move_str     = f"{(current-open_price)/open_price:+.3%}"
-        if move_pct < min_move_dur:
-            print(f"{Y}[SKIP] {label} → move {move_str} < {min_move_dur:.2%} needed | "
-                  f"beat=${open_price:,.2f} {src_tag} now=${current:,.2f}{RS}")
-            return
+        move_pct  = abs(current - open_price) / open_price if open_price > 0 else 0
+        direction = "Up" if current >= open_price else "Down"
+        move_str  = f"{(current-open_price)/open_price:+.3%}"
+        if move_pct < MIN_MOVE:
+            return None   # below noise floor — silent
 
-        # ── Multi-signal Score System ─────────────────────────────────────────
-        # Replaces binary pass/fail with a conviction score (0–13 pts).
-        # Weak signals reduce score; only extreme OB (>40% imbalance) hard-blocks.
-        # Score <5 → skip; 5-6 → 0.6x Kelly; 7-8 → 1.0x; ≥9 → 1.3x + fast taker.
+        # ── Multi-signal Score ────────────────────────────────────────────────
+        # Max possible: 2+3+4+1+3+3+2+1 = 19 pts
+        # score ≥ 4 → take trade (sized by conviction)
+        # score 4-5 → 0.4x Kelly (probe); 6-7 → 0.6x; 8-9 → 1.0x; ≥10 → 1.3x + fast taker
         score = 0
         is_up = (direction == "Up")
 
-        # Move size (0-3 pts — gated ≥MIN_MOVE above, but small moves OK if signals strong)
+        # Entry timing (0-2 pts) — earlier = AMM hasn't repriced yet = better odds
+        if   pct_remaining >= 0.85: score += 2   # first 2.25 min of 15-min market
+        elif pct_remaining >= 0.70: score += 1   # first 4.5 min
+
+        # Move size (0-3 pts)
         if   move_pct >= 0.0020: score += 3
         elif move_pct >= 0.0012: score += 2
         elif move_pct >= 0.0008: score += 1
-        # <0.08% → +0 (passes gate at 0.05%, but weak signal — need other signals to compensate)
 
         # Multi-timeframe momentum (0-4 pts)
         mom_30s  = self._momentum_prob(asset, seconds=30)
@@ -694,7 +681,6 @@ class LiveTrader:
         tf_votes     = tf_up_votes if is_up else tf_dn_votes
         if   tf_votes == 3: score += 4
         elif tf_votes == 2: score += 2
-        # tf_votes 0-1 → +0 (weak, still tradeable if other signals strong)
         very_strong_mom = (tf_votes == 3)
 
         # Chainlink direction agreement (+1 pt)
@@ -705,137 +691,129 @@ class LiveTrader:
                 cl_agree = False
         if cl_agree: score += 1
 
-        # Binance order book imbalance (−1 to +3 pts; >40% imbalance contra = hard block)
+        # Binance order book imbalance (−1 to +3; >40% contra = hard block)
         ob_imbalance = await self._binance_imbalance(asset)
-        extreme_contra = (is_up and ob_imbalance < -0.40) or (not is_up and ob_imbalance > 0.40)
-        if extreme_contra:
-            print(f"{Y}[SKIP] {label} → extreme OB contra {direction} "
-                  f"(imbalance={ob_imbalance:+.2f}){RS}")
-            return
+        if (is_up and ob_imbalance < -0.40) or (not is_up and ob_imbalance > 0.40):
+            return None   # extreme OB contra — hard block
         if   (is_up and ob_imbalance > 0.25) or (not is_up and ob_imbalance < -0.25): score += 3
         elif (is_up and ob_imbalance > 0.10) or (not is_up and ob_imbalance < -0.10): score += 2
         elif abs(ob_imbalance) <= 0.10: score += 1   # neutral
         else:                           score -= 1   # moderate contra
         imbalance_confirms = (is_up and ob_imbalance > 0.10) or (not is_up and ob_imbalance < -0.10)
 
-        # Binance taker buy/sell flow + volume vs 30-min avg (0-5 pts)
+        # Binance taker flow + volume vs 30-min avg (−1 to +5 pts)
         taker_ratio, vol_ratio = await self._binance_taker_flow(asset)
         if   (is_up and taker_ratio > 0.62) or (not is_up and taker_ratio < 0.38): score += 3
         elif (is_up and taker_ratio > 0.55) or (not is_up and taker_ratio < 0.45): score += 2
-        elif abs(taker_ratio - 0.50) < 0.05: score += 1   # neutral
-        else:                                score -= 1   # contra taker flow
+        elif abs(taker_ratio - 0.50) < 0.05: score += 1
+        else:                                score -= 1
         if   vol_ratio > 2.0: score += 2
         elif vol_ratio > 1.3: score += 1
 
-        # Inter-market continuity signal (+1 pt)
-        # Previous 15-min market close = this market's open_price (same Chainlink round).
-        # If prev market moved UP and current also moving UP → momentum continuation.
-        # If prev market moved UP and current moving DOWN → potential mean-reversion (neutral/+0).
+        # Inter-market continuity: previous 15-min market direction (+1 pt)
         prev_open = self.asset_prev_open.get(asset, 0)
         if prev_open > 0 and open_price > 0:
-            prev_market_was_up = open_price > prev_open   # previous market closed up
-            if (is_up and prev_market_was_up) or (not is_up and not prev_market_was_up):
-                score += 1   # momentum continuation — same direction as prev market
+            prev_was_up = open_price > prev_open
+            if (is_up and prev_was_up) or (not is_up and not prev_was_up):
+                score += 1   # momentum continuation
 
-        # Hard gate: minimum viable signal (raised to 6 since move gate was lowered)
-        if score < 6:
-            print(f"{Y}[SKIP] {label} → score={score}<6 | "
-                  f"TF={tf_votes}/3 ob={ob_imbalance:+.2f} tk={taker_ratio:.2f} "
-                  f"vol={vol_ratio:.1f}x move={move_str}{RS}")
-            return
-
-        # Size multiplier — scale bet by conviction
-        if   score >= 10: size_mult = 1.3
-        elif score >=  8: size_mult = 1.0
-        else:             size_mult = 0.6   # score 6-7: reduced half-conviction entry
-
-        # ── Combined probability: Black-Scholes + Momentum + Direction bias ──
+        # AMM edge check — still required even at score ≥ 4
         vol      = self.vols.get(asset, 0.70)
         bs_prob  = self._prob_up(current, open_price, mins_left, vol)
-        mom_prob = mom_90s   # already computed above
+        mom_prob = mom_90s
         mw       = self._adaptive_momentum_weight()
         combined = (1 - mw) * bs_prob + mw * mom_prob
-
-        # Direction bias from historical WR for this asset+side
         bias_up   = self._direction_bias(asset, "Up")
         bias_down = self._direction_bias(asset, "Down")
         prob_up   = max(0.05, min(0.95, combined + bias_up))
         prob_down = max(0.05, min(0.95, (1 - combined) + bias_down))
-
         edge_up   = prob_up   - up_price
         edge_down = prob_down - (1 - up_price)
-
-        # AMM-based pre-filter — loose (real edge checked vs CLOB ask in _place_order).
-        # Use low threshold (0.02) here: CLOB asks can be far cheaper than AMM mid,
-        # so we don't want to block opportunities where AMM edge is small but CLOB edge is large.
-        fee_est      = 0.025 * (1 - abs(up_price - 0.5) * 2)
-        min_edge     = self._adaptive_min_edge()
-        pre_filter   = max(0.02, min_edge * 0.30)   # loose pre-filter vs AMM
+        min_edge   = self._adaptive_min_edge()
+        pre_filter = max(0.02, min_edge * 0.25)   # loose pre-filter vs AMM
 
         if edge_up >= edge_down and edge_up >= pre_filter:
             side, edge, true_prob = "Up", edge_up, prob_up
         elif edge_down >= pre_filter:
             side, edge, true_prob = "Down", edge_down, prob_down
         else:
-            best_edge = max(edge_up, edge_down)
-            best_side = "Up" if edge_up >= edge_down else "Down"
-            print(f"{Y}[SKIP] {label} → no edge | {best_side} edge={best_edge:.3f} < {pre_filter:.3f} | "
-                  f"beat=${open_price:,.2f} {src_tag} move={move_str} "
-                  f"bs={bs_prob:.3f} mom={mom_prob:.3f} agree={'Y' if cl_agree else 'N'}{RS}")
-            return
+            return None   # no AMM edge — skip
+
+        # Bet size by conviction score
+        if   score >= 10: size_mult = 1.3
+        elif score >=  8: size_mult = 1.0
+        elif score >=  6: size_mult = 0.6
+        else:             size_mult = 0.4   # score 4-5: minimum probe entry
 
         entry    = up_price if side == "Up" else (1 - up_price)
         raw_size = self._kelly_size(true_prob, entry, edge)
         size     = round(max(MIN_BET, min(min(MAX_BET, self.bankroll * 0.25), raw_size * size_mult)), 2)
         token_id = m["token_up"] if side == "Up" else m["token_down"]
-
         if not token_id:
-            print(f"{Y}[SKIP] {label} → no token_id for {side} (market data incomplete){RS}")
-            self.seen.add(cid)
-            return
+            return None
 
-        agree_str  = "" if cl_agree else f" {Y}[CL!]{RS}"
-        ob_str     = f" ob={ob_imbalance:+.2f}" + ("✓" if imbalance_confirms else "")
-        tf_str     = f" TF={tf_votes}/3" + ("★" if very_strong_mom else "")
-        score_stars = f"{G}★★★{RS}" if score >= 10 else (f"{G}★★{RS}" if score >= 8 else "★")
-        prev_open  = self.asset_prev_open.get(asset, 0)
-        prev_str   = f" prev={((open_price-prev_open)/prev_open*100):+.2f}%" if prev_open > 0 else ""
-        print(f"{G}[EDGE] {label} → {side} | score={score} {score_stars} | "
-              f"beat=${open_price:,.2f} {src_tag} now=${current:,.2f} move={move_str}{prev_str} | "
-              f"bs={bs_prob:.3f} mom={mom_prob:.3f} prob={true_prob:.3f} "
-              f"mkt={up_price:.3f} edge={edge:.3f} ${size:.2f}{agree_str}{ob_str}{tf_str} "
-              f"tk={taker_ratio:.2f} vol={vol_ratio:.1f}x{RS}")
-
-        # Mark seen before placing — prevents double-bet if evaluate called concurrently
-        self.seen.add(cid)
-        self._save_seen()
-
-        # ── Place real order ──────────────────────────────────────────────────
-        # High conviction: all 3 TFs agree + order book confirms → skip maker wait, fill instantly
         force_taker = score >= 10 and very_strong_mom and imbalance_confirms and move_pct > 0.0015
-        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob, cl_agree, min_edge_req=min_edge, force_taker=force_taker)
 
-        trade = {
-            "side":          side,
-            "size":          size,
-            "entry":         entry,
-            "open_price":    open_price,
-            "current_price": current,
-            "true_prob":     true_prob,
-            "mkt_price":     up_price,
-            "edge":          round(edge, 4),
-            "mins_left":     mins_left,
-            "end_ts":        m["end_ts"],
-            "asset":         asset,
-            "duration":      duration,
-            "token_id":      token_id,
-            "order_id":      order_id or "",
+        return {
+            "cid": cid, "m": m, "score": score,
+            "side": side, "entry": entry, "size": size, "token_id": token_id,
+            "true_prob": true_prob, "cl_agree": cl_agree, "min_edge": min_edge,
+            "force_taker": force_taker, "edge": edge,
+            "label": label, "asset": asset, "duration": duration,
+            "open_price": open_price, "current": current, "move_str": move_str,
+            "src_tag": src_tag, "bs_prob": bs_prob, "mom_prob": mom_prob,
+            "up_price": up_price, "ob_imbalance": ob_imbalance,
+            "imbalance_confirms": imbalance_confirms, "tf_votes": tf_votes,
+            "very_strong_mom": very_strong_mom, "taker_ratio": taker_ratio,
+            "vol_ratio": vol_ratio, "pct_remaining": pct_remaining, "mins_left": mins_left,
         }
 
+    async def _execute_trade(self, sig: dict):
+        """Execute a pre-scored signal: log, mark seen, place order, update state."""
+        cid = sig["cid"]
+        if cid in self.seen or len(self.pending) >= MAX_OPEN:
+            return
+        score       = sig["score"]
+        score_stars = f"{G}★★★{RS}" if score >= 10 else (f"{G}★★{RS}" if score >= 8 else "★")
+        agree_str   = "" if sig["cl_agree"] else f" {Y}[CL!]{RS}"
+        ob_str      = f" ob={sig['ob_imbalance']:+.2f}" + ("✓" if sig["imbalance_confirms"] else "")
+        tf_str      = f" TF={sig['tf_votes']}/3" + ("★" if sig["very_strong_mom"] else "")
+        prev_open   = self.asset_prev_open.get(sig["asset"], 0)
+        prev_str    = f" prev={((sig['open_price']-prev_open)/prev_open*100):+.2f}%" if prev_open > 0 else ""
+        print(f"{G}[EDGE] {sig['label']} → {sig['side']} | score={score} {score_stars} | "
+              f"beat=${sig['open_price']:,.2f} {sig['src_tag']} now=${sig['current']:,.2f} "
+              f"move={sig['move_str']}{prev_str} pct={sig['pct_remaining']:.0%} | "
+              f"bs={sig['bs_prob']:.3f} mom={sig['mom_prob']:.3f} prob={sig['true_prob']:.3f} "
+              f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} ${sig['size']:.2f}"
+              f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x{RS}")
+
+        self.seen.add(cid)
+        self._save_seen()
+        order_id = await self._place_order(
+            sig["token_id"], sig["side"], sig["entry"], sig["size"],
+            sig["asset"], sig["duration"], sig["mins_left"],
+            sig["true_prob"], sig["cl_agree"],
+            min_edge_req=sig["min_edge"], force_taker=sig["force_taker"]
+        )
+        m = sig["m"]
+        trade = {
+            "side": sig["side"], "size": sig["size"], "entry": sig["entry"],
+            "open_price": sig["open_price"], "current_price": sig["current"],
+            "true_prob": sig["true_prob"], "mkt_price": sig["up_price"],
+            "edge": round(sig["edge"], 4), "mins_left": sig["mins_left"],
+            "end_ts": m["end_ts"], "asset": sig["asset"], "duration": sig["duration"],
+            "token_id": sig["token_id"], "order_id": order_id or "",
+        }
         if order_id:
             self.pending[cid] = (m, trade)
             self._save_pending()
             self._log(m, trade)
+
+    async def evaluate(self, m: dict):
+        """RTDS fast-path: score a single market and execute if score ≥ 4."""
+        sig = await self._score_market(m)
+        if sig and sig["score"] >= 4:
+            await self._execute_trade(sig)
 
     async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False):
         """Maker-first order strategy:
@@ -1745,7 +1723,21 @@ class LiveTrader:
                 if cid not in self.seen:
                     candidates.append(m)
             if candidates:
-                await asyncio.gather(*[self.evaluate(m) for m in candidates])
+                # Score all markets in parallel — pick best (best-of-round strategy)
+                signals = list(await asyncio.gather(*[self._score_market(m) for m in candidates]))
+                valid   = sorted([s for s in signals if s is not None], key=lambda x: -x["score"])
+                if valid:
+                    best = valid[0]
+                    other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
+                    print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
+                slots = MAX_OPEN - len(self.pending)
+                placed = 0
+                for sig in valid:
+                    if placed >= slots: break
+                    # Always take best market if score ≥ 4; 2nd trade only at score ≥ 8
+                    if placed >= 1 and sig["score"] < 8: break
+                    await self._execute_trade(sig)
+                    placed += 1
 
             await self._resolve()
             await asyncio.sleep(SCAN_INTERVAL)
