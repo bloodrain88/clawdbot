@@ -1157,29 +1157,37 @@ class LiveTrader:
         # Bet the signal direction — win rate drives P&L, not just payout
         entry = up_price if side == "Up" else (1 - up_price)
 
-        # ── Score gate ────────────────────────────────────────────────────────
-        if score < 4:
+        # ── Score gate: trade every market (any score ≥ 1) ──────────────────
+        if score < 1:
             return None
 
-        is_continuation = (prev_win_dir == direction)
-
         # ── ENTRY PRICE TIERS ────────────────────────────────────────────────
-        # Cheap  ≤45¢: any confirmed direction, 2.2x+ payout
-        # Favored 45-85¢: continuation ONLY + early entry → ~80% win rate
-        if entry <= 0.35:
+        # Always bet signal direction. Size scales with cheapness (payout).
+        # Never bet >55¢ — payout < 1.82x doesn't justify unproven accuracy.
+        if entry <= 0.30:
+            # ≤30¢ = 3.3x+ payout — biggest bets
             if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.25
             elif score >= 8:  kelly_frac, bankroll_pct = 0.40, 0.18
-            else:             kelly_frac, bankroll_pct = 0.25, 0.12
-        elif entry <= 0.45:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.45, 0.15
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.30, 0.10
-            else:             kelly_frac, bankroll_pct = 0.18, 0.06
-        elif entry <= 0.85 and is_continuation and pct_remaining > 0.75 and score >= 8:
-            # Favored continuation: market + signal agree = ~80%+ win rate
-            if   score >= 12: kelly_frac, bankroll_pct = 0.35, 0.15
-            else:             kelly_frac, bankroll_pct = 0.20, 0.10
+            elif score >= 4:  kelly_frac, bankroll_pct = 0.25, 0.12
+            else:             kelly_frac, bankroll_pct = 0.15, 0.07
+        elif entry <= 0.40:
+            # 30-40¢ = 2.5x+ payout — solid bets
+            if   score >= 12: kelly_frac, bankroll_pct = 0.45, 0.18
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.30, 0.12
+            elif score >= 4:  kelly_frac, bankroll_pct = 0.18, 0.08
+            else:             kelly_frac, bankroll_pct = 0.10, 0.05
+        elif entry <= 0.50:
+            # 40-50¢ = 2.0x+ payout — moderate bets
+            if   score >= 12: kelly_frac, bankroll_pct = 0.30, 0.12
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.20, 0.08
+            elif score >= 4:  kelly_frac, bankroll_pct = 0.12, 0.05
+            else:             kelly_frac, bankroll_pct = 0.08, 0.03
+        elif entry <= 0.55:
+            # 50-55¢ = 1.82x+ payout — small bets only, marginal edge
+            if   score >= 8:  kelly_frac, bankroll_pct = 0.15, 0.06
+            else:             kelly_frac, bankroll_pct = 0.08, 0.03
         else:
-            return None   # unknown direction on expensive token — skip
+            return None   # >55¢ = payout < 1.82x, not worth betting without proven accuracy
 
         wr_scale   = self._wr_bet_scale()
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
@@ -1196,16 +1204,14 @@ class LiveTrader:
         # This prevents entering at e.g. 64¢ when Gamma shows 45¢
         if pm_book_data is not None:
             _, clob_ask, _ = pm_book_data
-            max_ask = 0.85 if (is_continuation and pct_remaining > 0.75) else 0.45
-            if clob_ask > max_ask:
-                return None   # actual CLOB price exceeds tier limit
+            if clob_ask > 0.55:
+                return None   # actual CLOB price > 55¢ — payout too low
             entry = clob_ask  # use real fill price for sizing and display
 
-        # Force taker for high-score early continuation — fill immediately before AMM reprices
+        # Force taker for strong momentum — fill immediately before AMM reprices
         force_taker = (
             (score >= 12 and very_strong_mom and imbalance_confirms and move_pct > 0.0015) or
-            (score >= 12 and is_early_continuation) or
-            (entry > 0.50 and is_continuation and pct_remaining > 0.80)
+            (score >= 12 and is_early_continuation)
         )
 
         return {
@@ -2380,12 +2386,8 @@ class LiveTrader:
                     # Unified direction: correlated assets move together — never hold Up + Down simultaneously
                     if pending_dn > 0 and sig["side"] == "Up":   continue
                     if pending_up > 0 and sig["side"] == "Down":  continue
-                    # Late entry (40-60% remaining, no timing bonus): require score ≥ 8
-                    is_late = sig["pct_remaining"] < 0.60
-                    min_score = 8 if is_late else 4
-                    if sig["score"] < min_score: break
-                    # 2nd trade: only at score ≥ 8
-                    if placed >= 1 and sig["score"] < 8: break
+                    # Trade all markets — no score gate in loop (gate is in _score_market)
+                    pass
                     await self._execute_trade(sig)
                     placed += 1
 
