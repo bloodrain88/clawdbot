@@ -64,6 +64,8 @@ KELLY_FRAC     = 0.30     # 30% Kelly — still conservative, more capital on st
 MAX_DAILY_LOSS = 0.40     # 40% hard stop (session recovery mode)
 MAX_OPEN       = 8        # max simultaneous open positions
 
+USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
+
 # Chainlink oracle feeds on Polygon (same source Polymarket uses for resolution)
 CHAINLINK_FEEDS = {
     "BTC": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
@@ -509,7 +511,7 @@ class LiveTrader:
         q = 1 - true_prob
         kelly_f = (true_prob * b - q) / b
         kelly_f = max(0.0, kelly_f)
-        size = self.bankroll * kelly_f * KELLY_FRAC
+        size = self.bankroll * kelly_f * KELLY_FRAC * self._kelly_drawdown_scale()
         if edge >= 0.30:
             max_bet = min(80.0, self.bankroll * 0.35)
         elif edge >= 0.15:
@@ -611,13 +613,8 @@ class LiveTrader:
         up_price  = m["up_price"]
         label     = f"{asset} {duration}m | {m.get('question','')[:45]}"
 
-        # Stop-loss: use total effective value (USDC + locked bets not yet in API)
-        # Avoids false triggers when bankroll is temporarily low after a fill
-        locked_bets = sum(t.get("size", 0) for _, (_, t) in self.pending.items())
-        if (self.bankroll + locked_bets) <= self.start_bank * (1 - MAX_DAILY_LOSS):
-            print(f"{R}[SKIP] {label} → daily loss limit hit "
-                  f"(bank=${self.bankroll:.2f}+locked=${locked_bets:.2f} ≤ ${self.start_bank*(1-MAX_DAILY_LOSS):.2f}){RS}")
-            return
+        # No hard daily stop — bot always keeps trading but scales down size on drawdown
+        # (see _kelly_drawdown_scale): -10% → 60% size, -20% → 35%, -30% → 20%
 
         # Max open positions guard
         if len(self.pending) >= MAX_OPEN:
@@ -1382,6 +1379,21 @@ class LiveTrader:
         wr = s["wins"] / total
         return (wr - 0.5) * 0.25   # max ±0.125
 
+    def _kelly_drawdown_scale(self) -> float:
+        """Scale Kelly fraction down when in drawdown vs session high.
+        Bot keeps trading but reduces size automatically — no hard stop."""
+        if self.peak_bankroll <= 0:
+            return 1.0
+        dd = (self.peak_bankroll - self.bankroll) / self.peak_bankroll
+        if dd < 0.10:
+            return 1.0       # normal
+        elif dd < 0.20:
+            return 0.60      # -10-20% drawdown: 60% of normal size
+        elif dd < 0.30:
+            return 0.35      # -20-30%: 35%
+        else:
+            return 0.20      # >30%: 20% (survival mode, still trading)
+
     def _adaptive_min_edge(self) -> float:
         """Tighten MIN_EDGE when losing, relax slightly when winning."""
         if len(self.recent_trades) < 10:
@@ -1978,16 +1990,26 @@ class LiveTrader:
         import requests as _req
         loop = asyncio.get_event_loop()
         await self._sync_stats_from_api(loop, _req)
+        async def _guard(name, method):
+            """Restart a loop if it crashes — one failure can't kill all loops."""
+            while True:
+                try:
+                    await method()
+                    break  # clean exit (e.g. DRY_RUN early return)
+                except Exception as e:
+                    print(f"{R}[CRASH] {name}: {e} — restarting in 10s{RS}")
+                    await asyncio.sleep(10)
+
         await asyncio.gather(
-            self.stream_rtds(),
-            self.vol_loop(),
-            self.scan_loop(),
-            self._status_loop(),
-            self._refresh_balance(),
-            self._redeem_loop(),
-            self.chainlink_loop(),
-            self._redeemable_scan(),
-            self._position_sync_loop(),
+            _guard("stream_rtds",         self.stream_rtds),
+            _guard("vol_loop",            self.vol_loop),
+            _guard("scan_loop",           self.scan_loop),
+            _guard("_status_loop",        self._status_loop),
+            _guard("_refresh_balance",    self._refresh_balance),
+            _guard("_redeem_loop",        self._redeem_loop),
+            _guard("chainlink_loop",      self.chainlink_loop),
+            _guard("_redeemable_scan",    self._redeemable_scan),
+            _guard("_position_sync_loop", self._position_sync_loop),
         )
 
 
