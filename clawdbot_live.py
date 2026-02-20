@@ -754,27 +754,26 @@ class LiveTrader:
         elif (is_up     and funding_rate >  0.0010): score -= 1  # extremely crowded long + bet Up
         elif (not is_up and funding_rate < -0.0005): score -= 1  # crowded shorts + bet Down risky
 
-        # VWAP deviation: mean reversion signal (−2 to +2 pts)
-        # Price above window VWAP = overbought = bad for continuation bets
-        # Price below window VWAP = oversold = reversion opportunity
-        vwap_net = vwap_dev if is_up else -vwap_dev   # positive = overextended in our direction
-        if   vwap_net >  0.0015: score -= 2   # strongly overbought → likely partial reversion
-        elif vwap_net >  0.0008: score -= 1   # mildly overbought
-        elif vwap_net < -0.0015: score += 2   # strongly oversold → reversion confirms our bet
-        elif vwap_net < -0.0008: score += 1   # mildly oversold
+        # VWAP: momentum continuation signal (−2 to +2 pts)
+        # Data: 87.7% of 15-min markets CONTINUE the mid-window direction — NOT mean reversion
+        # Price ABOVE window VWAP in our direction = momentum confirms = good
+        # Price BELOW window VWAP in our direction = momentum weak = bad
+        vwap_net = vwap_dev if is_up else -vwap_dev   # positive = price above VWAP in bet direction
+        if   vwap_net >  0.0015: score += 2   # strongly above VWAP → momentum confirms bet
+        elif vwap_net >  0.0008: score += 1
+        elif vwap_net < -0.0015: score -= 2   # strongly below VWAP → momentum against bet
+        elif vwap_net < -0.0008: score -= 1
 
-        # Vol-normalized displacement: penalize chasing overextended ~1% moves (−4 to +2 pts)
-        # 15-min 1σ ≈ annual_vol × sqrt(15 / (252×390)) — typical BTC ~0.42%, ETH ~0.50%
+        # Vol-normalized displacement: continuation signal (−2 to +2 pts)
+        # 87.7% continuation — extended moves tend to KEEP going, not revert
         sigma_15m = self.vols.get(asset, 0.70) * (15 / (252 * 390)) ** 0.5
         open_price_disp = self.open_prices.get(asset)
         if open_price_disp and sigma_15m > 0:
             net_disp = (current - open_price_disp) / open_price_disp * (1 if is_up else -1)
-            if   net_disp > sigma_15m * 2.0: score -= 4   # >2σ: very likely to revert
-            elif net_disp > sigma_15m * 1.5: score -= 3
-            elif net_disp > sigma_15m * 1.0: score -= 2
-            elif net_disp > sigma_15m * 0.5: score -= 1
-            elif net_disp < -sigma_15m * 1.0: score += 2  # opposite overextended → reversion in our favour
-            elif net_disp < -sigma_15m * 0.5: score += 1
+            if   net_disp > sigma_15m * 1.0: score += 2   # extended in direction = strong momentum
+            elif net_disp > sigma_15m * 0.5: score += 1
+            elif net_disp < -sigma_15m * 1.0: score -= 2  # price moved opposite to our bet
+            elif net_disp < -sigma_15m * 0.5: score -= 1
 
         # Cross-asset confirmation: how many other assets trending same direction? (0-2 pts)
         cross_count = self._cross_asset_direction(asset, direction)
@@ -803,12 +802,24 @@ class LiveTrader:
         min_edge   = self._adaptive_min_edge()
         pre_filter = max(0.02, min_edge * 0.25)   # loose pre-filter vs AMM
 
-        if edge_up >= edge_down and edge_up >= pre_filter:
+        # Lock side to price direction when move is clear — 87.7% continuation on 15-min markets
+        # AMM edge comparison only used when price is flat (no clear directional signal)
+        if move_pct >= 0.0005:
+            forced_side = "Up" if current > open_price else "Down"
+            forced_edge = edge_up if forced_side == "Up" else edge_down
+            forced_prob = prob_up if forced_side == "Up" else prob_down
+            if forced_edge >= 0:
+                side, edge, true_prob = forced_side, forced_edge, forced_prob
+            elif forced_edge < -0.15:
+                return None   # AMM has massively overpriced this direction — no edge at all
+            else:
+                side, edge, true_prob = forced_side, max(0.01, forced_edge), forced_prob
+        elif edge_up >= edge_down and edge_up >= pre_filter:
             side, edge, true_prob = "Up", edge_up, prob_up
         elif edge_down >= pre_filter:
             side, edge, true_prob = "Down", edge_down, prob_down
         else:
-            return None   # no AMM edge — skip
+            return None   # flat price + no AMM edge — skip
 
         # Kelly fraction scales with conviction score (replaces hardcoded MIN/MAX_BET)
         # Higher score → larger fraction of Kelly → bigger bet automatically
