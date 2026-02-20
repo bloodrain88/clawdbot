@@ -691,7 +691,8 @@ class LiveTrader:
         elif prev_win_dir and pct_remaining > 0.80:
             direction = prev_win_dir  # window just opened — use continuation prior
         else:
-            return None   # price flat AND momentum flat — no signal, skip
+            # Truly flat — bet the cheaper side (best default when no signal)
+            direction = "Down" if up_price > 0.50 else "Up"
 
         is_up    = (direction == "Up")
         tf_votes = tf_up_votes if is_up else tf_dn_votes
@@ -859,29 +860,31 @@ class LiveTrader:
                 return None   # AMM massively overpriced our direction — no edge
             side, edge, true_prob = direction, max(0.01, dir_edge), dir_prob
 
-        # Skip low-conviction signals — only trade when score is strong
-        if score < 8:
-            return None
-
-        # Score-tiered Kelly fraction + bankroll cap: high conviction → bet more
+        # Score-tiered sizing — always bet, scale with conviction
         if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.20
         elif score >= 10: kelly_frac, bankroll_pct = 0.45, 0.15
-        else:             kelly_frac, bankroll_pct = 0.35, 0.10   # score 8-9
+        elif score >=  8: kelly_frac, bankroll_pct = 0.35, 0.10
+        elif score >=  6: kelly_frac, bankroll_pct = 0.25, 0.07
+        else:             kelly_frac, bankroll_pct = 0.15, 0.05   # score 4-5: small probe
 
-        entry     = up_price if side == "Up" else (1 - up_price)
-        # Early continuation: AMM near 50/50 but true prob ~75% → allow up to 55¢
-        # Mid/late window: require cheap side (<40¢) for real edge
-        max_entry = 0.55 if (is_early_continuation and score >= 8) else 0.40
-        if entry > max_entry:
-            return None   # expensive side — no edge
+        entry = up_price if side == "Up" else (1 - up_price)
+
+        # Low conviction: always take the cheaper side regardless of signal direction
+        if score < 8 and entry > 0.50:
+            side  = "Down" if side == "Up" else "Up"
+            entry = up_price if side == "Up" else (1 - up_price)
+
+        # High conviction: require entry < 55¢ (early) or < 40¢ (mid/late)
+        if score >= 8:
+            max_entry = 0.55 if (is_early_continuation and score >= 8) else 0.40
+            if entry > max_entry:
+                return None   # strong signal but AMM overpriced our side — skip
 
         wr_scale   = self._wr_bet_scale()
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
         max_single = min(100.0, self.bankroll * bankroll_pct)
         abs_cap    = max_single * 2 if is_early_continuation and score >= 10 else max_single
-        size       = round(min(abs_cap, raw_size * vol_mult * wr_scale), 2)
-        if size < DUST_BET:
-            return None   # Kelly says edge too small to justify minimum bet — skip
+        size       = max(DUST_BET, round(min(abs_cap, raw_size * vol_mult * wr_scale), 2))
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
             return None
