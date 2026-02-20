@@ -61,7 +61,7 @@ MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momen
 MIN_BET        = 5.0      # $5 floor
 MAX_BET        = 25.0     # $25 ceiling (Kelly can go higher on strong edges)
 KELLY_FRAC     = 0.30     # 30% Kelly — still conservative, more capital on strong edge
-MAX_DAILY_LOSS = 0.05     # 5% hard stop
+MAX_DAILY_LOSS = 0.40     # 40% hard stop (session recovery mode)
 MAX_OPEN       = 8        # max simultaneous open positions
 
 # Chainlink oracle feeds on Polygon (same source Polymarket uses for resolution)
@@ -988,6 +988,13 @@ class LiveTrader:
         ]
         ctf  = self.w3.eth.contract(address=ctf_addr, abi=CTF_ABI_FULL)
         loop = asyncio.get_event_loop()
+        # USDC contract for immediate bankroll refresh after wins
+        _usdc = self.w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_E),
+            abi=[{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf",
+                  "outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+        )
+        _addr_cs = Web3.to_checksum_address(ADDRESS)
 
         _wait_log_ts = {}   # cid → last time we printed [WAIT] for it
         while True:
@@ -1082,7 +1089,16 @@ class LiveTrader:
                             # CTF balance=0 — Polymarket already auto-redeemed, USDC in wallet
                             suffix = "auto-redeemed by Polymarket"
 
-                        # bankroll updated by _refresh_balance (on-chain USDC) — don't double-count
+                        # Immediately refresh bankroll from on-chain USDC so daily loss check
+                        # in evaluate() uses the correct value right away (not 30s stale)
+                        try:
+                            _raw = await loop.run_in_executor(
+                                None, lambda: _usdc.functions.balanceOf(_addr_cs).call()
+                            )
+                            if _raw > 0:
+                                self.bankroll = _raw / 1e6
+                        except Exception:
+                            pass
                         self.daily_pnl += pnl
                         self.total += 1; self.wins += 1
                         self._record_result(asset, side, True, trade.get("structural", False))
@@ -1610,6 +1626,10 @@ class LiveTrader:
                     self.bankroll = total
                     if total > self.peak_bankroll:
                         self.peak_bankroll = total
+                    # Keep start_bank current so daily loss % tracks from real balance
+                    # (don't let a stale startup value permanently block trading)
+                    if total > self.start_bank:
+                        self.start_bank = total
 
                 # 3. Recover any on-chain positions not tracked in pending (every tick = 30s)
                 now_ts = datetime.now(timezone.utc).timestamp()
