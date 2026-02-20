@@ -126,6 +126,7 @@ class LiveTrader:
         self.active_mkts = {}
         self.pending         = {}   # cid → (m, trade)
         self.pending_redeem  = {}   # cid → (side, asset)  — waiting on-chain resolution
+        self.redeemed_cids   = set()  # cids already processed — prevents _redeemable_scan re-queueing
         self._redeem_queued_ts = {}  # cid → timestamp when queued for redeem
         self.seen            = set()
         self._session        = None   # persistent aiohttp session
@@ -867,13 +868,16 @@ class LiveTrader:
         else:             kelly_frac = 0.12   # score 4-5: probe entry only
 
         entry    = up_price if side == "Up" else (1 - up_price)
+        if entry > 0.40:
+            return None   # only bet the cheap/underpriced side (<40¢) — better edge
         wr_scale = self._wr_bet_scale()
         raw_size = self._kelly_size(true_prob, entry, kelly_frac)
-        # Early continuation bets: 3× higher cap — AMM mispricing at 8–40¢ is the best edge
-        abs_cap  = MAX_ABS_BET * 3 if is_early_continuation and score >= 10 else MAX_ABS_BET
-        size     = round(min(abs_cap,
-                             self.bankroll * MAX_BANKROLL_PCT,
-                             raw_size * vol_mult * wr_scale), 2)
+        # Dynamic cap: scales with bankroll (10%), min $5, max $100; 2× for strong continuations
+        max_single = max(DUST_BET, min(100.0, self.bankroll * 0.10))
+        abs_cap    = max_single * 2 if is_early_continuation and score >= 10 else max_single
+        size       = round(min(abs_cap,
+                               self.bankroll * 0.15,
+                               raw_size * vol_mult * wr_scale), 2)
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
             return None
@@ -1261,15 +1265,27 @@ class LiveTrader:
                             print(f"{Y}[WAIT] {asset} {side} ~${size:.2f} — awaiting oracle ({elapsed:.0f}min){RS}")
                         continue   # not yet resolved on-chain
 
-                    # Determine actual winner from on-chain oracle result
-                    n0 = await loop.run_in_executor(
-                        None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 0).call()
-                    )
-                    n1 = await loop.run_in_executor(
-                        None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 1).call()
-                    )
-                    winner = "Up" if n0 > 0 else "Down"
-                    won    = (winner == side)
+                    # Determine actual winner — CLOB API first (matches Polymarket UI), fallback to on-chain
+                    winner = None
+                    try:
+                        import requests as _req2
+                        clob_r = await loop.run_in_executor(
+                            None, lambda c=cid: _req2.get(
+                                f"https://clob.polymarket.com/markets/{c}", timeout=5
+                            ).json()
+                        )
+                        for tok in clob_r.get("tokens", []):
+                            if tok.get("winner"):
+                                winner = tok.get("outcome")   # "Up" or "Down"
+                                break
+                    except Exception:
+                        pass
+                    if winner is None:
+                        n0 = await loop.run_in_executor(
+                            None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 0).call()
+                        )
+                        winner = "Up" if n0 > 0 else "Down"
+                    won = (winner == side)
                     size   = trade.get("size", 0)
                     entry  = trade.get("entry", 0.5)
 
@@ -1347,6 +1363,7 @@ class LiveTrader:
                     print(f"{Y}[REDEEM] {asset}: {e}{RS}")
             changed_pending = False
             for cid in done:
+                self.redeemed_cids.add(cid)
                 self.pending_redeem.pop(cid, None)
                 if self.pending.pop(cid, None) is not None:
                     changed_pending = True
@@ -2195,6 +2212,8 @@ class LiveTrader:
                     if not redeemable or val < 0.01 or not outcome or not cid:
                         continue
                     if cid in self.pending_redeem:
+                        continue
+                    if cid in self.redeemed_cids:
                         continue
                     asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
                              else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
