@@ -1394,23 +1394,32 @@ class LiveTrader:
         else:
             return 0.20      # >30%: 20% (survival mode, still trading)
 
+    def _last5_wr(self) -> float:
+        """Win rate over the last 5 resolved trades (0.0–1.0). -1 if < 5 trades."""
+        if len(self.recent_trades) < 5:
+            return -1.0
+        return sum(list(self.recent_trades)[-5:]) / 5
+
     def _adaptive_min_edge(self) -> float:
-        """Tighten MIN_EDGE when losing, relax slightly when winning."""
-        if len(self.recent_trades) < 10:
+        """Gate on last-5 WR: hot streak → relax, cold streak → require much higher edge."""
+        wr5 = self._last5_wr()
+        if wr5 < 0:           # not enough history yet
             return MIN_EDGE
-        recent_wr = sum(self.recent_trades) / len(self.recent_trades)
-        if recent_wr > 0.65:
+        if wr5 >= 0.80:       # 4-5/5 wins: hot streak — stay aggressive
             return max(0.06, MIN_EDGE - 0.01)
-        elif recent_wr < 0.50:
-            return min(0.13, MIN_EDGE + 0.02)
-        return MIN_EDGE
+        elif wr5 >= 0.60:     # 3/5: normal
+            return MIN_EDGE
+        elif wr5 >= 0.40:     # 2/5: tighten significantly
+            return MIN_EDGE + 0.05
+        else:                 # 0-1/5: cold streak — only exceptional setups
+            return MIN_EDGE + 0.10
 
     def _adaptive_momentum_weight(self) -> float:
         """Shift toward momentum when recent WR is poor."""
-        if len(self.recent_trades) < 10:
+        wr5 = self._last5_wr()
+        if wr5 < 0:
             return MOMENTUM_WEIGHT
-        recent_wr = sum(self.recent_trades) / len(self.recent_trades)
-        if recent_wr < 0.50:
+        if wr5 < 0.40:
             return min(0.65, MOMENTUM_WEIGHT + 0.15)
         return MOMENTUM_WEIGHT
 
@@ -1449,10 +1458,13 @@ class LiveTrader:
             self.peak_bankroll = self.bankroll
         self._save_stats()
         # Print adaptive state for visibility
-        mw  = self._adaptive_momentum_weight()
-        me  = self._adaptive_min_edge()
-        rwr = sum(self.recent_trades) / len(self.recent_trades) if self.recent_trades else 0
-        print(f"{B}[ADAPT] Recent WR={rwr:.0%}  MinEdge={me:.2f}  MomWeight={mw:.2f}{RS}")
+        mw   = self._adaptive_momentum_weight()
+        me   = self._adaptive_min_edge()
+        wr5  = self._last5_wr()
+        last5 = list(self.recent_trades)[-5:] if len(self.recent_trades) >= 5 else list(self.recent_trades)
+        streak = "".join("W" if x else "L" for x in last5)
+        label  = f"{wr5:.0%}" if wr5 >= 0 else "–"
+        print(f"{B}[ADAPT] Last5={streak} WR={label}  MinEdge={me:.2f}  DrawdownScale={self._kelly_drawdown_scale():.0%}{RS}")
 
     # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
     async def _get_chainlink_at(self, asset: str, start_ts: float) -> tuple:
