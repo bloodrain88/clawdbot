@@ -398,9 +398,11 @@ class LiveTrader:
                 status_str = "?"
                 payout_est = 0
                 move_str   = "(no ref)"
+            tok_price = t.get("entry", 0)
+            tok_str   = f"@{tok_price*100:.0f}¢→{(1/tok_price):.2f}x" if tok_price > 0 else "@?¢"
             print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
                   f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
-                  f"bet=${size:.2f} est=${payout_est:.2f} | {mins_left:.1f}min left")
+                  f"bet=${size:.2f} {tok_str} est=${payout_est:.2f} | {mins_left:.1f}min left")
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
             if isinstance(val[0], dict):
@@ -966,7 +968,8 @@ class LiveTrader:
               f"beat=${sig['open_price']:,.2f} {sig['src_tag']} now=${sig['current']:,.2f} "
               f"move={sig['move_str']}{prev_str} pct={sig['pct_remaining']:.0%} | "
               f"bs={sig['bs_prob']:.3f} mom={sig['mom_prob']:.3f} prob={sig['true_prob']:.3f} "
-              f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} ${sig['size']:.2f}"
+              f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} "
+              f"@{sig['entry']*100:.0f}¢→{(1/sig['entry']):.2f}x ${sig['size']:.2f}"
               f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x"
               f"{perp_str}{vwap_str}{cross_str}{cont_str}{RS}")
 
