@@ -61,7 +61,8 @@ MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momen
 MIN_BET        = 3.0      # $3 floor (small bankroll recovery mode)
 MAX_BET        = 12.0     # $12 ceiling — protect bankroll
 KELLY_FRAC     = 0.18     # 18% Kelly — conservative, reduce loss rate
-MAX_OPEN       = 3        # max 3 simultaneous positions — quality over quantity
+MAX_OPEN       = 2        # max 2 simultaneous positions — prevent 3 correlated losses
+MAX_SAME_DIR   = 1        # max 1 position per direction (no 2x Up or 2x Down)
 LOSS_STREAK_PAUSE = 3     # pause evaluation after N consecutive losses
 LOSS_STREAK_WAIT  = 25 * 60  # pause duration in seconds (25 min)
 
@@ -756,6 +757,19 @@ class LiveTrader:
         elif vwap_net >  0.0008: score -= 1   # mildly overbought
         elif vwap_net < -0.0015: score += 2   # strongly oversold → reversion confirms our bet
         elif vwap_net < -0.0008: score += 1   # mildly oversold
+
+        # Vol-normalized displacement: penalize chasing overextended ~1% moves (−4 to +2 pts)
+        # 15-min 1σ ≈ annual_vol × sqrt(15 / (252×390)) — typical BTC ~0.42%, ETH ~0.50%
+        sigma_15m = self.vols.get(asset, 0.70) * (15 / (252 * 390)) ** 0.5
+        open_price_disp = self.open_prices.get(asset)
+        if open_price_disp and sigma_15m > 0:
+            net_disp = (current - open_price_disp) / open_price_disp * (1 if is_up else -1)
+            if   net_disp > sigma_15m * 2.0: score -= 4   # >2σ: very likely to revert
+            elif net_disp > sigma_15m * 1.5: score -= 3
+            elif net_disp > sigma_15m * 1.0: score -= 2
+            elif net_disp > sigma_15m * 0.5: score -= 1
+            elif net_disp < -sigma_15m * 1.0: score += 2  # opposite overextended → reversion in our favour
+            elif net_disp < -sigma_15m * 0.5: score += 1
 
         # Cross-asset confirmation: how many other assets trending same direction? (0-2 pts)
         cross_count = self._cross_asset_direction(asset, direction)
@@ -1863,8 +1877,12 @@ class LiveTrader:
                 placed = 0
                 for sig in valid:
                     if placed >= slots: break
+                    # Direction cap: no 2x same-direction positions
+                    pending_up = sum(1 for _, t in self.pending.values() if t.get("side") == "Up")
+                    pending_dn = sum(1 for _, t in self.pending.values() if t.get("side") == "Down")
+                    if sig["side"] == "Up"   and pending_up >= MAX_SAME_DIR: continue
+                    if sig["side"] == "Down" and pending_dn >= MAX_SAME_DIR: continue
                     # Late entry (40-60% remaining, no timing bonus): require score ≥ 8
-                    # — only high-edge/high-conviction late trades are worth it
                     is_late = sig["pct_remaining"] < 0.60
                     min_score = 8 if is_late else 4
                     if sig["score"] < min_score: break
