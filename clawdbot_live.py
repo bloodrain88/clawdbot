@@ -2128,6 +2128,8 @@ class LiveTrader:
                         continue
                     if cid in self.pending or cid in self.pending_redeem:
                         continue
+                    if cid in self.redeemed_cids:
+                        continue   # already processed — don't re-add to pending
                     # Position exists on-chain but bot has no record — recover it
                     asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
                              else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
@@ -2318,6 +2320,8 @@ class LiveTrader:
                     self.seen.add(cid)
                     if val < DUST_BET:   # dust — mark seen only, don't track
                         continue
+                    if cid in self.redeemed_cids:
+                        continue   # already processed — don't re-add
                     if cid in self.pending or cid in self.pending_redeem:
                         continue
                     title = pos.get("title", "")
