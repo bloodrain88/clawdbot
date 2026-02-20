@@ -1725,8 +1725,8 @@ class LiveTrader:
                 print(f"{Y}[BANK] refresh error: {e}{RS}")
 
     async def _sync_stats_from_api(self, loop, _req):
-        """Derive total trades and win count from Polymarket activity API.
-        BUY events = bets placed, REDEEM events = winning positions cashed out."""
+        """Sync win/loss stats from Polymarket activity API (on-chain truth).
+        BUY = bet placed, REDEEM = win. Also syncs recent_trades deque for last-5 gate."""
         try:
             activity = await loop.run_in_executor(None, lambda: _req.get(
                 "https://data-api.polymarket.com/activity",
@@ -1736,26 +1736,54 @@ class LiveTrader:
             if not isinstance(activity, list):
                 return
 
-            seen_cids  = set()
-            total_bets = 0
-            total_wins = 0
+            # Group by conditionId, preserving order (API returns newest first)
+            by_cid = {}
+            order  = []   # conditionIds in newest-first order
             for evt in activity:
                 typ = (evt.get("type") or "").upper()
                 cid = evt.get("conditionId") or evt.get("market", {}).get("conditionId", "")
+                if not cid:
+                    continue
+                if cid not in by_cid:
+                    by_cid[cid] = {"buy": False, "redeem": False}
+                    order.append(cid)
                 if typ in ("BUY", "TRADE", "PURCHASE"):
-                    if cid and cid not in seen_cids:
-                        seen_cids.add(cid)
-                        total_bets += 1
+                    by_cid[cid]["buy"] = True
                 elif typ == "REDEEM":
-                    total_wins += 1
+                    by_cid[cid]["redeem"] = True
+
+            total_bets = sum(1 for d in by_cid.values() if d["buy"])
+            total_wins = sum(1 for d in by_cid.values() if d["buy"] and d["redeem"])
+
+            # Last 5 COMPLETED bets from API (skip still-open/settling positions)
+            api_last5 = []
+            for cid in order:
+                if len(api_last5) >= 5:
+                    break
+                if not by_cid[cid]["buy"]:
+                    continue
+                if cid in self.pending or cid in self.pending_redeem:
+                    continue  # still active — not resolved yet
+                api_last5.append(1 if by_cid[cid]["redeem"] else 0)
 
             if total_bets > 0:
                 old_t, old_w = self.total, self.wins
                 self.total = total_bets
                 self.wins  = total_wins
-                wr = f"{total_wins/total_bets*100:.1f}%"
-                print(f"{B}[STATS] API sync: {total_bets} trades, {total_wins} wins ({wr}) "
-                      f"[was {old_t}/{old_w}]{RS}")
+                # Overwrite the tail of recent_trades with API truth (oldest→newest)
+                if api_last5:
+                    api_oldest_first = list(reversed(api_last5))
+                    cur = list(self.recent_trades)
+                    if len(cur) >= len(api_oldest_first):
+                        cur[-len(api_oldest_first):] = api_oldest_first
+                    else:
+                        cur = api_oldest_first
+                    self.recent_trades = deque(cur, maxlen=30)
+                wr  = f"{total_wins/total_bets*100:.1f}%"
+                wr5 = f"{sum(api_last5)/len(api_last5):.0%}" if api_last5 else "–"
+                streak = "".join("W" if x else "L" for x in api_last5)
+                print(f"{B}[STATS] {total_bets} bets {total_wins} wins ({wr}) | "
+                      f"Last{len(api_last5)}={streak} ({wr5}) ← on-chain truth{RS}")
         except Exception as e:
             print(f"{Y}[STATS] activity sync error: {e}{RS}")
 
