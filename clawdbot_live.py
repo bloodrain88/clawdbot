@@ -670,7 +670,25 @@ class LiveTrader:
                   f"beat=${open_price:,.2f} {src_tag} now=${current:,.2f}{RS}")
             return
 
-        # Check RTDS vs Chainlink direction agreement
+        # ── Multi-timeframe momentum agreement check ─────────────────────────
+        # Require 2/3 timeframes agree with direction. Prevents betting when
+        # short-term reversal contradicts the detected move (false signal filter).
+        is_up    = (direction == "Up")
+        mom_30s  = self._momentum_prob(asset, seconds=30)
+        mom_90s  = self._momentum_prob(asset, seconds=90)
+        mom_180s = self._momentum_prob(asset, seconds=180)
+        th_up, th_dn = 0.53, 0.47  # thresholds for "agreeing" signal
+        tf_up_votes  = sum([mom_30s > th_up, mom_90s > th_up, mom_180s > th_up])
+        tf_dn_votes  = sum([mom_30s < th_dn, mom_90s < th_dn, mom_180s < th_dn])
+        tf_votes     = tf_up_votes if is_up else tf_dn_votes
+        if tf_votes < 2:
+            print(f"{Y}[SKIP] {label} → TF divergence | "
+                  f"m30={mom_30s:.2f} m90={mom_90s:.2f} m180={mom_180s:.2f} "
+                  f"votes={tf_votes}/3 dir={direction}{RS}")
+            return
+        very_strong_mom = (tf_votes == 3)
+
+        # ── Check RTDS vs Chainlink direction agreement ──────────────────────
         cl_now   = self.cl_prices.get(asset, 0)
         cl_agree = True
         if cl_now > 0 and open_price > 0:
@@ -679,10 +697,20 @@ class LiveTrader:
             if rtds_up != cl_up:
                 cl_agree = False
 
+        # ── Binance order book imbalance (non-price confirmation, ~30ms) ────
+        ob_imbalance = await self._binance_imbalance(asset)
+        # Allow neutral; only block strong counter-signal (e.g., price Up but heavy selling)
+        imbalance_contra = (is_up and ob_imbalance < -0.25) or (not is_up and ob_imbalance > 0.25)
+        if imbalance_contra:
+            print(f"{Y}[SKIP] {label} → order book contradicts {direction} "
+                  f"(imbalance={ob_imbalance:+.2f}){RS}")
+            return
+        imbalance_confirms = (is_up and ob_imbalance > 0.15) or (not is_up and ob_imbalance < -0.15)
+
         # ── Combined probability: Black-Scholes + Momentum + Direction bias ──
         vol      = self.vols.get(asset, 0.70)
         bs_prob  = self._prob_up(current, open_price, mins_left, vol)
-        mom_prob = self._momentum_prob(asset, seconds=90)
+        mom_prob = mom_90s   # already computed above
         mw       = self._adaptive_momentum_weight()
         combined = (1 - mw) * bs_prob + mw * mom_prob
 
@@ -723,17 +751,22 @@ class LiveTrader:
             self.seen.add(cid)
             return
 
-        agree_str = "" if cl_agree else f" {Y}[CL-disagree]{RS}"
+        agree_str = "" if cl_agree else f" {Y}[CL!]{RS}"
+        ob_str    = f" ob={ob_imbalance:+.2f}" + ("✓" if imbalance_confirms else "")
+        tf_str    = f" TF={tf_votes}/3" + ("★" if very_strong_mom else "")
+        conv_str  = f" {G}★HIGH-CONV★{RS}" if (very_strong_mom and imbalance_confirms) else ""
         print(f"{G}[EDGE] {label} → {side} | beat=${open_price:,.2f} {src_tag} now=${current:,.2f} move={move_str} | "
               f"bs={bs_prob:.3f} mom={mom_prob:.3f} prob={true_prob:.3f} "
-              f"mkt={up_price:.3f} edge={edge:.3f} ${size:.2f}{agree_str}{RS}")
+              f"mkt={up_price:.3f} edge={edge:.3f} ${size:.2f}{agree_str}{ob_str}{tf_str}{conv_str}{RS}")
 
         # Mark seen before placing — prevents double-bet if evaluate called concurrently
         self.seen.add(cid)
         self._save_seen()
 
         # ── Place real order ──────────────────────────────────────────────────
-        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob, cl_agree, min_edge_req=min_edge)
+        # High conviction: all 3 TFs agree + order book confirms → skip maker wait, fill instantly
+        force_taker = very_strong_mom and imbalance_confirms and move_pct > 0.0020
+        order_id = await self._place_order(token_id, side, entry, size, asset, duration, mins_left, true_prob, cl_agree, min_edge_req=min_edge, force_taker=force_taker)
 
         trade = {
             "side":          side,
@@ -757,7 +790,7 @@ class LiveTrader:
             self._save_pending()
             self._log(m, trade)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -801,6 +834,22 @@ class LiveTrader:
                     return None
                 kind = "cautious" if not cl_agree else "directional"
                 print(f"{B}[{kind.upper()}]{RS} {asset} {side} edge={taker_edge:.3f} req={edge_req:.2f}")
+
+                # High conviction: skip maker, go straight to taker for instant fill
+                if force_taker:
+                    taker_price = round(min(best_ask + tick, 0.97), 4)
+                    size_tok_t  = round(size_usdc / taker_price, 2)
+                    print(f"{G}[FAST-TAKER]{RS} {asset} {side} HIGH-CONV @ {taker_price:.3f} | ${size_usdc:.2f}")
+                    order_args = OrderArgs(token_id=token_id, price=taker_price, size=size_tok_t, side="BUY")
+                    signed  = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
+                    resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.GTC))
+                    order_id = resp.get("orderID") or resp.get("id", "")
+                    if order_id and resp.get("status") in ("matched", "filled", ""):
+                        self.bankroll -= size_usdc
+                        print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                        return order_id
+                    # If not filled immediately, fall through to normal maker/taker flow
+                    force_taker = False  # reset so we don't loop
 
                 # ── PHASE 1: Maker bid at mid ──────────────────────────────
                 mid          = (best_bid + best_ask) / 2
@@ -1370,6 +1419,26 @@ class LiveTrader:
         if vol_t == 0:
             return 0.5
         return float(norm.cdf(move / vol_t))
+
+    async def _binance_imbalance(self, asset: str) -> float:
+        """Fetch Binance top-10 order book imbalance for asset.
+        Returns +1.0 (all bids, buying pressure) to -1.0 (all asks, selling pressure).
+        Fast ~30ms call — use as non-price directional confirmation."""
+        try:
+            import requests as _req
+            sym  = asset + "USDT"
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, lambda: _req.get(
+                "https://api.binance.com/api/v3/depth",
+                params={"symbol": sym, "limit": 10}, timeout=2
+            ).json())
+            bid_vol = sum(float(b[1]) for b in data.get("bids", []))
+            ask_vol = sum(float(a[1]) for a in data.get("asks", []))
+            if bid_vol + ask_vol == 0:
+                return 0.0
+            return (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        except Exception:
+            return 0.0  # neutral on error — don't block trade
 
     def _direction_bias(self, asset: str, side: str) -> float:
         """Additive bias from historical win rate for this asset+direction.
