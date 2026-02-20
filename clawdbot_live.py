@@ -803,7 +803,8 @@ class LiveTrader:
 
         entry    = up_price if side == "Up" else (1 - up_price)
         raw_size = self._kelly_size(true_prob, entry, edge)
-        size     = round(max(MIN_BET, min(min(MAX_BET, self.bankroll * 0.25), raw_size * size_mult)), 2)
+        dyn_max  = min(MAX_BET * self._wr_bet_scale(), self.bankroll * 0.30)
+        size     = round(max(MIN_BET, min(dyn_max, raw_size * size_mult)), 2)
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
             return None
@@ -1662,6 +1663,24 @@ class LiveTrader:
             return -1.0
         return sum(list(self.recent_trades)[-5:]) / 5
 
+    def _wr_bet_scale(self) -> float:
+        """Scale MAX_BET up when win rate is consistently high (last 10 trades).
+        Needs ≥10 resolved trades to activate — avoids overconfidence on small samples.
+        Returns multiplier applied to MAX_BET cap:
+          WR ≥ 80%  → 2.0x (hot streak, push hard)
+          WR ≥ 70%  → 1.5x
+          WR ≥ 60%  → 1.2x
+          WR < 60%  → 1.0x (base — no change)
+        """
+        trades = list(self.recent_trades)
+        if len(trades) < 10:
+            return 1.0
+        wr10 = sum(trades[-10:]) / 10
+        if   wr10 >= 0.80: return 2.0
+        elif wr10 >= 0.70: return 1.5
+        elif wr10 >= 0.60: return 1.2
+        else:              return 1.0
+
     def _adaptive_min_edge(self) -> float:
         """CLOB edge sanity floor — keeps us from buying at obviously bad prices.
         Range: 3-8% only. Never blocks trading on its own."""
@@ -1727,7 +1746,9 @@ class LiveTrader:
         last5 = list(self.recent_trades)[-5:] if len(self.recent_trades) >= 5 else list(self.recent_trades)
         streak = "".join("W" if x else "L" for x in last5)
         label  = f"{wr5:.0%}" if wr5 >= 0 else "–"
-        print(f"{B}[ADAPT] Last5={streak} WR={label}  MinEdge={me:.2f}  Streak={self.consec_losses}L  DrawdownScale={self._kelly_drawdown_scale():.0%}{RS}")
+        wr_scale = self._wr_bet_scale()
+        wr_str   = f"  BetScale={wr_scale:.1f}x" if wr_scale > 1.0 else ""
+        print(f"{B}[ADAPT] Last5={streak} WR={label}  MinEdge={me:.2f}  Streak={self.consec_losses}L  DrawdownScale={self._kelly_drawdown_scale():.0%}{wr_str}{RS}")
 
     # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
     async def _get_chainlink_at(self, asset: str, start_ts: float) -> tuple:
