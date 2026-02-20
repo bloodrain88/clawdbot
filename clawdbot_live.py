@@ -982,6 +982,9 @@ class LiveTrader:
             {"inputs":[{"name":"conditionId","type":"bytes32"},{"name":"index","type":"uint256"}],
              "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],
              "stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"owner","type":"address"},{"name":"id","type":"uint256"}],
+             "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
         ]
         ctf  = self.w3.eth.contract(address=ctf_addr, abi=CTF_ABI_FULL)
         loop = asyncio.get_event_loop()
@@ -1031,51 +1034,65 @@ class LiveTrader:
                     size   = trade.get("size", 0)
                     entry  = trade.get("entry", 0.5)
 
+                    # Check on-chain CTF token balance — Polymarket may have auto-redeemed already
+                    from eth_utils import keccak as _keccak
+                    _idx = 1 if side == "Up" else 2
+                    _coll_id  = _keccak(b'\x00'*32 + cid_bytes + _idx.to_bytes(32, 'big'))
+                    _token_id = int.from_bytes(_coll_id, 'big')
+                    ctf_bal = await loop.run_in_executor(
+                        None, lambda ti=_token_id: ctf.functions.balanceOf(acct.address, ti).call()
+                    )
+
                     if won and size > 0:
-                        # Redeem winning CTF tokens → USDC
-                        index_set = 1 if side == "Up" else 2
-                        nonce  = await loop.run_in_executor(
-                            None, lambda: self.w3.eth.get_transaction_count(acct.address)
-                        )
-                        # EIP-1559 gas pricing — required by Polygon mainnet RPCs
-                        latest   = await loop.run_in_executor(None, lambda: self.w3.eth.get_block("latest"))
-                        base_fee = latest["baseFeePerGas"]
-                        pri_fee  = self.w3.to_wei(40, "gwei")
-                        max_fee  = base_fee * 2 + pri_fee
-                        tx = ctf.functions.redeemPositions(
-                            collat, b'\x00'*32, cid_bytes, [index_set]
-                        ).build_transaction({
-                            "from": acct.address, "nonce": nonce,
-                            "gas": 200_000,
-                            "maxFeePerGas": max_fee,
-                            "maxPriorityFeePerGas": pri_fee,
-                            "chainId": 137,
-                        })
-                        signed  = acct.sign_transaction(tx)
-                        tx_hash = await loop.run_in_executor(
-                            None, lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction)
-                        )
-                        receipt = await loop.run_in_executor(
-                            None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60)
-                        )
-                        if receipt.status == 1:
-                            fee    = size * 0.0156 * (1 - abs(trade.get("mkt_price", 0.5) - 0.5) * 2)
-                            payout = size / entry - fee
-                            pnl    = payout - size
-                            self.bankroll  += payout
-                            self.daily_pnl += pnl
-                            self.total += 1; self.wins += 1
-                            self._record_result(asset, side, True, trade.get("structural", False))
-                            self._log(m, trade, "WIN", pnl)
-                            wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
-                            print(f"{G}[WIN]{RS} {asset} {side} {trade.get('duration',0)}m | "
-                                  f"{G}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr} | "
-                                  f"tx={tx_hash.hex()[:16]}")
-                            done.append(cid)
+                        fee    = size * 0.0156 * (1 - abs(trade.get("mkt_price", 0.5) - 0.5) * 2)
+                        payout = size / entry - fee
+                        pnl    = payout - size
+
+                        if ctf_bal > 0:
+                            # We still hold tokens — redeem them ourselves
+                            index_set = _idx
+                            nonce  = await loop.run_in_executor(
+                                None, lambda: self.w3.eth.get_transaction_count(acct.address)
+                            )
+                            latest   = await loop.run_in_executor(None, lambda: self.w3.eth.get_block("latest"))
+                            base_fee = latest["baseFeePerGas"]
+                            pri_fee  = self.w3.to_wei(40, "gwei")
+                            max_fee  = base_fee * 2 + pri_fee
+                            tx = ctf.functions.redeemPositions(
+                                collat, b'\x00'*32, cid_bytes, [index_set]
+                            ).build_transaction({
+                                "from": acct.address, "nonce": nonce,
+                                "gas": 200_000,
+                                "maxFeePerGas": max_fee,
+                                "maxPriorityFeePerGas": pri_fee,
+                                "chainId": 137,
+                            })
+                            signed  = acct.sign_transaction(tx)
+                            tx_hash = await loop.run_in_executor(
+                                None, lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction)
+                            )
+                            receipt = await loop.run_in_executor(
+                                None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60)
+                            )
+                            if receipt.status != 1:
+                                print(f"{Y}[REDEEM] {asset} {side} tx failed, retrying...{RS}")
+                                continue
+                            suffix = f"tx={tx_hash.hex()[:16]}"
                         else:
-                            print(f"{Y}[REDEEM] {asset} {side} tx failed, retrying...{RS}")
+                            # CTF balance=0 — Polymarket already auto-redeemed, USDC in wallet
+                            suffix = "auto-redeemed by Polymarket"
+
+                        # bankroll updated by _refresh_balance (on-chain USDC) — don't double-count
+                        self.daily_pnl += pnl
+                        self.total += 1; self.wins += 1
+                        self._record_result(asset, side, True, trade.get("structural", False))
+                        self._log(m, trade, "WIN", pnl)
+                        wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
+                        print(f"{G}[WIN]{RS} {asset} {side} {trade.get('duration',0)}m | "
+                              f"{G}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr} | {suffix}")
+                        done.append(cid)
                     else:
-                        # Lost on-chain
+                        # Lost on-chain (on-chain is authoritative)
                         if size > 0:
                             pnl = -size
                             self.daily_pnl += pnl
