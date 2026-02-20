@@ -980,6 +980,14 @@ class LiveTrader:
         # Use pre-fetched book if it matches the bet token; else it will be re-fetched in _place_order
         pm_book_data = _pm_book if token_id == prefetch_token else None
 
+        # Re-check entry against LIVE CLOB ask (Gamma up_price can differ from actual orderbook)
+        # This prevents entering at e.g. 64¢ when Gamma shows 45¢
+        if pm_book_data is not None:
+            _, clob_ask, _ = pm_book_data
+            if clob_ask > 0.45:
+                return None   # actual CLOB price > tier limit — skip
+            entry = clob_ask  # use real fill price for sizing and display
+
         # Force taker for high-score early continuation — fill immediately before AMM reprices
         force_taker = (
             (score >= 12 and very_strong_mom and imbalance_confirms and move_pct > 0.0015) or
