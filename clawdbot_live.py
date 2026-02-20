@@ -61,7 +61,7 @@ MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momen
 DUST_BET       = 5.0      # $5 absolute floor (Polymarket minimum order size)
 MAX_ABS_BET    = 20.0     # $20 hard ceiling regardless of bankroll/WR/Kelly — prevents runaway sizing
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
-MAX_OPEN       = 1        # 1 position at a time — BTC+ETH are correlated, no point doubling
+MAX_OPEN       = 2        # 2 simultaneous — max data collection across 4 assets
 MAX_SAME_DIR   = 1        # max 1 position per direction (no 2x Up or 2x Down)
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
@@ -103,8 +103,8 @@ SERIES = {
     # AMM on 5-min adjusts too fast — no edge window by the time bot detects a move
     "btc-up-or-down-15m": {"asset": "BTC", "duration": 15, "id": "10192"},
     "eth-up-or-down-15m": {"asset": "ETH", "duration": 15, "id": "10191"},
-    # SOL/XRP removed: today 35%/47% WR, -$49/-$46 P&L — negative EV
-
+    "sol-up-or-down-15m": {"asset": "SOL", "duration": 15, "id": "10423"},
+    "xrp-up-or-down-15m": {"asset": "XRP", "duration": 15, "id": "10422"},
 }
 
 GAMMA = "https://gamma-api.polymarket.com"
@@ -882,7 +882,7 @@ class LiveTrader:
 
         wr_scale   = self._wr_bet_scale()
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
-        max_single = min(100.0, self.bankroll * bankroll_pct)
+        max_single = min(10.0, self.bankroll * bankroll_pct)   # TEST CAP $10 — preserve bankroll while collecting data
         abs_cap    = max_single * 2 if is_early_continuation and score >= 10 else max_single
         size       = max(DUST_BET, round(min(abs_cap, raw_size * vol_mult * wr_scale), 2))
         token_id = m["token_up"] if side == "Up" else m["token_down"]
