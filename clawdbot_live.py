@@ -986,6 +986,7 @@ class LiveTrader:
         ctf  = self.w3.eth.contract(address=ctf_addr, abi=CTF_ABI_FULL)
         loop = asyncio.get_event_loop()
 
+        _wait_log_ts = {}   # cid → last time we printed [WAIT] for it
         while True:
             await asyncio.sleep(5)
             if not self.pending_redeem:
@@ -1009,6 +1010,13 @@ class LiveTrader:
                         None, lambda b=cid_bytes: ctf.functions.payoutDenominator(b).call()
                     )
                     if denom == 0:
+                        # Log once per minute so user can see we're waiting
+                        now_ts = _time.time()
+                        if now_ts - _wait_log_ts.get(cid, 0) >= 60:
+                            _wait_log_ts[cid] = now_ts
+                            elapsed = (now_ts - self._redeem_queued_ts.get(cid, now_ts)) / 60
+                            size = trade.get("size", 0)
+                            print(f"{Y}[WAIT] {asset} {side} ~${size:.2f} — awaiting oracle ({elapsed:.0f}min){RS}")
                         continue   # not yet resolved on-chain
 
                     # Determine actual winner from on-chain oracle result
@@ -1205,7 +1213,11 @@ class LiveTrader:
                  "up_price": entry if outcome == "Up" else 1 - entry,
                  "mins_left": mins_left, "token_up": token_up, "token_down": token_down}
 
-            if cid in self.pending:
+            if cid in self.pending_redeem:
+                # Already queued for on-chain redeem — don't move it back to pending
+                print(f"{Y}[SYNC] Skip re-add (in redeem queue): {title[:40]} {outcome}{RS}")
+                continue
+            elif cid in self.pending:
                 # Update end_ts and market data on existing pending entry
                 old_m, old_t = self.pending[cid]
                 old_m.update({"end_ts": end_ts, "start_ts": start_ts, "duration": duration,
