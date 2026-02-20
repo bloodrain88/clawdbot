@@ -868,8 +868,11 @@ class LiveTrader:
         else:             kelly_frac = 0.12   # score 4-5: probe entry only
 
         entry    = up_price if side == "Up" else (1 - up_price)
-        if entry > 0.40:
-            return None   # only bet the cheap/underpriced side (<40¢) — better edge
+        # Early continuation: AMM still near 50/50, true prob ~75% → allow up to 55¢
+        # Mid/late window: require genuinely cheap side (<40¢) for real edge
+        max_entry = 0.55 if (is_early_continuation and score >= 8) else 0.40
+        if entry > max_entry:
+            return None   # expensive side — no edge
         wr_scale = self._wr_bet_scale()
         raw_size = self._kelly_size(true_prob, entry, kelly_frac)
         # Dynamic cap: scales with bankroll (10%), min $5, max $100; 2× for strong continuations
