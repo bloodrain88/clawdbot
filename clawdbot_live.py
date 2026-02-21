@@ -266,6 +266,7 @@ class LiveTrader:
         self.token_prices    = {}     # token_id → real-time price from RTDS market stream
         self._rtds_ws        = None   # live WebSocket handle for dynamic subscriptions
         self._redeem_queued_ts = {}  # cid → timestamp when queued for redeem
+        self._redeem_verify_counts = {}  # cid → non-claimable verification cycles before auto-close
         self.seen            = set()
         self._session        = None   # persistent aiohttp session
         self.cl_prices       = {}    # Chainlink oracle prices (resolution source)
@@ -2241,6 +2242,20 @@ class LiveTrader:
             await asyncio.sleep(REDEEM_POLL_SEC)
             if not self.pending_redeem:
                 continue
+            positions_by_cid = {}
+            try:
+                pos_rows = await self._http_get_json(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                    timeout=8,
+                )
+                if isinstance(pos_rows, list):
+                    positions_by_cid = {
+                        p.get("conditionId", ""): p
+                        for p in pos_rows if p.get("conditionId")
+                    }
+            except Exception:
+                positions_by_cid = {}
             done = []
             for cid, val in list(self.pending_redeem.items()):
                 # Support both (m, trade) from _resolve and legacy (side, asset) from _sync_redeemable
@@ -2312,6 +2327,7 @@ class LiveTrader:
                                 cid_bytes=cid_bytes, index_set=(1 if side == "Up" else 2),
                                 loop=loop
                             )
+                            self._redeem_verify_counts.pop(cid, None)
                             suffix = f"tx={tx_hash[:16]}"
                         except Exception:
                             # If still claimable, keep in queue and retry later (never miss redeem).
@@ -2319,8 +2335,29 @@ class LiveTrader:
                                 ctf=ctf, collat=collat, acct_addr=acct.address,
                                 cid_bytes=cid_bytes, index_set=(1 if side == "Up" else 2), loop=loop
                             ):
-                                print(f"{Y}[REDEEM] claimable but tx failed; will retry {asset} {side}{RS}")
+                                print(
+                                    f"{Y}[REDEEM-RETRY]{RS} claimable but tx failed; will retry "
+                                    f"{asset} {side} | rk={rk} cid={self._short_cid(cid)}"
+                                )
                                 continue
+                            pos = positions_by_cid.get(cid, {})
+                            pos_redeemable = bool(pos.get("redeemable", False))
+                            pos_val = float(pos.get("currentValue", 0) or 0)
+                            if pos_redeemable and pos_val >= 0.01:
+                                print(
+                                    f"{Y}[REDEEM-PENDING]{RS} still redeemable on API "
+                                    f"(value=${pos_val:.2f}) | rk={rk} cid={self._short_cid(cid)}"
+                                )
+                                continue
+                            checks = int(self._redeem_verify_counts.get(cid, 0)) + 1
+                            self._redeem_verify_counts[cid] = checks
+                            if checks < 3:
+                                print(
+                                    f"{Y}[REDEEM-VERIFY]{RS} non-claimable; waiting confirm "
+                                    f"({checks}/3) | rk={rk} cid={self._short_cid(cid)}"
+                                )
+                                continue
+                            self._redeem_verify_counts.pop(cid, None)
 
                         # Record win regardless of TX outcome
                         try:
@@ -2396,6 +2433,7 @@ class LiveTrader:
             changed_pending = False
             for cid in done:
                 self.redeemed_cids.add(cid)
+                self._redeem_verify_counts.pop(cid, None)
                 self.pending_redeem.pop(cid, None)
                 if self.pending.pop(cid, None) is not None:
                     changed_pending = True
