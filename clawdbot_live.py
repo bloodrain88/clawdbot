@@ -77,6 +77,9 @@ HC15_TARGET_ENTRY = float(os.environ.get("HC15_TARGET_ENTRY", "0.30"))
 HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
 PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
+FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "true").lower() == "true"
+FAST_EXEC_SCORE = int(os.environ.get("FAST_EXEC_SCORE", "11"))
+FAST_EXEC_EDGE = float(os.environ.get("FAST_EXEC_EDGE", "0.08"))
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
@@ -1319,6 +1322,9 @@ class LiveTrader:
             (score >= 12 and very_strong_mom and imbalance_confirms and move_pct > 0.0015) or
             (score >= 12 and is_early_continuation)
         )
+        if FAST_EXEC_ENABLED and (not use_limit):
+            if score >= FAST_EXEC_SCORE and edge >= FAST_EXEC_EDGE and entry <= MAX_ENTRY_PRICE:
+                force_taker = True
 
         return {
             "cid": cid, "m": m, "score": score,
@@ -1547,10 +1553,12 @@ class LiveTrader:
                           f"Bank ${self.bankroll:.2f}")
                     return order_id
 
-                # 5m markets: 3s maker wait  | 15m markets: 10s maker wait
-                # Reduced from 5/20s — faster fallback to taker improves fill rate
-                poll_interval = 3 if duration <= 5 else 5
-                max_wait  = min(6 if duration <= 5 else 10, int(mins_left * 60 * 0.10))
+                # Low-latency waits to avoid blocking other opportunities.
+                poll_interval = 1
+                max_wait = min(2 if duration <= 5 else 3, int(mins_left * 60 * 0.06))
+                if use_limit:
+                    # Pullback limit: do not stall the cycle waiting on far-away price.
+                    max_wait = 1
                 polls     = max(1, max_wait // poll_interval)
                 print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
                       f"waiting up to {polls*poll_interval}s for fill...{RS}")
@@ -2614,9 +2622,9 @@ class LiveTrader:
                     print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
                 slots = max(0, MAX_OPEN - len(active_pending))
-                placed = 0
+                to_exec = []
                 for sig in valid:
-                    if placed >= slots:
+                    if len(to_exec) >= slots:
                         break
                     if not TRADE_ALL_MARKETS:
                         pending_up = sum(1 for _, t in active_pending.values() if t.get("side") == "Up")
@@ -2625,8 +2633,9 @@ class LiveTrader:
                             continue
                         if sig["side"] == "Down" and pending_dn >= MAX_SAME_DIR:
                             continue
-                    await self._execute_trade(sig)
-                    placed += 1
+                    to_exec.append(sig)
+                if to_exec:
+                    await asyncio.gather(*[self._execute_trade(sig) for sig in to_exec])
 
             await self._resolve()
             await asyncio.sleep(SCAN_INTERVAL)
