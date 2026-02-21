@@ -602,12 +602,12 @@ class LiveTrader:
                 winning    = (side == "Up" and cur_p > open_p) or (side == "Down" and cur_p < open_p)
                 move_pct   = (cur_p - open_p) / open_p * 100
                 c          = G if winning else R
-                status_str = "WIN" if winning else "LOSS"
+                status_str = "LEADING" if winning else "TRAILING"
                 payout_est = size / t.get("entry", 0.5) if winning else 0
                 move_str   = f"({move_pct:+.2f}%)"
             else:
                 c          = Y
-                status_str = "?"
+                status_str = "UNSETTLED"
                 payout_est = 0
                 move_str   = "(no ref)"
             tok_price = t.get("entry", 0)
