@@ -124,6 +124,7 @@ MAX_OPEN       = int(os.environ.get("MAX_OPEN", "8"))
 MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "8"))
 MAX_CID_EXPOSURE_PCT = float(os.environ.get("MAX_CID_EXPOSURE_PCT", "0.10"))
 BLOCK_OPPOSITE_SIDE_SAME_CID = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_CID", "true").lower() == "true"
+BLOCK_OPPOSITE_SIDE_SAME_ROUND = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_ROUND", "true").lower() == "true"
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "true").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
@@ -483,6 +484,25 @@ class LiveTrader:
             return f"{asset}-{dur}m-{st}-{et}"
         return f"{asset}-{dur}m-cid{self._short_cid(cid)}"
 
+    def _round_fingerprint(self, cid: str = "", m: dict | None = None, t: dict | None = None) -> str:
+        """CID-independent round identity to prevent opposite-side same-round hedging."""
+        m = m or {}
+        t = t or {}
+        asset = (t.get("asset") or m.get("asset") or "?").upper()
+        dur = int(t.get("duration") or m.get("duration") or 0)
+        start_ts = float(m.get("start_ts") or 0)
+        end_ts = float(t.get("end_ts") or m.get("end_ts") or 0)
+        if not self._is_exact_round_bounds(start_ts, end_ts, dur):
+            q_st, q_et = self._round_bounds_from_question(m.get("question", ""))
+            if self._is_exact_round_bounds(q_st, q_et, dur):
+                start_ts, end_ts = q_st, q_et
+        if self._is_exact_round_bounds(start_ts, end_ts, dur):
+            st = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            et = datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            return f"{asset}-{dur}m-{st}-{et}"
+        q = (m.get("question", "") or "").strip().lower()
+        return f"{asset}-{dur}m-q:{q[:64]}"
+
     async def _http_get_json(self, url: str, params: dict | None = None, timeout: float = 8.0):
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
@@ -565,7 +585,8 @@ class LiveTrader:
             f"score_gate(5m/15m)={MIN_SCORE_GATE_5M}/{MIN_SCORE_GATE_15M} "
             f"max_entry={MAX_ENTRY_PRICE:.2f}+tol{MAX_ENTRY_TOL:.2f} payout>={MIN_PAYOUT_MULT:.2f}x "
             f"ev_net>={MIN_EV_NET:.3f} fee={FEE_RATE_EST:.4f} "
-            f"risk(max_open/same_dir/cid)={MAX_OPEN}/{MAX_SAME_DIR}/{MAX_CID_EXPOSURE_PCT:.0%}"
+            f"risk(max_open/same_dir/cid)={MAX_OPEN}/{MAX_SAME_DIR}/{MAX_CID_EXPOSURE_PCT:.0%} "
+            f"block_opp(cid/round)={BLOCK_OPPOSITE_SIDE_SAME_CID}/{BLOCK_OPPOSITE_SIDE_SAME_ROUND}"
         )
         print(
             f"{B}[BOOT]{RS} "
@@ -3003,6 +3024,8 @@ class LiveTrader:
         side = sig.get("side", "")
         bankroll_ref = max(self.bankroll, 1.0)
         cid_cap = bankroll_ref * MAX_CID_EXPOSURE_PCT
+        sig_m = sig.get("m", {}) if isinstance(sig.get("m", {}), dict) else {}
+        sig_fp = self._round_fingerprint(cid=cid, m=sig_m, t=sig)
         same_cid = [(m, t) for c, (m, t) in active_pending.items() if c == cid]
         if same_cid:
             same_side_open = sum(max(0.0, t.get("size", 0.0)) for _, t in same_cid if t.get("side") == side)
@@ -3014,6 +3037,21 @@ class LiveTrader:
             if same_side_open + sig.get("size", 0.0) > cid_cap:
                 if LOG_VERBOSE:
                     print(f"{Y}[RISK] skip {sig.get('asset')} cid exposure {(same_side_open + sig.get('size', 0.0)):.2f}>{cid_cap:.2f}{RS}")
+                return False
+        same_round = [
+            (c, m, t) for c, (m, t) in active_pending.items()
+            if self._round_fingerprint(cid=c, m=m, t=t) == sig_fp
+        ]
+        if same_round:
+            round_same_side = sum(max(0.0, t.get("size", 0.0)) for _, _, t in same_round if t.get("side") == side)
+            round_opp_side = sum(max(0.0, t.get("size", 0.0)) for _, _, t in same_round if t.get("side") != side)
+            if BLOCK_OPPOSITE_SIDE_SAME_ROUND and round_opp_side > 0:
+                if LOG_VERBOSE:
+                    print(f"{Y}[RISK] skip {sig.get('asset')} {side} opposite-side open on same round{RS}")
+                return False
+            if round_same_side + sig.get("size", 0.0) > cid_cap:
+                if LOG_VERBOSE:
+                    print(f"{Y}[RISK] skip {sig.get('asset')} round exposure {(round_same_side + sig.get('size', 0.0)):.2f}>{cid_cap:.2f}{RS}")
                 return False
         total_cap, side_cap = self._regime_caps()
         total_open = sum(max(0.0, t.get("size", 0.0)) for _, t in active_pending.values())
