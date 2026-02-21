@@ -278,6 +278,8 @@ class LiveTrader:
         self.start_bank      = BANKROLL
         self.onchain_wallet_usdc = BANKROLL
         self.onchain_open_positions = 0.0
+        self.onchain_open_count = 0
+        self.onchain_redeemable_count = 0
         self.onchain_total_equity = BANKROLL
         self.onchain_snapshot_ts = 0.0
         self.daily_pnl       = 0.0
@@ -942,7 +944,8 @@ class LiveTrader:
             f"  {B}Bankroll:{RS} ${display_bank:.2f}  "
             f"{B}P&L:{RS} {pc}${pnl:+.2f}{RS}  "
             f"{B}Network:{RS} {NETWORK}  "
-            f"{B}Open:{RS} {len(self.pending)}  {Y}Settling:{RS} {len(self.pending_redeem)}\n"
+            f"{B}Open(local/onchain):{RS} {len(self.pending)}/{self.onchain_open_count}  "
+            f"{Y}Settling(local/onchain):{RS} {len(self.pending_redeem)}/{self.onchain_redeemable_count}\n"
             f"  {price_str}\n"
             f"{W}{'─'*66}{RS}"
         )
@@ -3459,13 +3462,21 @@ class LiveTrader:
                     for p in positions
                     if not p.get("redeemable") and p.get("outcome")
                 )
+                open_count = sum(1 for p in positions if not p.get("redeemable") and p.get("outcome"))
+                redeemable_count = sum(1 for p in positions if p.get("redeemable") and p.get("outcome"))
 
                 total = round(usdc + open_val, 2)
                 self.onchain_wallet_usdc = round(usdc, 2)
                 self.onchain_open_positions = round(open_val, 2)
+                self.onchain_open_count = int(open_count)
+                self.onchain_redeemable_count = int(redeemable_count)
                 self.onchain_total_equity = total
                 self.onchain_snapshot_ts = _time.time()
-                print(f"{B}[BANK] on-chain USDC=${usdc:.2f}  open_positions=${open_val:.2f}  total=${total:.2f}{RS}")
+                print(
+                    f"{B}[BANK]{RS} on-chain USDC=${usdc:.2f}  "
+                    f"open_positions=${open_val:.2f} ({open_count})  "
+                    f"redeemable={redeemable_count}  total=${total:.2f}"
+                )
                 if total > 0:
                     self.bankroll = total
                     if total > self.peak_bankroll:
