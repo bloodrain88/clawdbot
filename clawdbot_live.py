@@ -102,6 +102,10 @@ LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
+ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
+FIVE_MIN_ASSETS = {
+    s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC").split(",") if s.strip()
+}
 CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
 CLOB_HOST = "https://clob.polymarket.com"
 
@@ -113,6 +117,15 @@ SERIES = {
     "sol-up-or-down-15m": {"asset": "SOL", "duration": 15, "id": "10423"},
     "xrp-up-or-down-15m": {"asset": "XRP", "duration": 15, "id": "10422"},
 }
+if ENABLE_5M:
+    _FIVE_MIN_SERIES = {
+        "btc-up-or-down-5m": {"asset": "BTC", "duration": 5, "id": "10684"},
+        # Keep optional assets defined but disabled by default due thinner books.
+        "eth-up-or-down-5m": {"asset": "ETH", "duration": 5, "id": "10683"},
+    }
+    for slug, info in _FIVE_MIN_SERIES.items():
+        if info["asset"] in FIVE_MIN_ASSETS:
+            SERIES[slug] = info
 
 GAMMA = "https://gamma-api.polymarket.com"
 RTDS  = "wss://ws-live-data.polymarket.com"
@@ -1674,28 +1687,25 @@ class LiveTrader:
                             print(f"{Y}[WAIT] {asset} {side} ~${size:.2f} — awaiting oracle ({elapsed:.0f}min){RS}")
                         continue   # not yet resolved on-chain
 
-                    # Determine actual winner — CLOB API first (matches Polymarket UI), fallback to on-chain
-                    winner = None
+                    # On-chain truth only: determine winner from payoutNumerators.
+                    n0 = await loop.run_in_executor(
+                        None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 0).call()
+                    )
+                    n1 = await loop.run_in_executor(
+                        None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 1).call()
+                    )
                     winner_source = "ONCHAIN_NUMERATOR"
-                    try:
-                        import requests as _req2
-                        clob_r = await loop.run_in_executor(
-                            None, lambda c=cid: _req2.get(
-                                f"https://clob.polymarket.com/markets/{c}", timeout=5
-                            ).json()
-                        )
-                        for tok in clob_r.get("tokens", []):
-                            if tok.get("winner"):
-                                winner = tok.get("outcome")   # "Up" or "Down"
-                                winner_source = "CLOB_API"
-                                break
-                    except Exception:
-                        pass
-                    if winner is None:
-                        n0 = await loop.run_in_executor(
-                            None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 0).call()
-                        )
-                        winner = "Up" if n0 > 0 else "Down"
+                    if n0 > 0 and n1 == 0:
+                        winner = "Up"
+                    elif n1 > 0 and n0 == 0:
+                        winner = "Down"
+                    elif n0 == 0 and n1 == 0:
+                        # Not finalized in a usable way yet
+                        continue
+                    else:
+                        # Ambiguous payout state (unexpected for binary market) — skip and retry
+                        print(f"{Y}[REDEEM] Ambiguous numerators for {asset} cid={cid[:10]}... n0={n0} n1={n1}{RS}")
+                        continue
                     won = (winner == side)
                     size   = trade.get("size", 0)
                     entry  = trade.get("entry", 0.5)
