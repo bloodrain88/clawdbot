@@ -206,6 +206,8 @@ FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "5"))
 REDEEMABLE_SCAN_SEC = int(os.environ.get("REDEEMABLE_SCAN_SEC", "10"))
 ROUND_RETRY_COOLDOWN_SEC = float(os.environ.get("ROUND_RETRY_COOLDOWN_SEC", "12"))
 RPC_OPTIMIZE_SEC = int(os.environ.get("RPC_OPTIMIZE_SEC", "45"))
+RPC_PROBE_COUNT = int(os.environ.get("RPC_PROBE_COUNT", "3"))
+RPC_SWITCH_MARGIN_MS = float(os.environ.get("RPC_SWITCH_MARGIN_MS", "15"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
 COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
@@ -215,6 +217,13 @@ COPYFLOW_MIN_ROI = float(os.environ.get("COPYFLOW_MIN_ROI", "-0.03"))
 FLOW_RELAX_SOFT_MIN = float(os.environ.get("FLOW_RELAX_SOFT_MIN", "3.0"))
 FLOW_RELAX_HARD_MIN = float(os.environ.get("FLOW_RELAX_HARD_MIN", "6.0"))
 ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
+ORDER_FAST_MODE = os.environ.get("ORDER_FAST_MODE", "true").lower() == "true"
+MAKER_POLL_5M_SEC = float(os.environ.get("MAKER_POLL_5M_SEC", "0.15"))
+MAKER_POLL_15M_SEC = float(os.environ.get("MAKER_POLL_15M_SEC", "0.25"))
+MAKER_WAIT_5M_SEC = float(os.environ.get("MAKER_WAIT_5M_SEC", "0.45"))
+MAKER_WAIT_15M_SEC = float(os.environ.get("MAKER_WAIT_15M_SEC", "0.80"))
+FAST_TAKER_NEAR_END_5M_SEC = float(os.environ.get("FAST_TAKER_NEAR_END_5M_SEC", "100"))
+FAST_TAKER_NEAR_END_15M_SEC = float(os.environ.get("FAST_TAKER_NEAR_END_15M_SEC", "150"))
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
 }
@@ -342,10 +351,14 @@ class LiveTrader:
         best_w3 = None
         for rpc in POLYGON_RPCS:
             try:
-                t0 = _time.perf_counter()
                 _w3 = self._build_w3(rpc, timeout=6)
-                _ = _w3.eth.block_number
-                ms = (_time.perf_counter() - t0) * 1000.0
+                samples = []
+                for _ in range(max(1, RPC_PROBE_COUNT)):
+                    t0 = _time.perf_counter()
+                    _ = _w3.eth.block_number
+                    samples.append((_time.perf_counter() - t0) * 1000.0)
+                samples.sort()
+                ms = samples[len(samples) // 2]
                 self._rpc_stats[rpc] = ms
                 if ms < best_ms:
                     best_ms = ms
@@ -603,6 +616,13 @@ class LiveTrader:
             f"ev_net>={MIN_EV_NET:.3f} fee={FEE_RATE_EST:.4f} "
             f"risk(max_open/same_dir/cid)={MAX_OPEN}/{MAX_SAME_DIR}/{MAX_CID_EXPOSURE_PCT:.0%} "
             f"block_opp(cid/round)={BLOCK_OPPOSITE_SIDE_SAME_CID}/{BLOCK_OPPOSITE_SIDE_SAME_ROUND}"
+        )
+        print(
+            f"{B}[BOOT]{RS} "
+            f"fast_mode={ORDER_FAST_MODE} maker_wait(5m/15m)={MAKER_WAIT_5M_SEC:.2f}/{MAKER_WAIT_15M_SEC:.2f}s "
+            f"maker_poll(5m/15m)={MAKER_POLL_5M_SEC:.2f}/{MAKER_POLL_15M_SEC:.2f}s "
+            f"near_end_fok(5m/15m)={FAST_TAKER_NEAR_END_5M_SEC:.0f}/{FAST_TAKER_NEAR_END_15M_SEC:.0f}s "
+            f"rpc_probe={RPC_PROBE_COUNT} switch_margin={RPC_SWITCH_MARGIN_MS:.0f}ms"
         )
         print(
             f"{B}[BOOT]{RS} "
@@ -1250,10 +1270,14 @@ class LiveTrader:
                 best_ms = self._rpc_stats.get(best_rpc, 1e18)
                 for rpc in POLYGON_RPCS:
                     try:
-                        t0 = _time.perf_counter()
                         _w3 = self._build_w3(rpc, timeout=4)
-                        await loop.run_in_executor(None, lambda w=_w3: w.eth.block_number)
-                        ms = (_time.perf_counter() - t0) * 1000.0
+                        samples = []
+                        for _ in range(max(1, RPC_PROBE_COUNT)):
+                            t0 = _time.perf_counter()
+                            await loop.run_in_executor(None, lambda w=_w3: w.eth.block_number)
+                            samples.append((_time.perf_counter() - t0) * 1000.0)
+                        samples.sort()
+                        ms = samples[len(samples) // 2]
                         self._rpc_stats[rpc] = ms
                         if ms < best_ms:
                             best_ms = ms
@@ -1261,7 +1285,7 @@ class LiveTrader:
                     except Exception:
                         continue
                 current_ms = self._rpc_stats.get(self._rpc_url, 1e18)
-                if best_rpc and best_rpc != self._rpc_url and best_ms + 25 < current_ms:
+                if best_rpc and best_rpc != self._rpc_url and best_ms + RPC_SWITCH_MARGIN_MS < current_ms:
                     try:
                         nw3 = self._build_w3(best_rpc, timeout=6)
                         _ = await asyncio.get_event_loop().run_in_executor(None, lambda: nw3.eth.block_number)
@@ -2145,6 +2169,26 @@ class LiveTrader:
                     print(f"{Y}[FOK] unfilled — falling back to maker{RS}")
                     force_taker = False  # reset so we don't loop
 
+                # Near market close, prioritize instant execution over maker wait.
+                # Missing the window costs more than paying a small spread.
+                if (not force_taker) and ORDER_FAST_MODE:
+                    secs_left = max(0.0, mins_left * 60.0)
+                    near_end_cut = FAST_TAKER_NEAR_END_5M_SEC if duration <= 5 else FAST_TAKER_NEAR_END_15M_SEC
+                    if secs_left <= near_end_cut and taker_edge >= edge_floor and best_ask <= (max_entry_allowed or 0.99):
+                        force_taker = True
+                        taker_price = round(min(best_ask + tick, 0.97), 4)
+                        print(f"{G}[FAST-TAKER]{RS} {asset} {side} near-end @ {taker_price:.3f} | ${size_usdc:.2f}")
+                        order_args = MarketOrderArgs(token_id=token_id, amount=round(size_usdc, 2), side="BUY")
+                        signed = await loop.run_in_executor(None, lambda: self.clob.create_market_order(order_args))
+                        resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
+                        order_id = resp.get("orderID") or resp.get("id", "")
+                        if resp.get("status") in ("matched", "filled"):
+                            self.bankroll -= size_usdc
+                            print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                            return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_near_end"}
+                        print(f"{Y}[FOK] near-end unfilled — fallback maker{RS}")
+                        force_taker = False
+
                 # ── PHASE 1: Maker bid ────────────────────────────────────
                 mid          = (best_bid + best_ask) / 2
                 if use_limit:
@@ -2180,11 +2224,12 @@ class LiveTrader:
                     return {"order_id": order_id, "fill_price": maker_price, "mode": "maker"}
 
                 # Ultra-low-latency waits to avoid blocking other opportunities.
-                poll_interval = 0.25 if duration <= 5 else 0.4
-                max_wait = min(0.75 if duration <= 5 else 1.5, max(0.4, mins_left * 60 * 0.03))
+                poll_interval = MAKER_POLL_5M_SEC if duration <= 5 else MAKER_POLL_15M_SEC
+                base_wait = MAKER_WAIT_5M_SEC if duration <= 5 else MAKER_WAIT_15M_SEC
+                max_wait = min(base_wait, max(0.25, mins_left * 60 * 0.02))
                 if use_limit:
                     # Pullback limit: do not stall the cycle waiting on far-away price.
-                    max_wait = 0.5 if duration <= 5 else 0.8
+                    max_wait = min(max_wait, 0.35 if duration <= 5 else 0.60)
                 polls     = max(1, int(max_wait / poll_interval))
                 print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
                       f"waiting up to {polls*poll_interval}s for fill...{RS}")
