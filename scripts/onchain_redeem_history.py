@@ -121,6 +121,50 @@ def _extract_cid_sides(activity_rows):
     return by_cid
 
 
+def _extract_from_pending(path: str):
+    by_cid = defaultdict(set)
+    if not path or not os.path.exists(path):
+        return by_cid
+    try:
+        raw = json.load(open(path, "r", encoding="utf-8"))
+    except Exception:
+        return by_cid
+    if not isinstance(raw, dict):
+        return by_cid
+    for cid, val in raw.items():
+        side = ""
+        if isinstance(val, list) and len(val) > 1 and isinstance(val[1], dict):
+            side = str(val[1].get("side", "")).strip().title()
+        if cid and side in ("Up", "Down"):
+            by_cid[cid].add(side)
+    return by_cid
+
+
+def _extract_from_metrics(path: str):
+    by_cid = defaultdict(set)
+    if not path or not os.path.exists(path):
+        return by_cid
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("event") not in ("ENTRY", "QUEUE_REDEEM"):
+                    continue
+                cid = r.get("condition_id", "")
+                side = str(r.get("side", "")).strip().title()
+                if cid and side in ("Up", "Down"):
+                    by_cid[cid].add(side)
+    except Exception:
+        return by_cid
+    return by_cid
+
+
 def _cid_bytes(cid: str):
     h = cid.lower().replace("0x", "")
     if len(h) != 64:
@@ -149,6 +193,7 @@ def main():
     ap.add_argument("--page-size", type=int, default=200, help="rows per page")
     ap.add_argument("--dry-run", action="store_true", help="do not submit tx")
     ap.add_argument("--report", default="onchain_redeem_history_report.json")
+    ap.add_argument("--data-dir", default=os.environ.get("DATA_DIR", "/data"))
     args = ap.parse_args()
 
     _load_env(args.env_file)
@@ -169,7 +214,14 @@ def main():
     address_cs = Web3.to_checksum_address(address)
 
     activity = _fetch_activity(address, args.pages, args.page_size)
-    cid_sides = _extract_cid_sides(activity)
+    cid_sides = defaultdict(set)
+    for source in (
+        _extract_cid_sides(activity),
+        _extract_from_pending(os.path.join(args.data_dir, "clawdbot_pending.json")),
+        _extract_from_metrics(os.path.join(args.data_dir, "clawdbot_onchain_metrics.jsonl")),
+    ):
+        for cid, sides in source.items():
+            cid_sides[cid].update(sides)
 
     report = {
         "ts": int(time.time()),
@@ -177,6 +229,11 @@ def main():
         "rpc": args.rpc,
         "activity_rows": len(activity),
         "cids_found": len(cid_sides),
+        "sources": {
+            "activity": len(_extract_cid_sides(activity)),
+            "pending_file": len(_extract_from_pending(os.path.join(args.data_dir, "clawdbot_pending.json"))),
+            "metrics_file": len(_extract_from_metrics(os.path.join(args.data_dir, "clawdbot_onchain_metrics.jsonl"))),
+        },
         "dry_run": bool(args.dry_run),
         "claimable": [],
         "redeemed": [],
