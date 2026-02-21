@@ -192,6 +192,7 @@ LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "30"))
 LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
+REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
 LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
 FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "90"))
 RPC_OPTIMIZE_SEC = int(os.environ.get("RPC_OPTIMIZE_SEC", "45"))
@@ -357,6 +358,28 @@ class LiveTrader:
             self._log_ts[key] = now
             return True
         return False
+
+    def _short_cid(self, cid: str) -> str:
+        if not cid:
+            return "n/a"
+        return f"{cid[:10]}..."
+
+    def _round_key(self, cid: str = "", m: dict | None = None, t: dict | None = None) -> str:
+        m = m or {}
+        t = t or {}
+        asset = (t.get("asset") or m.get("asset") or "?").upper()
+        dur = int(t.get("duration") or m.get("duration") or 0)
+        start_ts = float(m.get("start_ts") or 0)
+        end_ts = float(t.get("end_ts") or m.get("end_ts") or 0)
+        if start_ts <= 0 and end_ts > 0 and dur > 0:
+            start_ts = end_ts - dur * 60.0
+        if end_ts <= 0 and start_ts > 0 and dur > 0:
+            end_ts = start_ts + dur * 60.0
+        if start_ts > 0 and end_ts > 0:
+            st = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            et = datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            return f"{asset}-{dur}m-{st}-{et}"
+        return f"{asset}-{dur}m-cid{self._short_cid(cid)}"
 
     async def _http_get_json(self, url: str, params: dict | None = None, timeout: float = 8.0):
         if self._session is None or self._session.closed:
@@ -820,6 +843,7 @@ class LiveTrader:
             asset      = t.get("asset", "?")
             side       = t.get("side", "?")
             size       = t.get("size", 0)
+            rk         = self._round_key(cid=cid, m=m, t=t)
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
             # NOT the bot's trade entry price — market determines outcome from its own start
             open_p     = self.open_prices.get(cid, 0)
@@ -872,7 +896,8 @@ class LiveTrader:
             tok_str   = f"@{tok_price*100:.0f}¢→{(1/tok_price):.2f}x" if tok_price > 0 else "@?¢"
             print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
                   f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
-                  f"bet=${size:.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | {mins_left:.1f}min left")
+                  f"bet=${size:.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
+                  f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
             if isinstance(val[0], dict):
@@ -881,11 +906,14 @@ class LiveTrader:
                 side_r  = t_r.get("side", "?")
                 size_r  = t_r.get("size", 0)
                 title_r = m_r.get("question", "")[:38]
+                rk_r = self._round_key(cid=cid, m=m_r, t=t_r)
             else:
                 side_r, asset_r = val
                 size_r = 0; title_r = ""
+                rk_r = self._round_key(cid=cid, m={"asset": asset_r}, t={"asset": asset_r, "side": side_r})
             elapsed_r = (_time.time() - self._redeem_queued_ts.get(cid, _time.time())) / 60
-            print(f"  {Y}[SETTLING]{RS} {asset_r} {side_r} | {title_r} | bet=${size_r:.2f} | waiting {elapsed_r:.0f}min")
+            print(f"  {Y}[SETTLING]{RS} {asset_r} {side_r} | {title_r} | bet=${size_r:.2f} | "
+                  f"waiting {elapsed_r:.0f}min | rk={rk_r} cid={self._short_cid(cid)}")
 
     # ── RTDS ──────────────────────────────────────────────────────────────────
     async def stream_rtds(self):
@@ -1773,6 +1801,7 @@ class LiveTrader:
             if order_id:
                 self._bucket_stats.add_fill(stat_bucket, slip_bps)
             m = sig["m"]
+            round_key = self._round_key(cid=cid, m=m, t=sig)
             trade = {
                 "side": sig["side"], "size": sig["size"], "entry": sig["entry"],
                 "open_price": sig["open_price"], "current_price": sig["current"],
@@ -1789,6 +1818,7 @@ class LiveTrader:
                 "bucket": stat_bucket,
                 "fill_price": fill_price,
                 "slip_bps": round(slip_bps, 2),
+                "round_key": round_key,
             }
             self._log_onchain_event("ENTRY", cid, {
                 "asset": sig["asset"],
@@ -1811,6 +1841,7 @@ class LiveTrader:
                 "signal_latency_ms": round(sig.get("signal_latency_ms", 0.0), 2),
                 "quote_age_ms": round(sig.get("quote_age_ms", 0.0), 2),
                 "bucket": stat_bucket,
+                "round_key": round_key,
             })
             if order_id:
                 self.seen.add(cid)
@@ -2102,8 +2133,13 @@ class LiveTrader:
                     "entry_price": trade.get("entry", 0),
                     "open_price_source": trade.get("open_price_source", "?"),
                     "chainlink_age_s": trade.get("chainlink_age_s"),
+                    "round_key": self._round_key(cid=k, m=m, t=trade),
                 })
-                print(f"{B}[RESOLVE] {asset} {trade['side']} {trade['duration']}m → on-chain queue (checking in 5s){RS}")
+                print(
+                    f"{B}[RESOLVE]{RS} {asset} {trade['side']} {trade['duration']}m → on-chain queue "
+                    f"(checking in {REDEEM_POLL_SEC:.1f}s) | rk={self._round_key(cid=k, m=m, t=trade)} "
+                    f"cid={self._short_cid(k)}"
+                )
 
     # ── REDEEM LOOP — polls every 30s, determines win/loss on-chain ───────────
     async def _redeem_loop(self):
@@ -2138,7 +2174,7 @@ class LiveTrader:
 
         _wait_log_ts = {}   # cid → last time we printed [WAIT] for it
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(REDEEM_POLL_SEC)
             if not self.pending_redeem:
                 continue
             done = []
@@ -2154,6 +2190,7 @@ class LiveTrader:
                     trade = {"side": side, "asset": asset, "size": 0, "entry": 0.5,
                              "duration": 0, "mkt_price": 0.5, "mins_left": 0,
                              "open_price": 0, "token_id": "", "order_id": ""}
+                rk = self._round_key(cid=cid, m=m, t=trade)
                 try:
                     cid_bytes = bytes.fromhex(cid.lstrip("0x").zfill(64))
                     denom = await loop.run_in_executor(
@@ -2166,7 +2203,10 @@ class LiveTrader:
                             _wait_log_ts[cid] = now_ts
                             elapsed = (now_ts - self._redeem_queued_ts.get(cid, now_ts)) / 60
                             size = trade.get("size", 0)
-                            print(f"{Y}[WAIT] {asset} {side} ~${size:.2f} — awaiting oracle ({elapsed:.0f}min){RS}")
+                            print(
+                                f"{Y}[WAIT]{RS} {asset} {side} ~${size:.2f} — awaiting oracle "
+                                f"({elapsed:.0f}min) | rk={rk} cid={self._short_cid(cid)}"
+                            )
                         continue   # not yet resolved on-chain
 
                     # On-chain truth only: determine winner from payoutNumerators.
@@ -2248,10 +2288,12 @@ class LiveTrader:
                             "chainlink_age_s": trade.get("chainlink_age_s"),
                             "onchain_score_adj": trade.get("onchain_score_adj", 0),
                             "source_confidence": trade.get("source_confidence", 0.0),
+                            "round_key": rk,
                         })
                         wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                         print(f"{G}[WIN]{RS} {asset} {side} {trade.get('duration',0)}m | "
-                              f"{G}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr} | {suffix}")
+                              f"{G}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr} | "
+                              f"{suffix} | rk={rk} cid={self._short_cid(cid)}")
                         done.append(cid)
                     else:
                         # Lost on-chain (on-chain is authoritative)
@@ -2278,10 +2320,12 @@ class LiveTrader:
                                 "chainlink_age_s": trade.get("chainlink_age_s"),
                                 "onchain_score_adj": trade.get("onchain_score_adj", 0),
                                 "source_confidence": trade.get("source_confidence", 0.0),
+                                "round_key": rk,
                             })
                             wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                             print(f"{R}[LOSS]{RS} {asset} {side} {trade.get('duration',0)}m | "
-                                  f"{R}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr}")
+                                  f"{R}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr} | "
+                                  f"rk={rk} cid={self._short_cid(cid)}")
                         done.append(cid)
                 except Exception as e:
                     print(f"{Y}[REDEEM] {asset}: {e}{RS}")
@@ -3067,16 +3111,26 @@ class LiveTrader:
                         # Fallback to Chainlink
                         ref, src = await self._get_chainlink_at(asset, start_ts)
                     if src == "not-ready":
-                        print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | waiting for first round...{RS}")
+                        print(
+                            f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | waiting for first round... | "
+                            f"rk={self._round_key(cid=cid, m=m)} cid={self._short_cid(cid)}{RS}"
+                        )
                     elif ref <= 0:
-                        print(f"{Y}[NEW MARKET] {asset} {dur}m | {title_s} | no open price yet — retry{RS}")
+                        print(
+                            f"{Y}[NEW MARKET] {asset} {dur}m | {title_s} | no open price yet — retry | "
+                            f"rk={self._round_key(cid=cid, m=m)} cid={self._short_cid(cid)}{RS}"
+                        )
                     else:
                         if asset in self.asset_cur_open:
                             self.asset_prev_open[asset] = self.asset_cur_open[asset]
                         self.asset_cur_open[asset]   = ref
                         self.open_prices[cid]        = ref
                         self.open_prices_source[cid] = src
-                        print(f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | beat=${ref:,.4f} [{src}] | {m['mins_left']:.1f}min left{RS}")
+                        print(
+                            f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | beat=${ref:,.4f} [{src}] | "
+                            f"{m['mins_left']:.1f}min left | rk={self._round_key(cid=cid, m=m)} "
+                            f"cid={self._short_cid(cid)}{RS}"
+                        )
                 else:
                     # Already known — but if source isn't PM yet, retry authoritative API
                     src = self.open_prices_source.get(cid, "?")
@@ -3480,9 +3534,12 @@ class LiveTrader:
                         )
                         attempts += 1
                         self.redeemed_cids.add(cid)
-                        print(f"{G}[FORCE-REDEEM] {winner} {d['title'][:36]} | tx={tx_hash[:16]}{RS}")
+                        print(
+                            f"{G}[FORCE-REDEEM]{RS} {winner} {d['title'][:36]} | tx={tx_hash[:16]} | "
+                            f"cid={self._short_cid(cid)}"
+                        )
                     except Exception as e:
-                        print(f"{Y}[FORCE-REDEEM] retry later {cid[:10]}...: {e}{RS}")
+                        print(f"{Y}[FORCE-REDEEM] retry later {self._short_cid(cid)}: {e}{RS}")
             except Exception as e:
                 self._errors.tick("force_redeem_backfill", print, err=e, every=10)
                 print(f"{Y}[FORCE-REDEEM] Error: {e}{RS}")
