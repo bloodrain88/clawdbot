@@ -121,8 +121,9 @@ MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
 MAX_OPEN       = int(os.environ.get("MAX_OPEN", "24"))
 MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "24"))
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
+ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "true").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
-MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "8"))
+MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "6"))
 MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "4"))
 MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
 MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.01"))
@@ -2724,6 +2725,16 @@ class LiveTrader:
             return 1.10
         return 1.0
 
+    def _signal_growth_score(self, sig: dict) -> float:
+        """Rank candidates by growth quality (higher is better)."""
+        entry = max(float(sig.get("entry", 0.5)), 1e-6)
+        score = float(sig.get("score", 0))
+        edge = float(sig.get("edge", 0.0))
+        cl_bonus = 0.02 if sig.get("cl_agree", True) else -0.03
+        payout = (1.0 / entry) - 1.0
+        ev_net = (float(sig.get("true_prob", 0.5)) / entry) - 1.0 - FEE_RATE_EST
+        return ev_net + edge * 0.35 + payout * 0.06 + score * 0.003 + cl_bonus
+
     def _regime_caps(self) -> tuple[float, float]:
         vals = []
         for a in BNB_SYM:
@@ -3056,7 +3067,18 @@ class LiveTrader:
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
                 slots = max(0, MAX_OPEN - len(active_pending))
                 to_exec = []
-                for sig in valid:
+                selected = valid
+                if ROUND_BEST_ONLY and valid:
+                    best_5m = max((s for s in valid if s.get("duration", 0) <= 5), key=self._signal_growth_score, default=None)
+                    best_15m = max((s for s in valid if s.get("duration", 0) > 5), key=self._signal_growth_score, default=None)
+                    selected = [s for s in (best_5m, best_15m) if s is not None]
+                    if selected:
+                        picks = " | ".join(
+                            f"{s['asset']} {s['duration']}m {s['side']} g={self._signal_growth_score(s):+.3f}"
+                            for s in selected
+                        )
+                        print(f"{B}[ROUND-PICK]{RS} {picks}")
+                for sig in selected:
                     if len(to_exec) >= slots:
                         break
                     if not self._exposure_ok(sig, active_pending):
