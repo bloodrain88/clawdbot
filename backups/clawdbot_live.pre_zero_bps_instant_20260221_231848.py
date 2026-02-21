@@ -108,7 +108,7 @@ load_dotenv(os.path.expanduser("~/.clawdbot.env"))
 
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON, AMOY
-from py_clob_client.clob_types import OrderArgs, OrderType, AssetType, BalanceAllowanceParams, ApiCreds
+from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, AssetType, BalanceAllowanceParams, ApiCreds
 from py_clob_client.config import get_contract_config
 
 POLYGON_RPCS = [
@@ -409,7 +409,6 @@ class LiveTrader:
         self._exec_lock         = asyncio.Lock()
         self._executing_cids    = set()
         self._round_side_attempt_ts = {}          # "round_key|side" → last attempt ts
-        self._cid_side_attempt_ts = {}            # "cid|side" → last attempt ts
         self._round_side_block_until = {}         # "round_fingerprint|side" → ttl epoch
         self._redeem_tx_lock    = asyncio.Lock()  # serialize redeem txs to avoid nonce clashes
         self._nonce_mgr         = None
@@ -2526,7 +2525,6 @@ class LiveTrader:
         round_key = self._round_key(cid=cid, m=m, t=sig)
         round_fp = self._round_fingerprint(cid=cid, m=m, t=sig)
         round_side_key = f"{round_fp}|{side}"
-        cid_side_key = f"{cid}|{side}"
         now_attempt = _time.time()
         async with self._exec_lock:
             # Trim expired round-side blocks.
@@ -2541,19 +2539,12 @@ class LiveTrader:
             last_try = float(self._round_side_attempt_ts.get(round_side_key, 0) or 0)
             if last_try > 0 and (now_attempt - last_try) < ROUND_RETRY_COOLDOWN_SEC:
                 return
-            # Also prevent duplicate retries on the same exact CID+side.
-            last_try_cid_side = float(self._cid_side_attempt_ts.get(cid_side_key, 0) or 0)
-            if last_try_cid_side > 0 and (now_attempt - last_try_cid_side) < ROUND_RETRY_COOLDOWN_SEC:
-                return
             # Never re-enter same round/side if already in pending (handles cross-CID drift).
-            for cid_p, (m_p, t_p) in list(self.pending.items()):
-                if cid_p == cid and t_p.get("side") == side:
-                    return
+            for _, (m_p, t_p) in list(self.pending.items()):
                 rk_p = self._round_fingerprint(m=m_p, t=t_p)
                 if rk_p == round_fp and t_p.get("side") == side:
                     return
             self._round_side_attempt_ts[round_side_key] = now_attempt
-            self._cid_side_attempt_ts[cid_side_key] = now_attempt
             self._executing_cids.add(cid)
         score       = sig["score"]
         score_stars = f"{G}★★★{RS}" if score >= 12 else (f"{G}★★{RS}" if score >= 9 else "★")
@@ -2704,15 +2695,6 @@ class LiveTrader:
                 def _slip_bps(exec_price: float, ref_price: float) -> float:
                     return ((exec_price - ref_price) / max(ref_price, 1e-9)) * 10000.0
 
-                async def _post_limit_fok(exec_price: float) -> tuple[dict, float]:
-                    # Strict instant execution with price cap to keep slippage near zero.
-                    px = round(max(0.001, min(exec_price, 0.97)), 4)
-                    size_tok = round(size_usdc / max(px, 1e-9), 2)
-                    order_args = OrderArgs(token_id=token_id, price=px, size=size_tok, side="BUY")
-                    signed = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
-                    resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
-                    return resp, px
-
                 # Use pre-fetched book from scoring phase (free — ran in parallel with Binance signals)
                 # or fetch fresh if not cached (~36ms)
                 if pm_book_data is not None:
@@ -2781,6 +2763,10 @@ class LiveTrader:
                         and taker_edge >= (edge_floor + 0.01)
                     ):
                         force_taker = True
+                        print(
+                            f"{G}[FAST-PATH]{RS} {asset} {side} "
+                            f"tight-spread={spread:.3f} score={score} -> instant FOK"
+                        )
                     elif (
                         secs_elapsed <= early_cut
                         and score >= (score_cap + 1)
@@ -2789,15 +2775,25 @@ class LiveTrader:
                         and taker_edge >= (edge_floor + 0.015)
                     ):
                         force_taker = True
+                        print(
+                            f"{G}[FAST-PATH]{RS} {asset} {side} early-window={secs_elapsed:.0f}s "
+                            f"spread={spread:.3f} score={score} -> instant FOK"
+                        )
                     elif (
                         best_ask <= eff_max_entry
                         and taker_edge >= edge_floor
                         and (maker_edge_est - taker_edge) <= FAST_TAKER_EDGE_DIFF_MAX
                     ):
                         force_taker = True
+                        if LOG_VERBOSE:
+                            print(
+                                f"{G}[FAST-PATH]{RS} {asset} {side} "
+                                f"maker_gain={maker_edge_est - taker_edge:.3f} <= {FAST_TAKER_EDGE_DIFF_MAX:.3f} "
+                                f"-> instant FOK"
+                            )
 
                 if force_taker:
-                    taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
+                    taker_price = round(min(best_ask + tick, 0.97), 4)
                     slip_now = _slip_bps(taker_price, price)
                     if slip_now > slip_cap_bps:
                         print(
@@ -2806,12 +2802,10 @@ class LiveTrader:
                         )
                         force_taker = False
                     else:
-                        print(
-                            f"{G}[FAST-PATH]{RS} {asset} {side} spread={spread:.3f} "
-                            f"score={score} slip={slip_now:.1f}bps -> limit FOK"
-                        )
                         print(f"{G}[FAST-TAKER]{RS} {asset} {side} HIGH-CONV @ {taker_price:.3f} | ${size_usdc:.2f}")
-                        resp, _ = await _post_limit_fok(taker_price)
+                        order_args = MarketOrderArgs(token_id=token_id, amount=round(size_usdc, 2), side="BUY")
+                        signed  = await loop.run_in_executor(None, lambda: self.clob.create_market_order(order_args))
+                        resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
                         order_id = resp.get("orderID") or resp.get("id", "")
                         if resp.get("status") in ("matched", "filled"):
                             self.bankroll -= size_usdc
@@ -2828,7 +2822,7 @@ class LiveTrader:
                     near_end_cut = FAST_TAKER_NEAR_END_5M_SEC if duration <= 5 else FAST_TAKER_NEAR_END_15M_SEC
                     if secs_left <= near_end_cut and taker_edge >= edge_floor and best_ask <= (max_entry_allowed or 0.99):
                         force_taker = True
-                        taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
+                        taker_price = round(min(best_ask + tick, 0.97), 4)
                         slip_now = _slip_bps(taker_price, price)
                         if slip_now > slip_cap_bps:
                             print(
@@ -2838,7 +2832,9 @@ class LiveTrader:
                             force_taker = False
                         else:
                             print(f"{G}[FAST-TAKER]{RS} {asset} {side} near-end @ {taker_price:.3f} | ${size_usdc:.2f}")
-                            resp, _ = await _post_limit_fok(taker_price)
+                            order_args = MarketOrderArgs(token_id=token_id, amount=round(size_usdc, 2), side="BUY")
+                            signed = await loop.run_in_executor(None, lambda: self.clob.create_market_order(order_args))
+                            resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
                             order_id = resp.get("orderID") or resp.get("id", "")
                             if resp.get("status") in ("matched", "filled"):
                                 self.bankroll -= size_usdc
@@ -2936,7 +2932,9 @@ class LiveTrader:
                 except Exception:
                     pass
 
-                # ── PHASE 2: price-capped FOK fallback — re-fetch book for fresh ask ──
+                # ── PHASE 2: FAK taker fallback — re-fetch book for fresh ask ──
+                # FAK = Fill-and-Kill (IOC): fills what's available instantly, cancels remainder
+                # No sleep needed — response is immediate
                 try:
                     fresh     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
                     f_asks    = sorted(fresh.asks, key=lambda x: float(x.price)) if fresh.asks else []
@@ -2976,7 +2974,7 @@ class LiveTrader:
                     if fresh_ev_net < min_ev_fb:
                         print(f"{Y}[SKIP] {asset} {side} fallback ev_net={fresh_ev_net:.3f} < min={min_ev_fb:.3f}{RS}")
                         return None
-                    taker_price = round(min(fresh_ask, eff_max_entry, 0.97), 4)
+                    taker_price = round(min(fresh_ask + f_tick, 0.97), 4)
                     slip_now = _slip_bps(taker_price, price)
                     if slip_now > slip_cap_bps:
                         print(
@@ -2985,10 +2983,12 @@ class LiveTrader:
                         )
                         return None
                 except Exception:
-                    taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
+                    taker_price = round(min(best_ask + tick, 0.97), 4)
                     fresh_ask   = best_ask
-                print(f"{Y}[MAKER] unfilled — FOK taker @ {taker_price:.3f} (fresh ask={fresh_ask:.3f}){RS}")
-                resp, _  = await _post_limit_fok(taker_price)
+                print(f"{Y}[MAKER] unfilled — FAK taker @ {taker_price:.3f} (fresh ask={fresh_ask:.3f}){RS}")
+                order_args = MarketOrderArgs(token_id=token_id, amount=round(size_usdc, 2), side="BUY")
+                signed   = await loop.run_in_executor(None, lambda: self.clob.create_market_order(order_args))
+                resp     = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FAK))
                 order_id = resp.get("orderID") or resp.get("id", "")
                 status   = resp.get("status", "")
 
@@ -2996,9 +2996,9 @@ class LiveTrader:
                     self.bankroll -= size_usdc
                     print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
                           f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                    return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_fallback"}
+                    return {"order_id": order_id, "fill_price": taker_price, "mode": "fak"}
 
-                # FOK should not partially fill, but keep single state-check for exchange race.
+                # FAK may partially fill — check order state once
                 if order_id:
                     try:
                         info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
@@ -3006,10 +3006,10 @@ class LiveTrader:
                             self.bankroll -= size_usdc
                             print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
                                   f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                            return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_fallback"}
+                            return {"order_id": order_id, "fill_price": taker_price, "mode": "fak"}
                     except Exception:
                         self._errors.tick("order_status_check", print, every=50)
-                print(f"{Y}[ORDER] Both maker and FOK taker unfilled — cancelled{RS}")
+                print(f"{Y}[ORDER] Both maker and FAK taker unfilled — cancelled{RS}")
                 return None
 
             except Exception as e:
