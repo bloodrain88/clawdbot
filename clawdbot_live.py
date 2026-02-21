@@ -809,22 +809,24 @@ class LiveTrader:
                 src = "CL" if cl_p > 0 else "RTDS"
             if open_p > 0 and cur_p > 0:
                 pred_winner = "Up" if cur_p >= open_p else "Down"
-                winning    = (side == pred_winner)
+                projected_win = (side == pred_winner)
                 move_pct   = (cur_p - open_p) / open_p * 100
-                c          = G if winning else R
-                status_str = "LEADING" if winning else "TRAILING"
-                payout_est = size / t.get("entry", 0.5) if winning else 0
+                c          = Y
+                status_str = "LIVE"
+                payout_est = size / t.get("entry", 0.5) if projected_win else 0
                 move_str   = f"({move_pct:+.2f}%)"
+                proj_str   = "LEAD" if projected_win else "TRAIL"
             else:
                 c          = Y
                 status_str = "UNSETTLED"
                 payout_est = 0
                 move_str   = "(no ref)"
+                proj_str   = "NA"
             tok_price = t.get("entry", 0)
             tok_str   = f"@{tok_price*100:.0f}¢→{(1/tok_price):.2f}x" if tok_price > 0 else "@?¢"
             print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
                   f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
-                  f"bet=${size:.2f} {tok_str} est=${payout_est:.2f} | {mins_left:.1f}min left")
+                  f"bet=${size:.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | {mins_left:.1f}min left")
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
             if isinstance(val[0], dict):
