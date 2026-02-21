@@ -214,8 +214,6 @@ COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
 COPYFLOW_REFRESH_ENABLED = os.environ.get("COPYFLOW_REFRESH_ENABLED", "true").lower() == "true"
 COPYFLOW_REFRESH_SEC = int(os.environ.get("COPYFLOW_REFRESH_SEC", "300"))
 COPYFLOW_MIN_ROI = float(os.environ.get("COPYFLOW_MIN_ROI", "-0.03"))
-FLOW_RELAX_SOFT_MIN = float(os.environ.get("FLOW_RELAX_SOFT_MIN", "3.0"))
-FLOW_RELAX_HARD_MIN = float(os.environ.get("FLOW_RELAX_HARD_MIN", "6.0"))
 ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
 ORDER_FAST_MODE = os.environ.get("ORDER_FAST_MODE", "true").lower() == "true"
 MAKER_POLL_5M_SEC = float(os.environ.get("MAKER_POLL_5M_SEC", "0.15"))
@@ -325,7 +323,6 @@ class LiveTrader:
         self._copyflow_map      = {}
         self._copyflow_mtime    = 0.0
         self._copyflow_last_try = 0.0
-        self._last_entry_ts     = _time.time()
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
         # ── Mathematical signal state (EMA + Kalman) ──────────────────────────
@@ -1793,7 +1790,6 @@ class LiveTrader:
         # ── Entry strategy ────────────────────────────────────────────────────
         # Trade every eligible market while still preferring higher-payout entries.
         use_limit = False
-        drought_min = (_time.time() - self._last_entry_ts) / 60.0
         # Dynamic max entry: base + tolerance + small conviction slack.
         score_slack = 0.02 if score >= 12 else (0.01 if score >= 9 else 0.0)
         max_entry_allowed = min(0.97, MAX_ENTRY_PRICE + MAX_ENTRY_TOL + score_slack)
@@ -1808,12 +1804,8 @@ class LiveTrader:
         if score >= 9:
             max_entry_allowed = max(max_entry_allowed, min(0.85, model_cap))
         # Adaptive protection against poor payout fills from realized outcomes.
-        min_payout_req, min_ev_req, adaptive_hard_cap = self._adaptive_thresholds(duration, drought_min)
+        min_payout_req, min_ev_req, adaptive_hard_cap = self._adaptive_thresholds(duration)
         max_entry_allowed = min(max_entry_allowed, adaptive_hard_cap)
-        if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_SOFT_MIN:
-            min_entry_allowed = max(0.33, min_entry_allowed - 0.08)
-        if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_HARD_MIN:
-            min_entry_allowed = max(0.30, min_entry_allowed - 0.06)
         # High-conviction 15m mode: target lower cents early for better payout.
         hc15 = (
             HC15_ENABLED and duration == 15 and
@@ -1825,11 +1817,7 @@ class LiveTrader:
             use_limit = True
             entry = min(HC15_TARGET_ENTRY, max_entry_allowed)
         else:
-            # In drought, prioritize participation over deep pullback waiting.
-            if (not QUALITY_MODE) and drought_min >= 2 and min_entry_allowed <= live_entry <= max_entry_allowed:
-                entry = live_entry
-                use_limit = False
-            elif min_entry_allowed <= live_entry <= max_entry_allowed:
+            if min_entry_allowed <= live_entry <= max_entry_allowed:
                 entry = live_entry
             elif PULLBACK_LIMIT_ENABLED and pct_remaining >= PULLBACK_LIMIT_MIN_PCT_LEFT:
                 # Don't miss good-payout setups: park a pullback limit at max acceptable entry.
@@ -1850,9 +1838,9 @@ class LiveTrader:
             if LOG_VERBOSE:
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={min_ev_req:.3f}{RS}")
             return None
-        if self._should_log("flow-thresholds", 30):
+        if self._should_log("flow-thresholds", 60):
             print(
-                f"{B}[FLOW]{RS} drought={drought_min:.1f}m "
+                f"{B}[FLOW]{RS} "
                 f"payout>={min_payout_req:.2f}x ev>={min_ev_req:.3f} "
                 f"entry=[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]"
             )
@@ -2069,7 +2057,6 @@ class LiveTrader:
             if order_id:
                 self.seen.add(cid)
                 self._save_seen()
-                self._last_entry_ts = _time.time()
                 self.pending[cid] = (m, trade)
                 block_until = float(m.get("end_ts", 0) or 0)
                 if block_until <= now_attempt:
@@ -3179,7 +3166,7 @@ class LiveTrader:
             return 1.10
         return 1.0
 
-    def _adaptive_thresholds(self, duration: int, drought_min: float) -> tuple[float, float, float]:
+    def _adaptive_thresholds(self, duration: int) -> tuple[float, float, float]:
         """Dynamic payout/EV/entry thresholds from recent on-chain outcomes."""
         base_payout = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
         base_ev = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
@@ -3206,17 +3193,6 @@ class LiveTrader:
         min_payout = base_payout + (0.18 * tightness)
         min_ev = base_ev + (0.012 * tightness)
         max_entry_hard = max(0.33, hard_cap - (0.05 * tightness))
-
-        # Drought relax only when quality is not degraded.
-        can_relax = (not QUALITY_MODE) and (tightness < 0.35)
-        if can_relax and drought_min >= FLOW_RELAX_SOFT_MIN:
-            min_payout = max(1.85 if duration <= 5 else 2.15, min_payout - 0.08)
-            min_ev = max(0.015 if duration <= 5 else 0.030, min_ev - 0.006)
-            max_entry_hard = min(0.97, max_entry_hard + 0.02)
-        if can_relax and drought_min >= FLOW_RELAX_HARD_MIN:
-            min_payout = max(1.80 if duration <= 5 else 2.10, min_payout - 0.06)
-            min_ev = max(0.010 if duration <= 5 else 0.025, min_ev - 0.006)
-            max_entry_hard = min(0.97, max_entry_hard + 0.02)
 
         return min_payout, min_ev, max_entry_hard
 
@@ -3635,9 +3611,8 @@ class LiveTrader:
                     best = valid[0]
                     other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
                     print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
-                elif ((_time.time() - self._last_entry_ts) / 60.0) >= FLOW_RELAX_SOFT_MIN and self._should_log("round-empty", 60):
-                    drought_min = (_time.time() - self._last_entry_ts) / 60.0
-                    print(f"{Y}[ROUND]{RS} no executable signal | drought={drought_min:.1f}m")
+                elif self._should_log("round-empty", 60):
+                    print(f"{Y}[ROUND]{RS} no executable signal")
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
                 shadow_pending = dict(active_pending)
                 slots = max(0, MAX_OPEN - len(active_pending))
