@@ -128,12 +128,12 @@ BLOCK_OPPOSITE_SIDE_SAME_ROUND = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_ROUND"
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "true").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
-MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "6"))
-MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "4"))
-MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
+MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "9"))
+MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "8"))
+MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.42"))
 MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.01"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.45"))
-MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.50"))
+MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.45"))
 MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "2.2"))
 MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.04"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
@@ -145,12 +145,12 @@ HC15_TARGET_ENTRY = float(os.environ.get("HC15_TARGET_ENTRY", "0.30"))
 HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
 HC15_FALLBACK_MAX_ENTRY = float(os.environ.get("HC15_FALLBACK_MAX_ENTRY", "0.36"))
 MIN_PAYOUT_MULT_5M = float(os.environ.get("MIN_PAYOUT_MULT_5M", "1.85"))
-MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.005"))
-ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.55"))
-ENTRY_HARD_CAP_15M = float(os.environ.get("ENTRY_HARD_CAP_15M", "0.55"))
+MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.03"))
+ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.50"))
+ENTRY_HARD_CAP_15M = float(os.environ.get("ENTRY_HARD_CAP_15M", "0.50"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
 PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
-FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "true").lower() == "true"
+FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "false").lower() == "true"
 FAST_EXEC_SCORE = int(os.environ.get("FAST_EXEC_SCORE", "6"))
 FAST_EXEC_EDGE = float(os.environ.get("FAST_EXEC_EDGE", "0.02"))
 MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "1200"))
@@ -210,9 +210,9 @@ COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
 COPYFLOW_REFRESH_ENABLED = os.environ.get("COPYFLOW_REFRESH_ENABLED", "true").lower() == "true"
 COPYFLOW_REFRESH_SEC = int(os.environ.get("COPYFLOW_REFRESH_SEC", "300"))
 COPYFLOW_MIN_ROI = float(os.environ.get("COPYFLOW_MIN_ROI", "-0.03"))
-FLOW_RELAX_SOFT_MIN = float(os.environ.get("FLOW_RELAX_SOFT_MIN", "0.5"))
-FLOW_RELAX_HARD_MIN = float(os.environ.get("FLOW_RELAX_HARD_MIN", "1.5"))
-ENABLE_5M = os.environ.get("ENABLE_5M", "true").lower() == "true"
+FLOW_RELAX_SOFT_MIN = float(os.environ.get("FLOW_RELAX_SOFT_MIN", "3.0"))
+FLOW_RELAX_HARD_MIN = float(os.environ.get("FLOW_RELAX_HARD_MIN", "6.0"))
+ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
 }
@@ -2198,20 +2198,22 @@ class LiveTrader:
                     f_tick    = float(fresh.tick_size or tick)
                     fresh_ask = float(f_asks[0].price) if f_asks else best_ask
                     eff_max_entry = max_entry_allowed if max_entry_allowed is not None else MAX_ENTRY_PRICE
-                    if use_limit and fresh_ask > eff_max_entry:
+                    if fresh_ask > eff_max_entry:
                         print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={eff_max_entry:.2f}{RS}")
                         return None
                     fresh_payout = 1.0 / max(fresh_ask, 1e-9)
-                    if fresh_payout < MIN_PAYOUT_MULT:
-                        print(f"{Y}[SKIP] {asset} {side} fallback payout={fresh_payout:.2f}x < min={MIN_PAYOUT_MULT:.2f}x{RS}")
+                    min_payout_fb = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
+                    if fresh_payout < min_payout_fb:
+                        print(f"{Y}[SKIP] {asset} {side} fallback payout={fresh_payout:.2f}x < min={min_payout_fb:.2f}x{RS}")
                         return None
                     fresh_ep  = true_prob - fresh_ask
                     if fresh_ep < edge_floor:
                         print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_floor:.2f} — price moved against us{RS}")
                         return None
                     fresh_ev_net = (true_prob / max(fresh_ask, 1e-9)) - 1.0 - FEE_RATE_EST
-                    if fresh_ev_net < MIN_EV_NET:
-                        print(f"{Y}[SKIP] {asset} {side} fallback ev_net={fresh_ev_net:.3f} < min={MIN_EV_NET:.3f}{RS}")
+                    min_ev_fb = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
+                    if fresh_ev_net < min_ev_fb:
+                        print(f"{Y}[SKIP] {asset} {side} fallback ev_net={fresh_ev_net:.3f} < min={min_ev_fb:.3f}{RS}")
                         return None
                     taker_price = round(min(fresh_ask + f_tick, 0.97), 4)
                 except Exception:
