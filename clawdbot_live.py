@@ -78,8 +78,8 @@ HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
 PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
 FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "true").lower() == "true"
-FAST_EXEC_SCORE = int(os.environ.get("FAST_EXEC_SCORE", "11"))
-FAST_EXEC_EDGE = float(os.environ.get("FAST_EXEC_EDGE", "0.08"))
+FAST_EXEC_SCORE = int(os.environ.get("FAST_EXEC_SCORE", "7"))
+FAST_EXEC_EDGE = float(os.environ.get("FAST_EXEC_EDGE", "0.03"))
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
@@ -102,9 +102,9 @@ CHAINLINK_ABI = [
         {"name":"answeredInRound","type":"uint80"}],
      "stateMutability":"view","type":"function"},
 ]
-SCAN_INTERVAL  = 5   # market slot discovery only — real-time eval via RTDS ticks
-PING_INTERVAL  = 5
-STATUS_INTERVAL= 30
+SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "2"))
+PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "3"))
+STATUS_INTERVAL= int(os.environ.get("STATUS_INTERVAL", "20"))
 _DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
 LOG_FILE       = os.path.join(_DATA_DIR, "clawdbot_live_trades.csv")
 PENDING_FILE   = os.path.join(_DATA_DIR, "clawdbot_pending.json")
@@ -1553,13 +1553,13 @@ class LiveTrader:
                           f"Bank ${self.bankroll:.2f}")
                     return order_id
 
-                # Low-latency waits to avoid blocking other opportunities.
-                poll_interval = 1
-                max_wait = min(2 if duration <= 5 else 3, int(mins_left * 60 * 0.06))
+                # Ultra-low-latency waits to avoid blocking other opportunities.
+                poll_interval = 0.5
+                max_wait = min(1 if duration <= 5 else 2, int(mins_left * 60 * 0.04))
                 if use_limit:
                     # Pullback limit: do not stall the cycle waiting on far-away price.
-                    max_wait = 1
-                polls     = max(1, max_wait // poll_interval)
+                    max_wait = 0.8
+                polls     = max(1, int(max_wait / poll_interval))
                 print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
                       f"waiting up to {polls*poll_interval}s for fill...{RS}")
 
