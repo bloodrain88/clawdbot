@@ -3464,18 +3464,24 @@ class LiveTrader:
                 )
                 open_count = sum(1 for p in positions if not p.get("redeemable") and p.get("outcome"))
                 redeemable_count = sum(1 for p in positions if p.get("redeemable") and p.get("outcome"))
+                redeemable_claimable = sum(
+                    1 for p in positions
+                    if p.get("redeemable") and p.get("outcome")
+                    and float(p.get("currentValue", 0) or 0) >= 0.01
+                )
 
                 total = round(usdc + open_val, 2)
                 self.onchain_wallet_usdc = round(usdc, 2)
                 self.onchain_open_positions = round(open_val, 2)
                 self.onchain_open_count = int(open_count)
-                self.onchain_redeemable_count = int(redeemable_count)
+                self.onchain_redeemable_count = int(redeemable_claimable)
                 self.onchain_total_equity = total
                 self.onchain_snapshot_ts = _time.time()
                 print(
                     f"{B}[BANK]{RS} on-chain USDC=${usdc:.2f}  "
                     f"open_positions=${open_val:.2f} ({open_count})  "
-                    f"redeemable={redeemable_count}  total=${total:.2f}"
+                    f"redeemable_claimable={redeemable_claimable} "
+                    f"(raw={redeemable_count})  total=${total:.2f}"
                 )
                 if total > 0:
                     self.bankroll = total
