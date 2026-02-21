@@ -197,6 +197,11 @@ DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "false").lower() == "true"
 LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "30"))
 LOG_SCAN_ON_CHANGE_ONLY = os.environ.get("LOG_SCAN_ON_CHANGE_ONLY", "true").lower() == "true"
+LOG_FLOW_EVERY_SEC = int(os.environ.get("LOG_FLOW_EVERY_SEC", "120"))
+LOG_ROUND_EMPTY_EVERY_SEC = int(os.environ.get("LOG_ROUND_EMPTY_EVERY_SEC", "180"))
+LOG_SETTLE_FIRST_EVERY_SEC = int(os.environ.get("LOG_SETTLE_FIRST_EVERY_SEC", "20"))
+LOG_BANK_EVERY_SEC = int(os.environ.get("LOG_BANK_EVERY_SEC", "45"))
+LOG_BANK_MIN_DELTA = float(os.environ.get("LOG_BANK_MIN_DELTA", "0.50"))
 LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
@@ -277,6 +282,7 @@ class LiveTrader:
         self._mkt_log_ts        = {}   # cid → last [MKT] log time
         self._log_ts            = {}   # throttle map for repetitive logs
         self._scan_state_last   = None
+        self._bank_state_last   = None
         self.asset_cur_open     = {}   # asset → current market open price (for inter-market continuity)
         self.asset_prev_open    = {}   # asset → previous market open price
         self.active_mkts = {}
@@ -638,6 +644,12 @@ class LiveTrader:
         print(
             f"{B}[BOOT]{RS} scan_log_change_only={LOG_SCAN_ON_CHANGE_ONLY} "
             f"scan_heartbeat={LOG_SCAN_EVERY_SEC}s"
+        )
+        print(
+            f"{B}[BOOT]{RS} log(flow/round-empty/settle/bank)="
+            f"{LOG_FLOW_EVERY_SEC}/{LOG_ROUND_EMPTY_EVERY_SEC}/"
+            f"{LOG_SETTLE_FIRST_EVERY_SEC}/{LOG_BANK_EVERY_SEC}s "
+            f"bank_delta>={LOG_BANK_MIN_DELTA:.2f}"
         )
         print(
             f"{B}[BOOT]{RS} redeem_poll={REDEEM_POLL_SEC:.1f}s "
@@ -1850,7 +1862,7 @@ class LiveTrader:
             if LOG_VERBOSE:
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={min_ev_req:.3f}{RS}")
             return None
-        if self._should_log("flow-thresholds", 60):
+        if self._should_log("flow-thresholds", LOG_FLOW_EVERY_SEC):
             print(
                 f"{B}[FLOW]{RS} "
                 f"payout>={min_payout_req:.2f}x ev>={min_ev_req:.3f} "
@@ -3533,7 +3545,7 @@ class LiveTrader:
             # Settlement always has priority over new entries.
             await self._resolve()
             if self.pending_redeem:
-                if self._should_log("settle-first", 5):
+                if self._should_log("settle-first", LOG_SETTLE_FIRST_EVERY_SEC):
                     print(
                         f"{Y}[SETTLE-FIRST]{RS} pending_redeem={len(self.pending_redeem)} "
                         f"— skipping new entries until win/loss is finalized on-chain"
@@ -3649,7 +3661,7 @@ class LiveTrader:
                     best = valid[0]
                     other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
                     print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
-                elif self._should_log("round-empty", 60):
+                elif self._should_log("round-empty", LOG_ROUND_EMPTY_EVERY_SEC):
                     print(f"{Y}[ROUND]{RS} no executable signal")
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
                 shadow_pending = dict(active_pending)
@@ -3825,12 +3837,29 @@ class LiveTrader:
                 self.onchain_redeemable_count = int(settling_claim_count)
                 self.onchain_total_equity = total
                 self.onchain_snapshot_ts = _time.time()
-                print(
-                    f"{B}[BANK]{RS} on-chain USDC=${usdc:.2f}  "
-                    f"open_positions=${open_val:.2f} ({open_count})  "
-                    f"settling_claimable=${settling_claim_val:.2f} ({settling_claim_count})  "
-                    f"total=${total:.2f}"
+                bank_state = (
+                    round(usdc, 2),
+                    round(open_val, 2),
+                    int(open_count),
+                    round(settling_claim_val, 2),
+                    int(settling_claim_count),
+                    round(total, 2),
                 )
+                prev_bank_state = self._bank_state_last
+                state_changed = prev_bank_state is None or any(
+                    abs(float(a) - float(b)) >= LOG_BANK_MIN_DELTA
+                    if isinstance(a, (int, float)) and isinstance(b, (int, float))
+                    else a != b
+                    for a, b in zip(bank_state, prev_bank_state)
+                )
+                if state_changed or self._should_log("bank-heartbeat", LOG_BANK_EVERY_SEC):
+                    print(
+                        f"{B}[BANK]{RS} on-chain USDC=${usdc:.2f}  "
+                        f"open_positions=${open_val:.2f} ({open_count})  "
+                        f"settling_claimable=${settling_claim_val:.2f} ({settling_claim_count})  "
+                        f"total=${total:.2f}"
+                    )
+                self._bank_state_last = bank_state
                 if total > 0:
                     self.bankroll = total
                     if total > self.peak_bankroll:
