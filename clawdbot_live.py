@@ -153,6 +153,8 @@ PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT"
 FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "false").lower() == "true"
 FAST_EXEC_SCORE = int(os.environ.get("FAST_EXEC_SCORE", "6"))
 FAST_EXEC_EDGE = float(os.environ.get("FAST_EXEC_EDGE", "0.02"))
+QUALITY_MODE = os.environ.get("QUALITY_MODE", "true").lower() == "true"
+STRICT_PM_SOURCE = os.environ.get("STRICT_PM_SOURCE", "true").lower() == "true"
 MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "1200"))
 MAX_QUOTE_STALENESS_MS = float(os.environ.get("MAX_QUOTE_STALENESS_MS", "1200"))
 EXPOSURE_CAP_TOTAL_TREND = float(os.environ.get("EXPOSURE_CAP_TOTAL_TREND", "0.80"))
@@ -1494,6 +1496,8 @@ class LiveTrader:
 
         # On-chain-first confidence: prefer authoritative open-price source + fresh oracle.
         open_src = self.open_prices_source.get(cid, "?")
+        if STRICT_PM_SOURCE and open_src != "PM":
+            return None
         src_conf = 1.0 if open_src == "PM" else (0.9 if open_src == "CL-exact" else 0.6)
         onchain_adj = 0
         if open_src == "PM":
@@ -1748,10 +1752,10 @@ class LiveTrader:
         if score >= 9:
             max_entry_allowed = max(max_entry_allowed, min(0.85, model_cap))
         # Anti-drought relax: keep coverage when filters become too restrictive.
-        if drought_min >= FLOW_RELAX_SOFT_MIN:
+        if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_SOFT_MIN:
             max_entry_allowed = min(0.97, max_entry_allowed + 0.03)
             min_entry_allowed = max(0.30, min_entry_allowed - 0.12)
-        if drought_min >= FLOW_RELAX_HARD_MIN:
+        if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_HARD_MIN:
             max_entry_allowed = min(0.97, max_entry_allowed + 0.04)
             min_entry_allowed = max(0.25, min_entry_allowed - 0.08)
         # Absolute protection against poor payout fills.
@@ -1769,7 +1773,7 @@ class LiveTrader:
             entry = min(HC15_TARGET_ENTRY, max_entry_allowed)
         else:
             # In drought, prioritize participation over deep pullback waiting.
-            if drought_min >= 2 and min_entry_allowed <= live_entry <= max_entry_allowed:
+            if (not QUALITY_MODE) and drought_min >= 2 and min_entry_allowed <= live_entry <= max_entry_allowed:
                 entry = live_entry
                 use_limit = False
             elif min_entry_allowed <= live_entry <= max_entry_allowed:
@@ -1785,10 +1789,10 @@ class LiveTrader:
 
         min_payout_req = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
         min_ev_req = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
-        if drought_min >= FLOW_RELAX_SOFT_MIN:
+        if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_SOFT_MIN:
             min_payout_req = max(1.80 if duration <= 5 else 2.10, min_payout_req - 0.10)
             min_ev_req = max(0.010 if duration <= 5 else 0.030, min_ev_req - 0.010)
-        if drought_min >= FLOW_RELAX_HARD_MIN:
+        if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_HARD_MIN:
             min_payout_req = max(1.70 if duration <= 5 else 2.00, min_payout_req - 0.10)
             min_ev_req = max(0.005 if duration <= 5 else 0.020, min_ev_req - 0.010)
         payout_mult = 1.0 / max(entry, 1e-9)
@@ -1801,7 +1805,7 @@ class LiveTrader:
             if LOG_VERBOSE:
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={min_ev_req:.3f}{RS}")
             return None
-        if drought_min >= FLOW_RELAX_SOFT_MIN and self._should_log("flow-relax", 30):
+        if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_SOFT_MIN and self._should_log("flow-relax", 30):
             print(f"{B}[FLOW]{RS} drought={drought_min:.1f}m relax payout>={min_payout_req:.2f}x ev>={min_ev_req:.3f} entry=[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]")
         fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= 45)
 
