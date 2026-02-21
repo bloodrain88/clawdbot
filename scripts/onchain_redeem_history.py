@@ -111,11 +111,14 @@ def _extract_cid_sides(activity_rows):
     by_cid = defaultdict(set)
     for ev in activity_rows:
         typ = str(ev.get("type") or "").upper()
-        if typ not in ("BUY", "TRADE", "PURCHASE"):
+        if typ not in ("BUY", "TRADE", "PURCHASE", "SELL"):
             continue
         cid = ev.get("conditionId") or (ev.get("market") or {}).get("conditionId") or ""
-        side = ev.get("side") or ev.get("outcome") or ""
-        side = str(side).strip().title()
+        # Activity API often reports side=BUY/SELL and outcome=Up/Down.
+        # Prefer outcome for market direction extraction.
+        outcome = str(ev.get("outcome") or "").strip().title()
+        side_raw = str(ev.get("side") or "").strip().title()
+        side = outcome if outcome in ("Up", "Down") else side_raw
         if cid and side in ("Up", "Down"):
             by_cid[cid].add(side)
     return by_cid
