@@ -2406,6 +2406,16 @@ class LiveTrader:
 
                         # Try redeemPositions from wallet first; if unclaimable, settle as auto-redeemed.
                         suffix = "auto-redeemed"
+                        tx_hash_full = ""
+                        usdc_before = 0.0
+                        usdc_after = 0.0
+                        try:
+                            _raw_before = await loop.run_in_executor(
+                                None, lambda: _usdc.functions.balanceOf(_addr_cs).call()
+                            )
+                            usdc_before = (_raw_before or 0) / 1e6
+                        except Exception:
+                            usdc_before = 0.0
                         try:
                             tx_hash = await self._submit_redeem_tx(
                                 ctf=ctf, collat=collat, acct=acct,
@@ -2413,6 +2423,7 @@ class LiveTrader:
                                 loop=loop
                             )
                             self._redeem_verify_counts.pop(cid, None)
+                            tx_hash_full = tx_hash
                             suffix = f"tx={tx_hash[:16]}"
                         except Exception:
                             # If still claimable, keep in queue and retry later (never miss redeem).
@@ -2450,9 +2461,12 @@ class LiveTrader:
                                 None, lambda: _usdc.functions.balanceOf(_addr_cs).call()
                             )
                             if _raw > 0:
-                                self.bankroll = _raw / 1e6
+                                usdc_after = _raw / 1e6
+                                self.bankroll = usdc_after
                         except Exception:
                             pass
+                        if usdc_after <= 0:
+                            usdc_after = usdc_before
                         self.daily_pnl += pnl
                         self.total += 1; self.wins += 1
                         self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
@@ -2477,9 +2491,21 @@ class LiveTrader:
                             "round_key": rk,
                         })
                         wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
+                        usdc_delta = usdc_after - usdc_before
                         print(f"{G}[WIN]{RS} {asset} {side} {trade.get('duration',0)}m | "
                               f"{G}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr} | "
                               f"{suffix} | rk={rk} cid={self._short_cid(cid)}")
+                        if tx_hash_full:
+                            print(
+                                f"{G}[REDEEMED-ONCHAIN]{RS} cid={self._short_cid(cid)} "
+                                f"tx={tx_hash_full} usdc_delta=${usdc_delta:+.2f} "
+                                f"({usdc_before:.2f}->{usdc_after:.2f})"
+                            )
+                        else:
+                            print(
+                                f"{Y}[REDEEMED-AUTO]{RS} cid={self._short_cid(cid)} "
+                                f"usdc_delta=${usdc_delta:+.2f} ({usdc_before:.2f}->{usdc_after:.2f})"
+                            )
                         done.append(cid)
                     else:
                         # Lost on-chain (on-chain is authoritative)
