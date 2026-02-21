@@ -1869,32 +1869,44 @@ class LiveTrader:
     async def _submit_redeem_tx(self, ctf, collat, acct, cid_bytes: bytes, index_set: int, loop):
         """Submit redeem tx with serialized nonce handling."""
         async with self._redeem_tx_lock:
-            nonce  = await loop.run_in_executor(
-                None, lambda: self.w3.eth.get_transaction_count(acct.address)
-            )
-            latest   = await loop.run_in_executor(None, lambda: self.w3.eth.get_block("latest"))
-            base_fee = latest["baseFeePerGas"]
-            pri_fee  = self.w3.to_wei(40, "gwei")
-            max_fee  = base_fee * 2 + pri_fee
-            tx = ctf.functions.redeemPositions(
-                collat, b'\x00' * 32, cid_bytes, [index_set]
-            ).build_transaction({
-                "from": acct.address, "nonce": nonce,
-                "gas": 200_000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": pri_fee,
-                "chainId": 137,
-            })
-            signed = acct.sign_transaction(tx)
-            tx_hash = await loop.run_in_executor(
-                None, lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            )
-            receipt = await loop.run_in_executor(
-                None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60)
-            )
-            if receipt.status != 1:
-                raise RuntimeError("redeem tx reverted")
-            return tx_hash.hex()
+            last_err = None
+            for _ in range(4):
+                try:
+                    # Use pending nonce to avoid clashes with in-flight txs.
+                    nonce = await loop.run_in_executor(
+                        None, lambda: self.w3.eth.get_transaction_count(acct.address, "pending")
+                    )
+                    latest = await loop.run_in_executor(None, lambda: self.w3.eth.get_block("latest"))
+                    base_fee = latest["baseFeePerGas"]
+                    pri_fee = self.w3.to_wei(40, "gwei")
+                    max_fee = base_fee * 2 + pri_fee
+                    tx = ctf.functions.redeemPositions(
+                        collat, b'\x00' * 32, cid_bytes, [index_set]
+                    ).build_transaction({
+                        "from": acct.address, "nonce": nonce,
+                        "gas": 200_000,
+                        "maxFeePerGas": max_fee,
+                        "maxPriorityFeePerGas": pri_fee,
+                        "chainId": 137,
+                    })
+                    signed = acct.sign_transaction(tx)
+                    tx_hash = await loop.run_in_executor(
+                        None, lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction)
+                    )
+                    receipt = await loop.run_in_executor(
+                        None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60)
+                    )
+                    if receipt.status != 1:
+                        raise RuntimeError("redeem tx reverted")
+                    return tx_hash.hex()
+                except Exception as e:
+                    last_err = e
+                    msg = str(e).lower()
+                    if "nonce too low" in msg or "already known" in msg:
+                        await asyncio.sleep(0.4)
+                        continue
+                    raise
+            raise RuntimeError(f"redeem tx failed after retries: {last_err}")
 
     async def _is_redeem_claimable(self, ctf, collat, acct_addr: str, cid_bytes: bytes, index_set: int, loop) -> bool:
         """Best-effort eth_call preflight for redeem claimability."""
