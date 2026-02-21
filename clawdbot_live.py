@@ -222,6 +222,10 @@ MAKER_WAIT_5M_SEC = float(os.environ.get("MAKER_WAIT_5M_SEC", "0.45"))
 MAKER_WAIT_15M_SEC = float(os.environ.get("MAKER_WAIT_15M_SEC", "0.80"))
 FAST_TAKER_NEAR_END_5M_SEC = float(os.environ.get("FAST_TAKER_NEAR_END_5M_SEC", "100"))
 FAST_TAKER_NEAR_END_15M_SEC = float(os.environ.get("FAST_TAKER_NEAR_END_15M_SEC", "150"))
+FAST_TAKER_SPREAD_MAX_5M = float(os.environ.get("FAST_TAKER_SPREAD_MAX_5M", "0.012"))
+FAST_TAKER_SPREAD_MAX_15M = float(os.environ.get("FAST_TAKER_SPREAD_MAX_15M", "0.008"))
+FAST_TAKER_SCORE_5M = int(os.environ.get("FAST_TAKER_SCORE_5M", "9"))
+FAST_TAKER_SCORE_15M = int(os.environ.get("FAST_TAKER_SCORE_15M", "11"))
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
 }
@@ -619,6 +623,8 @@ class LiveTrader:
             f"fast_mode={ORDER_FAST_MODE} maker_wait(5m/15m)={MAKER_WAIT_5M_SEC:.2f}/{MAKER_WAIT_15M_SEC:.2f}s "
             f"maker_poll(5m/15m)={MAKER_POLL_5M_SEC:.2f}/{MAKER_POLL_15M_SEC:.2f}s "
             f"near_end_fok(5m/15m)={FAST_TAKER_NEAR_END_5M_SEC:.0f}/{FAST_TAKER_NEAR_END_15M_SEC:.0f}s "
+            f"fast_spread(5m/15m)<={FAST_TAKER_SPREAD_MAX_5M:.3f}/{FAST_TAKER_SPREAD_MAX_15M:.3f} "
+            f"fast_score(5m/15m)>={FAST_TAKER_SCORE_5M}/{FAST_TAKER_SCORE_15M} "
             f"rpc_probe={RPC_PROBE_COUNT} switch_margin={RPC_SWITCH_MARGIN_MS:.0f}ms"
         )
         print(
@@ -2141,6 +2147,22 @@ class LiveTrader:
 
                 # High conviction: skip maker, go straight to FOK taker for instant fill
                 # FOK = Fill-or-Kill: fills completely at price or cancels instantly — no waiting
+                if (not force_taker) and ORDER_FAST_MODE and (not use_limit):
+                    eff_max_entry = max_entry_allowed if max_entry_allowed is not None else 0.99
+                    spread_cap = FAST_TAKER_SPREAD_MAX_5M if duration <= 5 else FAST_TAKER_SPREAD_MAX_15M
+                    score_cap = FAST_TAKER_SCORE_5M if duration <= 5 else FAST_TAKER_SCORE_15M
+                    if (
+                        score >= score_cap
+                        and spread <= spread_cap
+                        and best_ask <= eff_max_entry
+                        and taker_edge >= (edge_floor + 0.01)
+                    ):
+                        force_taker = True
+                        print(
+                            f"{G}[FAST-PATH]{RS} {asset} {side} "
+                            f"tight-spread={spread:.3f} score={score} -> instant FOK"
+                        )
+
                 if force_taker:
                     taker_price = round(min(best_ask + tick, 0.97), 4)
                     print(f"{G}[FAST-TAKER]{RS} {asset} {side} HIGH-CONV @ {taker_price:.3f} | ${size_usdc:.2f}")
