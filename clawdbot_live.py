@@ -3340,6 +3340,16 @@ class LiveTrader:
         while True:
           try:
             self._reload_copyflow()
+            # Settlement always has priority over new entries.
+            await self._resolve()
+            if self.pending_redeem:
+                if self._should_log("settle-first", 5):
+                    print(
+                        f"{Y}[SETTLE-FIRST]{RS} pending_redeem={len(self.pending_redeem)} "
+                        f"— skipping new entries until win/loss is finalized on-chain"
+                    )
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
             markets = await self.fetch_markets()
             now     = datetime.now(timezone.utc).timestamp()
             open_local, settling_local = self._local_position_counts()
@@ -3472,7 +3482,6 @@ class LiveTrader:
                 if to_exec:
                     await asyncio.gather(*[self._execute_trade(sig) for sig in to_exec])
 
-            await self._resolve()
             await asyncio.sleep(SCAN_INTERVAL)
           except Exception as e:
             print(f"{R}[SCAN] Error (continuing): {e}{RS}")
