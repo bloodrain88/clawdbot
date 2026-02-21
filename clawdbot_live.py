@@ -440,6 +440,26 @@ class LiveTrader:
             t["duration"] = dur
         return True
 
+    def _force_expired_from_question_if_needed(self, m: dict, t: dict | None = None) -> bool:
+        """If title window is exact and already expired, force end_ts to that exact end."""
+        if not isinstance(m, dict):
+            return False
+        dur = int((t or {}).get("duration") or m.get("duration") or 0)
+        if dur <= 0:
+            return False
+        q_start, q_end = self._round_bounds_from_question(m.get("question", ""))
+        if not self._is_exact_round_bounds(q_start, q_end, dur):
+            return False
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if q_end > now_ts:
+            return False
+        m["start_ts"] = q_start
+        m["end_ts"] = q_end
+        if t is not None:
+            t["end_ts"] = q_end
+            t["duration"] = dur
+        return True
+
     def _round_key(self, cid: str = "", m: dict | None = None, t: dict | None = None) -> str:
         m = m or {}
         t = t or {}
@@ -920,6 +940,7 @@ class LiveTrader:
         # Show each open position with current win/loss status
         now_ts = _time.time()
         for cid, (m, t) in list(self.pending.items()):
+            self._force_expired_from_question_if_needed(m, t)
             self._apply_exact_window_from_question(m, t)
             asset      = t.get("asset", "?")
             side       = t.get("side", "?")
@@ -2180,6 +2201,7 @@ class LiveTrader:
         Never trust local price comparison — Polymarket resolves on Chainlink
         at the exact expiry timestamp, which may differ from current price."""
         for _, (m_fix, t_fix) in list(self.pending.items()):
+            self._force_expired_from_question_if_needed(m_fix, t_fix)
             self._apply_exact_window_from_question(m_fix, t_fix)
         now     = datetime.now(timezone.utc).timestamp()
         expired = [k for k, (m, t) in self.pending.items() if m.get("end_ts", 0) > 0 and m["end_ts"] <= now]
@@ -2611,6 +2633,8 @@ class LiveTrader:
             q_st, q_et = self._round_bounds_from_question(title)
             if self._is_exact_round_bounds(q_st, q_et, duration):
                 start_ts, end_ts = q_st, q_et
+            elif q_et > 0 and q_et <= now:
+                end_ts = q_et
 
             # Gamma /markets sometimes returns date-only endDate (e.g. "2026-02-20") which
             # parses to midnight UTC — falsely appears expired.
@@ -3439,6 +3463,8 @@ class LiveTrader:
                     q_st, q_et = self._round_bounds_from_question(title)
                     if self._is_exact_round_bounds(q_st, q_et, duration):
                         start_ts, end_ts = q_st, q_et
+                    elif q_et > 0 and q_et <= now_ts:
+                        end_ts = q_et
                     if end_ts > 0 and end_ts <= now_ts:
                         stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
                         if stored_end > now_ts:
@@ -3737,6 +3763,8 @@ class LiveTrader:
                     q_st, q_et = self._round_bounds_from_question(title)
                     if self._is_exact_round_bounds(q_st, q_et, duration):
                         start_ts, end_ts = q_st, q_et
+                    elif q_et > 0 and q_et <= now:
+                        end_ts = q_et
                     # If already expired: check if it's a Gamma date-only midnight UTC false alarm.
                     if end_ts > 0 and end_ts <= now:
                         stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
