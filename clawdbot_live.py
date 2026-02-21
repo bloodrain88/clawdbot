@@ -1521,10 +1521,10 @@ class LiveTrader:
             max_entry_allowed = min(max_entry_allowed, MAX_ENTRY_PRICE_5M)
             min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_5M)
         # Anti-drought relax: keep coverage when filters become too restrictive.
-        if drought_min >= 8:
+        if drought_min >= 2:
             max_entry_allowed = min(0.97, max_entry_allowed + 0.03)
             min_entry_allowed = max(0.30, min_entry_allowed - 0.12)
-        if drought_min >= 15:
+        if drought_min >= 5:
             max_entry_allowed = min(0.97, max_entry_allowed + 0.04)
             min_entry_allowed = max(0.25, min_entry_allowed - 0.08)
         # High-conviction 15m mode: target lower cents early for better payout.
@@ -1551,10 +1551,10 @@ class LiveTrader:
 
         min_payout_req = MIN_PAYOUT_MULT
         min_ev_req = MIN_EV_NET
-        if drought_min >= 8:
+        if drought_min >= 2:
             min_payout_req = max(1.80, MIN_PAYOUT_MULT - 0.25)
             min_ev_req = max(0.020, MIN_EV_NET - 0.015)
-        if drought_min >= 15:
+        if drought_min >= 5:
             min_payout_req = max(1.65, MIN_PAYOUT_MULT - 0.45)
             min_ev_req = max(0.010, MIN_EV_NET - 0.030)
         payout_mult = 1.0 / max(entry, 1e-9)
@@ -1567,7 +1567,7 @@ class LiveTrader:
             if LOG_VERBOSE:
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={min_ev_req:.3f}{RS}")
             return None
-        if drought_min >= 8 and self._should_log("flow-relax", 30):
+        if drought_min >= 2 and self._should_log("flow-relax", 30):
             print(f"{B}[FLOW]{RS} drought={drought_min:.1f}m relax payout>={min_payout_req:.2f}x ev>={min_ev_req:.3f} entry=[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]")
         fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= 45)
 
@@ -1931,11 +1931,8 @@ class LiveTrader:
                     f_tick    = float(fresh.tick_size or tick)
                     fresh_ask = float(f_asks[0].price) if f_asks else best_ask
                     eff_max_entry = max_entry_allowed if max_entry_allowed is not None else MAX_ENTRY_PRICE
-                    if hc15_mode and use_limit:
-                        eff_max_entry = min(eff_max_entry, hc15_fallback_cap)
                     if use_limit and fresh_ask > eff_max_entry:
-                        reason = "hc15 cap" if hc15_mode and use_limit else "max_entry"
-                        print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > {reason}={eff_max_entry:.2f}{RS}")
+                        print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={eff_max_entry:.2f}{RS}")
                         return None
                     fresh_payout = 1.0 / max(fresh_ask, 1e-9)
                     if fresh_payout < MIN_PAYOUT_MULT:
