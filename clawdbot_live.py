@@ -418,11 +418,27 @@ class LiveTrader:
             et_ts = et_local.astimezone(timezone.utc).timestamp()
             # Handle midnight crossing edge-case.
             if et_ts <= st_ts:
-                et_local = et_local.replace(day=min(day + 1, 28))
-                et_ts = et_local.astimezone(timezone.utc).timestamp()
+                et_ts = st_ts + 24 * 3600
             return st_ts, et_ts
         except Exception:
             return 0.0, 0.0
+
+    def _apply_exact_window_from_question(self, m: dict, t: dict | None = None) -> bool:
+        """Normalize start/end timestamps from explicit ET window in title when possible."""
+        if not isinstance(m, dict):
+            return False
+        dur = int((t or {}).get("duration") or m.get("duration") or 0)
+        if dur <= 0:
+            return False
+        q_start, q_end = self._round_bounds_from_question(m.get("question", ""))
+        if not self._is_exact_round_bounds(q_start, q_end, dur):
+            return False
+        m["start_ts"] = q_start
+        m["end_ts"] = q_end
+        if t is not None:
+            t["end_ts"] = q_end
+            t["duration"] = dur
+        return True
 
     def _round_key(self, cid: str = "", m: dict | None = None, t: dict | None = None) -> str:
         m = m or {}
@@ -904,6 +920,7 @@ class LiveTrader:
         # Show each open position with current win/loss status
         now_ts = _time.time()
         for cid, (m, t) in list(self.pending.items()):
+            self._apply_exact_window_from_question(m, t)
             asset      = t.get("asset", "?")
             side       = t.get("side", "?")
             size       = t.get("size", 0)
@@ -2162,6 +2179,8 @@ class LiveTrader:
         """Queue all expired positions for on-chain resolution.
         Never trust local price comparison — Polymarket resolves on Chainlink
         at the exact expiry timestamp, which may differ from current price."""
+        for _, (m_fix, t_fix) in list(self.pending.items()):
+            self._apply_exact_window_from_question(m_fix, t_fix)
         now     = datetime.now(timezone.utc).timestamp()
         expired = [k for k, (m, t) in self.pending.items() if m.get("end_ts", 0) > 0 and m["end_ts"] <= now]
 
@@ -2589,6 +2608,9 @@ class LiveTrader:
                 token_down = tokens[1] if len(tokens) > 1 else ""
             except Exception as e:
                 print(f"{Y}[SYNC] Gamma lookup failed for {cid[:10]}: {e}{RS}")
+            q_st, q_et = self._round_bounds_from_question(title)
+            if self._is_exact_round_bounds(q_st, q_et, duration):
+                start_ts, end_ts = q_st, q_et
 
             # Gamma /markets sometimes returns date-only endDate (e.g. "2026-02-20") which
             # parses to midnight UTC — falsely appears expired.
@@ -2602,8 +2624,9 @@ class LiveTrader:
                     print(f"{Y}[SYNC] {title[:40]} — Gamma date-only, using stored end_ts ({(end_ts-now)/60:.1f}min){RS}")
                 else:
                     # No reliable end_ts — API says open, so use duration estimate
-                    end_ts = now + duration * 60
-                    print(f"{Y}[SYNC] {title[:40]} — Gamma date-only, estimating {duration}min remaining{RS}")
+                    if not self._is_exact_round_bounds(start_ts, end_ts, duration):
+                        end_ts = now + duration * 60
+                        print(f"{Y}[SYNC] {title[:40]} — Gamma date-only, estimating {duration}min remaining{RS}")
 
             if end_ts == 0:
                 # No end_ts at all — estimate from duration
@@ -3413,12 +3436,16 @@ class LiveTrader:
                         token_down = toks[1] if len(toks) > 1 else ""
                     except Exception:
                         pass
+                    q_st, q_et = self._round_bounds_from_question(title)
+                    if self._is_exact_round_bounds(q_st, q_et, duration):
+                        start_ts, end_ts = q_st, q_et
                     if end_ts > 0 and end_ts <= now_ts:
                         stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
                         if stored_end > now_ts:
                             end_ts = stored_end  # trust stored real end_ts
                         elif end_ts % 86400 < 3600:  # midnight UTC — Gamma sent date-only, false expiry
-                            end_ts = now_ts + duration * 60
+                            if not self._is_exact_round_bounds(start_ts, end_ts, duration):
+                                end_ts = now_ts + duration * 60
                         # else: genuinely expired — keep real end_ts; _resolve() queues immediately
                     if end_ts == 0:
                         end_ts = now_ts + duration * 60
@@ -3707,13 +3734,17 @@ class LiveTrader:
                         token_down = toks[1] if len(toks) > 1 else ""
                     except Exception:
                         pass
+                    q_st, q_et = self._round_bounds_from_question(title)
+                    if self._is_exact_round_bounds(q_st, q_et, duration):
+                        start_ts, end_ts = q_st, q_et
                     # If already expired: check if it's a Gamma date-only midnight UTC false alarm.
                     if end_ts > 0 and end_ts <= now:
                         stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
                         if stored_end > now:
                             end_ts = stored_end  # trust stored real end_ts
                         elif end_ts % 86400 < 3600:  # midnight UTC — date-only field, false expiry
-                            end_ts = now + duration * 60
+                            if not self._is_exact_round_bounds(start_ts, end_ts, duration):
+                                end_ts = now + duration * 60
                         # else: genuinely expired — keep real end_ts; _resolve() queues immediately
                     if end_ts == 0:
                         print(f"{Y}[SYNC] {title[:40]} — no end_ts from Gamma, skipping{RS}")
