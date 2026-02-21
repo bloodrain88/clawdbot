@@ -189,6 +189,9 @@ LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180
 LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
 FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "90"))
 RPC_OPTIMIZE_SEC = int(os.environ.get("RPC_OPTIMIZE_SEC", "45"))
+COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
+COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
+COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
 ENABLE_5M = os.environ.get("ENABLE_5M", "true").lower() == "true"
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
@@ -279,6 +282,9 @@ class LiveTrader:
         self._nonce_mgr         = None
         self._errors            = ErrorTracker()
         self._bucket_stats      = BucketStats()
+        self._copyflow_map      = {}
+        self._copyflow_mtime    = 0.0
+        self._copyflow_last_try = 0.0
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
         # ── Mathematical signal state (EMA + Kalman) ──────────────────────────
@@ -355,6 +361,29 @@ class LiveTrader:
         except Exception as e:
             self._errors.tick("http_get_json", print, err=e, every=20)
             raise
+
+    def _reload_copyflow(self):
+        now = _time.time()
+        if now - self._copyflow_last_try < COPYFLOW_RELOAD_SEC:
+            return
+        self._copyflow_last_try = now
+        try:
+            candidates = [COPYFLOW_FILE, "/app/clawdbot_copyflow.json"]
+            src = next((p for p in candidates if p and os.path.exists(p)), "")
+            if not src:
+                return
+            mtime = os.path.getmtime(src)
+            if mtime <= self._copyflow_mtime:
+                return
+            with open(src, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            market_flow = payload.get("market_side_flow", {})
+            if isinstance(market_flow, dict):
+                self._copyflow_map = market_flow
+                self._copyflow_mtime = mtime
+                print(f"{B}[COPY]{RS} loaded {len(self._copyflow_map)} market side-flow entries from {src}")
+        except Exception as e:
+            self._errors.tick("copyflow_reload", print, err=e, every=10)
 
     def _startup_self_check(self):
         rpc_rank = sorted(self._rpc_stats.items(), key=lambda x: x[1])[:3]
@@ -1439,6 +1468,20 @@ class LiveTrader:
                 return None   # AMM massively overpriced our direction — no edge
             side, edge, true_prob = direction, max(0.01, dir_edge), dir_prob
 
+        # Optional copyflow signal from externally ranked leader wallets on same market.
+        copy_adj = 0
+        copy_net = 0.0
+        flow = self._copyflow_map.get(cid, {})
+        if isinstance(flow, dict):
+            up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
+            dn_conf = float(flow.get("Down", flow.get("down", 0.0)) or 0.0)
+            pref = up_conf if side == "Up" else dn_conf
+            opp = dn_conf if side == "Up" else up_conf
+            copy_net = pref - opp
+            copy_adj = int(round(max(-COPYFLOW_BONUS_MAX, min(COPYFLOW_BONUS_MAX, copy_net * COPYFLOW_BONUS_MAX))))
+            score += copy_adj
+            edge += copy_net * 0.01
+
         # Bet the signal direction — win rate drives P&L, not just payout
         entry = up_price if side == "Up" else (1 - up_price)
 
@@ -1578,6 +1621,8 @@ class LiveTrader:
                               if self.prices.get(asset, 0) > 0 and cl_now > 0 else 0.0,
             "max_entry_allowed": max_entry_allowed,
             "min_entry_allowed": min_entry_allowed,
+            "copy_adj": copy_adj,
+            "copy_net": copy_net,
             "quote_age_ms": quote_age_ms,
             "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
         }
@@ -1615,10 +1660,11 @@ class LiveTrader:
                   f"{perp_str}{vwap_str}{cross_str} {chain_str}{cont_str}{hc_tag}{RS}")
         else:
             hc_tag = " hc15" if sig.get("hc15_mode") else ""
+            cp_tag = f" copy={sig.get('copy_adj',0):+d}" if sig.get("copy_adj", 0) else ""
             print(f"{tag} {sig['asset']} {sig['duration']}m {sig['side']} | "
                   f"score={score} edge={sig['edge']:+.3f} size=${sig['size']:.2f} "
                   f"entry={sig['entry']:.3f} src={sig.get('open_price_source','?')} "
-                  f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{hc_tag}{agree_str}{RS}")
+                  f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{hc_tag}{cp_tag}{agree_str}{RS}")
 
         try:
             if sig.get("quote_age_ms", 0) > MAX_QUOTE_STALENESS_MS:
@@ -2878,6 +2924,7 @@ class LiveTrader:
         await asyncio.sleep(6)
         while True:
           try:
+            self._reload_copyflow()
             markets = await self.fetch_markets()
             now     = datetime.now(timezone.utc).timestamp()
             if LOG_VERBOSE or self._should_log("scan-summary", LOG_SCAN_EVERY_SEC):
