@@ -933,11 +933,8 @@ class LiveTrader:
             direction = "Up"
         elif tf_dn_votes > tf_up_votes:
             direction = "Down"
-        elif prev_win_dir and pct_remaining > 0.80:
-            direction = prev_win_dir  # window just opened — use continuation prior
         else:
-            # Truly flat — bet the cheaper side (best default when no signal)
-            direction = "Down" if up_price > 0.50 else "Up"
+            return None   # no clear signal — don't guess
 
         is_up    = (direction == "Up")
         tf_votes = tf_up_votes if is_up else tf_dn_votes
