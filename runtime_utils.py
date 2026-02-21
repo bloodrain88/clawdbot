@@ -47,7 +47,19 @@ class BucketStats:
     """Bucketed execution/outcome tracker."""
 
     def __init__(self):
-        self.rows = defaultdict(lambda: {"n": 0, "wins": 0, "pnl": 0.0, "slip_bps": 0.0, "fills": 0})
+        self.rows = defaultdict(
+            lambda: {
+                "n": 0,
+                "wins": 0,
+                "losses": 0,
+                "outcomes": 0,
+                "pnl": 0.0,
+                "gross_win": 0.0,
+                "gross_loss": 0.0,
+                "slip_bps": 0.0,
+                "fills": 0,
+            }
+        )
 
     def add_fill(self, bucket: str, slip_bps: float):
         r = self.rows[bucket]
@@ -58,6 +70,11 @@ class BucketStats:
     def add_outcome(self, bucket: str, won: bool, pnl: float):
         r = self.rows[bucket]
         r["n"] += 1
+        r["outcomes"] += 1
         if won:
             r["wins"] += 1
+            r["gross_win"] += max(0.0, float(pnl))
+        else:
+            r["losses"] += 1
+            r["gross_loss"] += max(0.0, -float(pnl))
         r["pnl"] += pnl

@@ -72,19 +72,7 @@ except ModuleNotFoundError:
 
     class BucketStats:
         def __init__(self):
-            self.rows = defaultdict(
-                lambda: {
-                    "n": 0,
-                    "wins": 0,
-                    "losses": 0,
-                    "outcomes": 0,
-                    "pnl": 0.0,
-                    "gross_win": 0.0,
-                    "gross_loss": 0.0,
-                    "slip_bps": 0.0,
-                    "fills": 0,
-                }
-            )
+            self.rows = defaultdict(lambda: {"n": 0, "wins": 0, "pnl": 0.0, "slip_bps": 0.0, "fills": 0})
 
         def add_fill(self, bucket: str, slip_bps: float):
             r = self.rows[bucket]
@@ -95,13 +83,8 @@ except ModuleNotFoundError:
         def add_outcome(self, bucket: str, won: bool, pnl: float):
             r = self.rows[bucket]
             r["n"] += 1
-            r["outcomes"] += 1
             if won:
                 r["wins"] += 1
-                r["gross_win"] += max(0.0, float(pnl))
-            else:
-                r["losses"] += 1
-                r["gross_loss"] += max(0.0, -float(pnl))
             r["pnl"] += pnl
 
 load_dotenv(os.path.expanduser("~/.clawdbot.env"))
@@ -130,7 +113,7 @@ PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
 ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
-MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per realized PnL quality)
+MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
 MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to determine direction
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 DUST_BET       = 5.0      # $5 floor — at 4.55x payout: $5 → $22.75 win
@@ -257,7 +240,6 @@ FAST_TAKER_SPREAD_MAX_5M = float(os.environ.get("FAST_TAKER_SPREAD_MAX_5M", "0.0
 FAST_TAKER_SPREAD_MAX_15M = float(os.environ.get("FAST_TAKER_SPREAD_MAX_15M", "0.008"))
 FAST_TAKER_SCORE_5M = int(os.environ.get("FAST_TAKER_SCORE_5M", "9"))
 FAST_TAKER_SCORE_15M = int(os.environ.get("FAST_TAKER_SCORE_15M", "11"))
-FAST_TAKER_EDGE_DIFF_MAX = float(os.environ.get("FAST_TAKER_EDGE_DIFF_MAX", "0.015"))
 FAST_TAKER_EARLY_WINDOW_SEC_5M = float(os.environ.get("FAST_TAKER_EARLY_WINDOW_SEC_5M", "45"))
 FAST_TAKER_EARLY_WINDOW_SEC_15M = float(os.environ.get("FAST_TAKER_EARLY_WINDOW_SEC_15M", "75"))
 FIVE_MIN_ASSETS = {
@@ -352,8 +334,6 @@ class LiveTrader:
         self.price_history   = {a: deque(maxlen=300) for a in ["BTC","ETH","SOL","XRP"]}
         self.stats           = {}    # {asset: {side: {wins, total}}} — persisted
         self.recent_trades   = deque(maxlen=30)   # rolling window for WR adaptation
-        self.recent_pnl      = deque(maxlen=40)   # rolling pnl window for profit-factor/expectancy adaptation
-        self.side_perf       = {}                 # "ASSET|SIDE" -> {n, gross_win, gross_loss, pnl}
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
         self._exec_lock         = asyncio.Lock()
         self._executing_cids    = set()
@@ -371,8 +351,6 @@ class LiveTrader:
         self._copyflow_last_try = 0.0
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
-        self._last_round_best   = ""
-        self._last_round_pick   = ""
         # ── Mathematical signal state (EMA + Kalman) ──────────────────────────
         _EMA_HLS = (5, 15, 30, 60, 120)
         self.emas    = {a: {hl: 0.0 for hl in _EMA_HLS} for a in ["BTC","ETH","SOL","XRP"]}
@@ -1152,17 +1130,10 @@ class LiveTrader:
             )[0]
             k, v = top_bucket
             avg_slip = (v["slip_bps"] / v["fills"]) if v.get("fills", 0) else 0.0
-            outcomes = int(v.get("outcomes", v.get("wins", 0) + v.get("losses", 0)))
-            wr_b = (v["wins"] / outcomes * 100.0) if outcomes > 0 else 0.0
-            pf_b = (
-                float(v.get("gross_win", 0.0)) / float(v.get("gross_loss", 1e-9))
-                if float(v.get("gross_loss", 0.0)) > 0
-                else (2.0 if float(v.get("gross_win", 0.0)) > 0 else 1.0)
-            )
-            exp_b = float(v.get("pnl", 0.0)) / max(1, outcomes)
+            wr_b = (v["wins"] / v["n"] * 100.0) if v.get("n", 0) else 0.0
             print(
-                f"  {B}ExecQ:{RS} top={k} n={outcomes} pf={pf_b:.2f} exp={exp_b:+.2f} "
-                f"wr={wr_b:.1f}% avg_slip={avg_slip:.1f}bps pnl={v['pnl']:+.2f}"
+                f"  {B}ExecQ:{RS} top={k} n={v['n']} wr={wr_b:.1f}% "
+                f"avg_slip={avg_slip:.1f}bps pnl={v['pnl']:+.2f}"
             )
         # Show each open position with current win/loss status
         now_ts = _time.time()
@@ -1904,7 +1875,7 @@ class LiveTrader:
                 score += 2
                 edge += max(0.0, conf - 0.5) * 0.05
 
-        # Bet the signal direction — EV_net and execution quality drive growth.
+        # Bet the signal direction — win rate drives P&L, not just payout
         entry = up_price if side == "Up" else (1 - up_price)
 
         # ── Score gate (duration-aware) ─────────────────────────────────────
@@ -2315,18 +2286,6 @@ class LiveTrader:
                             f"{G}[FAST-PATH]{RS} {asset} {side} early-window={secs_elapsed:.0f}s "
                             f"spread={spread:.3f} score={score} -> instant FOK"
                         )
-                    elif (
-                        best_ask <= eff_max_entry
-                        and taker_edge >= edge_floor
-                        and (maker_edge_est - taker_edge) <= FAST_TAKER_EDGE_DIFF_MAX
-                    ):
-                        force_taker = True
-                        if LOG_VERBOSE:
-                            print(
-                                f"{G}[FAST-PATH]{RS} {asset} {side} "
-                                f"maker_gain={maker_edge_est - taker_edge:.3f} <= {FAST_TAKER_EDGE_DIFF_MAX:.3f} "
-                                f"-> instant FOK"
-                            )
 
                 if force_taker:
                     taker_price = round(min(best_ask + tick, 0.97), 4)
@@ -2470,7 +2429,7 @@ class LiveTrader:
                             print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={eff_max_entry:.2f}{RS}")
                             return None
                     fresh_payout = 1.0 / max(fresh_ask, 1e-9)
-                    min_payout_fb, min_ev_fb, _ = self._adaptive_thresholds(duration)
+                    min_payout_fb = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
                     if fresh_payout < min_payout_fb:
                         print(f"{Y}[SKIP] {asset} {side} fallback payout={fresh_payout:.2f}x < min={min_payout_fb:.2f}x{RS}")
                         return None
@@ -2479,6 +2438,7 @@ class LiveTrader:
                         print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_floor:.2f} — price moved against us{RS}")
                         return None
                     fresh_ev_net = (true_prob / max(fresh_ask, 1e-9)) - 1.0 - FEE_RATE_EST
+                    min_ev_fb = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
                     if fresh_ev_net < min_ev_fb:
                         print(f"{Y}[SKIP] {asset} {side} fallback ev_net={fresh_ev_net:.3f} < min={min_ev_fb:.3f}{RS}")
                         return None
@@ -2550,7 +2510,7 @@ class LiveTrader:
                     self.bankroll += trade["size"] / trade["entry"]
                 self.total += 1
                 if won: self.wins += 1
-                self._record_result(asset, trade["side"], won, trade.get("structural", False), pnl=pnl)
+                self._record_result(asset, trade["side"], won, trade.get("structural", False))
                 self._log(m, trade, "WIN" if won else "LOSS", pnl)
                 c  = G if won else R
                 wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
@@ -2788,7 +2748,7 @@ class LiveTrader:
                         self.daily_pnl += pnl
                         self.total += 1; self.wins += 1
                         self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
-                        self._record_result(asset, side, True, trade.get("structural", False), pnl=pnl)
+                        self._record_result(asset, side, True, trade.get("structural", False))
                         self._log(m, trade, "WIN", pnl)
                         self._log_onchain_event("RESOLVE", cid, {
                             "asset": asset,
@@ -2832,7 +2792,7 @@ class LiveTrader:
                             self.daily_pnl += pnl
                             self.total += 1
                             self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
-                            self._record_result(asset, side, False, trade.get("structural", False), pnl=pnl)
+                            self._record_result(asset, side, False, trade.get("structural", False))
                             self._log(m, trade, "LOSS", pnl)
                             self._log_onchain_event("RESOLVE", cid, {
                                 "asset": asset,
@@ -2966,7 +2926,7 @@ class LiveTrader:
                     size_p = t_p.get("size", 0)
                     if size_p > 0:
                         self.total += 1
-                        self._record_result(asset_p, side_p, False, t_p.get("structural", False), pnl=-size_p)
+                        self._record_result(asset_p, side_p, False, t_p.get("structural", False))
                 self._save_pending()
 
         for pos in positions:
@@ -3341,103 +3301,69 @@ class LiveTrader:
         entry_bucket = "<30c" if entry < 0.30 else ("30-50c" if entry <= 0.50 else ">50c")
         return f"{duration}m|{score_bucket}|{entry_bucket}"
 
-    def _growth_snapshot(self) -> dict:
-        rows = list(self._bucket_stats.rows.values())
-        outcomes = sum(int(r.get("outcomes", r.get("wins", 0) + r.get("losses", 0))) for r in rows)
-        gross_win = sum(float(r.get("gross_win", 0.0)) for r in rows)
-        gross_loss = sum(float(r.get("gross_loss", 0.0)) for r in rows)
-        pnl = sum(float(r.get("pnl", 0.0)) for r in rows)
-        fills = sum(int(r.get("fills", 0)) for r in rows)
-        slip = sum(float(r.get("slip_bps", 0.0)) for r in rows)
-        pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
-        expectancy = pnl / max(1, outcomes)
-        avg_slip = slip / max(1, fills)
-        recent_pnl = list(self.recent_pnl)[-20:]
-        recent_pf = 1.0
-        if recent_pnl:
-            rp_win = sum(p for p in recent_pnl if p > 0)
-            rp_loss = -sum(p for p in recent_pnl if p < 0)
-            recent_pf = (rp_win / rp_loss) if rp_loss > 0 else (2.0 if rp_win > 0 else 1.0)
-        return {
-            "outcomes": outcomes,
-            "gross_win": gross_win,
-            "gross_loss": gross_loss,
-            "pf": pf,
-            "recent_pf": recent_pf,
-            "expectancy": expectancy,
-            "avg_slip": avg_slip,
-        }
-
     def _bucket_size_scale(self, duration: int, score: int, entry: float) -> float:
-        """Adaptive size control from realized EV quality by bucket."""
+        """Adaptive size control from realized execution/outcome quality by bucket."""
         k = self._bucket_key(duration, score, entry)
         r = self._bucket_stats.rows.get(k)
         if not r:
             return 1.0
-        outcomes = int(r.get("outcomes", r.get("wins", 0) + r.get("losses", 0)))
-        if outcomes < 8:
+        n = int(r.get("n", 0))
+        if n < 8:
             return 1.0
+        wr = (r.get("wins", 0) / n) if n > 0 else 0.5
         pnl = float(r.get("pnl", 0.0))
-        gross_win = float(r.get("gross_win", 0.0))
-        gross_loss = float(r.get("gross_loss", 0.0))
-        pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
-        exp = pnl / max(1, outcomes)
-        fills = int(r.get("fills", 0))
-        avg_slip = (float(r.get("slip_bps", 0.0)) / max(1, fills))
-        scale = 1.0
-        if outcomes >= 12 and (pf < 0.90 or exp < -0.25):
-            scale = 0.45
-        elif pf < 1.05 or exp < 0.0:
-            scale = 0.70
-        elif pf > 1.35 and exp > 0.30 and avg_slip < 120.0:
-            scale = 1.15
-        if avg_slip > 350.0:
-            scale *= 0.75
-        return max(0.40, min(1.20, scale))
+        if n >= 15 and (wr < 0.40 or pnl < -25):
+            return 0.40
+        if wr < 0.50 or pnl < 0:
+            return 0.65
+        if wr > 0.62 and pnl > 0:
+            return 1.10
+        return 1.0
 
     def _adaptive_thresholds(self, duration: int) -> tuple[float, float, float]:
-        """Dynamic payout/EV/entry thresholds from realized quality (PF/expectancy/slippage)."""
+        """Dynamic payout/EV/entry thresholds from recent on-chain outcomes."""
         base_payout = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
         base_ev = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
         hard_cap = ENTRY_HARD_CAP_5M if duration <= 5 else ENTRY_HARD_CAP_15M
 
-        snap = self._growth_snapshot()
+        recent = list(self.recent_trades)[-20:]
+        recent_n = len(recent)
+        recent_wr = (sum(recent) / recent_n) if recent_n > 0 else 0.5
+
+        bucket_rows = list(self._bucket_stats.rows.values())
+        bucket_n = sum(int(r.get("n", 0)) for r in bucket_rows)
+        bucket_pnl = sum(float(r.get("pnl", 0.0)) for r in bucket_rows)
+
+        # Tightness > 0 means "trade safer" after weak realized quality.
         tightness = 0.0
-        if snap["outcomes"] >= 10 and snap["pf"] < 1.0:
-            tightness += min(1.2, (1.0 - snap["pf"]) * 1.5)
-        if snap["outcomes"] >= 10 and snap["expectancy"] < 0:
-            tightness += min(1.0, abs(snap["expectancy"]) / 0.8)
-        if snap["avg_slip"] > 220:
-            tightness += min(0.6, (snap["avg_slip"] - 220.0) / 600.0)
+        if recent_n >= 8 and recent_wr < 0.52:
+            tightness += min(1.0, (0.52 - recent_wr) / 0.08)
         if self.consec_losses >= 2:
             tightness += min(1.0, (self.consec_losses - 1) * 0.25)
-        if snap["outcomes"] >= 12 and snap["pf"] > 1.35 and snap["expectancy"] > 0.30 and snap["avg_slip"] < 120:
-            tightness -= 0.35
-        tightness = min(1.8, max(-0.5, tightness))
+        if bucket_n >= 12 and bucket_pnl < 0:
+            tightness += 0.4
+        tightness = min(1.6, max(0.0, tightness))
 
-        min_payout = max(1.55, base_payout + (0.20 * tightness))
-        min_ev = max(0.005, base_ev + (0.015 * tightness))
-        max_entry_hard = max(0.33, min(0.80, hard_cap - (0.06 * tightness)))
+        min_payout = base_payout + (0.18 * tightness)
+        min_ev = base_ev + (0.012 * tightness)
+        max_entry_hard = max(0.33, hard_cap - (0.05 * tightness))
 
         return min_payout, min_ev, max_entry_hard
 
     def _prob_shrink_factor(self) -> float:
-        """Calibrate model confidence to realized PnL quality (anti-overconfidence)."""
-        snap = self._growth_snapshot()
-        if snap["outcomes"] < 8:
-            return 0.75
-        shrink = 0.82
-        if snap["pf"] < 1.0:
-            shrink -= min(0.25, (1.0 - snap["pf"]) * 0.50)
-        if snap["expectancy"] < 0:
-            shrink -= min(0.20, abs(snap["expectancy"]) / 1.0)
-        if snap["avg_slip"] > 240:
-            shrink -= min(0.10, (snap["avg_slip"] - 240.0) / 900.0)
-        if snap["pf"] > 1.40 and snap["expectancy"] > 0.20 and snap["avg_slip"] < 120:
-            shrink += 0.05
+        """Calibrate model confidence to recent realized outcomes (anti-overconfidence)."""
+        recent = list(self.recent_trades)[-30:]
+        n = len(recent)
+        if n < 8:
+            return 0.78
+        wr = sum(recent) / max(n, 1)
+        # Base confidence multiplier, shrunk when realized WR drops.
+        shrink = 0.86
+        if wr < 0.50:
+            shrink -= min(0.30, (0.50 - wr) * 2.0)
         if self.consec_losses >= 2:
-            shrink -= min(0.15, 0.04 * self.consec_losses)
-        return max(0.40, min(0.92, shrink))
+            shrink -= min(0.20, 0.05 * self.consec_losses)
+        return max(0.45, min(0.90, shrink))
 
     def _signal_growth_score(self, sig: dict) -> float:
         """Rank candidates by growth quality (higher is better)."""
@@ -3521,19 +3447,14 @@ class LiveTrader:
         return True
 
     def _direction_bias(self, asset: str, side: str) -> float:
-        """Small additive bias from realized side expectancy/profit factor."""
-        k = f"{asset}|{side}"
-        s = self.side_perf.get(k, {})
-        n = int(s.get("n", 0))
-        if n < 8:
+        """Additive bias from historical win rate for this asset+direction.
+        Returns 0 until 5 trades, then scales from -0.10 to +0.10."""
+        s = self.stats.get(asset, {}).get(side, {})
+        total = s.get("total", 0)
+        if total < 5:
             return 0.0
-        gw = float(s.get("gross_win", 0.0))
-        gl = float(s.get("gross_loss", 0.0))
-        pnl = float(s.get("pnl", 0.0))
-        pf = (gw / gl) if gl > 0 else (2.0 if gw > 0 else 1.0)
-        exp = pnl / max(1, n)
-        bias = (pf - 1.0) * 0.02 + (exp / 8.0)
-        return max(-0.06, min(0.06, bias))
+        wr = s["wins"] / total
+        return (wr - 0.5) * 0.25   # max ±0.125
 
     def _kelly_drawdown_scale(self) -> float:
         """Scale Kelly fraction down when in drawdown vs session high.
@@ -3550,43 +3471,46 @@ class LiveTrader:
         else:
             return 0.20      # >30%: 20% (survival mode, still trading)
 
+    def _last5_wr(self) -> float:
+        """Win rate over the last 5 resolved trades (0.0–1.0). -1 if < 5 trades."""
+        if len(self.recent_trades) < 5:
+            return -1.0
+        return sum(list(self.recent_trades)[-5:]) / 5
+
     def _wr_bet_scale(self) -> float:
-        """Scale size with realized PF/expectancy, not win-rate."""
-        pnl = list(self.recent_pnl)[-16:]
-        if len(pnl) < 8:
+        """Scale bet size up when win rate is consistently high (last 10 trades).
+        Needs ≥10 resolved trades to activate — avoids overconfidence on small samples.
+        Returns multiplier applied to raw Kelly size:
+          WR ≥ 80%  → 1.10x
+          WR ≥ 70%  → 1.05x
+          WR ≥ 60%  → 1.00x
+          WR < 60%  → 1.0x (base — no change)
+        """
+        trades = list(self.recent_trades)
+        if len(trades) < 10:
             return 1.0
-        gross_win = sum(p for p in pnl if p > 0)
-        gross_loss = -sum(p for p in pnl if p < 0)
-        pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
-        exp = sum(pnl) / len(pnl)
-        if pf >= 1.45 and exp > 0.40:
-            return 1.12
-        if pf >= 1.20 and exp > 0.10:
-            return 1.05
-        if pf < 1.00 or exp < 0.0:
-            return 0.85
-        return 1.0
+        wr10 = sum(trades[-10:]) / 10
+        if   wr10 >= 0.80: return 1.10
+        elif wr10 >= 0.70: return 1.05
+        elif wr10 >= 0.60: return 1.00
+        else:              return 1.0
 
     def _adaptive_min_edge(self) -> float:
         """CLOB edge sanity floor — keeps us from buying at obviously bad prices.
         Range: 3-8% only. Never blocks trading on its own."""
-        snap = self._growth_snapshot()
-        edge = 0.045
-        if snap["avg_slip"] > 250:
-            edge += min(0.015, (snap["avg_slip"] - 250.0) / 25000.0)
-        if snap["outcomes"] >= 10 and snap["pf"] < 1.0:
-            edge += min(0.015, (1.0 - snap["pf"]) * 0.03)
-        if snap["outcomes"] >= 10 and snap["pf"] > 1.35 and snap["expectancy"] > 0.2:
-            edge -= 0.008
-        return max(0.03, min(0.08, edge))
+        wr5 = self._last5_wr()
+        if   wr5 < 0:        return 0.04   # no history: moderate
+        elif wr5 >= 0.80:    return 0.03   # hot streak: very permissive
+        elif wr5 >= 0.60:    return 0.04   # normal
+        elif wr5 >= 0.40:    return 0.05   # slightly cold
+        else:                return 0.06   # cold: 6% — circuit breaker handles the rest
 
     def _adaptive_momentum_weight(self) -> float:
-        """Shift toward momentum only when realized expectancy degrades."""
-        pnl = list(self.recent_pnl)[-10:]
-        if len(pnl) < 5:
+        """Shift toward momentum when recent WR is poor."""
+        wr5 = self._last5_wr()
+        if wr5 < 0:
             return MOMENTUM_WEIGHT
-        exp = sum(pnl) / max(1, len(pnl))
-        if exp < 0:
+        if wr5 < 0.40:
             return min(0.65, MOMENTUM_WEIGHT + 0.15)
         return MOMENTUM_WEIGHT
 
@@ -3596,8 +3520,6 @@ class LiveTrader:
                 data = json.load(f)
             self.stats        = data.get("stats", {})
             self.recent_trades = deque(data.get("recent", []), maxlen=30)
-            self.recent_pnl = deque(data.get("recent_pnl", []), maxlen=40)
-            self.side_perf = data.get("side_perf", {})
             total = sum(s.get("total",0) for a in self.stats.values() for s in a.values())
             wins  = sum(s.get("wins",0)  for a in self.stats.values() for s in a.values())
             if total and LOG_VERBOSE:
@@ -3605,25 +3527,15 @@ class LiveTrader:
         except Exception:
             self.stats        = {}
             self.recent_trades = deque(maxlen=30)
-            self.recent_pnl = deque(maxlen=40)
-            self.side_perf = {}
 
     def _save_stats(self):
         try:
             with open(STATS_FILE, "w") as f:
-                json.dump(
-                    {
-                        "stats": self.stats,
-                        "recent": list(self.recent_trades),
-                        "recent_pnl": list(self.recent_pnl),
-                        "side_perf": self.side_perf,
-                    },
-                    f,
-                )
+                json.dump({"stats": self.stats, "recent": list(self.recent_trades)}, f)
         except Exception:
             pass
 
-    def _record_result(self, asset: str, side: str, won: bool, structural: bool = False, pnl: float = 0.0):
+    def _record_result(self, asset: str, side: str, won: bool, structural: bool = False):
         if asset not in self.stats:
             self.stats[asset] = {}
         if side not in self.stats[asset]:
@@ -3632,16 +3544,6 @@ class LiveTrader:
         if won:
             self.stats[asset][side]["wins"] += 1
         self.recent_trades.append(1 if won else 0)
-        self.recent_pnl.append(float(pnl))
-        sp_key = f"{asset}|{side}"
-        row = self.side_perf.get(sp_key, {"n": 0, "gross_win": 0.0, "gross_loss": 0.0, "pnl": 0.0})
-        row["n"] = int(row.get("n", 0)) + 1
-        if pnl >= 0:
-            row["gross_win"] = float(row.get("gross_win", 0.0)) + float(pnl)
-        else:
-            row["gross_loss"] = float(row.get("gross_loss", 0.0)) + abs(float(pnl))
-        row["pnl"] = float(row.get("pnl", 0.0)) + float(pnl)
-        self.side_perf[sp_key] = row
         # Track consecutive losses for adaptive signals (no pause — trade every cycle)
         if won:
             self.consec_losses = 0
@@ -3652,17 +3554,15 @@ class LiveTrader:
             self.peak_bankroll = self.bankroll
         self._save_stats()
         # Print adaptive state for visibility
+        mw   = self._adaptive_momentum_weight()
         me   = self._adaptive_min_edge()
-        snap = self._growth_snapshot()
-        last5 = list(self.recent_pnl)[-5:]
-        streak = "".join("+" if x > 0 else "-" for x in last5) if last5 else ""
+        wr5  = self._last5_wr()
+        last5 = list(self.recent_trades)[-5:] if len(self.recent_trades) >= 5 else list(self.recent_trades)
+        streak = "".join("W" if x else "L" for x in last5)
+        label  = f"{wr5:.0%}" if wr5 >= 0 else "–"
         wr_scale = self._wr_bet_scale()
         wr_str   = f"  BetScale={wr_scale:.1f}x" if wr_scale > 1.0 else ""
-        print(
-            f"{B}[ADAPT]{RS} Last5PnL={streak or '–'} PF={snap['recent_pf']:.2f} "
-            f"Exp={sum(last5)/max(1,len(last5)):+.2f} MinEdge={me:.2f} "
-            f"Streak={self.consec_losses}L DrawdownScale={self._kelly_drawdown_scale():.0%}{wr_str}"
-        )
+        print(f"{B}[ADAPT] Last5={streak} WR={label}  MinEdge={me:.2f}  Streak={self.consec_losses}L  DrawdownScale={self._kelly_drawdown_scale():.0%}{wr_str}{RS}")
 
     # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
     async def _get_polymarket_open_price(self, asset: str, start_ts: float, end_ts: float, duration: int = 15) -> float:
@@ -3913,10 +3813,7 @@ class LiveTrader:
                 if valid:
                     best = valid[0]
                     other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
-                    best_sig = f"{best.get('cid','')}|{best['asset']}|{best['side']}|{best['score']}"
-                    if best_sig != self._last_round_best or self._should_log("round-best-heartbeat", 20):
-                        self._last_round_best = best_sig
-                        print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
+                    print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
                 elif self._should_log("round-empty", LOG_ROUND_EMPTY_EVERY_SEC):
                     print(f"{Y}[ROUND]{RS} no executable signal")
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
@@ -3933,9 +3830,7 @@ class LiveTrader:
                             f"{s['asset']} {s['duration']}m {s['side']} g={self._signal_growth_score(s):+.3f}"
                             for s in selected
                         )
-                        if picks != self._last_round_pick or self._should_log("round-pick-heartbeat", 20):
-                            self._last_round_pick = picks
-                            print(f"{B}[ROUND-PICK]{RS} {picks}")
+                        print(f"{B}[ROUND-PICK]{RS} {picks}")
                 for sig in selected:
                     if len(to_exec) >= slots:
                         break
