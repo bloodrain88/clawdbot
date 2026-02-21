@@ -141,6 +141,8 @@ HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
 HC15_FALLBACK_MAX_ENTRY = float(os.environ.get("HC15_FALLBACK_MAX_ENTRY", "0.36"))
 MIN_PAYOUT_MULT_5M = float(os.environ.get("MIN_PAYOUT_MULT_5M", "1.35"))
 MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.005"))
+ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.70"))
+ENTRY_HARD_CAP_15M = float(os.environ.get("ENTRY_HARD_CAP_15M", "0.55"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
 PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
 FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "true").lower() == "true"
@@ -1576,6 +1578,9 @@ class LiveTrader:
         if drought_min >= FLOW_RELAX_HARD_MIN:
             max_entry_allowed = min(0.97, max_entry_allowed + 0.04)
             min_entry_allowed = max(0.25, min_entry_allowed - 0.08)
+        # Absolute protection against poor payout fills.
+        hard_cap = ENTRY_HARD_CAP_5M if duration <= 5 else ENTRY_HARD_CAP_15M
+        max_entry_allowed = min(max_entry_allowed, hard_cap)
         # High-conviction 15m mode: target lower cents early for better payout.
         hc15 = (
             HC15_ENABLED and duration == 15 and
@@ -1605,10 +1610,10 @@ class LiveTrader:
         min_payout_req = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
         min_ev_req = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
         if drought_min >= FLOW_RELAX_SOFT_MIN:
-            min_payout_req = max(1.25 if duration <= 5 else 1.80, min_payout_req - 0.25)
+            min_payout_req = max(1.45 if duration <= 5 else 2.00, min_payout_req - 0.20)
             min_ev_req = max(0.0 if duration <= 5 else 0.020, min_ev_req - 0.015)
         if drought_min >= FLOW_RELAX_HARD_MIN:
-            min_payout_req = max(1.20 if duration <= 5 else 1.65, min_payout_req - 0.20)
+            min_payout_req = max(1.40 if duration <= 5 else 1.95, min_payout_req - 0.15)
             min_ev_req = max(-0.002 if duration <= 5 else 0.010, min_ev_req - 0.015)
         payout_mult = 1.0 / max(entry, 1e-9)
         if payout_mult < min_payout_req:
