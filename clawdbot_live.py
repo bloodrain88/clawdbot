@@ -2968,8 +2968,7 @@ class LiveTrader:
             self._reload_copyflow()
             markets = await self.fetch_markets()
             now     = datetime.now(timezone.utc).timestamp()
-            if LOG_VERBOSE or self._should_log("scan-summary", LOG_SCAN_EVERY_SEC):
-                print(f"{B}[SCAN] Live markets: {len(markets)} | Open: {len(self.pending)} | Settling: {len(self.pending_redeem)}{RS}")
+            print(f"{B}[SCAN] Live markets: {len(markets)} | Open: {len(self.pending)} | Settling: {len(self.pending_redeem)}{RS}")
 
             # Subscribe new markets to RTDS token price stream
             if self._rtds_ws:
@@ -3051,7 +3050,7 @@ class LiveTrader:
                     best = valid[0]
                     other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
                     print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
-                elif self._should_log("round-empty", 30):
+                elif ((_time.time() - self._last_entry_ts) / 60.0) >= 2 and self._should_log("round-empty", 60):
                     drought_min = (_time.time() - self._last_entry_ts) / 60.0
                     print(f"{Y}[ROUND]{RS} no executable signal | drought={drought_min:.1f}m")
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
