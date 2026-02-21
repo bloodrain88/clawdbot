@@ -220,6 +220,10 @@ COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
 COPYFLOW_REFRESH_ENABLED = os.environ.get("COPYFLOW_REFRESH_ENABLED", "true").lower() == "true"
 COPYFLOW_REFRESH_SEC = int(os.environ.get("COPYFLOW_REFRESH_SEC", "300"))
 COPYFLOW_MIN_ROI = float(os.environ.get("COPYFLOW_MIN_ROI", "-0.03"))
+COPYFLOW_LIVE_ENABLED = os.environ.get("COPYFLOW_LIVE_ENABLED", "true").lower() == "true"
+COPYFLOW_LIVE_REFRESH_SEC = int(os.environ.get("COPYFLOW_LIVE_REFRESH_SEC", "12"))
+COPYFLOW_LIVE_TRADES_LIMIT = int(os.environ.get("COPYFLOW_LIVE_TRADES_LIMIT", "80"))
+COPYFLOW_LIVE_MAX_MARKETS = int(os.environ.get("COPYFLOW_LIVE_MAX_MARKETS", "8"))
 ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
 ORDER_FAST_MODE = os.environ.get("ORDER_FAST_MODE", "true").lower() == "true"
 MAKER_POLL_5M_SEC = float(os.environ.get("MAKER_POLL_5M_SEC", "0.15"))
@@ -333,6 +337,8 @@ class LiveTrader:
         self._errors            = ErrorTracker()
         self._bucket_stats      = BucketStats()
         self._copyflow_map      = {}
+        self._copyflow_leaders  = {}
+        self._copyflow_live     = {}
         self._copyflow_mtime    = 0.0
         self._copyflow_last_try = 0.0
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
@@ -573,10 +579,22 @@ class LiveTrader:
             with open(src, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             market_flow = payload.get("market_side_flow", {})
+            leaders = payload.get("leaders", [])
             if isinstance(market_flow, dict):
                 self._copyflow_map = market_flow
+                if isinstance(leaders, list):
+                    lw = {}
+                    for row in leaders:
+                        w = (row.get("wallet") or "").lower().strip()
+                        sc = float(row.get("score", 0.0) or 0.0)
+                        if w and sc > 0:
+                            lw[w] = sc
+                    self._copyflow_leaders = lw
                 self._copyflow_mtime = mtime
-                print(f"{B}[COPY]{RS} loaded {len(self._copyflow_map)} market side-flow entries from {src}")
+                print(
+                    f"{B}[COPY]{RS} loaded {len(self._copyflow_map)} market side-flow "
+                    f"+ {len(self._copyflow_leaders)} leaders from {src}"
+                )
         except Exception as e:
             self._errors.tick("copyflow_reload", print, err=e, every=10)
 
@@ -613,6 +631,61 @@ class LiveTrader:
                     self._errors.tick("copyflow_refresh", print, err=em, every=5)
             except Exception as e:
                 self._errors.tick("copyflow_refresh_loop", print, err=e, every=5)
+
+    async def _copyflow_live_loop(self):
+        """Build per-market leader side-flow from latest PM trades for active markets."""
+        if not COPYFLOW_LIVE_ENABLED or DRY_RUN:
+            return
+        while True:
+            await asyncio.sleep(COPYFLOW_LIVE_REFRESH_SEC)
+            try:
+                leaders = self._copyflow_leaders
+                if not leaders:
+                    continue
+                cids = list(self.active_mkts.keys())[: max(1, COPYFLOW_LIVE_MAX_MARKETS)]
+                if not cids:
+                    continue
+
+                tasks = [
+                    self._http_get_json(
+                        "https://data-api.polymarket.com/trades",
+                        params={"market": cid, "limit": str(COPYFLOW_LIVE_TRADES_LIMIT)},
+                        timeout=8,
+                    )
+                    for cid in cids
+                ]
+                rows_list = await asyncio.gather(*tasks, return_exceptions=True)
+                updated = 0
+                for cid, rows in zip(cids, rows_list):
+                    if isinstance(rows, Exception) or not isinstance(rows, list):
+                        continue
+                    up = down = 0.0
+                    for tr in rows:
+                        if (tr.get("side") or "").upper() != "BUY":
+                            continue
+                        w = (tr.get("proxyWallet") or "").lower().strip()
+                        wt = float(leaders.get(w, 0.0) or 0.0)
+                        if wt <= 0:
+                            continue
+                        out = tr.get("outcome") or ""
+                        if out == "Up":
+                            up += wt
+                        elif out == "Down":
+                            down += wt
+                    s = up + down
+                    if s <= 0:
+                        continue
+                    self._copyflow_live[cid] = {
+                        "Up": round(up / s, 4),
+                        "Down": round(down / s, 4),
+                        "n": int(round(s * 10)),
+                        "src": "live",
+                    }
+                    updated += 1
+                if updated and self._should_log("copyflow-live", 60):
+                    print(f"{B}[COPY-LIVE]{RS} refreshed {updated} active markets")
+            except Exception as e:
+                self._errors.tick("copyflow_live_loop", print, err=e, every=10)
 
     def _startup_self_check(self):
         rpc_rank = sorted(self._rpc_stats.items(), key=lambda x: x[1])[:3]
@@ -1787,7 +1860,7 @@ class LiveTrader:
         # Optional copyflow signal from externally ranked leader wallets on same market.
         copy_adj = 0
         copy_net = 0.0
-        flow = self._copyflow_map.get(cid, {})
+        flow = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
         if isinstance(flow, dict):
             up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
             dn_conf = float(flow.get("Down", flow.get("down", 0.0)) or 0.0)
@@ -3609,7 +3682,22 @@ class LiveTrader:
             # Evaluate ALL eligible markets in parallel — no more sequential blocking
             candidates = []
             for cid, m in markets.items():
-                if m["start_ts"] > now: continue
+                if m["start_ts"] > now:
+                    sec_to_start = m["start_ts"] - now
+                    if sec_to_start <= 120:
+                        flow_pre = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
+                        if isinstance(flow_pre, dict):
+                            upc = float(flow_pre.get("Up", 0.0) or 0.0)
+                            dnc = float(flow_pre.get("Down", 0.0) or 0.0)
+                            if (upc + dnc) > 0 and self._should_log(f"prebid:{cid}", 30):
+                                side_pre = "Up" if upc >= dnc else "Down"
+                                conf_pre = max(upc, dnc)
+                                print(
+                                    f"{B}[PRE-BID]{RS} {m.get('asset','?')} {m.get('duration',0)}m "
+                                    f"starts in {sec_to_start:.0f}s | side={side_pre} conf={conf_pre:.2f} "
+                                    f"rk={self._round_key(cid=cid, m=m)}"
+                                )
+                    continue
                 if (m["end_ts"] - now) / 60 < 1: continue
                 m["mins_left"] = (m["end_ts"] - now) / 60
                 # Set open_price from Chainlink at exact market start time.
@@ -4365,6 +4453,7 @@ class LiveTrader:
             _guard("_force_redeem_backfill_loop", self._force_redeem_backfill_loop),
             _guard("chainlink_loop",        self.chainlink_loop),
             _guard("_copyflow_refresh_loop", self._copyflow_refresh_loop),
+            _guard("_copyflow_live_loop",   self._copyflow_live_loop),
             _guard("_rpc_optimizer_loop",   self._rpc_optimizer_loop),
             _guard("_redeemable_scan",      self._redeemable_scan),
             _guard("_position_sync_loop",   self._position_sync_loop),
