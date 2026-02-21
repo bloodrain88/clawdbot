@@ -142,7 +142,7 @@ PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT"
 FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "true").lower() == "true"
 FAST_EXEC_SCORE = int(os.environ.get("FAST_EXEC_SCORE", "7"))
 FAST_EXEC_EDGE = float(os.environ.get("FAST_EXEC_EDGE", "0.03"))
-MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "350"))
+MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "1200"))
 MAX_QUOTE_STALENESS_MS = float(os.environ.get("MAX_QUOTE_STALENESS_MS", "1200"))
 EXPOSURE_CAP_TOTAL_TREND = float(os.environ.get("EXPOSURE_CAP_TOTAL_TREND", "0.80"))
 EXPOSURE_CAP_TOTAL_CHOP = float(os.environ.get("EXPOSURE_CAP_TOTAL_CHOP", "0.60"))
@@ -1551,12 +1551,6 @@ class LiveTrader:
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={MIN_EV_NET:.3f}{RS}")
             return None
         fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= 45)
-        if fresh_cl_disagree and duration == 15:
-            # Keep trading broad coverage, but avoid low-quality oracle disagreement entries.
-            if score < 14 or edge < max(0.10, min_edge):
-                if LOG_VERBOSE:
-                    print(f"{Y}[SKIP] {asset} {side} fresh CL disagreement score={score} edge={edge:.3f}{RS}")
-                return None
 
         # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
         # Higher payout (cheaper tokens) gets larger Kelly fraction.
@@ -1671,13 +1665,17 @@ class LiveTrader:
 
         try:
             if sig.get("quote_age_ms", 0) > MAX_QUOTE_STALENESS_MS:
-                if LOG_VERBOSE:
-                    print(f"{Y}[SKIP] stale quote {sig['asset']} age={sig.get('quote_age_ms', 0):.0f}ms{RS}")
-                return
+                # Soft gate: keep trading unless quote is extremely stale.
+                if sig.get("quote_age_ms", 0) > MAX_QUOTE_STALENESS_MS * 3:
+                    if LOG_VERBOSE:
+                        print(f"{Y}[SKIP] very stale quote {sig['asset']} age={sig.get('quote_age_ms', 0):.0f}ms{RS}")
+                    return
             if sig.get("signal_latency_ms", 0) > MAX_SIGNAL_LATENCY_MS:
-                if LOG_VERBOSE:
-                    print(f"{Y}[SKIP] latency budget {sig['asset']} signal={sig.get('signal_latency_ms', 0):.0f}ms{RS}")
-                return
+                # Soft gate: keep coverage unless decision latency is extreme.
+                if sig.get("signal_latency_ms", 0) > MAX_SIGNAL_LATENCY_MS * 2:
+                    if LOG_VERBOSE:
+                        print(f"{Y}[SKIP] extreme latency {sig['asset']} signal={sig.get('signal_latency_ms', 0):.0f}ms{RS}")
+                    return
             self.seen.add(cid)
             self._save_seen()
             t_ord = _time.perf_counter()
