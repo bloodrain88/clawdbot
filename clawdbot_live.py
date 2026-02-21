@@ -199,8 +199,8 @@ LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
 LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
-FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "30"))
-REDEEMABLE_SCAN_SEC = int(os.environ.get("REDEEMABLE_SCAN_SEC", "20"))
+FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "5"))
+REDEEMABLE_SCAN_SEC = int(os.environ.get("REDEEMABLE_SCAN_SEC", "10"))
 RPC_OPTIMIZE_SEC = int(os.environ.get("RPC_OPTIMIZE_SEC", "45"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
@@ -2522,6 +2522,10 @@ class LiveTrader:
                 self.pending_redeem.pop(cid, None)
                 if self.pending.pop(cid, None) is not None:
                     changed_pending = True
+                # Remove closed cid from live-log caches immediately.
+                self._mkt_log_ts.pop(cid, None)
+                self.open_prices.pop(cid, None)
+                self.open_prices_source.pop(cid, None)
             if changed_pending:
                 self._save_pending()
 
