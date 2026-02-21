@@ -65,8 +65,12 @@ MAX_OPEN       = int(os.environ.get("MAX_OPEN", "24"))
 MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "24"))
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
+MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "8"))
+MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "4"))
 MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
 MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.01"))
+MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.45"))
+MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.60"))
 MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "2.2"))
 MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.04"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
@@ -206,6 +210,8 @@ class LiveTrader:
         self.stats           = {}    # {asset: {side: {wins, total}}} — persisted
         self.recent_trades   = deque(maxlen=30)   # rolling window for WR adaptation
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
+        self._exec_lock         = asyncio.Lock()
+        self._executing_cids    = set()
         self._redeem_tx_lock    = asyncio.Lock()  # serialize redeem txs to avoid nonce clashes
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
@@ -1316,8 +1322,13 @@ class LiveTrader:
         # Bet the signal direction — win rate drives P&L, not just payout
         entry = up_price if side == "Up" else (1 - up_price)
 
-        # ── Score gate ────────────────────────────────────────────────────────
-        if score < MIN_SCORE_GATE:
+        # ── Score gate (duration-aware) ─────────────────────────────────────
+        min_score_local = MIN_SCORE_GATE
+        if duration <= 5:
+            min_score_local = max(min_score_local, MIN_SCORE_GATE_5M)
+        else:
+            min_score_local = max(min_score_local, MIN_SCORE_GATE_15M)
+        if score < min_score_local:
             return None
 
         token_id = m["token_up"] if side == "Up" else m["token_down"]
@@ -1337,6 +1348,10 @@ class LiveTrader:
         # Dynamic max entry: base + tolerance + small conviction slack.
         score_slack = 0.02 if score >= 12 else (0.01 if score >= 9 else 0.0)
         max_entry_allowed = min(0.97, MAX_ENTRY_PRICE + MAX_ENTRY_TOL + score_slack)
+        min_entry_allowed = 0.01
+        if duration <= 5:
+            max_entry_allowed = min(max_entry_allowed, MAX_ENTRY_PRICE_5M)
+            min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_5M)
         # High-conviction 15m mode: target lower cents early for better payout.
         hc15 = (
             HC15_ENABLED and duration == 15 and
@@ -1348,7 +1363,7 @@ class LiveTrader:
             use_limit = True
             entry = min(HC15_TARGET_ENTRY, max_entry_allowed)
         else:
-            if live_entry <= max_entry_allowed:
+            if min_entry_allowed <= live_entry <= max_entry_allowed:
                 entry = live_entry
             elif PULLBACK_LIMIT_ENABLED and pct_remaining >= PULLBACK_LIMIT_MIN_PCT_LEFT:
                 # Don't miss good-payout setups: park a pullback limit at max acceptable entry.
@@ -1356,7 +1371,7 @@ class LiveTrader:
                 entry = max_entry_allowed
             else:
                 if LOG_VERBOSE:
-                    print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} > max_entry={max_entry_allowed:.2f}{RS}")
+                    print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} outside [{min_entry_allowed:.2f},{max_entry_allowed:.2f}]{RS}")
                 return None
 
         payout_mult = 1.0 / max(entry, 1e-9)
@@ -1433,13 +1448,16 @@ class LiveTrader:
             "oracle_gap_bps": ((self.prices.get(asset, 0) - cl_now) / cl_now * 10000.0)
                               if self.prices.get(asset, 0) > 0 and cl_now > 0 else 0.0,
             "max_entry_allowed": max_entry_allowed,
+            "min_entry_allowed": min_entry_allowed,
         }
 
     async def _execute_trade(self, sig: dict):
         """Execute a pre-scored signal: log, mark seen, place order, update state."""
         cid = sig["cid"]
-        if cid in self.seen or len(self.pending) >= MAX_OPEN:
-            return
+        async with self._exec_lock:
+            if cid in self.seen or cid in self._executing_cids or len(self.pending) >= MAX_OPEN:
+                return
+            self._executing_cids.add(cid)
         score       = sig["score"]
         score_stars = f"{G}★★★{RS}" if score >= 12 else (f"{G}★★{RS}" if score >= 9 else "★")
         agree_str   = "" if sig["cl_agree"] else f" {Y}[CL!]{RS}"
@@ -1471,55 +1489,59 @@ class LiveTrader:
                   f"entry={sig['entry']:.3f} src={sig.get('open_price_source','?')} "
                   f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{hc_tag}{agree_str}{RS}")
 
-        self.seen.add(cid)
-        self._save_seen()
-        t_ord = _time.perf_counter()
-        order_id = await self._place_order(
-            sig["token_id"], sig["side"], sig["entry"], sig["size"],
-            sig["asset"], sig["duration"], sig["mins_left"],
-            sig["true_prob"], sig["cl_agree"],
-            min_edge_req=sig["min_edge"], force_taker=sig["force_taker"],
-            score=sig["score"], pm_book_data=sig.get("pm_book_data"),
-            use_limit=sig.get("use_limit", False),
-            max_entry_allowed=sig.get("max_entry_allowed", MAX_ENTRY_PRICE),
-        )
-        self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
-        m = sig["m"]
-        trade = {
-            "side": sig["side"], "size": sig["size"], "entry": sig["entry"],
-            "open_price": sig["open_price"], "current_price": sig["current"],
-            "true_prob": sig["true_prob"], "mkt_price": sig["up_price"],
-            "edge": round(sig["edge"], 4), "mins_left": sig["mins_left"],
-            "end_ts": m["end_ts"], "asset": sig["asset"], "duration": sig["duration"],
-            "token_id": sig["token_id"], "order_id": order_id or "",
-            "score": sig["score"], "cl_agree": sig["cl_agree"],
-            "open_price_source": sig.get("open_price_source", "?"),
-            "chainlink_age_s": sig.get("chainlink_age_s"),
-            "onchain_score_adj": sig.get("onchain_score_adj", 0),
-            "source_confidence": sig.get("source_confidence", 0.0),
-            "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
-        }
-        self._log_onchain_event("ENTRY", cid, {
-            "asset": sig["asset"],
-            "side": sig["side"],
-            "score": sig["score"],
-            "size_usdc": sig["size"],
-            "entry_price": sig["entry"],
-            "edge": round(sig["edge"], 4),
-            "true_prob": round(sig["true_prob"], 4),
-            "cl_agree": bool(sig["cl_agree"]),
-            "open_price_source": sig.get("open_price_source", "?"),
-            "chainlink_age_s": sig.get("chainlink_age_s"),
-            "onchain_score_adj": sig.get("onchain_score_adj", 0),
-            "source_confidence": sig.get("source_confidence", 0.0),
-            "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
-            "placed": bool(order_id),
-            "order_id": order_id or "",
-        })
-        if order_id:
-            self.pending[cid] = (m, trade)
-            self._save_pending()
-            self._log(m, trade)
+        try:
+            self.seen.add(cid)
+            self._save_seen()
+            t_ord = _time.perf_counter()
+            order_id = await self._place_order(
+                sig["token_id"], sig["side"], sig["entry"], sig["size"],
+                sig["asset"], sig["duration"], sig["mins_left"],
+                sig["true_prob"], sig["cl_agree"],
+                min_edge_req=sig["min_edge"], force_taker=sig["force_taker"],
+                score=sig["score"], pm_book_data=sig.get("pm_book_data"),
+                use_limit=sig.get("use_limit", False),
+                max_entry_allowed=sig.get("max_entry_allowed", MAX_ENTRY_PRICE),
+            )
+            self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
+            m = sig["m"]
+            trade = {
+                "side": sig["side"], "size": sig["size"], "entry": sig["entry"],
+                "open_price": sig["open_price"], "current_price": sig["current"],
+                "true_prob": sig["true_prob"], "mkt_price": sig["up_price"],
+                "edge": round(sig["edge"], 4), "mins_left": sig["mins_left"],
+                "end_ts": m["end_ts"], "asset": sig["asset"], "duration": sig["duration"],
+                "token_id": sig["token_id"], "order_id": order_id or "",
+                "score": sig["score"], "cl_agree": sig["cl_agree"],
+                "open_price_source": sig.get("open_price_source", "?"),
+                "chainlink_age_s": sig.get("chainlink_age_s"),
+                "onchain_score_adj": sig.get("onchain_score_adj", 0),
+                "source_confidence": sig.get("source_confidence", 0.0),
+                "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
+            }
+            self._log_onchain_event("ENTRY", cid, {
+                "asset": sig["asset"],
+                "side": sig["side"],
+                "score": sig["score"],
+                "size_usdc": sig["size"],
+                "entry_price": sig["entry"],
+                "edge": round(sig["edge"], 4),
+                "true_prob": round(sig["true_prob"], 4),
+                "cl_agree": bool(sig["cl_agree"]),
+                "open_price_source": sig.get("open_price_source", "?"),
+                "chainlink_age_s": sig.get("chainlink_age_s"),
+                "onchain_score_adj": sig.get("onchain_score_adj", 0),
+                "source_confidence": sig.get("source_confidence", 0.0),
+                "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
+                "placed": bool(order_id),
+                "order_id": order_id or "",
+            })
+            if order_id:
+                self.pending[cid] = (m, trade)
+                self._save_pending()
+                self._log(m, trade)
+        finally:
+            async with self._exec_lock:
+                self._executing_cids.discard(cid)
 
     async def evaluate(self, m: dict):
         """RTDS fast-path: score a single market and execute if score gate passes."""
