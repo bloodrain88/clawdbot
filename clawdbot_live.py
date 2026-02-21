@@ -115,6 +115,7 @@ MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
 MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to determine direction
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 DUST_BET       = 5.0      # $5 floor — at 4.55x payout: $5 → $22.75 win
+DUST_RECOVER_MIN = float(os.environ.get("DUST_RECOVER_MIN", "0.50"))
 MAX_ABS_BET    = 15.0     # $15 hard ceiling
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
 MAX_OPEN       = int(os.environ.get("MAX_OPEN", "24"))
@@ -1916,6 +1917,22 @@ class LiveTrader:
                           f"Bank ${self.bankroll:.2f}")
                     return {"order_id": order_id, "fill_price": maker_price, "mode": "maker"}
 
+                # Partial maker fill protection:
+                # status may remain "live" while filled_size > 0. Track it so position is not missed.
+                try:
+                    info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                    if isinstance(info, dict):
+                        filled_sz = float(info.get("filled_size") or info.get("filledSize") or 0.0)
+                        if filled_sz > 0:
+                            fill_usdc = filled_sz * maker_price
+                            if fill_usdc >= DUST_RECOVER_MIN:
+                                self.bankroll -= min(size_usdc, fill_usdc)
+                                print(f"{Y}[PARTIAL]{RS} {side} {asset} {duration}m | "
+                                      f"filled≈${fill_usdc:.2f} @ {maker_price:.3f} | tracking open position")
+                                return {"order_id": order_id, "fill_price": maker_price, "mode": "maker_partial"}
+                except Exception:
+                    self._errors.tick("order_partial_check", print, every=50)
+
                 # Cancel maker, fall back to taker with fresh book
                 try:
                     await loop.run_in_executor(None, lambda: self.clob.cancel(order_id))
@@ -3125,7 +3142,7 @@ class LiveTrader:
                     val  = float(p.get("currentValue", 0))
                     side = p.get("outcome", "")
                     title = p.get("title", "")
-                    if rdm or not side or not cid or val < DUST_BET:
+                    if rdm or not side or not cid or val < DUST_RECOVER_MIN:
                         continue
                     if cid in self.pending or cid in self.pending_redeem:
                         continue
@@ -3416,7 +3433,7 @@ class LiveTrader:
                     if rdm or not side or not cid:
                         continue
                     self.seen.add(cid)
-                    if val < DUST_BET:   # dust — mark seen only, don't track
+                    if val < DUST_RECOVER_MIN:   # tiny dust — mark seen only, don't track
                         continue
                     if cid in self.redeemed_cids:
                         continue   # already processed — don't re-add
