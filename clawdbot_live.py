@@ -148,6 +148,7 @@ MIN_PAYOUT_MULT_5M = float(os.environ.get("MIN_PAYOUT_MULT_5M", "1.85"))
 MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.03"))
 ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.50"))
 ENTRY_HARD_CAP_15M = float(os.environ.get("ENTRY_HARD_CAP_15M", "0.50"))
+ENTRY_NEAR_MISS_TOL = float(os.environ.get("ENTRY_NEAR_MISS_TOL", "0.015"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
 PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
 FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "false").lower() == "true"
@@ -702,6 +703,7 @@ class LiveTrader:
             f"trade_all={TRADE_ALL_MARKETS} 5m={ENABLE_5M} assets={','.join(sorted(FIVE_MIN_ASSETS))} "
             f"score_gate(5m/15m)={MIN_SCORE_GATE_5M}/{MIN_SCORE_GATE_15M} "
             f"max_entry={MAX_ENTRY_PRICE:.2f}+tol{MAX_ENTRY_TOL:.2f} payout>={MIN_PAYOUT_MULT:.2f}x "
+            f"near_miss_tol={ENTRY_NEAR_MISS_TOL:.3f} "
             f"ev_net>={MIN_EV_NET:.3f} fee={FEE_RATE_EST:.4f} "
             f"risk(max_open/same_dir/cid)={MAX_OPEN}/{MAX_SAME_DIR}/{MAX_CID_EXPOSURE_PCT:.0%} "
             f"block_opp(cid/round)={BLOCK_OPPOSITE_SIDE_SAME_CID}/{BLOCK_OPPOSITE_SIDE_SAME_ROUND}"
@@ -2416,8 +2418,16 @@ class LiveTrader:
                     fresh_ask = float(f_asks[0].price) if f_asks else best_ask
                     eff_max_entry = max_entry_allowed if max_entry_allowed is not None else MAX_ENTRY_PRICE
                     if fresh_ask > eff_max_entry:
-                        print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={eff_max_entry:.2f}{RS}")
-                        return None
+                        if fresh_ask <= (eff_max_entry + ENTRY_NEAR_MISS_TOL):
+                            # Near-miss tolerance: allow 1-2 ticks overshoot when still +EV.
+                            if LOG_VERBOSE:
+                                print(
+                                    f"{Y}[NEAR-MISS]{RS} {asset} {side} ask={fresh_ask:.3f} "
+                                    f"within tol={ENTRY_NEAR_MISS_TOL:.3f} over max_entry={eff_max_entry:.3f}"
+                                )
+                        else:
+                            print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={eff_max_entry:.2f}{RS}")
+                            return None
                     fresh_payout = 1.0 / max(fresh_ask, 1e-9)
                     min_payout_fb = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
                     if fresh_payout < min_payout_fb:
