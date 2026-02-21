@@ -28,7 +28,6 @@ from dotenv import load_dotenv
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 from eth_account import Account
-from runtime_utils import NonceManager, ErrorTracker, BucketStats
 
 load_dotenv(os.path.expanduser("~/.clawdbot.env"))
 
@@ -86,12 +85,6 @@ PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT"
 FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "true").lower() == "true"
 FAST_EXEC_SCORE = int(os.environ.get("FAST_EXEC_SCORE", "7"))
 FAST_EXEC_EDGE = float(os.environ.get("FAST_EXEC_EDGE", "0.03"))
-MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "350"))
-MAX_QUOTE_STALENESS_MS = float(os.environ.get("MAX_QUOTE_STALENESS_MS", "1200"))
-EXPOSURE_CAP_TOTAL_TREND = float(os.environ.get("EXPOSURE_CAP_TOTAL_TREND", "0.80"))
-EXPOSURE_CAP_TOTAL_CHOP = float(os.environ.get("EXPOSURE_CAP_TOTAL_CHOP", "0.60"))
-EXPOSURE_CAP_SIDE_TREND = float(os.environ.get("EXPOSURE_CAP_SIDE_TREND", "0.55"))
-EXPOSURE_CAP_SIDE_CHOP = float(os.environ.get("EXPOSURE_CAP_SIDE_CHOP", "0.40"))
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
@@ -220,9 +213,6 @@ class LiveTrader:
         self._exec_lock         = asyncio.Lock()
         self._executing_cids    = set()
         self._redeem_tx_lock    = asyncio.Lock()  # serialize redeem txs to avoid nonce clashes
-        self._nonce_mgr         = None
-        self._errors            = ErrorTracker()
-        self._bucket_stats      = BucketStats()
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
         # ── Mathematical signal state (EMA + Kalman) ──────────────────────────
@@ -263,7 +253,6 @@ class LiveTrader:
             self.w3 = best_w3
             self._rpc_url = best_rpc
             self._rpc_epoch += 1
-            self._nonce_mgr = NonceManager(self.w3, ADDRESS)
             print(f"{G}[RPC] Connected: {best_rpc} ({best_ms:.0f}ms){RS}")
             return
         print(f"{Y}[RPC] No working Polygon RPC — on-chain redemption disabled{RS}")
@@ -283,40 +272,6 @@ class LiveTrader:
             self._log_ts[key] = now
             return True
         return False
-
-    async def _http_get_json(self, url: str, params: dict | None = None, timeout: float = 8.0):
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        try:
-            async with self._session.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as r:
-                if r.status >= 400:
-                    raise RuntimeError(f"http {r.status} {url}")
-                return await r.json()
-        except Exception as e:
-            self._errors.tick("http_get_json", print, err=e, every=20)
-            raise
-
-    def _startup_self_check(self):
-        rpc_rank = sorted(self._rpc_stats.items(), key=lambda x: x[1])[:3]
-        rpc_str = ", ".join(f"{u.split('//')[-1]}={ms:.0f}ms" for u, ms in rpc_rank) if rpc_rank else "n/a"
-        print(
-            f"{B}[BOOT]{RS} "
-            f"trade_all={TRADE_ALL_MARKETS} 5m={ENABLE_5M} assets={','.join(sorted(FIVE_MIN_ASSETS))} "
-            f"score_gate(5m/15m)={MIN_SCORE_GATE_5M}/{MIN_SCORE_GATE_15M} "
-            f"max_entry={MAX_ENTRY_PRICE:.2f}+tol{MAX_ENTRY_TOL:.2f} payout>={MIN_PAYOUT_MULT:.2f}x "
-            f"ev_net>={MIN_EV_NET:.3f} fee={FEE_RATE_EST:.4f}"
-        )
-        print(
-            f"{B}[BOOT]{RS} "
-            f"latency<= {MAX_SIGNAL_LATENCY_MS:.0f}ms quote_stale<= {MAX_QUOTE_STALENESS_MS:.0f}ms "
-            f"exposure trend(total/side)={EXPOSURE_CAP_TOTAL_TREND:.0%}/{EXPOSURE_CAP_SIDE_TREND:.0%} "
-            f"chop(total/side)={EXPOSURE_CAP_TOTAL_CHOP:.0%}/{EXPOSURE_CAP_SIDE_CHOP:.0%}"
-        )
-        print(f"{B}[BOOT]{RS} rpc={self._rpc_url or 'none'} | top={rpc_str}")
 
     # ── Mathematical signal helpers ───────────────────────────────────────────
 
@@ -670,19 +625,6 @@ class LiveTrader:
                 f"order_ema={self._perf_stats.get('order_ms_ema', 0.0):.0f}ms "
                 f"{B}RPC:{RS} {self._rpc_url} ({rpc_ms:.0f}ms)"
             )
-        if self._bucket_stats.rows:
-            top_bucket = sorted(
-                self._bucket_stats.rows.items(),
-                key=lambda kv: kv[1].get("n", 0),
-                reverse=True,
-            )[0]
-            k, v = top_bucket
-            avg_slip = (v["slip_bps"] / v["fills"]) if v.get("fills", 0) else 0.0
-            wr_b = (v["wins"] / v["n"] * 100.0) if v.get("n", 0) else 0.0
-            print(
-                f"  {B}ExecQ:{RS} top={k} n={v['n']} wr={wr_b:.1f}% "
-                f"avg_slip={avg_slip:.1f}bps pnl={v['pnl']:+.2f}"
-            )
         # Show each open position with current win/loss status
         now_ts = _time.time()
         for cid, (m, t) in list(self.pending.items()):
@@ -930,7 +872,6 @@ class LiveTrader:
                         self.w3 = nw3
                         self._rpc_url = best_rpc
                         self._rpc_epoch += 1
-                        self._nonce_mgr = NonceManager(self.w3, ADDRESS)
                         print(f"{G}[RPC] Switched to fastest: {best_rpc} ({best_ms:.0f}ms){RS}")
                     except Exception:
                         pass
@@ -1065,7 +1006,6 @@ class LiveTrader:
     async def _score_market(self, m: dict) -> dict | None:
         """Score a market opportunity. Returns signal dict or None if hard-blocked.
         Pure analysis — no side effects, no order placement."""
-        score_started = _time.perf_counter()
         cid       = m["conditionId"]
         if cid in self.seen:
             return None
@@ -1079,10 +1019,6 @@ class LiveTrader:
 
         current = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
         if current == 0:
-            return None
-        last_tick_ts = self.price_history.get(asset, deque(maxlen=1))[-1][0] if self.price_history.get(asset) else 0
-        quote_age_ms = (_time.time() - last_tick_ts) * 1000.0 if last_tick_ts else 9e9
-        if quote_age_ms > MAX_QUOTE_STALENESS_MS:
             return None
 
         open_price = self.open_prices.get(cid)
@@ -1513,8 +1449,6 @@ class LiveTrader:
                               if self.prices.get(asset, 0) > 0 and cl_now > 0 else 0.0,
             "max_entry_allowed": max_entry_allowed,
             "min_entry_allowed": min_entry_allowed,
-            "quote_age_ms": quote_age_ms,
-            "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
         }
 
     async def _execute_trade(self, sig: dict):
@@ -1556,18 +1490,10 @@ class LiveTrader:
                   f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{hc_tag}{agree_str}{RS}")
 
         try:
-            if sig.get("quote_age_ms", 0) > MAX_QUOTE_STALENESS_MS:
-                if LOG_VERBOSE:
-                    print(f"{Y}[SKIP] stale quote {sig['asset']} age={sig.get('quote_age_ms', 0):.0f}ms{RS}")
-                return
-            if sig.get("signal_latency_ms", 0) > MAX_SIGNAL_LATENCY_MS:
-                if LOG_VERBOSE:
-                    print(f"{Y}[SKIP] latency budget {sig['asset']} signal={sig.get('signal_latency_ms', 0):.0f}ms{RS}")
-                return
             self.seen.add(cid)
             self._save_seen()
             t_ord = _time.perf_counter()
-            exec_result = await self._place_order(
+            order_id = await self._place_order(
                 sig["token_id"], sig["side"], sig["entry"], sig["size"],
                 sig["asset"], sig["duration"], sig["mins_left"],
                 sig["true_prob"], sig["cl_agree"],
@@ -1577,13 +1503,6 @@ class LiveTrader:
                 max_entry_allowed=sig.get("max_entry_allowed", MAX_ENTRY_PRICE),
             )
             self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
-            order_id = (exec_result or {}).get("order_id", "")
-            fill_price = float((exec_result or {}).get("fill_price", sig["entry"]) or sig["entry"])
-            slip_bps = ((fill_price - sig["entry"]) / max(sig["entry"], 1e-9)) * 10000.0
-            score_bucket = "s12+" if sig["score"] >= 12 else ("s9-11" if sig["score"] >= 9 else "s0-8")
-            entry_bucket = "<30c" if sig["entry"] < 0.30 else ("30-50c" if sig["entry"] <= 0.50 else ">50c")
-            stat_bucket = f"{sig['duration']}m|{score_bucket}|{entry_bucket}"
-            self._bucket_stats.add_fill(stat_bucket, slip_bps)
             m = sig["m"]
             trade = {
                 "side": sig["side"], "size": sig["size"], "entry": sig["entry"],
@@ -1598,9 +1517,6 @@ class LiveTrader:
                 "onchain_score_adj": sig.get("onchain_score_adj", 0),
                 "source_confidence": sig.get("source_confidence", 0.0),
                 "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
-                "bucket": stat_bucket,
-                "fill_price": fill_price,
-                "slip_bps": round(slip_bps, 2),
             }
             self._log_onchain_event("ENTRY", cid, {
                 "asset": sig["asset"],
@@ -1618,11 +1534,6 @@ class LiveTrader:
                 "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
                 "placed": bool(order_id),
                 "order_id": order_id or "",
-                "fill_price": round(fill_price, 6),
-                "slippage_bps": round(slip_bps, 2),
-                "signal_latency_ms": round(sig.get("signal_latency_ms", 0.0), 2),
-                "quote_age_ms": round(sig.get("quote_age_ms", 0.0), 2),
-                "bucket": stat_bucket,
             })
             if order_id:
                 self.pending[cid] = (m, trade)
@@ -1646,12 +1557,12 @@ class LiveTrader:
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
         3. If unfilled, cancel and fall back to taker at best_ask+tick
         4. If taker unfilled after 3s, cancel and return None.
-        Returns dict {order_id, fill_price, mode} or None."""
+        Returns order_id or None."""
         if DRY_RUN:
             fake_id = f"DRY-{asset[:3]}-{int(datetime.now(timezone.utc).timestamp())}"
             # Simulate at AMM price (approximates maker fill quality)
             print(f"{Y}[DRY-RUN]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {price:.3f} | id={fake_id}")
-            return {"order_id": fake_id, "fill_price": price, "mode": "dry"}
+            return fake_id
 
         for attempt in range(2):
             try:
@@ -1715,7 +1626,7 @@ class LiveTrader:
                     if resp.get("status") in ("matched", "filled"):
                         self.bankroll -= size_usdc
                         print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                        return {"order_id": order_id, "fill_price": taker_price, "mode": "fok"}
+                        return order_id
                     # FOK not filled (thin liquidity) — fall through to normal maker/taker flow
                     print(f"{Y}[FOK] unfilled — falling back to maker{RS}")
                     force_taker = False  # reset so we don't loop
@@ -1752,7 +1663,7 @@ class LiveTrader:
                     print(f"{G}[MAKER FILL]{RS} {side} {asset} {duration}m | "
                           f"${size_usdc:.2f} @ {maker_price:.3f} | payout=${payout:.2f} | "
                           f"Bank ${self.bankroll:.2f}")
-                    return {"order_id": order_id, "fill_price": maker_price, "mode": "maker"}
+                    return order_id
 
                 # Ultra-low-latency waits to avoid blocking other opportunities.
                 poll_interval = 0.5
@@ -1781,7 +1692,7 @@ class LiveTrader:
                     print(f"{G}[MAKER FILL]{RS} {side} {asset} {duration}m | "
                           f"${size_usdc:.2f} @ {maker_price:.3f} | payout=${payout:.2f} | "
                           f"Bank ${self.bankroll:.2f}")
-                    return {"order_id": order_id, "fill_price": maker_price, "mode": "maker"}
+                    return order_id
 
                 # Cancel maker, fall back to taker with fresh book
                 try:
@@ -1820,7 +1731,7 @@ class LiveTrader:
                     self.bankroll -= size_usdc
                     print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
                           f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                    return {"order_id": order_id, "fill_price": taker_price, "mode": "fak"}
+                    return order_id
 
                 # FAK may partially fill — check order state once
                 if order_id:
@@ -1830,9 +1741,9 @@ class LiveTrader:
                             self.bankroll -= size_usdc
                             print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
                                   f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                            return {"order_id": order_id, "fill_price": taker_price, "mode": "fak"}
+                            return order_id
                     except Exception:
-                        self._errors.tick("order_status_check", print, every=50)
+                        pass
                 print(f"{Y}[ORDER] Both maker and FAK taker unfilled — cancelled{RS}")
                 return None
 
@@ -1841,7 +1752,6 @@ class LiveTrader:
                 if "429" in err or "rate limit" in err.lower():
                     await asyncio.sleep(10 * (attempt + 1))
                     continue
-                self._errors.tick("place_order", print, err=e, every=10)
                 print(f"{R}[ORDER FAILED] {asset} {side}: {e}{RS}")
                 return None
         return None
@@ -2014,7 +1924,6 @@ class LiveTrader:
                             pass
                         self.daily_pnl += pnl
                         self.total += 1; self.wins += 1
-                        self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
                         self._record_result(asset, side, True, trade.get("structural", False))
                         self._log(m, trade, "WIN", pnl)
                         self._log_onchain_event("RESOLVE", cid, {
@@ -2044,7 +1953,6 @@ class LiveTrader:
                             pnl = -size
                             self.daily_pnl += pnl
                             self.total += 1
-                            self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
                             self._record_result(asset, side, False, trade.get("structural", False))
                             self._log(m, trade, "LOSS", pnl)
                             self._log_onchain_event("RESOLVE", cid, {
@@ -2085,9 +1993,10 @@ class LiveTrader:
             last_err = None
             for _ in range(4):
                 try:
-                    if self._nonce_mgr is None:
-                        self._nonce_mgr = NonceManager(self.w3, acct.address)
-                    nonce = await self._nonce_mgr.next_nonce(loop)
+                    # Use pending nonce to avoid clashes with in-flight txs.
+                    nonce = await loop.run_in_executor(
+                        None, lambda: self.w3.eth.get_transaction_count(acct.address, "pending")
+                    )
                     latest = await loop.run_in_executor(None, lambda: self.w3.eth.get_block("latest"))
                     base_fee = latest["baseFeePerGas"]
                     pri_fee = self.w3.to_wei(40, "gwei")
@@ -2115,8 +2024,6 @@ class LiveTrader:
                     last_err = e
                     msg = str(e).lower()
                     if "nonce too low" in msg or "already known" in msg:
-                        if self._nonce_mgr is not None:
-                            await self._nonce_mgr.reset_from_chain(loop)
                         await asyncio.sleep(0.4)
                         continue
                     raise
@@ -2428,16 +2335,14 @@ class LiveTrader:
                     params={"symbol": s, "limit": 20}, timeout=5).json())
                 self.binance_cache[asset]["depth_bids"] = depth.get("bids", [])
                 self.binance_cache[asset]["depth_asks"] = depth.get("asks", [])
-            except Exception as e:
-                self._errors.tick("bnb_seed_depth", print, err=e, every=25)
+            except Exception: pass
             try:
                 klines = await loop.run_in_executor(None, lambda s=sym_api: _req.get(
                     "https://api.binance.com/api/v3/klines",
                     params={"symbol": s, "interval": "1m", "limit": 33}, timeout=5).json())
                 if isinstance(klines, list):
                     self.binance_cache[asset]["klines"] = klines
-            except Exception as e:
-                self._errors.tick("bnb_seed_klines", print, err=e, every=25)
+            except Exception: pass
             try:
                 mark = await loop.run_in_executor(None, lambda s=sym_api: _req.get(
                     "https://fapi.binance.com/fapi/v1/premiumIndex",
@@ -2445,8 +2350,7 @@ class LiveTrader:
                 self.binance_cache[asset]["mark"]    = float(mark.get("markPrice", 0))
                 self.binance_cache[asset]["index"]   = float(mark.get("indexPrice", 0))
                 self.binance_cache[asset]["funding"] = float(mark.get("lastFundingRate", 0))
-            except Exception as e:
-                self._errors.tick("bnb_seed_perp", print, err=e, every=25)
+            except Exception: pass
         print(f"{G}[BNB-SEED] Binance cache seeded for {list(BNB_SYM)}{RS}")
 
     async def _stream_binance_spot(self):
@@ -2535,38 +2439,6 @@ class LiveTrader:
             if (cur > op) == is_up:
                 count += 1
         return count
-
-    def _regime_caps(self) -> tuple[float, float]:
-        vals = []
-        for a in BNB_SYM:
-            vals.append((self._variance_ratio(a), self._autocorr_regime(a)))
-        if not vals:
-            return EXPOSURE_CAP_TOTAL_CHOP, EXPOSURE_CAP_SIDE_CHOP
-        trending = sum(1 for vr, ac in vals if vr > 1.02 and ac > 0.02)
-        if trending >= max(1, len(vals) // 2):
-            return EXPOSURE_CAP_TOTAL_TREND, EXPOSURE_CAP_SIDE_TREND
-        return EXPOSURE_CAP_TOTAL_CHOP, EXPOSURE_CAP_SIDE_CHOP
-
-    def _exposure_ok(self, sig: dict, active_pending: dict) -> bool:
-        total_cap, side_cap = self._regime_caps()
-        total_open = sum(max(0.0, t.get("size", 0.0)) for _, t in active_pending.values())
-        side_open = sum(
-            max(0.0, t.get("size", 0.0))
-            for _, t in active_pending.values()
-            if t.get("side") == sig.get("side")
-        )
-        after_total = total_open + sig.get("size", 0.0)
-        after_side = side_open + sig.get("size", 0.0)
-        bankroll_ref = max(self.bankroll, 1.0)
-        if after_total > bankroll_ref * total_cap:
-            if LOG_VERBOSE:
-                print(f"{Y}[RISK] skip {sig.get('asset')} total exposure {after_total/bankroll_ref:.0%}>{total_cap:.0%}{RS}")
-            return False
-        if after_side > bankroll_ref * side_cap:
-            if LOG_VERBOSE:
-                print(f"{Y}[RISK] skip {sig.get('asset')} {sig.get('side')} exposure {after_side/bankroll_ref:.0%}>{side_cap:.0%}{RS}")
-            return False
-        return True
 
     def _direction_bias(self, asset: str, side: str) -> float:
         """Additive bias from historical win rate for this asset+direction.
@@ -2695,11 +2567,14 @@ class LiveTrader:
             sym  = asset  # BTC, ETH, SOL, XRP
             st   = datetime.fromtimestamp(start_ts, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             et   = datetime.fromtimestamp(end_ts,   tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            data = await self._http_get_json(
-                "https://polymarket.com/api/crypto/crypto-price",
-                params={"symbol": sym, "eventStartTime": st, "variant": "fifteen", "endDate": et},
-                timeout=6,
-            )
+            url  = "https://polymarket.com/api/crypto/crypto-price"
+            loop = asyncio.get_event_loop()
+            import requests as _req
+            r = await loop.run_in_executor(None, lambda: _req.get(
+                url, params={"symbol": sym, "eventStartTime": st, "variant": "fifteen", "endDate": et},
+                timeout=6
+            ))
+            data = r.json()
             price = data.get("openPrice") or 0.0
             return float(price) if price else 0.0
         except Exception:
@@ -2868,8 +2743,6 @@ class LiveTrader:
                 for sig in valid:
                     if len(to_exec) >= slots:
                         break
-                    if not self._exposure_ok(sig, active_pending):
-                        continue
                     if not TRADE_ALL_MARKETS:
                         pending_up = sum(1 for _, t in active_pending.values() if t.get("side") == "Up")
                         pending_dn = sum(1 for _, t in active_pending.values() if t.get("side") == "Down")
@@ -2911,6 +2784,7 @@ class LiveTrader:
             tick += 1
             try:
                 loop = asyncio.get_event_loop()
+                import requests as _req
 
                 # 1. On-chain USDC.e balance
                 usdc_raw = await loop.run_in_executor(
@@ -2921,11 +2795,10 @@ class LiveTrader:
                 usdc = usdc_raw / 1e6
 
                 # 2. Current value of open CTF positions (locked in CTF, not in wallet)
-                positions = await self._http_get_json(
+                positions = await loop.run_in_executor(None, lambda: _req.get(
                     "https://data-api.polymarket.com/positions",
-                    params={"user": ADDRESS, "sizeThreshold": "0.01"},
-                    timeout=10,
-                )
+                    params={"user": ADDRESS, "sizeThreshold": "0.01"}, timeout=10
+                ).json())
                 api_cids = {p.get("conditionId","") for p in positions}
                 open_val = sum(
                     float(p.get("currentValue", 0))
@@ -2969,9 +2842,9 @@ class LiveTrader:
                     end_ts = 0; start_ts = now_ts - 60; duration = 15
                     token_up = token_down = ""
                     try:
-                        mkt_data = await self._http_get_json(
-                            f"{GAMMA}/markets", params={"conditionId": cid}, timeout=8
-                        )
+                        mkt_data = await loop.run_in_executor(None, lambda c=cid: _req.get(
+                            f"{GAMMA}/markets", params={"conditionId": c}, timeout=8
+                        ).json())
                         mkt = mkt_data[0] if isinstance(mkt_data, list) and mkt_data else (
                               mkt_data if isinstance(mkt_data, dict) else {})
                         es = mkt.get("endDate") or mkt.get("end_date", "")
@@ -3018,21 +2891,20 @@ class LiveTrader:
 
                 # 4. Sync trades + win rate from Polymarket activity API (every 5 ticks ~2.5min)
                 if tick % 5 == 1:
-                    await self._sync_stats_from_api()
+                    await self._sync_stats_from_api(loop, _req)
 
             except Exception as e:
-                self._errors.tick("refresh_balance", print, err=e, every=10)
                 print(f"{Y}[BANK] refresh error: {e}{RS}")
 
-    async def _sync_stats_from_api(self):
+    async def _sync_stats_from_api(self, loop, _req):
         """Sync win/loss stats from Polymarket activity API (on-chain truth).
         BUY = bet placed, REDEEM = win. Also syncs recent_trades deque for last-5 gate."""
         try:
-            activity = await self._http_get_json(
+            activity = await loop.run_in_executor(None, lambda: _req.get(
                 "https://data-api.polymarket.com/activity",
                 params={"user": ADDRESS, "limit": "500"},
-                timeout=10,
-            )
+                timeout=10
+            ).json())
             if not isinstance(activity, list):
                 return
 
@@ -3085,7 +2957,6 @@ class LiveTrader:
                 print(f"{B}[STATS] {total_bets} bets {total_wins} wins ({wr}) | "
                       f"Last{len(api_last5)}={streak} ({wr5}) ← on-chain truth{RS}")
         except Exception as e:
-            self._errors.tick("sync_stats_api", print, err=e, every=10)
             print(f"{Y}[STATS] activity sync error: {e}{RS}")
 
     async def _redeemable_scan(self):
@@ -3096,10 +2967,14 @@ class LiveTrader:
         while True:
             await asyncio.sleep(20)
             try:
-                positions = await self._http_get_json(
-                    "https://data-api.polymarket.com/positions",
-                    params={"user": ADDRESS, "sizeThreshold": "0.01"},
-                    timeout=10,
+                loop = asyncio.get_event_loop()
+                import requests as _req
+                positions = await loop.run_in_executor(
+                    None, lambda: _req.get(
+                        "https://data-api.polymarket.com/positions",
+                        params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                        timeout=10
+                    ).json()
                 )
                 for pos in positions:
                     cid        = pos.get("conditionId", "")
@@ -3123,7 +2998,6 @@ class LiveTrader:
                     self.pending_redeem[cid] = (m_s, t_s)
                     print(f"{G}[SCAN-REDEEM] Queued: {title} {outcome} ~${val:.2f}{RS}")
             except Exception as e:
-                self._errors.tick("redeemable_scan", print, err=e, every=10)
                 print(f"{Y}[SCAN-REDEEM] Error: {e}{RS}")
 
     async def _force_redeem_backfill_loop(self):
@@ -3152,11 +3026,12 @@ class LiveTrader:
         while True:
             await asyncio.sleep(FORCE_REDEEM_SCAN_SEC)
             try:
-                activity = await self._http_get_json(
+                import requests as _req
+                activity = await loop.run_in_executor(None, lambda: _req.get(
                     "https://data-api.polymarket.com/activity",
                     params={"user": ADDRESS, "limit": "600"},
-                    timeout=12,
-                )
+                    timeout=12
+                ).json())
                 if not isinstance(activity, list):
                     continue
 
@@ -3221,7 +3096,6 @@ class LiveTrader:
                     except Exception as e:
                         print(f"{Y}[FORCE-REDEEM] retry later {cid[:10]}...: {e}{RS}")
             except Exception as e:
-                self._errors.tick("force_redeem_backfill", print, err=e, every=10)
                 print(f"{Y}[FORCE-REDEEM] Error: {e}{RS}")
 
     async def _position_sync_loop(self):
@@ -3346,11 +3220,12 @@ class LiveTrader:
 ║  {'DRY-RUN (simulated, no real orders)' if DRY_RUN else 'LIVE — ordini reali su Polymarket':<44}║
 ╚══════════════════════════════════════════════════════════════╝{RS}
 """)
-        self._startup_self_check()
         self.init_clob()
         self._sync_redeemable()   # redeem any wins from previous runs
         # Sync stats from API immediately so first status print shows real data
-        await self._sync_stats_from_api()
+        import requests as _req
+        loop = asyncio.get_event_loop()
+        await self._sync_stats_from_api(loop, _req)
         await self._seed_binance_cache()   # populate Binance cache before WS streams start
         async def _guard(name, method):
             """Restart a loop if it crashes — one failure can't kill all loops."""
