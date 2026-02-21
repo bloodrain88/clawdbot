@@ -118,10 +118,12 @@ MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to de
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 DUST_BET       = 5.0      # $5 floor — at 4.55x payout: $5 → $22.75 win
 DUST_RECOVER_MIN = float(os.environ.get("DUST_RECOVER_MIN", "0.50"))
-MAX_ABS_BET    = 15.0     # $15 hard ceiling
+MAX_ABS_BET    = float(os.environ.get("MAX_ABS_BET", "10.0"))     # hard ceiling
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
-MAX_OPEN       = int(os.environ.get("MAX_OPEN", "24"))
-MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "24"))
+MAX_OPEN       = int(os.environ.get("MAX_OPEN", "8"))
+MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "8"))
+MAX_CID_EXPOSURE_PCT = float(os.environ.get("MAX_CID_EXPOSURE_PCT", "0.10"))
+BLOCK_OPPOSITE_SIDE_SAME_CID = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_CID", "true").lower() == "true"
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "true").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
@@ -558,7 +560,8 @@ class LiveTrader:
             f"trade_all={TRADE_ALL_MARKETS} 5m={ENABLE_5M} assets={','.join(sorted(FIVE_MIN_ASSETS))} "
             f"score_gate(5m/15m)={MIN_SCORE_GATE_5M}/{MIN_SCORE_GATE_15M} "
             f"max_entry={MAX_ENTRY_PRICE:.2f}+tol{MAX_ENTRY_TOL:.2f} payout>={MIN_PAYOUT_MULT:.2f}x "
-            f"ev_net>={MIN_EV_NET:.3f} fee={FEE_RATE_EST:.4f}"
+            f"ev_net>={MIN_EV_NET:.3f} fee={FEE_RATE_EST:.4f} "
+            f"risk(max_open/same_dir/cid)={MAX_OPEN}/{MAX_SAME_DIR}/{MAX_CID_EXPOSURE_PCT:.0%}"
         )
         print(
             f"{B}[BOOT]{RS} "
@@ -743,7 +746,7 @@ class LiveTrader:
                 with open(SEEN_FILE) as f:
                     loaded = json.load(f)
                 # Keep only last 200 entries — older conditionIds are from expired markets
-                self.seen = set(loaded[-200:] if len(loaded) > 200 else loaded)
+                self.seen = set(loaded[-2000:] if len(loaded) > 2000 else loaded)
                 print(f"{Y}[RESUME] Loaded {len(self.seen)} seen markets from disk{RS}")
             except Exception:
                 pass
@@ -1740,11 +1743,11 @@ class LiveTrader:
         min_payout_req = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
         min_ev_req = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
         if drought_min >= FLOW_RELAX_SOFT_MIN:
-            min_payout_req = max(1.45 if duration <= 5 else 2.00, min_payout_req - 0.20)
-            min_ev_req = max(0.0 if duration <= 5 else 0.020, min_ev_req - 0.015)
+            min_payout_req = max(1.80 if duration <= 5 else 2.10, min_payout_req - 0.10)
+            min_ev_req = max(0.010 if duration <= 5 else 0.030, min_ev_req - 0.010)
         if drought_min >= FLOW_RELAX_HARD_MIN:
-            min_payout_req = max(1.40 if duration <= 5 else 1.95, min_payout_req - 0.15)
-            min_ev_req = max(-0.002 if duration <= 5 else 0.010, min_ev_req - 0.015)
+            min_payout_req = max(1.70 if duration <= 5 else 2.00, min_payout_req - 0.10)
+            min_ev_req = max(0.005 if duration <= 5 else 0.020, min_ev_req - 0.010)
         payout_mult = 1.0 / max(entry, 1e-9)
         if payout_mult < min_payout_req:
             if LOG_VERBOSE:
@@ -1763,33 +1766,34 @@ class LiveTrader:
         # Higher payout (cheaper tokens) gets larger Kelly fraction.
         # Expensive tokens still traded but with smaller exposure.
         if entry <= 0.20:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.30
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.45, 0.22
-            else:             kelly_frac, bankroll_pct = 0.30, 0.15
+            if   score >= 12: kelly_frac, bankroll_pct = 0.20, 0.10
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.16, 0.08
+            else:             kelly_frac, bankroll_pct = 0.12, 0.06
         elif entry <= 0.30:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.40, 0.20
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.28, 0.14
-            else:             kelly_frac, bankroll_pct = 0.18, 0.09
-        elif entry <= 0.40:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.25, 0.12
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.15, 0.08
+            if   score >= 12: kelly_frac, bankroll_pct = 0.16, 0.08
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.12, 0.06
             else:             kelly_frac, bankroll_pct = 0.10, 0.05
+        elif entry <= 0.40:
+            if   score >= 12: kelly_frac, bankroll_pct = 0.12, 0.06
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.10, 0.05
+            else:             kelly_frac, bankroll_pct = 0.08, 0.04
         elif entry <= 0.55:
             if   score >= 12: kelly_frac, bankroll_pct = 0.08, 0.04
             elif score >= 8:  kelly_frac, bankroll_pct = 0.06, 0.03
             else:             kelly_frac, bankroll_pct = 0.05, 0.025
         else:  # 0.55–0.85
-            if   score >= 12: kelly_frac, bankroll_pct = 0.05, 0.025
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.04, 0.02
-            else:             kelly_frac, bankroll_pct = 0.03, 0.015
+            if   score >= 12: kelly_frac, bankroll_pct = 0.04, 0.02
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.03, 0.015
+            else:             kelly_frac, bankroll_pct = 0.02, 0.010
 
         wr_scale   = self._wr_bet_scale()
         oracle_scale = 0.60 if fresh_cl_disagree else (0.80 if not cl_agree else 1.0)
         bucket_scale = self._bucket_size_scale(duration, score, entry)
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
         max_single = min(100.0, self.bankroll * bankroll_pct)
-        abs_cap    = max_single * 1.5 if score >= 12 and entry <= 0.20 else max_single
+        abs_cap    = max_single
         size       = max(DUST_BET, round(min(abs_cap, raw_size * vol_mult * wr_scale * oracle_scale * bucket_scale), 2))
+        size       = min(size, max(DUST_BET, self.bankroll * MAX_CID_EXPOSURE_PCT))
 
         # Immediate fills: FOK on strong signal, GTC limit otherwise
         # Limit orders (use_limit=True) are always GTC — force_taker stays False
@@ -2990,16 +2994,31 @@ class LiveTrader:
         return EXPOSURE_CAP_TOTAL_CHOP, EXPOSURE_CAP_SIDE_CHOP
 
     def _exposure_ok(self, sig: dict, active_pending: dict) -> bool:
+        cid = sig.get("cid", "")
+        side = sig.get("side", "")
+        bankroll_ref = max(self.bankroll, 1.0)
+        cid_cap = bankroll_ref * MAX_CID_EXPOSURE_PCT
+        same_cid = [(m, t) for c, (m, t) in active_pending.items() if c == cid]
+        if same_cid:
+            same_side_open = sum(max(0.0, t.get("size", 0.0)) for _, t in same_cid if t.get("side") == side)
+            opposite_open = sum(max(0.0, t.get("size", 0.0)) for _, t in same_cid if t.get("side") != side)
+            if BLOCK_OPPOSITE_SIDE_SAME_CID and opposite_open > 0:
+                if LOG_VERBOSE:
+                    print(f"{Y}[RISK] skip {sig.get('asset')} {side} opposite-side open on same cid{RS}")
+                return False
+            if same_side_open + sig.get("size", 0.0) > cid_cap:
+                if LOG_VERBOSE:
+                    print(f"{Y}[RISK] skip {sig.get('asset')} cid exposure {(same_side_open + sig.get('size', 0.0)):.2f}>{cid_cap:.2f}{RS}")
+                return False
         total_cap, side_cap = self._regime_caps()
         total_open = sum(max(0.0, t.get("size", 0.0)) for _, t in active_pending.values())
         side_open = sum(
             max(0.0, t.get("size", 0.0))
             for _, t in active_pending.values()
-            if t.get("side") == sig.get("side")
+            if t.get("side") == side
         )
         after_total = total_open + sig.get("size", 0.0)
         after_side = side_open + sig.get("size", 0.0)
-        bankroll_ref = max(self.bankroll, 1.0)
         if after_total > bankroll_ref * total_cap:
             if LOG_VERBOSE:
                 print(f"{Y}[RISK] skip {sig.get('asset')} total exposure {after_total/bankroll_ref:.0%}>{total_cap:.0%}{RS}")
@@ -3045,18 +3064,18 @@ class LiveTrader:
         """Scale bet size up when win rate is consistently high (last 10 trades).
         Needs ≥10 resolved trades to activate — avoids overconfidence on small samples.
         Returns multiplier applied to raw Kelly size:
-          WR ≥ 80%  → 2.0x (hot streak, push hard)
-          WR ≥ 70%  → 1.5x
-          WR ≥ 60%  → 1.2x
+          WR ≥ 80%  → 1.10x
+          WR ≥ 70%  → 1.05x
+          WR ≥ 60%  → 1.00x
           WR < 60%  → 1.0x (base — no change)
         """
         trades = list(self.recent_trades)
         if len(trades) < 10:
             return 1.0
         wr10 = sum(trades[-10:]) / 10
-        if   wr10 >= 0.80: return 2.0
-        elif wr10 >= 0.70: return 1.5
-        elif wr10 >= 0.60: return 1.2
+        if   wr10 >= 0.80: return 1.10
+        elif wr10 >= 0.70: return 1.05
+        elif wr10 >= 0.60: return 1.00
         else:              return 1.0
 
     def _adaptive_min_edge(self) -> float:
