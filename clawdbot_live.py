@@ -95,8 +95,8 @@ from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, Ass
 from py_clob_client.config import get_contract_config
 
 POLYGON_RPCS = [
-    "https://polygon-bor-rpc.publicnode.com",
     "https://polygon-mainnet.public.blastapi.io",
+    "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.drpc.org",
     "https://rpc.ankr.com/polygon",
 ]
