@@ -198,6 +198,7 @@ LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
+REDEEM_REQUIRE_ONCHAIN_CONFIRM = os.environ.get("REDEEM_REQUIRE_ONCHAIN_CONFIRM", "true").lower() == "true"
 LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
 FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "5"))
 REDEEMABLE_SCAN_SEC = int(os.environ.get("REDEEMABLE_SCAN_SEC", "10"))
@@ -2421,6 +2422,7 @@ class LiveTrader:
                         # Try redeemPositions from wallet first; if unclaimable, settle as auto-redeemed.
                         suffix = "auto-redeemed"
                         tx_hash_full = ""
+                        redeem_confirmed = False
                         usdc_before = 0.0
                         usdc_after = 0.0
                         try:
@@ -2438,6 +2440,7 @@ class LiveTrader:
                             )
                             self._redeem_verify_counts.pop(cid, None)
                             tx_hash_full = tx_hash
+                            redeem_confirmed = True
                             suffix = f"tx={tx_hash[:16]}"
                         except Exception:
                             # If still claimable, keep in queue and retry later (never miss redeem).
@@ -2459,17 +2462,49 @@ class LiveTrader:
                                     f"(value=${pos_val:.2f}) | rk={rk} cid={self._short_cid(cid)}"
                                 )
                                 continue
-                            checks = int(self._redeem_verify_counts.get(cid, 0)) + 1
-                            self._redeem_verify_counts[cid] = checks
-                            if checks < 3:
-                                print(
-                                    f"{Y}[REDEEM-VERIFY]{RS} non-claimable; waiting confirm "
-                                    f"({checks}/3) | rk={rk} cid={self._short_cid(cid)}"
-                                )
-                                continue
-                            self._redeem_verify_counts.pop(cid, None)
+                            if REDEEM_REQUIRE_ONCHAIN_CONFIRM:
+                                # Strict mode: close only with explicit on-chain confirmation.
+                                # If winning token balance is zero on-chain, there is nothing claimable
+                                # in this wallet, so position can be finalized as non-wallet-redeem.
+                                tok = str(trade.get("token_id", "") or "").strip()
+                                tok_bal = -1
+                                if tok.isdigit():
+                                    try:
+                                        tok_bal = await loop.run_in_executor(
+                                            None,
+                                            lambda ti=int(tok): ctf.functions.balanceOf(_addr_cs, ti).call(),
+                                        )
+                                    except Exception:
+                                        tok_bal = -1
+                                if tok_bal == 0:
+                                    redeem_confirmed = True
+                                    suffix = "onchain-no-wallet-balance"
+                                else:
+                                    print(
+                                        f"{Y}[REDEEM-UNCONFIRMED]{RS} waiting on-chain confirm "
+                                        f"(tx missing, token_balance={tok_bal}) | rk={rk} cid={self._short_cid(cid)}"
+                                    )
+                                    continue
+                            else:
+                                checks = int(self._redeem_verify_counts.get(cid, 0)) + 1
+                                self._redeem_verify_counts[cid] = checks
+                                if checks < 3:
+                                    print(
+                                        f"{Y}[REDEEM-VERIFY]{RS} non-claimable; waiting confirm "
+                                        f"({checks}/3) | rk={rk} cid={self._short_cid(cid)}"
+                                    )
+                                    continue
+                                self._redeem_verify_counts.pop(cid, None)
 
-                        # Record win regardless of TX outcome
+                        # Record win only after strict on-chain confirmation.
+                        if REDEEM_REQUIRE_ONCHAIN_CONFIRM and not redeem_confirmed:
+                            print(
+                                f"{Y}[REDEEM-UNCONFIRMED]{RS} strict mode active; keeping in queue "
+                                f"| rk={rk} cid={self._short_cid(cid)}"
+                            )
+                            continue
+
+                        # Record confirmed win
                         try:
                             _raw = await loop.run_in_executor(
                                 None, lambda: _usdc.functions.balanceOf(_addr_cs).call()
