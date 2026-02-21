@@ -75,6 +75,8 @@ HC15_MIN_TRUE_PROB = float(os.environ.get("HC15_MIN_TRUE_PROB", "0.62"))
 HC15_MIN_EDGE = float(os.environ.get("HC15_MIN_EDGE", "0.10"))
 HC15_TARGET_ENTRY = float(os.environ.get("HC15_TARGET_ENTRY", "0.30"))
 HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
+PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
+PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
@@ -1261,6 +1263,10 @@ class LiveTrader:
         else:
             if live_entry <= MAX_ENTRY_PRICE:
                 entry = live_entry
+            elif PULLBACK_LIMIT_ENABLED and pct_remaining >= PULLBACK_LIMIT_MIN_PCT_LEFT:
+                # Don't miss good-payout setups: park a pullback limit at max acceptable entry.
+                use_limit = True
+                entry = MAX_ENTRY_PRICE
             else:
                 if LOG_VERBOSE:
                     print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} > max_entry={MAX_ENTRY_PRICE:.2f}{RS}")
@@ -1465,6 +1471,9 @@ class LiveTrader:
                 taker_edge     = true_prob - best_ask
                 mid_est        = (best_bid + best_ask) / 2
                 maker_edge_est = true_prob - mid_est
+                edge_floor = min_edge_req if min_edge_req is not None else 0.04
+                if not cl_agree:
+                    edge_floor += 0.02
 
                 if use_limit:
                     # GTC limit at target price (price << market) — skip market-based edge gate
@@ -1480,8 +1489,6 @@ class LiveTrader:
                     print(f"{B}[FILL]{RS} {asset} {side} score={score} maker_edge={maker_edge_est:.3f} taker_edge={taker_edge:.3f}")
                 else:
                     # Normal conviction: taker edge gate applies
-                    edge_floor = min_edge_req if min_edge_req is not None else 0.04
-                    if not cl_agree: edge_floor += 0.02
                     if taker_edge < edge_floor:
                         kind = "disagree" if not cl_agree else "directional"
                         print(f"{Y}[SKIP] {asset} {side} [{kind}]: taker_edge={taker_edge:.3f} < {edge_floor:.2f} "
@@ -1581,6 +1588,9 @@ class LiveTrader:
                     f_asks    = sorted(fresh.asks, key=lambda x: float(x.price)) if fresh.asks else []
                     f_tick    = float(fresh.tick_size or tick)
                     fresh_ask = float(f_asks[0].price) if f_asks else best_ask
+                    if use_limit and fresh_ask > MAX_ENTRY_PRICE:
+                        print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={MAX_ENTRY_PRICE:.2f}{RS}")
+                        return None
                     fresh_ep  = true_prob - fresh_ask
                     if fresh_ep < edge_floor:
                         print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_floor:.2f} — price moved against us{RS}")
