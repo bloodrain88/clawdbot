@@ -194,10 +194,6 @@ QUALITY_MODE = os.environ.get("QUALITY_MODE", "true").lower() == "true"
 STRICT_PM_SOURCE = os.environ.get("STRICT_PM_SOURCE", "true").lower() == "true"
 MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "1200"))
 MAX_QUOTE_STALENESS_MS = float(os.environ.get("MAX_QUOTE_STALENESS_MS", "1200"))
-MIN_MINS_LEFT_5M = float(os.environ.get("MIN_MINS_LEFT_5M", "2.0"))
-MIN_MINS_LEFT_15M = float(os.environ.get("MIN_MINS_LEFT_15M", "3.0"))
-EXTRA_SCORE_GATE_BTC_5M = int(os.environ.get("EXTRA_SCORE_GATE_BTC_5M", "2"))
-EXTRA_SCORE_GATE_XRP_15M = int(os.environ.get("EXTRA_SCORE_GATE_XRP_15M", "2"))
 EXPOSURE_CAP_TOTAL_TREND = float(os.environ.get("EXPOSURE_CAP_TOTAL_TREND", "0.80"))
 EXPOSURE_CAP_TOTAL_CHOP = float(os.environ.get("EXPOSURE_CAP_TOTAL_CHOP", "0.60"))
 EXPOSURE_CAP_SIDE_TREND = float(os.environ.get("EXPOSURE_CAP_SIDE_TREND", "0.55"))
@@ -1134,8 +1130,6 @@ class LiveTrader:
         print(
             f"{B}[BOOT]{RS} "
             f"latency<= {MAX_SIGNAL_LATENCY_MS:.0f}ms quote_stale<= {MAX_QUOTE_STALENESS_MS:.0f}ms "
-            f"min_mins_left(5m/15m)={MIN_MINS_LEFT_5M:.1f}/{MIN_MINS_LEFT_15M:.1f} "
-            f"extra_score(BTC5m/XRP15m)=+{EXTRA_SCORE_GATE_BTC_5M}/+{EXTRA_SCORE_GATE_XRP_15M} "
             f"exposure trend(total/side)={EXPOSURE_CAP_TOTAL_TREND:.0%}/{EXPOSURE_CAP_SIDE_TREND:.0%} "
             f"chop(total/side)={EXPOSURE_CAP_TOTAL_CHOP:.0%}/{EXPOSURE_CAP_SIDE_CHOP:.0%}"
         )
@@ -2594,31 +2588,6 @@ class LiveTrader:
                   f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{hc_tag}{cp_tag}{agree_str}{RS}")
 
         try:
-            duration = int(sig.get("duration", 0) or 0)
-            mins_left = float(sig.get("mins_left", 0.0) or 0.0)
-            min_left_gate = MIN_MINS_LEFT_5M if duration <= 5 else MIN_MINS_LEFT_15M
-            if mins_left <= min_left_gate:
-                if LOG_VERBOSE:
-                    print(
-                        f"{Y}[SKIP]{RS} {sig['asset']} {duration}m {sig['side']} "
-                        f"mins_left={mins_left:.1f} <= gate={min_left_gate:.1f}"
-                    )
-                return
-            extra_score_gate = 0
-            if sig.get("asset") == "BTC" and duration <= 5:
-                extra_score_gate = max(extra_score_gate, EXTRA_SCORE_GATE_BTC_5M)
-            if sig.get("asset") == "XRP" and duration > 5:
-                extra_score_gate = max(extra_score_gate, EXTRA_SCORE_GATE_XRP_15M)
-            if extra_score_gate > 0:
-                base_gate = MIN_SCORE_GATE_5M if duration <= 5 else MIN_SCORE_GATE_15M
-                req_score = base_gate + extra_score_gate
-                if float(sig.get("score", 0.0) or 0.0) < req_score:
-                    if LOG_VERBOSE:
-                        print(
-                            f"{Y}[SKIP]{RS} {sig['asset']} {duration}m {sig['side']} "
-                            f"score={sig.get('score', 0):.0f} < req={req_score:.0f}"
-                        )
-                    return
             if sig.get("quote_age_ms", 0) > MAX_QUOTE_STALENESS_MS:
                 # Soft gate: keep trading unless quote is extremely stale.
                 if sig.get("quote_age_ms", 0) > MAX_QUOTE_STALENESS_MS * 3:
