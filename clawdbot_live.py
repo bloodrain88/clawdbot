@@ -65,6 +65,10 @@ MAX_OPEN       = int(os.environ.get("MAX_OPEN", "24"))
 MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "24"))
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
+MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
+MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "2.2"))
+MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.04"))
+FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
@@ -1238,9 +1242,22 @@ class LiveTrader:
         # ── Entry strategy ────────────────────────────────────────────────────
         # Trade every eligible market while still preferring higher-payout entries.
         use_limit = False
-        if live_entry <= 0.85:
+        if live_entry <= MAX_ENTRY_PRICE:
             entry = live_entry                # immediate fill at current price
         else:
+            if LOG_VERBOSE:
+                print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} > max_entry={MAX_ENTRY_PRICE:.2f}{RS}")
+            return None
+
+        payout_mult = 1.0 / max(entry, 1e-9)
+        if payout_mult < MIN_PAYOUT_MULT:
+            if LOG_VERBOSE:
+                print(f"{Y}[SKIP] {asset} {side} payout={payout_mult:.2f}x < min={MIN_PAYOUT_MULT:.2f}x{RS}")
+            return None
+        ev_net = (true_prob / max(entry, 1e-9)) - 1.0 - FEE_RATE_EST
+        if ev_net < MIN_EV_NET:
+            if LOG_VERBOSE:
+                print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={MIN_EV_NET:.3f}{RS}")
             return None
 
         # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
