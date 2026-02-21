@@ -96,6 +96,12 @@ STATS_FILE     = os.path.join(_DATA_DIR, "clawdbot_stats.json")
 METRICS_FILE   = os.path.join(_DATA_DIR, "clawdbot_onchain_metrics.jsonl")
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
+LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "false").lower() == "true"
+LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "30"))
+LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
+LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
+LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
+LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
 CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
 CLOB_HOST = "https://clob.polymarket.com"
 
@@ -132,6 +138,7 @@ class LiveTrader:
         self.open_prices        = {}   # cid → float price
         self.open_prices_source = {}   # cid → "CL-exact" | "CL-fallback"
         self._mkt_log_ts        = {}   # cid → last [MKT] log time
+        self._log_ts            = {}   # throttle map for repetitive logs
         self.asset_cur_open     = {}   # asset → current market open price (for inter-market continuity)
         self.asset_prev_open    = {}   # asset → previous market open price
         self.active_mkts = {}
@@ -185,6 +192,14 @@ class LiveTrader:
             except Exception:
                 continue
         print(f"{Y}[RPC] No working Polygon RPC — on-chain redemption disabled{RS}")
+
+    def _should_log(self, key: str, every_sec: float) -> bool:
+        now = _time.time()
+        last = self._log_ts.get(key, 0.0)
+        if now - last >= every_sec:
+            self._log_ts[key] = now
+            return True
+        return False
 
     # ── Mathematical signal helpers ───────────────────────────────────────────
 
@@ -889,7 +904,8 @@ class LiveTrader:
 
         open_price = self.open_prices.get(cid)
         if not open_price:
-            print(f"{Y}[WAIT] {label} → waiting for first CL round{RS}")
+            if LOG_VERBOSE or self._should_log(f"wait-open:{cid}", LOG_OPEN_WAIT_EVERY_SEC):
+                print(f"{Y}[WAIT] {label} → waiting for first CL round{RS}")
             return None
 
         src = self.open_prices_source.get(cid, "?")
@@ -1284,14 +1300,20 @@ class LiveTrader:
         cont_str    = (f" {G}[CONT {sig['prev_win_dir']} {sig['prev_win_move']*100:.2f}%]{RS}"
                        if sig.get("is_early_continuation") else "")
         tag = f"{G}[CONT-ENTRY]{RS}" if sig.get("is_early_continuation") else f"{G}[EDGE]{RS}"
-        print(f"{tag} {sig['label']} → {sig['side']} | score={score} {score_stars} | "
-              f"beat=${sig['open_price']:,.2f} {sig['src_tag']} now=${sig['current']:,.2f} "
-              f"move={sig['move_str']}{prev_str} pct={sig['pct_remaining']:.0%} | "
-              f"bs={sig['bs_prob']:.3f} mom={sig['mom_prob']:.3f} prob={sig['true_prob']:.3f} "
-              f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} "
-              f"@{sig['entry']*100:.0f}¢→{(1/sig['entry']):.2f}x ${sig['size']:.2f}"
-              f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x"
-              f"{perp_str}{vwap_str}{cross_str} {chain_str}{cont_str}{RS}")
+        if LOG_VERBOSE:
+            print(f"{tag} {sig['label']} → {sig['side']} | score={score} {score_stars} | "
+                  f"beat=${sig['open_price']:,.2f} {sig['src_tag']} now=${sig['current']:,.2f} "
+                  f"move={sig['move_str']}{prev_str} pct={sig['pct_remaining']:.0%} | "
+                  f"bs={sig['bs_prob']:.3f} mom={sig['mom_prob']:.3f} prob={sig['true_prob']:.3f} "
+                  f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} "
+                  f"@{sig['entry']*100:.0f}¢→{(1/sig['entry']):.2f}x ${sig['size']:.2f}"
+                  f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x"
+                  f"{perp_str}{vwap_str}{cross_str} {chain_str}{cont_str}{RS}")
+        else:
+            print(f"{tag} {sig['asset']} {sig['duration']}m {sig['side']} | "
+                  f"score={score} edge={sig['edge']:+.3f} size=${sig['size']:.2f} "
+                  f"entry={sig['entry']:.3f} src={sig.get('open_price_source','?')} "
+                  f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{agree_str}{RS}")
 
         self.seen.add(cid)
         self._save_seen()
@@ -1643,9 +1665,9 @@ class LiveTrader:
                         None, lambda b=cid_bytes: ctf.functions.payoutDenominator(b).call()
                     )
                     if denom == 0:
-                        # Log once per minute so user can see we're waiting
+                        # Throttled wait log so operator sees progress without spam
                         now_ts = _time.time()
-                        if now_ts - _wait_log_ts.get(cid, 0) >= 60:
+                        if now_ts - _wait_log_ts.get(cid, 0) >= LOG_REDEEM_WAIT_EVERY_SEC:
                             _wait_log_ts[cid] = now_ts
                             elapsed = (now_ts - self._redeem_queued_ts.get(cid, now_ts)) / 60
                             size = trade.get("size", 0)
@@ -2406,7 +2428,8 @@ class LiveTrader:
           try:
             markets = await self.fetch_markets()
             now     = datetime.now(timezone.utc).timestamp()
-            print(f"{B}[SCAN] Live markets: {len(markets)} | Open: {len(self.pending)} | Settling: {len(self.pending_redeem)}{RS}")
+            if LOG_VERBOSE or self._should_log("scan-summary", LOG_SCAN_EVERY_SEC):
+                print(f"{B}[SCAN] Live markets: {len(markets)} | Open: {len(self.pending)} | Settling: {len(self.pending_redeem)}{RS}")
 
             # Subscribe new markets to RTDS token price stream
             if self._rtds_ws:
@@ -2468,11 +2491,12 @@ class LiveTrader:
                     ref = self.open_prices[cid]
                     cur = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
                     now_ts = _time.time()
-                    if cur > 0 and now_ts - self._mkt_log_ts.get(cid, 0) >= 30:
+                    if cur > 0 and now_ts - self._mkt_log_ts.get(cid, 0) >= LOG_MARKET_EVERY_SEC:
                         self._mkt_log_ts[cid] = now_ts
                         move = (cur - ref) / ref * 100
-                        print(f"{B}[MKT] {asset} {dur}m | beat=${ref:,.2f} [{src}] | "
-                              f"now=${cur:,.2f} move={move:+.3f}% | {m['mins_left']:.1f}min left{RS}")
+                        if LOG_VERBOSE or abs(move) >= LOG_MKT_MOVE_THRESHOLD_PCT:
+                            print(f"{B}[MKT] {asset} {dur}m | beat=${ref:,.2f} [{src}] | "
+                                  f"now=${cur:,.2f} move={move:+.3f}% | {m['mins_left']:.1f}min left{RS}")
                 if cid not in self.seen:
                     candidates.append(m)
             if candidates:
