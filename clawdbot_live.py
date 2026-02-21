@@ -199,6 +199,8 @@ COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
 COPYFLOW_REFRESH_ENABLED = os.environ.get("COPYFLOW_REFRESH_ENABLED", "true").lower() == "true"
 COPYFLOW_REFRESH_SEC = int(os.environ.get("COPYFLOW_REFRESH_SEC", "300"))
 COPYFLOW_MIN_ROI = float(os.environ.get("COPYFLOW_MIN_ROI", "-0.03"))
+FLOW_RELAX_SOFT_MIN = float(os.environ.get("FLOW_RELAX_SOFT_MIN", "0.5"))
+FLOW_RELAX_HARD_MIN = float(os.environ.get("FLOW_RELAX_HARD_MIN", "1.5"))
 ENABLE_5M = os.environ.get("ENABLE_5M", "true").lower() == "true"
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
@@ -1561,11 +1563,17 @@ class LiveTrader:
         if duration <= 5:
             max_entry_allowed = min(max_entry_allowed, MAX_ENTRY_PRICE_5M)
             min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_5M)
+        # Adaptive model-consistent cap: if conviction is high, allow higher entry as long
+        # expected value after fees remains positive.
+        min_ev_base = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
+        model_cap = true_prob / max(1.0 + FEE_RATE_EST + max(0.003, min_ev_base), 1e-9)
+        if score >= 9:
+            max_entry_allowed = max(max_entry_allowed, min(0.85, model_cap))
         # Anti-drought relax: keep coverage when filters become too restrictive.
-        if drought_min >= 2:
+        if drought_min >= FLOW_RELAX_SOFT_MIN:
             max_entry_allowed = min(0.97, max_entry_allowed + 0.03)
             min_entry_allowed = max(0.30, min_entry_allowed - 0.12)
-        if drought_min >= 5:
+        if drought_min >= FLOW_RELAX_HARD_MIN:
             max_entry_allowed = min(0.97, max_entry_allowed + 0.04)
             min_entry_allowed = max(0.25, min_entry_allowed - 0.08)
         # High-conviction 15m mode: target lower cents early for better payout.
@@ -1596,10 +1604,10 @@ class LiveTrader:
 
         min_payout_req = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
         min_ev_req = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
-        if drought_min >= 2:
+        if drought_min >= FLOW_RELAX_SOFT_MIN:
             min_payout_req = max(1.25 if duration <= 5 else 1.80, min_payout_req - 0.25)
             min_ev_req = max(0.0 if duration <= 5 else 0.020, min_ev_req - 0.015)
-        if drought_min >= 5:
+        if drought_min >= FLOW_RELAX_HARD_MIN:
             min_payout_req = max(1.20 if duration <= 5 else 1.65, min_payout_req - 0.20)
             min_ev_req = max(-0.002 if duration <= 5 else 0.010, min_ev_req - 0.015)
         payout_mult = 1.0 / max(entry, 1e-9)
@@ -1612,7 +1620,7 @@ class LiveTrader:
             if LOG_VERBOSE:
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={min_ev_req:.3f}{RS}")
             return None
-        if drought_min >= 2 and self._should_log("flow-relax", 30):
+        if drought_min >= FLOW_RELAX_SOFT_MIN and self._should_log("flow-relax", 30):
             print(f"{B}[FLOW]{RS} drought={drought_min:.1f}m relax payout>={min_payout_req:.2f}x ev>={min_ev_req:.3f} entry=[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]")
         fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= 45)
 
@@ -1740,8 +1748,6 @@ class LiveTrader:
                     if LOG_VERBOSE:
                         print(f"{Y}[SKIP] extreme latency {sig['asset']} signal={sig.get('signal_latency_ms', 0):.0f}ms{RS}")
                     return
-            self.seen.add(cid)
-            self._save_seen()
             t_ord = _time.perf_counter()
             exec_result = await self._place_order(
                 sig["token_id"], sig["side"], sig["entry"], sig["size"],
@@ -1802,6 +1808,8 @@ class LiveTrader:
                 "bucket": stat_bucket,
             })
             if order_id:
+                self.seen.add(cid)
+                self._save_seen()
                 self._last_entry_ts = _time.time()
                 self.pending[cid] = (m, trade)
                 self._save_pending()
@@ -3098,7 +3106,7 @@ class LiveTrader:
                     best = valid[0]
                     other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
                     print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
-                elif ((_time.time() - self._last_entry_ts) / 60.0) >= 2 and self._should_log("round-empty", 60):
+                elif ((_time.time() - self._last_entry_ts) / 60.0) >= FLOW_RELAX_SOFT_MIN and self._should_log("round-empty", 60):
                     drought_min = (_time.time() - self._last_entry_ts) / 60.0
                     print(f"{Y}[ROUND]{RS} no executable signal | drought={drought_min:.1f}m")
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
