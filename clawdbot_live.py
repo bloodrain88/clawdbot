@@ -308,6 +308,7 @@ class LiveTrader:
         self._exec_lock         = asyncio.Lock()
         self._executing_cids    = set()
         self._round_side_attempt_ts = {}          # "round_key|side" → last attempt ts
+        self._round_side_block_until = {}         # "round_fingerprint|side" → ttl epoch
         self._redeem_tx_lock    = asyncio.Lock()  # serialize redeem txs to avoid nonce clashes
         self._nonce_mgr         = None
         self._errors            = ErrorTracker()
@@ -483,6 +484,10 @@ class LiveTrader:
         end_ts = float(t.get("end_ts") or m.get("end_ts") or 0)
         if not self._is_exact_round_bounds(start_ts, end_ts, dur):
             q_st, q_et = self._round_bounds_from_question(m.get("question", ""))
+            if dur <= 0 and q_st > 0 and q_et > q_st:
+                q_dur = int(round((q_et - q_st) / 60.0))
+                if q_dur in (5, 15):
+                    dur = q_dur
             if self._is_exact_round_bounds(q_st, q_et, dur):
                 start_ts, end_ts = q_st, q_et
         if self._is_exact_round_bounds(start_ts, end_ts, dur):
@@ -501,6 +506,10 @@ class LiveTrader:
         end_ts = float(t.get("end_ts") or m.get("end_ts") or 0)
         if not self._is_exact_round_bounds(start_ts, end_ts, dur):
             q_st, q_et = self._round_bounds_from_question(m.get("question", ""))
+            if dur <= 0 and q_st > 0 and q_et > q_st:
+                q_dur = int(round((q_et - q_st) / 60.0))
+                if q_dur in (5, 15):
+                    dur = q_dur
             if self._is_exact_round_bounds(q_st, q_et, dur):
                 start_ts, end_ts = q_st, q_et
         if self._is_exact_round_bounds(start_ts, end_ts, dur):
@@ -1679,13 +1688,19 @@ class LiveTrader:
         # Apply 87.7% continuation prior: prior scales 70–80% with prev move size.
         # This is why mapleghost can buy at 15¢ — true prob is 75%, not 50%.
         if prev_win_dir == direction and pct_remaining > 0.80:
-            prior = min(0.80, 0.70 + prev_win_move * 20)   # 70–80% depending on prev move size
+            prior = min(0.68, 0.58 + prev_win_move * 10)   # conservative continuation prior
             if direction == "Up":
                 prob_up   = max(prob_up, prior)
                 prob_down = 1 - prob_up
             else:
                 prob_down = max(prob_down, prior)
                 prob_up   = 1 - prob_down
+
+        # Online calibration: shrink overconfident probabilities toward 50% when live WR degrades.
+        shrink = self._prob_shrink_factor()
+        prob_up = 0.5 + (prob_up - 0.5) * shrink
+        prob_up = max(0.05, min(0.95, prob_up))
+        prob_down = 1.0 - prob_up
 
         edge_up   = prob_up   - up_price
         edge_down = prob_down - (1 - up_price)
@@ -1768,16 +1783,13 @@ class LiveTrader:
         model_cap = true_prob / max(1.0 + FEE_RATE_EST + max(0.003, min_ev_base), 1e-9)
         if score >= 9:
             max_entry_allowed = max(max_entry_allowed, min(0.85, model_cap))
-        # Anti-drought relax: keep coverage when filters become too restrictive.
+        # Adaptive protection against poor payout fills from realized outcomes.
+        min_payout_req, min_ev_req, adaptive_hard_cap = self._adaptive_thresholds(duration, drought_min)
+        max_entry_allowed = min(max_entry_allowed, adaptive_hard_cap)
         if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_SOFT_MIN:
-            max_entry_allowed = min(0.97, max_entry_allowed + 0.03)
-            min_entry_allowed = max(0.30, min_entry_allowed - 0.12)
+            min_entry_allowed = max(0.33, min_entry_allowed - 0.08)
         if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_HARD_MIN:
-            max_entry_allowed = min(0.97, max_entry_allowed + 0.04)
-            min_entry_allowed = max(0.25, min_entry_allowed - 0.08)
-        # Absolute protection against poor payout fills.
-        hard_cap = ENTRY_HARD_CAP_5M if duration <= 5 else ENTRY_HARD_CAP_15M
-        max_entry_allowed = min(max_entry_allowed, hard_cap)
+            min_entry_allowed = max(0.30, min_entry_allowed - 0.06)
         # High-conviction 15m mode: target lower cents early for better payout.
         hc15 = (
             HC15_ENABLED and duration == 15 and
@@ -1804,14 +1816,6 @@ class LiveTrader:
                     print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} outside [{min_entry_allowed:.2f},{max_entry_allowed:.2f}]{RS}")
                 return None
 
-        min_payout_req = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
-        min_ev_req = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
-        if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_SOFT_MIN:
-            min_payout_req = max(1.80 if duration <= 5 else 2.10, min_payout_req - 0.10)
-            min_ev_req = max(0.010 if duration <= 5 else 0.030, min_ev_req - 0.010)
-        if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_HARD_MIN:
-            min_payout_req = max(1.70 if duration <= 5 else 2.00, min_payout_req - 0.10)
-            min_ev_req = max(0.005 if duration <= 5 else 0.020, min_ev_req - 0.010)
         payout_mult = 1.0 / max(entry, 1e-9)
         if payout_mult < min_payout_req:
             if LOG_VERBOSE:
@@ -1822,8 +1826,12 @@ class LiveTrader:
             if LOG_VERBOSE:
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={min_ev_req:.3f}{RS}")
             return None
-        if (not QUALITY_MODE) and drought_min >= FLOW_RELAX_SOFT_MIN and self._should_log("flow-relax", 30):
-            print(f"{B}[FLOW]{RS} drought={drought_min:.1f}m relax payout>={min_payout_req:.2f}x ev>={min_ev_req:.3f} entry=[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]")
+        if self._should_log("flow-thresholds", 30):
+            print(
+                f"{B}[FLOW]{RS} drought={drought_min:.1f}m "
+                f"payout>={min_payout_req:.2f}x ev>={min_ev_req:.3f} "
+                f"entry=[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]"
+            )
         fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= 45)
 
         # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
@@ -1903,11 +1911,19 @@ class LiveTrader:
         """Execute a pre-scored signal: log, mark seen, place order, update state."""
         cid = sig["cid"]
         m = sig["m"]
+        side = sig.get("side", "")
         round_key = self._round_key(cid=cid, m=m, t=sig)
-        round_side_key = f"{round_key}|{sig.get('side','')}"
+        round_fp = self._round_fingerprint(cid=cid, m=m, t=sig)
+        round_side_key = f"{round_fp}|{side}"
         now_attempt = _time.time()
         async with self._exec_lock:
+            # Trim expired round-side blocks.
+            for k, exp in list(self._round_side_block_until.items()):
+                if float(exp or 0) <= now_attempt:
+                    self._round_side_block_until.pop(k, None)
             if cid in self.seen or cid in self._executing_cids or len(self.pending) >= MAX_OPEN:
+                return
+            if float(self._round_side_block_until.get(round_side_key, 0) or 0) > now_attempt:
                 return
             # Prevent rapid-fire retries on the same round/side.
             last_try = float(self._round_side_attempt_ts.get(round_side_key, 0) or 0)
@@ -1915,8 +1931,8 @@ class LiveTrader:
                 return
             # Never re-enter same round/side if already in pending (handles cross-CID drift).
             for _, (m_p, t_p) in list(self.pending.items()):
-                rk_p = self._round_key(m=m_p, t=t_p)
-                if rk_p == round_key and t_p.get("side") == sig.get("side"):
+                rk_p = self._round_fingerprint(m=m_p, t=t_p)
+                if rk_p == round_fp and t_p.get("side") == side:
                     return
             self._round_side_attempt_ts[round_side_key] = now_attempt
             self._executing_cids.add(cid)
@@ -2031,6 +2047,10 @@ class LiveTrader:
                 self._save_seen()
                 self._last_entry_ts = _time.time()
                 self.pending[cid] = (m, trade)
+                block_until = float(m.get("end_ts", 0) or 0)
+                if block_until <= now_attempt:
+                    block_until = now_attempt + max(60.0, ROUND_RETRY_COOLDOWN_SEC * 2)
+                self._round_side_block_until[round_side_key] = block_until + 15.0
                 self._save_pending()
                 self._log(m, trade)
         finally:
@@ -3114,6 +3134,62 @@ class LiveTrader:
             return 1.10
         return 1.0
 
+    def _adaptive_thresholds(self, duration: int, drought_min: float) -> tuple[float, float, float]:
+        """Dynamic payout/EV/entry thresholds from recent on-chain outcomes."""
+        base_payout = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
+        base_ev = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
+        hard_cap = ENTRY_HARD_CAP_5M if duration <= 5 else ENTRY_HARD_CAP_15M
+
+        recent = list(self.recent_trades)[-20:]
+        recent_n = len(recent)
+        recent_wr = (sum(recent) / recent_n) if recent_n > 0 else 0.5
+
+        bucket_rows = list(self._bucket_stats.rows.values())
+        bucket_n = sum(int(r.get("n", 0)) for r in bucket_rows)
+        bucket_pnl = sum(float(r.get("pnl", 0.0)) for r in bucket_rows)
+
+        # Tightness > 0 means "trade safer" after weak realized quality.
+        tightness = 0.0
+        if recent_n >= 8 and recent_wr < 0.52:
+            tightness += min(1.0, (0.52 - recent_wr) / 0.08)
+        if self.consec_losses >= 2:
+            tightness += min(1.0, (self.consec_losses - 1) * 0.25)
+        if bucket_n >= 12 and bucket_pnl < 0:
+            tightness += 0.4
+        tightness = min(1.6, max(0.0, tightness))
+
+        min_payout = base_payout + (0.18 * tightness)
+        min_ev = base_ev + (0.012 * tightness)
+        max_entry_hard = max(0.33, hard_cap - (0.05 * tightness))
+
+        # Drought relax only when quality is not degraded.
+        can_relax = (not QUALITY_MODE) and (tightness < 0.35)
+        if can_relax and drought_min >= FLOW_RELAX_SOFT_MIN:
+            min_payout = max(1.85 if duration <= 5 else 2.15, min_payout - 0.08)
+            min_ev = max(0.015 if duration <= 5 else 0.030, min_ev - 0.006)
+            max_entry_hard = min(0.97, max_entry_hard + 0.02)
+        if can_relax and drought_min >= FLOW_RELAX_HARD_MIN:
+            min_payout = max(1.80 if duration <= 5 else 2.10, min_payout - 0.06)
+            min_ev = max(0.010 if duration <= 5 else 0.025, min_ev - 0.006)
+            max_entry_hard = min(0.97, max_entry_hard + 0.02)
+
+        return min_payout, min_ev, max_entry_hard
+
+    def _prob_shrink_factor(self) -> float:
+        """Calibrate model confidence to recent realized outcomes (anti-overconfidence)."""
+        recent = list(self.recent_trades)[-30:]
+        n = len(recent)
+        if n < 8:
+            return 0.78
+        wr = sum(recent) / max(n, 1)
+        # Base confidence multiplier, shrunk when realized WR drops.
+        shrink = 0.86
+        if wr < 0.50:
+            shrink -= min(0.30, (0.50 - wr) * 2.0)
+        if self.consec_losses >= 2:
+            shrink -= min(0.20, 0.05 * self.consec_losses)
+        return max(0.45, min(0.90, shrink))
+
     def _signal_growth_score(self, sig: dict) -> float:
         """Rank candidates by growth quality (higher is better)."""
         entry = max(float(sig.get("entry", 0.5)), 1e-6)
@@ -3122,7 +3198,14 @@ class LiveTrader:
         cl_bonus = 0.02 if sig.get("cl_agree", True) else -0.03
         payout = (1.0 / entry) - 1.0
         ev_net = (float(sig.get("true_prob", 0.5)) / entry) - 1.0 - FEE_RATE_EST
-        return ev_net + edge * 0.35 + payout * 0.06 + score * 0.003 + cl_bonus
+        q_age = float(sig.get("quote_age_ms", 0.0) or 0.0)
+        s_lat = float(sig.get("signal_latency_ms", 0.0) or 0.0)
+        lag_penalty = 0.0
+        if q_age > 900:
+            lag_penalty -= 0.03
+        if s_lat > 550:
+            lag_penalty -= 0.03
+        return ev_net + edge * 0.35 + payout * 0.06 + score * 0.003 + cl_bonus + lag_penalty
 
     def _regime_caps(self) -> tuple[float, float]:
         vals = []
@@ -3511,6 +3594,7 @@ class LiveTrader:
                     drought_min = (_time.time() - self._last_entry_ts) / 60.0
                     print(f"{Y}[ROUND]{RS} no executable signal | drought={drought_min:.1f}m")
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
+                shadow_pending = dict(active_pending)
                 slots = max(0, MAX_OPEN - len(active_pending))
                 to_exec = []
                 selected = valid
@@ -3527,16 +3611,25 @@ class LiveTrader:
                 for sig in selected:
                     if len(to_exec) >= slots:
                         break
-                    if not self._exposure_ok(sig, active_pending):
+                    if not self._exposure_ok(sig, shadow_pending):
                         continue
                     if not TRADE_ALL_MARKETS:
-                        pending_up = sum(1 for _, t in active_pending.values() if t.get("side") == "Up")
-                        pending_dn = sum(1 for _, t in active_pending.values() if t.get("side") == "Down")
+                        pending_up = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Up")
+                        pending_dn = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Down")
                         if sig["side"] == "Up" and pending_up >= MAX_SAME_DIR:
                             continue
                         if sig["side"] == "Down" and pending_dn >= MAX_SAME_DIR:
                             continue
                     to_exec.append(sig)
+                    m_sig = sig.get("m", {}) if isinstance(sig.get("m", {}), dict) else {}
+                    t_sig = {
+                        "side": sig.get("side", ""),
+                        "size": float(sig.get("size", 0.0) or 0.0),
+                        "asset": sig.get("asset", ""),
+                        "duration": int(sig.get("duration", 0) or 0),
+                        "end_ts": float(m_sig.get("end_ts", now + 60) or (now + 60)),
+                    }
+                    shadow_pending[f"__pick__{len(to_exec)}"] = (m_sig, t_sig)
                 if to_exec:
                     await asyncio.gather(*[self._execute_trade(sig) for sig in to_exec])
 
