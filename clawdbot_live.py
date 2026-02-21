@@ -808,7 +808,8 @@ class LiveTrader:
             if open_p > 0 and src == "?":
                 src = "CL" if cl_p > 0 else "RTDS"
             if open_p > 0 and cur_p > 0:
-                winning    = (side == "Up" and cur_p > open_p) or (side == "Down" and cur_p < open_p)
+                pred_winner = "Up" if cur_p >= open_p else "Down"
+                winning    = (side == pred_winner)
                 move_pct   = (cur_p - open_p) / open_p * 100
                 c          = G if winning else R
                 status_str = "LEADING" if winning else "TRAILING"
