@@ -275,6 +275,10 @@ class LiveTrader:
         self.cl_updated      = {}    # Chainlink last update timestamp per asset
         self.bankroll        = BANKROLL
         self.start_bank      = BANKROLL
+        self.onchain_wallet_usdc = BANKROLL
+        self.onchain_open_positions = 0.0
+        self.onchain_total_equity = BANKROLL
+        self.onchain_snapshot_ts = 0.0
         self.daily_pnl       = 0.0
         self.total           = 0
         self.wins            = 0
@@ -901,7 +905,8 @@ class LiveTrader:
         el   = datetime.now(timezone.utc) - self.start_time
         h, m = int(el.total_seconds()//3600), int(el.total_seconds()%3600//60)
         wr   = f"{self.wins/self.total*100:.1f}%" if self.total else "–"
-        pnl  = self.bankroll - self.start_bank
+        display_bank = self.onchain_total_equity if self.onchain_snapshot_ts > 0 else self.bankroll
+        pnl  = display_bank - self.start_bank
         roi  = pnl / self.start_bank * 100 if self.start_bank > 0 else 0
         pc   = G if pnl >= 0 else R
         rs   = G if self.rtds_ok else R
@@ -913,7 +918,7 @@ class LiveTrader:
             f"  {B}Time:{RS} {h}h{m}m  {rs}RTDS{'✓' if self.rtds_ok else '✗'}{RS}  "
             f"{B}Trades:{RS} {self.total}  {B}Win:{RS} {wr}  "
             f"{B}ROI:{RS} {pc}{roi:+.1f}%{RS}\n"
-            f"  {B}Bankroll:{RS} ${self.bankroll:.2f}  "
+            f"  {B}Bankroll:{RS} ${display_bank:.2f}  "
             f"{B}P&L:{RS} {pc}${pnl:+.2f}{RS}  "
             f"{B}Network:{RS} {NETWORK}  "
             f"{B}Open:{RS} {len(self.pending)}  {Y}Settling:{RS} {len(self.pending_redeem)}\n"
@@ -3411,22 +3416,17 @@ class LiveTrader:
                     params={"user": ADDRESS, "sizeThreshold": "0.01"},
                     timeout=10,
                 )
-                api_cids = {p.get("conditionId","") for p in positions}
                 open_val = sum(
                     float(p.get("currentValue", 0))
                     for p in positions
                     if not p.get("redeemable") and p.get("outcome")
                 )
-                # Add pending positions not yet visible in the API (fill→API lag ~10-30s)
-                for cid, (_, t) in self.pending.items():
-                    if cid not in api_cids:
-                        # API lag guard: only add just-filled positions for a short window.
-                        # Prevents stale local pending from overstating total bankroll.
-                        age_s = _time.time() - float(t.get("placed_ts", 0) or 0)
-                        if 0 <= age_s <= 90:
-                            open_val += t.get("size", 0)
 
                 total = round(usdc + open_val, 2)
+                self.onchain_wallet_usdc = round(usdc, 2)
+                self.onchain_open_positions = round(open_val, 2)
+                self.onchain_total_equity = total
+                self.onchain_snapshot_ts = _time.time()
                 print(f"{B}[BANK] on-chain USDC=${usdc:.2f}  open_positions=${open_val:.2f}  total=${total:.2f}{RS}")
                 if total > 0:
                     self.bankroll = total
