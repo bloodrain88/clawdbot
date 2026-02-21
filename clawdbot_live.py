@@ -143,8 +143,8 @@ MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.005"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
 PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
 FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "true").lower() == "true"
-FAST_EXEC_SCORE = int(os.environ.get("FAST_EXEC_SCORE", "7"))
-FAST_EXEC_EDGE = float(os.environ.get("FAST_EXEC_EDGE", "0.03"))
+FAST_EXEC_SCORE = int(os.environ.get("FAST_EXEC_SCORE", "6"))
+FAST_EXEC_EDGE = float(os.environ.get("FAST_EXEC_EDGE", "0.02"))
 MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "1200"))
 MAX_QUOTE_STALENESS_MS = float(os.environ.get("MAX_QUOTE_STALENESS_MS", "1200"))
 EXPOSURE_CAP_TOTAL_TREND = float(os.environ.get("EXPOSURE_CAP_TOTAL_TREND", "0.80"))
@@ -173,9 +173,9 @@ CHAINLINK_ABI = [
         {"name":"answeredInRound","type":"uint80"}],
      "stateMutability":"view","type":"function"},
 ]
-SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "2"))
-PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "3"))
-STATUS_INTERVAL= int(os.environ.get("STATUS_INTERVAL", "20"))
+SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "1"))
+PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "2"))
+STATUS_INTERVAL= int(os.environ.get("STATUS_INTERVAL", "15"))
 _DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
 LOG_FILE       = os.path.join(_DATA_DIR, "clawdbot_live_trades.csv")
 PENDING_FILE   = os.path.join(_DATA_DIR, "clawdbot_pending.json")
@@ -916,7 +916,7 @@ class LiveTrader:
                                 if m.get("asset") != asset: continue
                                 if cid in self.seen: continue
                                 if cid not in self.open_prices: continue
-                                if now_t - self._last_eval_time.get(cid, 0) < 0.5: continue
+                                if now_t - self._last_eval_time.get(cid, 0) < 0.25: continue
                                 mins = (m["end_ts"] - now_t) / 60
                                 if mins < 1: continue
                                 self._last_eval_time[cid] = now_t
@@ -1895,11 +1895,11 @@ class LiveTrader:
                     return {"order_id": order_id, "fill_price": maker_price, "mode": "maker"}
 
                 # Ultra-low-latency waits to avoid blocking other opportunities.
-                poll_interval = 0.5
-                max_wait = min(1 if duration <= 5 else 2, int(mins_left * 60 * 0.04))
+                poll_interval = 0.25 if duration <= 5 else 0.4
+                max_wait = min(0.75 if duration <= 5 else 1.5, max(0.4, mins_left * 60 * 0.03))
                 if use_limit:
                     # Pullback limit: do not stall the cycle waiting on far-away price.
-                    max_wait = 0.8
+                    max_wait = 0.5 if duration <= 5 else 0.8
                 polls     = max(1, int(max_wait / poll_interval))
                 print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
                       f"waiting up to {polls*poll_interval}s for fill...{RS}")
