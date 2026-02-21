@@ -20,9 +20,11 @@ import json
 import math
 import csv
 import os
+import re
 import time as _time
 from collections import deque
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from scipy.stats import norm
 from dotenv import load_dotenv
 from web3 import Web3
@@ -194,7 +196,8 @@ LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
 LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
-FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "90"))
+FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "30"))
+REDEEMABLE_SCAN_SEC = int(os.environ.get("REDEEMABLE_SCAN_SEC", "20"))
 RPC_OPTIMIZE_SEC = int(os.environ.get("RPC_OPTIMIZE_SEC", "45"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
@@ -364,6 +367,62 @@ class LiveTrader:
             return "n/a"
         return f"{cid[:10]}..."
 
+    def _is_exact_round_bounds(self, start_ts: float, end_ts: float, dur: int) -> bool:
+        if start_ts <= 0 or end_ts <= 0 or dur <= 0:
+            return False
+        if abs((end_ts - start_ts) - dur * 60.0) > 2.5:
+            return False
+        st = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+        et = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+        if st.second != 0 or et.second != 0:
+            return False
+        if dur in (5, 15):
+            if st.minute % dur != 0 or et.minute % dur != 0:
+                return False
+        return True
+
+    def _round_bounds_from_question(self, question: str) -> tuple[float, float]:
+        """Best-effort exact ET round parsing from market title."""
+        if not question:
+            return 0.0, 0.0
+        # Example: "February 21, 8:30AM-8:45AM ET"
+        m = re.search(
+            r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{1,2}:\d{2})(AM|PM)?-(\d{1,2}:\d{2})(AM|PM)\s*ET",
+            question,
+        )
+        if not m:
+            return 0.0, 0.0
+        month_s, day_s, t1_s, ap1_s, t2_s, ap2_s = m.groups()
+        months = {
+            "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+            "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+        }
+        mon = months.get(month_s.lower())
+        if mon is None:
+            return 0.0, 0.0
+        day = int(day_s)
+        ap1 = ap1_s or ap2_s
+        if ap1 is None:
+            return 0.0, 0.0
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        year = now_et.year
+        try:
+            st_local = datetime.strptime(f"{year}-{mon:02d}-{day:02d} {t1_s}{ap1}", "%Y-%m-%d %I:%M%p").replace(
+                tzinfo=ZoneInfo("America/New_York")
+            )
+            et_local = datetime.strptime(f"{year}-{mon:02d}-{day:02d} {t2_s}{ap2_s}", "%Y-%m-%d %I:%M%p").replace(
+                tzinfo=ZoneInfo("America/New_York")
+            )
+            st_ts = st_local.astimezone(timezone.utc).timestamp()
+            et_ts = et_local.astimezone(timezone.utc).timestamp()
+            # Handle midnight crossing edge-case.
+            if et_ts <= st_ts:
+                et_local = et_local.replace(day=min(day + 1, 28))
+                et_ts = et_local.astimezone(timezone.utc).timestamp()
+            return st_ts, et_ts
+        except Exception:
+            return 0.0, 0.0
+
     def _round_key(self, cid: str = "", m: dict | None = None, t: dict | None = None) -> str:
         m = m or {}
         t = t or {}
@@ -371,11 +430,11 @@ class LiveTrader:
         dur = int(t.get("duration") or m.get("duration") or 0)
         start_ts = float(m.get("start_ts") or 0)
         end_ts = float(t.get("end_ts") or m.get("end_ts") or 0)
-        if start_ts <= 0 and end_ts > 0 and dur > 0:
-            start_ts = end_ts - dur * 60.0
-        if end_ts <= 0 and start_ts > 0 and dur > 0:
-            end_ts = start_ts + dur * 60.0
-        if start_ts > 0 and end_ts > 0:
+        if not self._is_exact_round_bounds(start_ts, end_ts, dur):
+            q_st, q_et = self._round_bounds_from_question(m.get("question", ""))
+            if self._is_exact_round_bounds(q_st, q_et, dur):
+                start_ts, end_ts = q_st, q_et
+        if self._is_exact_round_bounds(start_ts, end_ts, dur):
             st = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             et = datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             return f"{asset}-{dur}m-{st}-{et}"
@@ -1823,6 +1882,7 @@ class LiveTrader:
                 "fill_price": fill_price,
                 "slip_bps": round(slip_bps, 2),
                 "round_key": round_key,
+                "placed_ts": _time.time(),
             }
             self._log_onchain_event("ENTRY", cid, {
                 "asset": sig["asset"],
@@ -3256,7 +3316,11 @@ class LiveTrader:
                 # Add pending positions not yet visible in the API (fill→API lag ~10-30s)
                 for cid, (_, t) in self.pending.items():
                     if cid not in api_cids:
-                        open_val += t.get("size", 0)
+                        # API lag guard: only add just-filled positions for a short window.
+                        # Prevents stale local pending from overstating total bankroll.
+                        age_s = _time.time() - float(t.get("placed_ts", 0) or 0)
+                        if 0 <= age_s <= 90:
+                            open_val += t.get("size", 0)
 
                 total = round(usdc + open_val, 2)
                 print(f"{B}[BANK] on-chain USDC=${usdc:.2f}  open_positions=${open_val:.2f}  total=${total:.2f}{RS}")
@@ -3415,7 +3479,6 @@ class LiveTrader:
         if DRY_RUN or self.w3 is None:
             return
         while True:
-            await asyncio.sleep(20)
             try:
                 positions = await self._http_get_json(
                     "https://data-api.polymarket.com/positions",
@@ -3446,6 +3509,7 @@ class LiveTrader:
             except Exception as e:
                 self._errors.tick("redeemable_scan", print, err=e, every=10)
                 print(f"{Y}[SCAN-REDEEM] Error: {e}{RS}")
+            await asyncio.sleep(REDEEMABLE_SCAN_SEC)
 
     async def _force_redeem_backfill_loop(self):
         """Periodic backfill: force redeem resolved winners from recent activity.
@@ -3471,7 +3535,6 @@ class LiveTrader:
         ])
         loop = asyncio.get_event_loop()
         while True:
-            await asyncio.sleep(FORCE_REDEEM_SCAN_SEC)
             try:
                 activity = await self._http_get_json(
                     "https://data-api.polymarket.com/activity",
@@ -3547,6 +3610,7 @@ class LiveTrader:
             except Exception as e:
                 self._errors.tick("force_redeem_backfill", print, err=e, every=10)
                 print(f"{Y}[FORCE-REDEEM] Error: {e}{RS}")
+            await asyncio.sleep(FORCE_REDEEM_SCAN_SEC)
 
     async def _position_sync_loop(self):
         """Every 5 min: sync on-chain positions to pending — catches any fills the bot missed."""
