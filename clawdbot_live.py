@@ -1069,21 +1069,31 @@ class LiveTrader:
             if open_p <= 0:
                 start_ts_m = m.get("start_ts", 0)
                 end_ts_m   = m.get("end_ts", 0)
+                dur_m      = int(t.get("duration") or m.get("duration") or 15)
                 if start_ts_m > 0 and end_ts_m > 0:
                     try:
                         import requests as _rq
                         from datetime import datetime as _dt, timezone as _tz
-                        st = _dt.fromtimestamp(start_ts_m, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        et = _dt.fromtimestamp(end_ts_m,   tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        _r = _rq.get("https://polymarket.com/api/crypto/crypto-price",
-                                     params={"symbol": asset, "eventStartTime": st,
-                                             "variant": "fifteen", "endDate": et}, timeout=3)
-                        _p = _r.json().get("openPrice") or 0
-                        if _p:
-                            open_p = float(_p)
-                            self.open_prices[cid]        = open_p
-                            self.open_prices_source[cid] = "PM"
-                            src = "PM"
+                        dur_m = 5 if dur_m <= 5 else 15
+                        st_dt = _dt.fromtimestamp(start_ts_m, tz=_tz.utc)
+                        st_floor = st_dt.replace(minute=(st_dt.minute // dur_m) * dur_m, second=0, microsecond=0)
+                        et_floor = st_floor.timestamp() + dur_m * 60
+                        st = st_floor.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        et = _dt.fromtimestamp(et_floor, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        variants = ["five", "fifteen"] if dur_m == 5 else ["fifteen"]
+                        for variant in variants:
+                            _r = _rq.get(
+                                "https://polymarket.com/api/crypto/crypto-price",
+                                params={"symbol": asset, "eventStartTime": st, "variant": variant, "endDate": et},
+                                timeout=3,
+                            )
+                            _p = _r.json().get("openPrice") or 0
+                            if _p:
+                                open_p = float(_p)
+                                self.open_prices[cid] = open_p
+                                self.open_prices_source[cid] = "PM"
+                                src = "PM"
+                                break
                     except Exception:
                         pass
             # Use Chainlink (resolution source) for win/loss; fall back to RTDS if unavailable
@@ -3451,21 +3461,32 @@ class LiveTrader:
         print(f"{B}[ADAPT] Last5={streak} WR={label}  MinEdge={me:.2f}  Streak={self.consec_losses}L  DrawdownScale={self._kelly_drawdown_scale():.0%}{wr_str}{RS}")
 
     # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
-    async def _get_polymarket_open_price(self, asset: str, start_ts: float, end_ts: float) -> float:
+    async def _get_polymarket_open_price(self, asset: str, start_ts: float, end_ts: float, duration: int = 15) -> float:
         """Call Polymarket's own price API to get the authoritative 'price to beat'.
         Returns openPrice float or 0.0 on any error."""
         try:
             from datetime import datetime, timezone as _tz
-            sym  = asset  # BTC, ETH, SOL, XRP
-            st   = datetime.fromtimestamp(start_ts, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            et   = datetime.fromtimestamp(end_ts,   tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            data = await self._http_get_json(
-                "https://polymarket.com/api/crypto/crypto-price",
-                params={"symbol": sym, "eventStartTime": st, "variant": "fifteen", "endDate": et},
-                timeout=6,
-            )
-            price = data.get("openPrice") or 0.0
-            return float(price) if price else 0.0
+            sym = asset  # BTC, ETH, SOL, XRP
+            dur = 5 if int(duration or 0) <= 5 else 15
+
+            # Canonical PM round boundaries: start at exact 5m/15m slot.
+            st_dt = datetime.fromtimestamp(start_ts, tz=_tz.utc)
+            st_floor = st_dt.replace(minute=(st_dt.minute // dur) * dur, second=0, microsecond=0)
+            et_floor = st_floor.timestamp() + dur * 60
+            st = st_floor.strftime("%Y-%m-%dT%H:%M:%SZ")
+            et = datetime.fromtimestamp(et_floor, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            variants = ["five", "fifteen"] if dur == 5 else ["fifteen"]
+            for variant in variants:
+                data = await self._http_get_json(
+                    "https://polymarket.com/api/crypto/crypto-price",
+                    params={"symbol": sym, "eventStartTime": st, "variant": variant, "endDate": et},
+                    timeout=6,
+                )
+                price = (data or {}).get("openPrice", 0.0) if isinstance(data, dict) else 0.0
+                if price:
+                    return float(price)
+            return 0.0
         except Exception:
             return 0.0
 
@@ -3600,7 +3621,7 @@ class LiveTrader:
                     start_ts = m.get("start_ts", now)
                     end_ts_m = m.get("end_ts", now + dur * 60)
                     # Authoritative reference: Polymarket's own price API
-                    ref = await self._get_polymarket_open_price(asset, start_ts, end_ts_m)
+                    ref = await self._get_polymarket_open_price(asset, start_ts, end_ts_m, dur)
                     if ref > 0:
                         src = "PM"
                     else:
@@ -3633,7 +3654,7 @@ class LiveTrader:
                     if src != "PM":
                         start_ts = m.get("start_ts", now)
                         end_ts_m = m.get("end_ts", now + dur * 60)
-                        pm_ref = await self._get_polymarket_open_price(asset, start_ts, end_ts_m)
+                        pm_ref = await self._get_polymarket_open_price(asset, start_ts, end_ts_m, dur)
                         if pm_ref > 0:
                             self.open_prices[cid]        = pm_ref
                             self.open_prices_source[cid] = "PM"
