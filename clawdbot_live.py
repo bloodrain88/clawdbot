@@ -201,6 +201,7 @@ REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
 LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
 FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "5"))
 REDEEMABLE_SCAN_SEC = int(os.environ.get("REDEEMABLE_SCAN_SEC", "10"))
+ROUND_RETRY_COOLDOWN_SEC = float(os.environ.get("ROUND_RETRY_COOLDOWN_SEC", "12"))
 RPC_OPTIMIZE_SEC = int(os.environ.get("RPC_OPTIMIZE_SEC", "45"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
@@ -303,6 +304,7 @@ class LiveTrader:
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
         self._exec_lock         = asyncio.Lock()
         self._executing_cids    = set()
+        self._round_side_attempt_ts = {}          # "round_key|side" → last attempt ts
         self._redeem_tx_lock    = asyncio.Lock()  # serialize redeem txs to avoid nonce clashes
         self._nonce_mgr         = None
         self._errors            = ErrorTracker()
@@ -1878,9 +1880,23 @@ class LiveTrader:
     async def _execute_trade(self, sig: dict):
         """Execute a pre-scored signal: log, mark seen, place order, update state."""
         cid = sig["cid"]
+        m = sig["m"]
+        round_key = self._round_key(cid=cid, m=m, t=sig)
+        round_side_key = f"{round_key}|{sig.get('side','')}"
+        now_attempt = _time.time()
         async with self._exec_lock:
             if cid in self.seen or cid in self._executing_cids or len(self.pending) >= MAX_OPEN:
                 return
+            # Prevent rapid-fire retries on the same round/side.
+            last_try = float(self._round_side_attempt_ts.get(round_side_key, 0) or 0)
+            if last_try > 0 and (now_attempt - last_try) < ROUND_RETRY_COOLDOWN_SEC:
+                return
+            # Never re-enter same round/side if already in pending (handles cross-CID drift).
+            for _, (m_p, t_p) in list(self.pending.items()):
+                rk_p = self._round_key(m=m_p, t=t_p)
+                if rk_p == round_key and t_p.get("side") == sig.get("side"):
+                    return
+            self._round_side_attempt_ts[round_side_key] = now_attempt
             self._executing_cids.add(cid)
         score       = sig["score"]
         score_stars = f"{G}★★★{RS}" if score >= 12 else (f"{G}★★{RS}" if score >= 9 else "★")
@@ -1946,8 +1962,6 @@ class LiveTrader:
             stat_bucket = self._bucket_key(sig["duration"], sig["score"], sig["entry"])
             if order_id:
                 self._bucket_stats.add_fill(stat_bucket, slip_bps)
-            m = sig["m"]
-            round_key = self._round_key(cid=cid, m=m, t=sig)
             trade = {
                 "side": sig["side"], "size": sig["size"], "entry": sig["entry"],
                 "open_price": sig["open_price"], "current_price": sig["current"],
@@ -2062,7 +2076,7 @@ class LiveTrader:
                         print(f"{Y}[SKIP] {asset} {side} [high-conv]: maker_edge={maker_edge_est:.3f} < 0 "
                               f"(mid={mid_est:.3f} model={true_prob:.3f}){RS}")
                         return None
-                    print(f"{B}[FILL]{RS} {asset} {side} score={score} maker_edge={maker_edge_est:.3f} taker_edge={taker_edge:.3f}")
+                    print(f"{B}[EXEC-CHECK]{RS} {asset} {side} score={score} maker_edge={maker_edge_est:.3f} taker_edge={taker_edge:.3f}")
                 else:
                     # Normal conviction: taker edge gate applies
                     if taker_edge < edge_floor:
@@ -2070,7 +2084,7 @@ class LiveTrader:
                         print(f"{Y}[SKIP] {asset} {side} [{kind}]: taker_edge={taker_edge:.3f} < {edge_floor:.2f} "
                               f"(ask={best_ask:.3f} model={true_prob:.3f}){RS}")
                         return None
-                    print(f"{B}[FILL]{RS} {asset} {side} edge={taker_edge:.3f} floor={edge_floor:.2f}")
+                    print(f"{B}[EXEC-CHECK]{RS} {asset} {side} edge={taker_edge:.3f} floor={edge_floor:.2f}")
 
                 # High conviction: skip maker, go straight to FOK taker for instant fill
                 # FOK = Fill-or-Kill: fills completely at price or cancels instantly — no waiting
