@@ -108,7 +108,7 @@ load_dotenv(os.path.expanduser("~/.clawdbot.env"))
 
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON, AMOY
-from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, AssetType, BalanceAllowanceParams, ApiCreds
+from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, AssetType, BalanceAllowanceParams
 from py_clob_client.config import get_contract_config
 
 POLYGON_RPCS = [
@@ -126,25 +126,8 @@ CTF_ABI = [
 ]
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-def _clean_env(v: str) -> str:
-    if v is None:
-        return ""
-    return str(v).strip().strip('"').strip("'")
-
-
-def _pick_env(*names: str) -> str:
-    for n in names:
-        v = _clean_env(os.environ.get(n, ""))
-        if v:
-            return v
-    return ""
-
-
-PRIVATE_KEY    = _pick_env("POLY_PRIVATE_KEY", "PRIVATE_KEY", "PK")
-ADDRESS        = _pick_env("POLY_ADDRESS", "ADDRESS")
-POLY_API_KEY   = _pick_env("POLY_API_KEY")
-POLY_API_SECRET = _pick_env("POLY_API_SECRET")
-POLY_API_PASSPHRASE = _pick_env("POLY_API_PASSPHRASE")
+PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
+ADDRESS        = os.environ["POLY_ADDRESS"]
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per realized PnL quality)
@@ -282,13 +265,6 @@ FIVE_MIN_ASSETS = {
 }
 CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
 CLOB_HOST = "https://clob.polymarket.com"
-
-# Auto-derive address if only private key is set.
-if not ADDRESS and PRIVATE_KEY:
-    try:
-        ADDRESS = Account.from_key(PRIVATE_KEY).address
-    except Exception:
-        ADDRESS = ""
 
 SERIES = {
     # 5-min markets EXCLUDED: negative EV (36% WR vs 38% breakeven, payout ~1.6x)
@@ -1009,15 +985,6 @@ class LiveTrader:
     # ── CLOB INIT ─────────────────────────────────────────────────────────────
     def init_clob(self):
         print(f"{B}[CLOB] Connecting to Polymarket CLOB ({NETWORK})...{RS}")
-        if not ADDRESS:
-            raise RuntimeError("Missing POLY_ADDRESS/ADDRESS (wallet address)")
-        key_hex = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith("0x") else PRIVATE_KEY
-        if PRIVATE_KEY and not re.fullmatch(r"[0-9a-fA-F]{64}", key_hex):
-            raise RuntimeError("POLY_PRIVATE_KEY format invalid (expected 64 hex chars)")
-        if not PRIVATE_KEY and not (POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE):
-            raise RuntimeError(
-                "Missing auth: set POLY_PRIVATE_KEY or POLY_API_KEY/POLY_API_SECRET/POLY_API_PASSPHRASE"
-            )
         self.clob = ClobClient(
             host=CLOB_HOST,
             key=PRIVATE_KEY,
@@ -1025,23 +992,14 @@ class LiveTrader:
             signature_type=0,   # EOA (direct wallet, not proxy)
             funder=ADDRESS,     # address holding the USDC
         )
-        # Prefer explicit API creds when provided; otherwise derive from private key.
+        # Derive/create API credentials (signed from private key — no external account needed)
         try:
-            if POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE:
-                creds = ApiCreds(
-                    api_key=POLY_API_KEY,
-                    api_secret=POLY_API_SECRET,
-                    api_passphrase=POLY_API_PASSPHRASE,
-                )
-                self.clob.set_api_creds(creds)
-                print(f"{G}[CLOB] API creds from env OK: {POLY_API_KEY[:8]}...{RS}")
-            else:
-                creds = self.clob.create_or_derive_api_creds()
-                self.clob.set_api_creds(creds)
-                print(f"{G}[CLOB] API creds OK: {creds.api_key[:8]}...{RS}")
+            creds = self.clob.create_or_derive_api_creds()
+            self.clob.set_api_creds(creds)
+            print(f"{G}[CLOB] API creds OK: {creds.api_key[:8]}...{RS}")
         except Exception as e:
             print(f"{R}[CLOB] Creds error: {e}{RS}")
-            raise RuntimeError("CLOB authentication failed (invalid/missing key or API creds)") from e
+            raise
 
         # Sync USDC (COLLATERAL) allowance with Polymarket backend
         # CONDITIONAL not needed — bot only places BUY orders (USDC→tokens)
@@ -4615,15 +4573,9 @@ class LiveTrader:
 ║  Bankroll: sync on-chain at startup                          ║
 ║  {'DRY-RUN (simulated, no real orders)' if DRY_RUN else 'LIVE — ordini reali su Polymarket':<44}║
 ╚══════════════════════════════════════════════════════════════╝{RS}
-        """)
+""")
         self._startup_self_check()
-        while True:
-            try:
-                self.init_clob()
-                break
-            except Exception as e:
-                print(f"{R}[BOOT]{RS} CLOB init failed: {e} — retry in 20s")
-                await asyncio.sleep(20)
+        self.init_clob()
         self._sync_redeemable()   # redeem any wins from previous runs
         # Sync stats from API immediately so first status print shows real data
         await self._sync_stats_from_api()
