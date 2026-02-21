@@ -3287,7 +3287,11 @@ class LiveTrader:
             self._reload_copyflow()
             markets = await self.fetch_markets()
             now     = datetime.now(timezone.utc).timestamp()
-            print(f"{B}[SCAN] Live markets: {len(markets)} | Open: {len(self.pending)} | Settling: {len(self.pending_redeem)}{RS}")
+            print(
+                f"{B}[SCAN]{RS} Live markets: {len(markets)} | "
+                f"Open(local/onchain): {len(self.pending)}/{self.onchain_open_count} | "
+                f"Settling(local/onchain): {len(self.pending_redeem)}/{self.onchain_redeemable_count}"
+            )
 
             # Subscribe new markets to RTDS token price stream
             if self._rtds_ws:
