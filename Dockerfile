@@ -25,4 +25,5 @@ COPY clawdbot_paper.py .
 COPY clawdbot_live.py .
 COPY runtime_utils.py .
 COPY clawdbot_copyflow.json .
+COPY scripts ./scripts
 CMD ["python", "-u", "clawdbot_live.py"]

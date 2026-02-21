@@ -196,6 +196,9 @@ RPC_OPTIMIZE_SEC = int(os.environ.get("RPC_OPTIMIZE_SEC", "45"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
 COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
+COPYFLOW_REFRESH_ENABLED = os.environ.get("COPYFLOW_REFRESH_ENABLED", "true").lower() == "true"
+COPYFLOW_REFRESH_SEC = int(os.environ.get("COPYFLOW_REFRESH_SEC", "300"))
+COPYFLOW_MIN_ROI = float(os.environ.get("COPYFLOW_MIN_ROI", "-0.03"))
 ENABLE_5M = os.environ.get("ENABLE_5M", "true").lower() == "true"
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
@@ -389,6 +392,40 @@ class LiveTrader:
                 print(f"{B}[COPY]{RS} loaded {len(self._copyflow_map)} market side-flow entries from {src}")
         except Exception as e:
             self._errors.tick("copyflow_reload", print, err=e, every=10)
+
+    async def _copyflow_refresh_loop(self):
+        """Periodic copy-wallet recalculation from live on-chain data."""
+        if not COPYFLOW_REFRESH_ENABLED or DRY_RUN:
+            return
+        script_path = "/app/scripts/polymarket_copy_alpha.py"
+        out_path = COPYFLOW_FILE
+        while True:
+            await asyncio.sleep(COPYFLOW_REFRESH_SEC)
+            try:
+                if not os.path.exists(script_path):
+                    if self._should_log("copyflow-no-script", 300):
+                        print(f"{Y}[COPY]{RS} refresh skipped: missing {script_path}")
+                    continue
+                cmd = [
+                    "python", script_path,
+                    "--wallet", ADDRESS,
+                    "--out", out_path,
+                    "--min-roi", str(COPYFLOW_MIN_ROI),
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await proc.communicate()
+                if proc.returncode == 0:
+                    msg = (out.decode("utf-8", "ignore").strip().splitlines() or ["ok"])[0]
+                    print(f"{B}[COPY]{RS} refreshed: {msg}")
+                else:
+                    em = err.decode("utf-8", "ignore").strip()[:180]
+                    self._errors.tick("copyflow_refresh", print, err=em, every=5)
+            except Exception as e:
+                self._errors.tick("copyflow_refresh_loop", print, err=e, every=5)
 
     def _startup_self_check(self):
         rpc_rank = sorted(self._rpc_stats.items(), key=lambda x: x[1])[:3]
@@ -3586,6 +3623,7 @@ class LiveTrader:
             _guard("_redeem_loop",          self._redeem_loop),
             _guard("_force_redeem_backfill_loop", self._force_redeem_backfill_loop),
             _guard("chainlink_loop",        self.chainlink_loop),
+            _guard("_copyflow_refresh_loop", self._copyflow_refresh_loop),
             _guard("_rpc_optimizer_loop",   self._rpc_optimizer_loop),
             _guard("_redeemable_scan",      self._redeemable_scan),
             _guard("_position_sync_loop",   self._position_sync_loop),
