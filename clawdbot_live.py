@@ -3425,12 +3425,31 @@ class LiveTrader:
         ERC20_ABI = [{"inputs":[{"name":"account","type":"address"}],
                       "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
                       "stateMutability":"view","type":"function"}]
+        CTF_BAL_ABI = [
+            {"inputs":[{"name":"owner","type":"address"},{"name":"id","type":"uint256"}],
+             "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"conditionId","type":"bytes32"}],
+             "name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"conditionId","type":"bytes32"},{"name":"index","type":"uint256"}],
+             "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+        ]
         usdc_contract = None
+        ctf_bal_contract = None
+        addr_cs = None
         if self.w3 is not None:
             try:
                 usdc_contract = self.w3.eth.contract(
                     address=Web3.to_checksum_address(USDC_E), abi=ERC20_ABI
                 )
+                cfg = get_contract_config(CHAIN_ID, neg_risk=False)
+                ctf_bal_contract = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(cfg.conditional_tokens),
+                    abi=CTF_BAL_ABI,
+                )
+                addr_cs = Web3.to_checksum_address(ADDRESS)
             except Exception:
                 pass
 
@@ -3446,42 +3465,91 @@ class LiveTrader:
                 # 1. On-chain USDC.e balance
                 usdc_raw = await loop.run_in_executor(
                     None, lambda: usdc_contract.functions.balanceOf(
-                        Web3.to_checksum_address(ADDRESS)
+                        addr_cs
                     ).call()
                 ) if usdc_contract else 0
                 usdc = usdc_raw / 1e6
 
-                # 2. Current value of open CTF positions (locked in CTF, not in wallet)
-                positions = await self._http_get_json(
-                    "https://data-api.polymarket.com/positions",
-                    params={"user": ADDRESS, "sizeThreshold": "0.01"},
-                    timeout=10,
-                )
-                open_val = sum(
-                    float(p.get("currentValue", 0))
-                    for p in positions
-                    if not p.get("redeemable") and p.get("outcome")
-                )
-                open_count = sum(1 for p in positions if not p.get("redeemable") and p.get("outcome"))
-                redeemable_count = sum(1 for p in positions if p.get("redeemable") and p.get("outcome"))
-                redeemable_claimable = sum(
-                    1 for p in positions
-                    if p.get("redeemable") and p.get("outcome")
-                    and float(p.get("currentValue", 0) or 0) >= 0.01
-                )
+                # 2. Strict on-chain CID valuation from wallet token balances.
+                open_val = 0.0
+                open_count = 0
+                settling_claim_val = 0.0
+                settling_claim_count = 0
+                if ctf_bal_contract is not None and addr_cs is not None:
+                    # Open (unresolved) positions from local tracked cids, valued by token price cache.
+                    for cid, (m_o, t_o) in list(self.pending.items()):
+                        tok = str(t_o.get("token_id", "") or "").strip()
+                        if not tok.isdigit():
+                            continue
+                        try:
+                            bal_raw = await loop.run_in_executor(
+                                None,
+                                lambda ti=int(tok): ctf_bal_contract.functions.balanceOf(addr_cs, ti).call(),
+                            )
+                            qty = bal_raw / 1e6
+                            if qty <= 0:
+                                continue
+                            px = float(self.token_prices.get(tok) or 0.0)
+                            if px <= 0:
+                                up_px = float(m_o.get("up_price") or t_o.get("mkt_price") or 0.5)
+                                px = up_px if t_o.get("side") == "Up" else max(0.0, 1.0 - up_px)
+                            open_val += qty * px
+                            open_count += 1
+                        except Exception:
+                            continue
 
-                total = round(usdc + open_val, 2)
+                    # Settling (resolved winners not redeemed yet): claimable notional from on-chain numerators.
+                    for cid, val in list(self.pending_redeem.items()):
+                        if isinstance(val[0], dict):
+                            m_s, t_s = val
+                            side_s = t_s.get("side", "")
+                            tok = str(t_s.get("token_id", "") or "").strip()
+                        else:
+                            side_s, _ = val
+                            m_s = {"conditionId": cid}
+                            tok = ""
+                        if not tok.isdigit():
+                            continue
+                        try:
+                            cid_bytes = bytes.fromhex(cid.lower().replace("0x", "").zfill(64))
+                            denom = await loop.run_in_executor(
+                                None, lambda b=cid_bytes: ctf_bal_contract.functions.payoutDenominator(b).call()
+                            )
+                            if int(denom) == 0:
+                                continue
+                            n0 = await loop.run_in_executor(
+                                None, lambda b=cid_bytes: ctf_bal_contract.functions.payoutNumerators(b, 0).call()
+                            )
+                            n1 = await loop.run_in_executor(
+                                None, lambda b=cid_bytes: ctf_bal_contract.functions.payoutNumerators(b, 1).call()
+                            )
+                            winner = "Up" if n0 > 0 and n1 == 0 else "Down" if n1 > 0 and n0 == 0 else ""
+                            if winner != side_s:
+                                continue
+                            bal_raw = await loop.run_in_executor(
+                                None,
+                                lambda ti=int(tok): ctf_bal_contract.functions.balanceOf(addr_cs, ti).call(),
+                            )
+                            qty = bal_raw / 1e6
+                            if qty <= 0:
+                                continue
+                            settling_claim_val += qty
+                            settling_claim_count += 1
+                        except Exception:
+                            continue
+
+                total = round(usdc + open_val + settling_claim_val, 2)
                 self.onchain_wallet_usdc = round(usdc, 2)
                 self.onchain_open_positions = round(open_val, 2)
                 self.onchain_open_count = int(open_count)
-                self.onchain_redeemable_count = int(redeemable_claimable)
+                self.onchain_redeemable_count = int(settling_claim_count)
                 self.onchain_total_equity = total
                 self.onchain_snapshot_ts = _time.time()
                 print(
                     f"{B}[BANK]{RS} on-chain USDC=${usdc:.2f}  "
                     f"open_positions=${open_val:.2f} ({open_count})  "
-                    f"redeemable_claimable={redeemable_claimable} "
-                    f"(raw={redeemable_count})  total=${total:.2f}"
+                    f"settling_claimable=${settling_claim_val:.2f} ({settling_claim_count})  "
+                    f"total=${total:.2f}"
                 )
                 if total > 0:
                     self.bankroll = total
@@ -3492,7 +3560,13 @@ class LiveTrader:
                     if total > self.start_bank:
                         self.start_bank = total
 
-                # 3. Recover any on-chain positions not tracked in pending (every tick = 30s)
+                # 3. API recovery/stats only (does not drive bankroll valuation)
+                positions = await self._http_get_json(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                    timeout=10,
+                )
+                # Recover any on-chain positions not tracked in pending (every tick = 30s)
                 now_ts = datetime.now(timezone.utc).timestamp()
                 for p in positions:
                     cid  = p.get("conditionId", "")
