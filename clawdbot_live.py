@@ -857,20 +857,37 @@ class LiveTrader:
             except Exception as e:
                 print(f"{Y}[CLOB] Allowance sync: {e}{RS}")
 
-        # Sync real USDC balance → override bankroll with actual on-chain value
-        try:
-            bal  = self.clob.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-            usdc = float(bal.get("balance", 0)) / 1e6
-            allowances = bal.get("allowances", {})
-            allow = max((float(v) for v in allowances.values()), default=0) / 1e6
-            if usdc > 0:
-                self.bankroll   = usdc
-                self.start_bank = usdc
-            print(f"{G}[CLOB] USDC balance: ${usdc:.2f}  allowance: ${allow:.2f}  → bankroll set to ${self.bankroll:.2f}{RS}")
-            if usdc < 10 and not DRY_RUN:
-                print(f"{R}[WARN] Saldo basso! Fondi il wallet prima di fare trading live.{RS}")
-        except Exception as e:
-            print(f"{Y}[CLOB] Balance check: {e}{RS}")
+        # In paper mode, bankroll must stay simulated and never be overridden by CLOB/on-chain.
+        if DRY_RUN:
+            self.bankroll = BANKROLL
+            self.start_bank = BANKROLL
+            self.peak_bankroll = BANKROLL
+            self.onchain_wallet_usdc = BANKROLL
+            self.onchain_open_positions = 0.0
+            self.onchain_open_count = 0
+            self.onchain_redeemable_count = 0
+            self.onchain_total_equity = BANKROLL
+            print(f"{B}[PAPER]{RS} DRY_RUN bankroll fixed at ${BANKROLL:.2f} (no CLOB balance sync)")
+        else:
+            # Sync real USDC balance → override bankroll with actual on-chain value
+            try:
+                bal = self.clob.get_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                )
+                usdc = float(bal.get("balance", 0)) / 1e6
+                allowances = bal.get("allowances", {})
+                allow = max((float(v) for v in allowances.values()), default=0) / 1e6
+                if usdc > 0:
+                    self.bankroll = usdc
+                    self.start_bank = usdc
+                print(
+                    f"{G}[CLOB] USDC balance: ${usdc:.2f}  allowance: ${allow:.2f}  "
+                    f"→ bankroll set to ${self.bankroll:.2f}{RS}"
+                )
+                if usdc < 10:
+                    print(f"{R}[WARN] Saldo basso! Fondi il wallet prima di fare trading live.{RS}")
+            except Exception as e:
+                print(f"{Y}[CLOB] Balance check: {e}{RS}")
 
         # Cancel any stale GTC orders (from previous run) before syncing positions
         if not DRY_RUN:
