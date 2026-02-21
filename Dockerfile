@@ -23,4 +23,5 @@ RUN mkdir -p /data
 
 COPY clawdbot_paper.py .
 COPY clawdbot_live.py .
+COPY runtime_utils.py .
 CMD ["python", "-u", "clawdbot_live.py"]
