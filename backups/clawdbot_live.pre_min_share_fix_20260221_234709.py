@@ -152,8 +152,6 @@ MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to de
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 DUST_BET       = 5.0      # $5 floor — at 4.55x payout: $5 → $22.75 win
 MIN_BET_ABS    = float(os.environ.get("MIN_BET_ABS", "1.50"))
-MIN_ORDER_SIZE_SHARES = float(os.environ.get("MIN_ORDER_SIZE_SHARES", "5.0"))
-ORDER_SIZE_PAD_SHARES = float(os.environ.get("ORDER_SIZE_PAD_SHARES", "0.02"))
 MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.01"))
 DUST_RECOVER_MIN = float(os.environ.get("DUST_RECOVER_MIN", "0.50"))
 MAX_ABS_BET    = float(os.environ.get("MAX_ABS_BET", "10.0"))     # hard ceiling
@@ -2647,14 +2645,13 @@ class LiveTrader:
             )
             self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
             order_id = (exec_result or {}).get("order_id", "")
-            actual_size_usdc = float((exec_result or {}).get("notional_usdc", sig["size"]) or sig["size"])
             fill_price = float((exec_result or {}).get("fill_price", sig["entry"]) or sig["entry"])
             slip_bps = ((fill_price - sig["entry"]) / max(sig["entry"], 1e-9)) * 10000.0
             stat_bucket = self._bucket_key(sig["duration"], sig["score"], sig["entry"])
             if order_id:
                 self._bucket_stats.add_fill(stat_bucket, slip_bps)
             trade = {
-                "side": sig["side"], "size": actual_size_usdc, "entry": sig["entry"],
+                "side": sig["side"], "size": sig["size"], "entry": sig["entry"],
                 "open_price": sig["open_price"], "current_price": sig["current"],
                 "true_prob": sig["true_prob"], "mkt_price": sig["up_price"],
                 "edge": round(sig["edge"], 4), "mins_left": sig["mins_left"],
@@ -2676,7 +2673,7 @@ class LiveTrader:
                 "asset": sig["asset"],
                 "side": sig["side"],
                 "score": sig["score"],
-                "size_usdc": actual_size_usdc,
+                "size_usdc": sig["size"],
                 "entry_price": sig["entry"],
                 "edge": round(sig["edge"], 4),
                 "true_prob": round(sig["true_prob"], 4),
@@ -2738,17 +2735,10 @@ class LiveTrader:
                 def _slip_bps(exec_price: float, ref_price: float) -> float:
                     return ((exec_price - ref_price) / max(ref_price, 1e-9)) * 10000.0
 
-                def _normalize_order_size(exec_price: float, intended_usdc: float) -> tuple[float, float]:
-                    min_shares = max(0.01, MIN_ORDER_SIZE_SHARES + ORDER_SIZE_PAD_SHARES)
-                    raw_shares = max(0.0, intended_usdc) / max(exec_price, 1e-9)
-                    shares = round(max(raw_shares, min_shares), 2)
-                    notional = round(shares * exec_price, 2)
-                    return shares, notional
-
                 async def _post_limit_fok(exec_price: float) -> tuple[dict, float]:
                     # Strict instant execution with price cap to keep slippage near zero.
                     px = round(max(0.001, min(exec_price, 0.97)), 4)
-                    size_tok, _ = _normalize_order_size(px, size_usdc)
+                    size_tok = round(size_usdc / max(px, 1e-9), 2)
                     order_args = OrderArgs(token_id=token_id, price=px, size=size_tok, side="BUY")
                     signed = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
                     resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
@@ -2775,21 +2765,6 @@ class LiveTrader:
                 taker_edge     = true_prob - best_ask
                 mid_est        = (best_bid + best_ask) / 2
                 maker_edge_est = true_prob - mid_est
-                # Ensure order notional always satisfies CLOB minimum size in shares.
-                _, min_notional = _normalize_order_size(best_ask, 0.0)
-                if size_usdc < min_notional:
-                    if min_notional > self.bankroll:
-                        print(
-                            f"{Y}[SKIP]{RS} {asset} {side} min-order notional=${min_notional:.2f} "
-                            f"> bankroll=${self.bankroll:.2f}"
-                        )
-                        return None
-                    if LOG_VERBOSE:
-                        print(
-                            f"{Y}[SIZE-ADJ]{RS} {asset} {side} ${size_usdc:.2f} -> "
-                            f"${min_notional:.2f} (min {MIN_ORDER_SIZE_SHARES:.0f} shares)"
-                        )
-                    size_usdc = min_notional
                 edge_floor = min_edge_req if min_edge_req is not None else 0.04
                 if not cl_agree:
                     edge_floor += 0.02
@@ -2872,7 +2847,7 @@ class LiveTrader:
                         if resp.get("status") in ("matched", "filled"):
                             self.bankroll -= size_usdc
                             print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                            return {"order_id": order_id, "fill_price": taker_price, "mode": "fok", "notional_usdc": size_usdc}
+                            return {"order_id": order_id, "fill_price": taker_price, "mode": "fok"}
                         # FOK not filled (thin liquidity) — fall through to normal maker/taker flow
                         print(f"{Y}[FOK] unfilled — falling back to maker{RS}")
                         force_taker = False  # reset so we don't loop
@@ -2899,7 +2874,7 @@ class LiveTrader:
                             if resp.get("status") in ("matched", "filled"):
                                 self.bankroll -= size_usdc
                                 print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                                return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_near_end", "notional_usdc": size_usdc}
+                                return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_near_end"}
                             print(f"{Y}[FOK] near-end unfilled — fallback maker{RS}")
                             force_taker = False
 
@@ -2915,8 +2890,7 @@ class LiveTrader:
                     if maker_price > entry_cap:
                         maker_price = max(tick, entry_cap)
                 maker_edge   = true_prob - maker_price
-                size_tok_m, maker_notional = _normalize_order_size(maker_price, size_usdc)
-                size_usdc = maker_notional
+                size_tok_m   = round(size_usdc / maker_price, 2)
 
                 print(f"{G}[MAKER] {asset} {side}: bid={maker_price:.3f} "
                       f"ask={best_ask:.3f} spread={spread:.3f} "
@@ -2939,7 +2913,7 @@ class LiveTrader:
                     print(f"{G}[MAKER FILL]{RS} {side} {asset} {duration}m | "
                           f"${size_usdc:.2f} @ {maker_price:.3f} | payout=${payout:.2f} | "
                           f"Bank ${self.bankroll:.2f}")
-                    return {"order_id": order_id, "fill_price": maker_price, "mode": "maker", "notional_usdc": size_usdc}
+                    return {"order_id": order_id, "fill_price": maker_price, "mode": "maker"}
 
                 # Ultra-low-latency waits to avoid blocking other opportunities.
                 poll_interval = MAKER_POLL_5M_SEC if duration <= 5 else MAKER_POLL_15M_SEC
@@ -2969,7 +2943,7 @@ class LiveTrader:
                     print(f"{G}[MAKER FILL]{RS} {side} {asset} {duration}m | "
                           f"${size_usdc:.2f} @ {maker_price:.3f} | payout=${payout:.2f} | "
                           f"Bank ${self.bankroll:.2f}")
-                    return {"order_id": order_id, "fill_price": maker_price, "mode": "maker", "notional_usdc": size_usdc}
+                    return {"order_id": order_id, "fill_price": maker_price, "mode": "maker"}
 
                 # Partial maker fill protection:
                 # status may remain "live" while filled_size > 0. Track it so position is not missed.
@@ -2983,7 +2957,7 @@ class LiveTrader:
                                 self.bankroll -= min(size_usdc, fill_usdc)
                                 print(f"{Y}[PARTIAL]{RS} {side} {asset} {duration}m | "
                                       f"filled≈${fill_usdc:.2f} @ {maker_price:.3f} | tracking open position")
-                                return {"order_id": order_id, "fill_price": maker_price, "mode": "maker_partial", "notional_usdc": min(size_usdc, fill_usdc)}
+                                return {"order_id": order_id, "fill_price": maker_price, "mode": "maker_partial"}
                 except Exception:
                     self._errors.tick("order_partial_check", print, every=50)
 
@@ -3053,7 +3027,7 @@ class LiveTrader:
                     self.bankroll -= size_usdc
                     print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
                           f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                    return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_fallback", "notional_usdc": size_usdc}
+                    return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_fallback"}
 
                 # FOK should not partially fill, but keep single state-check for exchange race.
                 if order_id:
@@ -3063,7 +3037,7 @@ class LiveTrader:
                             self.bankroll -= size_usdc
                             print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
                                   f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
-                            return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_fallback", "notional_usdc": size_usdc}
+                            return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_fallback"}
                     except Exception:
                         self._errors.tick("order_status_check", print, every=50)
                 print(f"{Y}[ORDER] Both maker and FOK taker unfilled — cancelled{RS}")
