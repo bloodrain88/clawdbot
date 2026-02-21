@@ -470,6 +470,10 @@ class LiveTrader:
             f"exposure trend(total/side)={EXPOSURE_CAP_TOTAL_TREND:.0%}/{EXPOSURE_CAP_SIDE_TREND:.0%} "
             f"chop(total/side)={EXPOSURE_CAP_TOTAL_CHOP:.0%}/{EXPOSURE_CAP_SIDE_CHOP:.0%}"
         )
+        print(
+            f"{B}[BOOT]{RS} redeem_poll={REDEEM_POLL_SEC:.1f}s "
+            f"force_redeem_scan={FORCE_REDEEM_SCAN_SEC}s"
+        )
         print(f"{B}[BOOT]{RS} rpc={self._rpc_url or 'none'} | top={rpc_str}")
 
     # ── Mathematical signal helpers ───────────────────────────────────────────
