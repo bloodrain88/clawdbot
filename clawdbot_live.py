@@ -69,6 +69,12 @@ MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
 MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "2.2"))
 MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.04"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
+HC15_ENABLED = os.environ.get("HC15_ENABLED", "true").lower() == "true"
+HC15_MIN_SCORE = int(os.environ.get("HC15_MIN_SCORE", "10"))
+HC15_MIN_TRUE_PROB = float(os.environ.get("HC15_MIN_TRUE_PROB", "0.62"))
+HC15_MIN_EDGE = float(os.environ.get("HC15_MIN_EDGE", "0.10"))
+HC15_TARGET_ENTRY = float(os.environ.get("HC15_TARGET_ENTRY", "0.30"))
+HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
@@ -1242,12 +1248,23 @@ class LiveTrader:
         # ── Entry strategy ────────────────────────────────────────────────────
         # Trade every eligible market while still preferring higher-payout entries.
         use_limit = False
-        if live_entry <= MAX_ENTRY_PRICE:
-            entry = live_entry                # immediate fill at current price
+        # High-conviction 15m mode: target lower cents early for better payout.
+        hc15 = (
+            HC15_ENABLED and duration == 15 and
+            score >= HC15_MIN_SCORE and
+            true_prob >= HC15_MIN_TRUE_PROB and
+            edge >= HC15_MIN_EDGE
+        )
+        if hc15 and pct_remaining > HC15_FALLBACK_PCT_LEFT and live_entry > HC15_TARGET_ENTRY:
+            use_limit = True
+            entry = min(HC15_TARGET_ENTRY, MAX_ENTRY_PRICE)
         else:
-            if LOG_VERBOSE:
-                print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} > max_entry={MAX_ENTRY_PRICE:.2f}{RS}")
-            return None
+            if live_entry <= MAX_ENTRY_PRICE:
+                entry = live_entry
+            else:
+                if LOG_VERBOSE:
+                    print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} > max_entry={MAX_ENTRY_PRICE:.2f}{RS}")
+                return None
 
         payout_mult = 1.0 / max(entry, 1e-9)
         if payout_mult < MIN_PAYOUT_MULT:
@@ -1314,6 +1331,7 @@ class LiveTrader:
             "prev_win_dir": prev_win_dir, "prev_win_move": prev_win_move,
             "is_early_continuation": is_early_continuation,
             "pm_book_data": pm_book_data, "use_limit": use_limit,
+            "hc15_mode": hc15,
             "open_price_source": open_src, "chainlink_age_s": cl_age_s,
             "onchain_score_adj": onchain_adj, "source_confidence": src_conf,
             "oracle_gap_bps": ((self.prices.get(asset, 0) - cl_now) / cl_now * 10000.0)
@@ -1340,6 +1358,7 @@ class LiveTrader:
                        if sig.get("is_early_continuation") else "")
         tag = f"{G}[CONT-ENTRY]{RS}" if sig.get("is_early_continuation") else f"{G}[EDGE]{RS}"
         if LOG_VERBOSE:
+            hc_tag = f" {B}[HC15]{RS}" if sig.get("hc15_mode") else ""
             print(f"{tag} {sig['label']} → {sig['side']} | score={score} {score_stars} | "
                   f"beat=${sig['open_price']:,.2f} {sig['src_tag']} now=${sig['current']:,.2f} "
                   f"move={sig['move_str']}{prev_str} pct={sig['pct_remaining']:.0%} | "
@@ -1347,12 +1366,13 @@ class LiveTrader:
                   f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} "
                   f"@{sig['entry']*100:.0f}¢→{(1/sig['entry']):.2f}x ${sig['size']:.2f}"
                   f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x"
-                  f"{perp_str}{vwap_str}{cross_str} {chain_str}{cont_str}{RS}")
+                  f"{perp_str}{vwap_str}{cross_str} {chain_str}{cont_str}{hc_tag}{RS}")
         else:
+            hc_tag = " hc15" if sig.get("hc15_mode") else ""
             print(f"{tag} {sig['asset']} {sig['duration']}m {sig['side']} | "
                   f"score={score} edge={sig['edge']:+.3f} size=${sig['size']:.2f} "
                   f"entry={sig['entry']:.3f} src={sig.get('open_price_source','?')} "
-                  f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{agree_str}{RS}")
+                  f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{hc_tag}{agree_str}{RS}")
 
         self.seen.add(cid)
         self._save_seen()
@@ -1402,9 +1422,9 @@ class LiveTrader:
             self._log(m, trade)
 
     async def evaluate(self, m: dict):
-        """RTDS fast-path: score a single market and execute if score ≥ 4."""
+        """RTDS fast-path: score a single market and execute if score gate passes."""
         sig = await self._score_market(m)
-        if sig and sig["score"] >= 4:
+        if sig and sig["score"] >= MIN_SCORE_GATE:
             await self._execute_trade(sig)
 
     async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False):
