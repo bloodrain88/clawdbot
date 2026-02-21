@@ -61,8 +61,10 @@ MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momen
 DUST_BET       = 5.0      # $5 floor — at 4.55x payout: $5 → $22.75 win
 MAX_ABS_BET    = 15.0     # $15 hard ceiling
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
-MAX_OPEN       = 4        # 1 per asset (BTC/ETH/SOL/XRP) per window
-MAX_SAME_DIR   = 4        # unified direction check handles limits — allow all same-dir
+MAX_OPEN       = int(os.environ.get("MAX_OPEN", "24"))
+MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "24"))
+TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
+MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
@@ -102,9 +104,10 @@ LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
-ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
+FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "90"))
+ENABLE_5M = os.environ.get("ENABLE_5M", "true").lower() == "true"
 FIVE_MIN_ASSETS = {
-    s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC").split(",") if s.strip()
+    s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
 }
 CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
 CLOB_HOST = "https://clob.polymarket.com"
@@ -179,6 +182,7 @@ class LiveTrader:
         self.stats           = {}    # {asset: {side: {wins, total}}} — persisted
         self.recent_trades   = deque(maxlen=30)   # rolling window for WR adaptation
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
+        self._redeem_tx_lock    = asyncio.Lock()  # serialize redeem txs to avoid nonce clashes
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
         # ── Mathematical signal state (EMA + Kalman) ──────────────────────────
@@ -1216,8 +1220,8 @@ class LiveTrader:
         # Bet the signal direction — win rate drives P&L, not just payout
         entry = up_price if side == "Up" else (1 - up_price)
 
-        # ── Score gate: trade all markets ────────────────────────────────────
-        if score < 1:
+        # ── Score gate ────────────────────────────────────────────────────────
+        if score < MIN_SCORE_GATE:
             return None
 
         token_id = m["token_up"] if side == "Up" else m["token_down"]
@@ -1232,19 +1236,16 @@ class LiveTrader:
             live_entry = clob_ask
 
         # ── Entry strategy ────────────────────────────────────────────────────
-        # Only bet when token is ALREADY cheap (≤40¢ = 2.5x+ payout).
-        # No GTC speculative limits — adverse selection risk (fills when signal is wrong).
-        # At market open tokens are ~50¢; as window progresses cheap tokens appear.
+        # Trade every eligible market while still preferring higher-payout entries.
         use_limit = False
-        if live_entry <= 0.40:
+        if live_entry <= 0.85:
             entry = live_entry                # immediate fill at current price
         else:
-            return None                       # token too expensive — skip this market
+            return None
 
         # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
-        # ≤22¢ = 4.5x+ payout. At 21% WR: EV = 0.21×4.5−1 = −0.055 (near break-even)
-        # ≤20¢ = 5x+.         At 21% WR: EV = 0.21×5.0−1 = +0.05  (profitable)
-        # Max bet on cheapest tokens where edge is real.
+        # Higher payout (cheaper tokens) gets larger Kelly fraction.
+        # Expensive tokens still traded but with smaller exposure.
         if entry <= 0.20:
             if   score >= 12: kelly_frac, bankroll_pct = 0.55, 0.30
             elif score >= 8:  kelly_frac, bankroll_pct = 0.45, 0.22
@@ -1253,10 +1254,18 @@ class LiveTrader:
             if   score >= 12: kelly_frac, bankroll_pct = 0.40, 0.20
             elif score >= 8:  kelly_frac, bankroll_pct = 0.28, 0.14
             else:             kelly_frac, bankroll_pct = 0.18, 0.09
-        else:  # 0.30–0.40
+        elif entry <= 0.40:
             if   score >= 12: kelly_frac, bankroll_pct = 0.25, 0.12
             elif score >= 8:  kelly_frac, bankroll_pct = 0.15, 0.08
             else:             kelly_frac, bankroll_pct = 0.10, 0.05
+        elif entry <= 0.55:
+            if   score >= 12: kelly_frac, bankroll_pct = 0.08, 0.04
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.06, 0.03
+            else:             kelly_frac, bankroll_pct = 0.05, 0.025
+        else:  # 0.55–0.85
+            if   score >= 12: kelly_frac, bankroll_pct = 0.05, 0.025
+            elif score >= 8:  kelly_frac, bankroll_pct = 0.04, 0.02
+            else:             kelly_frac, bankroll_pct = 0.03, 0.015
 
         wr_scale   = self._wr_bet_scale()
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
@@ -1718,38 +1727,23 @@ class LiveTrader:
                         payout = size / entry - fee
                         pnl    = payout - size
 
-                        # Try redeemPositions — CLOB positions always revert (exchange holds tokens,
-                        # Polymarket auto-redeems). Wrap entire TX path so any failure still records win.
+                        # Try redeemPositions from wallet first; if unclaimable, settle as auto-redeemed.
                         suffix = "auto-redeemed"
                         try:
-                            index_set = 1 if side == "Up" else 2
-                            nonce  = await loop.run_in_executor(
-                                None, lambda: self.w3.eth.get_transaction_count(acct.address)
+                            tx_hash = await self._submit_redeem_tx(
+                                ctf=ctf, collat=collat, acct=acct,
+                                cid_bytes=cid_bytes, index_set=(1 if side == "Up" else 2),
+                                loop=loop
                             )
-                            latest   = await loop.run_in_executor(None, lambda: self.w3.eth.get_block("latest"))
-                            base_fee = latest["baseFeePerGas"]
-                            pri_fee  = self.w3.to_wei(40, "gwei")
-                            max_fee  = base_fee * 2 + pri_fee
-                            tx = ctf.functions.redeemPositions(
-                                collat, b'\x00'*32, cid_bytes, [index_set]
-                            ).build_transaction({
-                                "from": acct.address, "nonce": nonce,
-                                "gas": 200_000,
-                                "maxFeePerGas": max_fee,
-                                "maxPriorityFeePerGas": pri_fee,
-                                "chainId": 137,
-                            })
-                            signed  = acct.sign_transaction(tx)
-                            tx_hash = await loop.run_in_executor(
-                                None, lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction)
-                            )
-                            receipt = await loop.run_in_executor(
-                                None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60)
-                            )
-                            if receipt.status == 1:
-                                suffix = f"tx={tx_hash.hex()[:16]}"
+                            suffix = f"tx={tx_hash[:16]}"
                         except Exception:
-                            pass  # Expected for CLOB: tokens held by exchange, Polymarket auto-redeems
+                            # If still claimable, keep in queue and retry later (never miss redeem).
+                            if await self._is_redeem_claimable(
+                                ctf=ctf, collat=collat, acct_addr=acct.address,
+                                cid_bytes=cid_bytes, index_set=(1 if side == "Up" else 2), loop=loop
+                            ):
+                                print(f"{Y}[REDEEM] claimable but tx failed; will retry {asset} {side}{RS}")
+                                continue
 
                         # Record win regardless of TX outcome
                         try:
@@ -1824,6 +1818,48 @@ class LiveTrader:
                     changed_pending = True
             if changed_pending:
                 self._save_pending()
+
+    async def _submit_redeem_tx(self, ctf, collat, acct, cid_bytes: bytes, index_set: int, loop):
+        """Submit redeem tx with serialized nonce handling."""
+        async with self._redeem_tx_lock:
+            nonce  = await loop.run_in_executor(
+                None, lambda: self.w3.eth.get_transaction_count(acct.address)
+            )
+            latest   = await loop.run_in_executor(None, lambda: self.w3.eth.get_block("latest"))
+            base_fee = latest["baseFeePerGas"]
+            pri_fee  = self.w3.to_wei(40, "gwei")
+            max_fee  = base_fee * 2 + pri_fee
+            tx = ctf.functions.redeemPositions(
+                collat, b'\x00' * 32, cid_bytes, [index_set]
+            ).build_transaction({
+                "from": acct.address, "nonce": nonce,
+                "gas": 200_000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": pri_fee,
+                "chainId": 137,
+            })
+            signed = acct.sign_transaction(tx)
+            tx_hash = await loop.run_in_executor(
+                None, lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            )
+            receipt = await loop.run_in_executor(
+                None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60)
+            )
+            if receipt.status != 1:
+                raise RuntimeError("redeem tx reverted")
+            return tx_hash.hex()
+
+    async def _is_redeem_claimable(self, ctf, collat, acct_addr: str, cid_bytes: bytes, index_set: int, loop) -> bool:
+        """Best-effort eth_call preflight for redeem claimability."""
+        try:
+            await loop.run_in_executor(
+                None, lambda: ctf.functions.redeemPositions(
+                    collat, b'\x00' * 32, cid_bytes, [index_set]
+                ).call({"from": acct_addr})
+            )
+            return True
+        except Exception:
+            return False
 
     # ── STARTUP OPEN POSITIONS SYNC ───────────────────────────────────────────
     def _sync_open_positions(self):
@@ -2510,27 +2546,26 @@ class LiveTrader:
                 if cid not in self.seen:
                     candidates.append(m)
             if candidates:
-                # Score all markets in parallel — pick best (best-of-round strategy)
+                # Score all markets in parallel.
                 signals = list(await asyncio.gather(*[self._score_market(m) for m in candidates]))
                 valid   = sorted([s for s in signals if s is not None], key=lambda x: -x["score"])
                 if valid:
                     best = valid[0]
                     other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
                     print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
-                # Only count ACTIVE (non-expired) positions toward slot limit
-                active_pending = {c: (m2,t) for c,(m2,t) in self.pending.items() if m2.get("end_ts",0) > now}
-                slots = MAX_OPEN - len(active_pending)
+                active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
+                slots = max(0, MAX_OPEN - len(active_pending))
                 placed = 0
                 for sig in valid:
-                    if placed >= slots: break
-                    # Direction check uses active positions only
-                    pending_up = sum(1 for _, t in active_pending.values() if t.get("side") == "Up")
-                    pending_dn = sum(1 for _, t in active_pending.values() if t.get("side") == "Down")
-                    if sig["side"] == "Up"   and pending_up >= MAX_SAME_DIR: continue
-                    if sig["side"] == "Down" and pending_dn >= MAX_SAME_DIR: continue
-                    # Unified direction: correlated assets move together — never hold Up + Down simultaneously
-                    if pending_dn > 0 and sig["side"] == "Up":   continue
-                    if pending_up > 0 and sig["side"] == "Down":  continue
+                    if placed >= slots:
+                        break
+                    if not TRADE_ALL_MARKETS:
+                        pending_up = sum(1 for _, t in active_pending.values() if t.get("side") == "Up")
+                        pending_dn = sum(1 for _, t in active_pending.values() if t.get("side") == "Down")
+                        if sig["side"] == "Up" and pending_up >= MAX_SAME_DIR:
+                            continue
+                        if sig["side"] == "Down" and pending_dn >= MAX_SAME_DIR:
+                            continue
                     await self._execute_trade(sig)
                     placed += 1
 
@@ -2780,6 +2815,104 @@ class LiveTrader:
             except Exception as e:
                 print(f"{Y}[SCAN-REDEEM] Error: {e}{RS}")
 
+    async def _force_redeem_backfill_loop(self):
+        """Periodic backfill: force redeem resolved winners from recent activity.
+        Prevents missed redeems when pending tracking is incomplete."""
+        if DRY_RUN or self.w3 is None:
+            return
+        cfg      = get_contract_config(CHAIN_ID, neg_risk=False)
+        ctf_addr = Web3.to_checksum_address(cfg.conditional_tokens)
+        collat   = Web3.to_checksum_address(cfg.collateral)
+        acct     = Account.from_key(PRIVATE_KEY)
+        ctf = self.w3.eth.contract(address=ctf_addr, abi=[
+            {"inputs":[{"name":"collateralToken","type":"address"},
+                       {"name":"parentCollectionId","type":"bytes32"},
+                       {"name":"conditionId","type":"bytes32"},
+                       {"name":"indexSets","type":"uint256[]"}],
+             "name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"name":"conditionId","type":"bytes32"}],
+             "name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"conditionId","type":"bytes32"},{"name":"index","type":"uint256"}],
+             "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+        ])
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(FORCE_REDEEM_SCAN_SEC)
+            try:
+                import requests as _req
+                activity = await loop.run_in_executor(None, lambda: _req.get(
+                    "https://data-api.polymarket.com/activity",
+                    params={"user": ADDRESS, "limit": "600"},
+                    timeout=12
+                ).json())
+                if not isinstance(activity, list):
+                    continue
+
+                by_cid = {}
+                for evt in activity:
+                    cid = evt.get("conditionId") or ""
+                    if not cid:
+                        continue
+                    typ = (evt.get("type") or "").upper()
+                    d = by_cid.setdefault(cid, {"redeem": False, "net": {}, "title": evt.get("title", "")})
+                    if typ == "REDEEM":
+                        d["redeem"] = True
+                    elif typ in ("BUY", "TRADE", "PURCHASE"):
+                        outcome = evt.get("outcome") or ""
+                        if not outcome:
+                            continue
+                        side = (evt.get("side") or "BUY").upper()
+                        size = float(evt.get("size") or 0.0)
+                        if size <= 0:
+                            continue
+                        prev = d["net"].get(outcome, 0.0)
+                        d["net"][outcome] = prev + (size if side == "BUY" else -size)
+
+                attempts = 0
+                for cid, d in by_cid.items():
+                    if attempts >= 8:  # bound each cycle
+                        break
+                    if d["redeem"] or cid in self.redeemed_cids:
+                        continue
+                    cid_bytes = bytes.fromhex(cid.lstrip("0x").zfill(64))
+                    try:
+                        denom = await loop.run_in_executor(None, lambda b=cid_bytes: ctf.functions.payoutDenominator(b).call())
+                        if denom == 0:
+                            continue
+                        n0 = await loop.run_in_executor(None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 0).call())
+                        n1 = await loop.run_in_executor(None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 1).call())
+                    except Exception:
+                        continue
+                    if n0 > 0 and n1 == 0:
+                        winner = "Up"
+                    elif n1 > 0 and n0 == 0:
+                        winner = "Down"
+                    else:
+                        continue
+                    held = d["net"].get(winner, 0.0)
+                    if held <= 0.0001:
+                        continue
+                    idx = 1 if winner == "Up" else 2
+                    if not await self._is_redeem_claimable(
+                        ctf=ctf, collat=collat, acct_addr=acct.address,
+                        cid_bytes=cid_bytes, index_set=idx, loop=loop
+                    ):
+                        continue
+                    try:
+                        tx_hash = await self._submit_redeem_tx(
+                            ctf=ctf, collat=collat, acct=acct,
+                            cid_bytes=cid_bytes, index_set=idx, loop=loop
+                        )
+                        attempts += 1
+                        self.redeemed_cids.add(cid)
+                        print(f"{G}[FORCE-REDEEM] {winner} {d['title'][:36]} | tx={tx_hash[:16]}{RS}")
+                    except Exception as e:
+                        print(f"{Y}[FORCE-REDEEM] retry later {cid[:10]}...: {e}{RS}")
+            except Exception as e:
+                print(f"{Y}[FORCE-REDEEM] Error: {e}{RS}")
+
     async def _position_sync_loop(self):
         """Every 5 min: sync on-chain positions to pending — catches any fills the bot missed."""
         if DRY_RUN:
@@ -2928,6 +3061,7 @@ class LiveTrader:
             _guard("_status_loop",          self._status_loop),
             _guard("_refresh_balance",      self._refresh_balance),
             _guard("_redeem_loop",          self._redeem_loop),
+            _guard("_force_redeem_backfill_loop", self._force_redeem_backfill_loop),
             _guard("chainlink_loop",        self.chainlink_loop),
             _guard("_redeemable_scan",      self._redeemable_scan),
             _guard("_position_sync_loop",   self._position_sync_loop),
