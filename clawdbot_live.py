@@ -131,13 +131,15 @@ MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.60"))
 MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "2.2"))
 MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.04"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
-HC15_ENABLED = os.environ.get("HC15_ENABLED", "true").lower() == "true"
+HC15_ENABLED = os.environ.get("HC15_ENABLED", "false").lower() == "true"
 HC15_MIN_SCORE = int(os.environ.get("HC15_MIN_SCORE", "10"))
 HC15_MIN_TRUE_PROB = float(os.environ.get("HC15_MIN_TRUE_PROB", "0.62"))
 HC15_MIN_EDGE = float(os.environ.get("HC15_MIN_EDGE", "0.10"))
 HC15_TARGET_ENTRY = float(os.environ.get("HC15_TARGET_ENTRY", "0.30"))
 HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
 HC15_FALLBACK_MAX_ENTRY = float(os.environ.get("HC15_FALLBACK_MAX_ENTRY", "0.36"))
+MIN_PAYOUT_MULT_5M = float(os.environ.get("MIN_PAYOUT_MULT_5M", "1.35"))
+MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.005"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
 PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
 FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "true").lower() == "true"
@@ -1539,7 +1541,11 @@ class LiveTrader:
             use_limit = True
             entry = min(HC15_TARGET_ENTRY, max_entry_allowed)
         else:
-            if min_entry_allowed <= live_entry <= max_entry_allowed:
+            # In drought, prioritize participation over deep pullback waiting.
+            if drought_min >= 2 and min_entry_allowed <= live_entry <= min(0.85, max_entry_allowed + 0.10):
+                entry = live_entry
+                use_limit = False
+            elif min_entry_allowed <= live_entry <= max_entry_allowed:
                 entry = live_entry
             elif PULLBACK_LIMIT_ENABLED and pct_remaining >= PULLBACK_LIMIT_MIN_PCT_LEFT:
                 # Don't miss good-payout setups: park a pullback limit at max acceptable entry.
@@ -1550,14 +1556,14 @@ class LiveTrader:
                     print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} outside [{min_entry_allowed:.2f},{max_entry_allowed:.2f}]{RS}")
                 return None
 
-        min_payout_req = MIN_PAYOUT_MULT
-        min_ev_req = MIN_EV_NET
+        min_payout_req = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
+        min_ev_req = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
         if drought_min >= 2:
-            min_payout_req = max(1.80, MIN_PAYOUT_MULT - 0.25)
-            min_ev_req = max(0.020, MIN_EV_NET - 0.015)
+            min_payout_req = max(1.25 if duration <= 5 else 1.80, min_payout_req - 0.25)
+            min_ev_req = max(0.0 if duration <= 5 else 0.020, min_ev_req - 0.015)
         if drought_min >= 5:
-            min_payout_req = max(1.65, MIN_PAYOUT_MULT - 0.45)
-            min_ev_req = max(0.010, MIN_EV_NET - 0.030)
+            min_payout_req = max(1.20 if duration <= 5 else 1.65, min_payout_req - 0.20)
+            min_ev_req = max(-0.002 if duration <= 5 else 0.010, min_ev_req - 0.015)
         payout_mult = 1.0 / max(entry, 1e-9)
         if payout_mult < min_payout_req:
             if LOG_VERBOSE:
