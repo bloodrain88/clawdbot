@@ -224,6 +224,9 @@ COPYFLOW_LIVE_ENABLED = os.environ.get("COPYFLOW_LIVE_ENABLED", "true").lower() 
 COPYFLOW_LIVE_REFRESH_SEC = int(os.environ.get("COPYFLOW_LIVE_REFRESH_SEC", "12"))
 COPYFLOW_LIVE_TRADES_LIMIT = int(os.environ.get("COPYFLOW_LIVE_TRADES_LIMIT", "80"))
 COPYFLOW_LIVE_MAX_MARKETS = int(os.environ.get("COPYFLOW_LIVE_MAX_MARKETS", "8"))
+PREBID_ARM_ENABLED = os.environ.get("PREBID_ARM_ENABLED", "true").lower() == "true"
+PREBID_MIN_CONF = float(os.environ.get("PREBID_MIN_CONF", "0.58"))
+PREBID_ARM_WINDOW_SEC = float(os.environ.get("PREBID_ARM_WINDOW_SEC", "30"))
 ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
 ORDER_FAST_MODE = os.environ.get("ORDER_FAST_MODE", "true").lower() == "true"
 MAKER_POLL_5M_SEC = float(os.environ.get("MAKER_POLL_5M_SEC", "0.15"))
@@ -342,6 +345,7 @@ class LiveTrader:
         self._copyflow_map      = {}
         self._copyflow_leaders  = {}
         self._copyflow_live     = {}
+        self._prebid_plan       = {}
         self._copyflow_mtime    = 0.0
         self._copyflow_last_try = 0.0
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
@@ -1853,6 +1857,22 @@ class LiveTrader:
             score += copy_adj
             edge += copy_net * 0.01
 
+        # Pre-bid arm: for first seconds after open, bias side/execution to pre-planned signal.
+        arm = self._prebid_plan.get(cid, {})
+        arm_active = False
+        if isinstance(arm, dict) and PREBID_ARM_ENABLED:
+            now_ts = _time.time()
+            start_ts = float(arm.get("start_ts", 0) or 0)
+            conf = float(arm.get("conf", 0.0) or 0.0)
+            arm_side = arm.get("side", "")
+            if start_ts > 0 and now_ts >= start_ts and (now_ts - start_ts) <= PREBID_ARM_WINDOW_SEC and conf >= PREBID_MIN_CONF:
+                arm_active = True
+                if arm_side in ("Up", "Down") and arm_side != side:
+                    side = arm_side
+                    entry = up_price if side == "Up" else (1 - up_price)
+                score += 2
+                edge += max(0.0, conf - 0.5) * 0.05
+
         # Bet the signal direction — win rate drives P&L, not just payout
         entry = up_price if side == "Up" else (1 - up_price)
 
@@ -1862,6 +1882,8 @@ class LiveTrader:
             min_score_local = max(min_score_local, MIN_SCORE_GATE_5M)
         else:
             min_score_local = max(min_score_local, MIN_SCORE_GATE_15M)
+        if arm_active:
+            min_score_local = max(0, min_score_local - 2)
         if score < min_score_local:
             return None
 
@@ -1977,6 +1999,8 @@ class LiveTrader:
         if FAST_EXEC_ENABLED and (not use_limit):
             if score >= FAST_EXEC_SCORE and edge >= FAST_EXEC_EDGE and entry <= MAX_ENTRY_PRICE:
                 force_taker = True
+        if arm_active:
+            force_taker = True
 
         return {
             "cid": cid, "m": m, "score": score,
@@ -2006,6 +2030,7 @@ class LiveTrader:
             "copy_net": copy_net,
             "quote_age_ms": quote_age_ms,
             "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
+            "prebid_arm": arm_active,
         }
 
     async def _execute_trade(self, sig: dict):
@@ -3632,6 +3657,12 @@ class LiveTrader:
         while True:
           try:
             self._reload_copyflow()
+            # Cleanup stale pre-bid plans.
+            now_epoch = _time.time()
+            for pcid, plan in list(self._prebid_plan.items()):
+                st = float((plan or {}).get("start_ts", 0) or 0)
+                if st <= 0 or now_epoch > (st + PREBID_ARM_WINDOW_SEC + 120):
+                    self._prebid_plan.pop(pcid, None)
             # Settlement always has priority over new entries.
             await self._resolve()
             if self.pending_redeem:
@@ -3688,6 +3719,13 @@ class LiveTrader:
                             if (upc + dnc) > 0 and self._should_log(f"prebid:{cid}", 30):
                                 side_pre = "Up" if upc >= dnc else "Down"
                                 conf_pre = max(upc, dnc)
+                                if PREBID_ARM_ENABLED and conf_pre >= PREBID_MIN_CONF:
+                                    self._prebid_plan[cid] = {
+                                        "side": side_pre,
+                                        "conf": conf_pre,
+                                        "start_ts": float(m.get("start_ts", now)),
+                                        "armed_at": _time.time(),
+                                    }
                                 print(
                                     f"{B}[PRE-BID]{RS} {m.get('asset','?')} {m.get('duration',0)}m "
                                     f"starts in {sec_to_start:.0f}s | side={side_pre} conf={conf_pre:.2f} "
