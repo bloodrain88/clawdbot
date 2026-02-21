@@ -120,6 +120,7 @@ LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
 FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "90"))
+RPC_OPTIMIZE_SEC = int(os.environ.get("RPC_OPTIMIZE_SEC", "45"))
 ENABLE_5M = os.environ.get("ENABLE_5M", "true").lower() == "true"
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
@@ -192,6 +193,13 @@ class LiveTrader:
         self.rtds_ok         = False
         self.clob            = None
         self.w3              = None   # shared Polygon RPC connection
+        self._rpc_url        = ""
+        self._rpc_epoch      = 0
+        self._rpc_stats      = {}
+        self._perf_stats     = {
+            "score_ms_ema": 0.0, "score_n": 0,
+            "order_ms_ema": 0.0, "order_n": 0,
+        }
         # ── Adaptive strategy state ──────────────────────────────────────────
         self.price_history   = {a: deque(maxlen=300) for a in ["BTC","ETH","SOL","XRP"]}
         self.stats           = {}    # {asset: {side: {wins, total}}} — persisted
@@ -212,18 +220,43 @@ class LiveTrader:
         self._load_stats()
         self._init_w3()
 
+    def _build_w3(self, rpc: str, timeout: int = 6):
+        _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": timeout}))
+        _w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        return _w3
+
     def _init_w3(self):
+        best_rpc = ""
+        best_ms = 1e18
+        best_w3 = None
         for rpc in POLYGON_RPCS:
             try:
-                _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
-                _w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-                _w3.eth.block_number
-                self.w3 = _w3
-                print(f"{G}[RPC] Connected: {rpc}{RS}")
-                return
+                t0 = _time.perf_counter()
+                _w3 = self._build_w3(rpc, timeout=6)
+                _ = _w3.eth.block_number
+                ms = (_time.perf_counter() - t0) * 1000.0
+                self._rpc_stats[rpc] = ms
+                if ms < best_ms:
+                    best_ms = ms
+                    best_rpc = rpc
+                    best_w3 = _w3
             except Exception:
                 continue
+        if best_w3 is not None:
+            self.w3 = best_w3
+            self._rpc_url = best_rpc
+            self._rpc_epoch += 1
+            print(f"{G}[RPC] Connected: {best_rpc} ({best_ms:.0f}ms){RS}")
+            return
         print(f"{Y}[RPC] No working Polygon RPC — on-chain redemption disabled{RS}")
+
+    def _perf_update(self, key: str, ms: float):
+        ema_key = f"{key}_ema"
+        n_key = f"{key.replace('_ms', '')}_n"
+        alpha = 0.2
+        prev = self._perf_stats.get(ema_key, 0.0)
+        self._perf_stats[ema_key] = ms if prev <= 0 else (alpha * ms + (1 - alpha) * prev)
+        self._perf_stats[n_key] = int(self._perf_stats.get(n_key, 0)) + 1
 
     def _should_log(self, key: str, every_sec: float) -> bool:
         now = _time.time()
@@ -578,6 +611,13 @@ class LiveTrader:
             f"  {price_str}\n"
             f"{W}{'─'*66}{RS}"
         )
+        if self._perf_stats.get("score_n", 0) > 0 or self._perf_stats.get("order_n", 0) > 0:
+            rpc_ms = self._rpc_stats.get(self._rpc_url, 0.0)
+            print(
+                f"  {B}Perf:{RS} score_ema={self._perf_stats.get('score_ms_ema', 0.0):.0f}ms "
+                f"order_ema={self._perf_stats.get('order_ms_ema', 0.0):.0f}ms "
+                f"{B}RPC:{RS} {self._rpc_url} ({rpc_ms:.0f}ms)"
+            )
         # Show each open position with current win/loss status
         now_ts = _time.time()
         for cid, (m, t) in list(self.pending.items()):
@@ -763,19 +803,25 @@ class LiveTrader:
             print(f"{Y}[CL] No RPC — Chainlink disabled, using RTDS fallback{RS}")
             return
         contracts = {}
-        for asset, addr in CHAINLINK_FEEDS.items():
-            try:
-                contracts[asset] = self.w3.eth.contract(
-                    address=Web3.to_checksum_address(addr), abi=CHAINLINK_ABI
-                )
-            except Exception as e:
-                print(f"{Y}[CL] {asset} contract error: {e}{RS}")
-        if not contracts:
-            return
+        rpc_epoch_local = -1
         loop = asyncio.get_event_loop()
-        ok_assets = list(contracts.keys())
-        print(f"{G}[CL] Chainlink feeds: {', '.join(ok_assets)}{RS}")
         while True:
+            if self.w3 is None:
+                await asyncio.sleep(3)
+                continue
+            if rpc_epoch_local != self._rpc_epoch or not contracts:
+                contracts = {}
+                for asset, addr in CHAINLINK_FEEDS.items():
+                    try:
+                        contracts[asset] = self.w3.eth.contract(
+                            address=Web3.to_checksum_address(addr), abi=CHAINLINK_ABI
+                        )
+                    except Exception as e:
+                        print(f"{Y}[CL] {asset} contract error: {e}{RS}")
+                rpc_epoch_local = self._rpc_epoch
+                if contracts:
+                    ok_assets = list(contracts.keys())
+                    print(f"{G}[CL] Chainlink feeds: {', '.join(ok_assets)} | rpc={self._rpc_url}{RS}")
             for asset, contract in contracts.items():
                 try:
                     data = await loop.run_in_executor(
@@ -790,6 +836,40 @@ class LiveTrader:
                 except Exception:
                     pass
             await asyncio.sleep(5)
+
+    async def _rpc_optimizer_loop(self):
+        """Continuously measure RPC latency and switch to fastest healthy endpoint."""
+        while True:
+            await asyncio.sleep(RPC_OPTIMIZE_SEC)
+            try:
+                loop = asyncio.get_event_loop()
+                best_rpc = self._rpc_url
+                best_ms = self._rpc_stats.get(best_rpc, 1e18)
+                for rpc in POLYGON_RPCS:
+                    try:
+                        t0 = _time.perf_counter()
+                        _w3 = self._build_w3(rpc, timeout=4)
+                        await loop.run_in_executor(None, lambda w=_w3: w.eth.block_number)
+                        ms = (_time.perf_counter() - t0) * 1000.0
+                        self._rpc_stats[rpc] = ms
+                        if ms < best_ms:
+                            best_ms = ms
+                            best_rpc = rpc
+                    except Exception:
+                        continue
+                current_ms = self._rpc_stats.get(self._rpc_url, 1e18)
+                if best_rpc and best_rpc != self._rpc_url and best_ms + 25 < current_ms:
+                    try:
+                        nw3 = self._build_w3(best_rpc, timeout=6)
+                        _ = await asyncio.get_event_loop().run_in_executor(None, lambda: nw3.eth.block_number)
+                        self.w3 = nw3
+                        self._rpc_url = best_rpc
+                        self._rpc_epoch += 1
+                        print(f"{G}[RPC] Switched to fastest: {best_rpc} ({best_ms:.0f}ms){RS}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     def _current_price(self, asset: str) -> float:
         """For direction decisions: RTDS (real-time) is current price.
@@ -1388,6 +1468,7 @@ class LiveTrader:
 
         self.seen.add(cid)
         self._save_seen()
+        t_ord = _time.perf_counter()
         order_id = await self._place_order(
             sig["token_id"], sig["side"], sig["entry"], sig["size"],
             sig["asset"], sig["duration"], sig["mins_left"],
@@ -1396,6 +1477,7 @@ class LiveTrader:
             score=sig["score"], pm_book_data=sig.get("pm_book_data"),
             use_limit=sig.get("use_limit", False)
         )
+        self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
         m = sig["m"]
         trade = {
             "side": sig["side"], "size": sig["size"], "entry": sig["entry"],
@@ -1435,7 +1517,9 @@ class LiveTrader:
 
     async def evaluate(self, m: dict):
         """RTDS fast-path: score a single market and execute if score gate passes."""
+        t0 = _time.perf_counter()
         sig = await self._score_market(m)
+        self._perf_update("score_ms", (_time.perf_counter() - t0) * 1000.0)
         if sig and sig["score"] >= MIN_SCORE_GATE:
             await self._execute_trade(sig)
 
@@ -2614,7 +2698,11 @@ class LiveTrader:
                     candidates.append(m)
             if candidates:
                 # Score all markets in parallel.
+                t_score = _time.perf_counter()
                 signals = list(await asyncio.gather(*[self._score_market(m) for m in candidates]))
+                elapsed_ms = (_time.perf_counter() - t_score) * 1000.0
+                if candidates:
+                    self._perf_update("score_ms", elapsed_ms / max(1, len(candidates)))
                 valid   = sorted([s for s in signals if s is not None], key=lambda x: -x["score"])
                 if valid:
                     best = valid[0]
@@ -3131,6 +3219,7 @@ class LiveTrader:
             _guard("_redeem_loop",          self._redeem_loop),
             _guard("_force_redeem_backfill_loop", self._force_redeem_backfill_loop),
             _guard("chainlink_loop",        self.chainlink_loop),
+            _guard("_rpc_optimizer_loop",   self._rpc_optimizer_loop),
             _guard("_redeemable_scan",      self._redeemable_scan),
             _guard("_position_sync_loop",   self._position_sync_loop),
         )
