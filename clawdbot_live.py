@@ -133,7 +133,7 @@ MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "4"))
 MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
 MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.01"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.45"))
-MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.60"))
+MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.50"))
 MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "2.2"))
 MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.04"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
@@ -144,9 +144,9 @@ HC15_MIN_EDGE = float(os.environ.get("HC15_MIN_EDGE", "0.10"))
 HC15_TARGET_ENTRY = float(os.environ.get("HC15_TARGET_ENTRY", "0.30"))
 HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
 HC15_FALLBACK_MAX_ENTRY = float(os.environ.get("HC15_FALLBACK_MAX_ENTRY", "0.36"))
-MIN_PAYOUT_MULT_5M = float(os.environ.get("MIN_PAYOUT_MULT_5M", "1.35"))
+MIN_PAYOUT_MULT_5M = float(os.environ.get("MIN_PAYOUT_MULT_5M", "1.85"))
 MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.005"))
-ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.70"))
+ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.55"))
 ENTRY_HARD_CAP_15M = float(os.environ.get("ENTRY_HARD_CAP_15M", "0.55"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
 PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
@@ -1752,7 +1752,7 @@ class LiveTrader:
             entry = min(HC15_TARGET_ENTRY, max_entry_allowed)
         else:
             # In drought, prioritize participation over deep pullback waiting.
-            if drought_min >= 2 and min_entry_allowed <= live_entry <= min(0.85, max_entry_allowed + 0.10):
+            if drought_min >= 2 and min_entry_allowed <= live_entry <= max_entry_allowed:
                 entry = live_entry
                 use_limit = False
             elif min_entry_allowed <= live_entry <= max_entry_allowed:
