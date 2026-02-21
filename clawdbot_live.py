@@ -61,8 +61,8 @@ MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momen
 DUST_BET       = 10.0     # $10 absolute floor — no dust bets
 MAX_ABS_BET    = 20.0     # $20 hard ceiling regardless of bankroll/WR/Kelly — prevents runaway sizing
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
-MAX_OPEN       = 2        # 2 simultaneous — max data collection across 4 assets
-MAX_SAME_DIR   = 1        # max 1 position per direction (no 2x Up or 2x Down)
+MAX_OPEN       = 4        # 1 per asset (BTC/ETH/SOL/XRP) per window
+MAX_SAME_DIR   = 4        # unified direction check handles limits — allow all same-dir
 
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e on Polygon
 
@@ -2387,20 +2387,20 @@ class LiveTrader:
                     best = valid[0]
                     other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
                     print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
-                slots = MAX_OPEN - len(self.pending)
+                # Only count ACTIVE (non-expired) positions toward slot limit
+                active_pending = {c: (m2,t) for c,(m2,t) in self.pending.items() if m2.get("end_ts",0) > now}
+                slots = MAX_OPEN - len(active_pending)
                 placed = 0
                 for sig in valid:
                     if placed >= slots: break
-                    # Direction cap: no 2x same-direction positions
-                    pending_up = sum(1 for _, t in self.pending.values() if t.get("side") == "Up")
-                    pending_dn = sum(1 for _, t in self.pending.values() if t.get("side") == "Down")
+                    # Direction check uses active positions only
+                    pending_up = sum(1 for _, t in active_pending.values() if t.get("side") == "Up")
+                    pending_dn = sum(1 for _, t in active_pending.values() if t.get("side") == "Down")
                     if sig["side"] == "Up"   and pending_up >= MAX_SAME_DIR: continue
                     if sig["side"] == "Down" and pending_dn >= MAX_SAME_DIR: continue
                     # Unified direction: correlated assets move together — never hold Up + Down simultaneously
                     if pending_dn > 0 and sig["side"] == "Up":   continue
                     if pending_up > 0 and sig["side"] == "Down":  continue
-                    # Trade all markets — no score gate in loop (gate is in _score_market)
-                    pass
                     await self._execute_trade(sig)
                     placed += 1
 
