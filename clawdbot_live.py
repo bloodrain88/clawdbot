@@ -66,6 +66,7 @@ MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "24"))
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
+MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.01"))
 MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "2.2"))
 MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.04"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
@@ -1333,6 +1334,9 @@ class LiveTrader:
         # ── Entry strategy ────────────────────────────────────────────────────
         # Trade every eligible market while still preferring higher-payout entries.
         use_limit = False
+        # Dynamic max entry: base + tolerance + small conviction slack.
+        score_slack = 0.02 if score >= 12 else (0.01 if score >= 9 else 0.0)
+        max_entry_allowed = min(0.97, MAX_ENTRY_PRICE + MAX_ENTRY_TOL + score_slack)
         # High-conviction 15m mode: target lower cents early for better payout.
         hc15 = (
             HC15_ENABLED and duration == 15 and
@@ -1342,17 +1346,17 @@ class LiveTrader:
         )
         if hc15 and pct_remaining > HC15_FALLBACK_PCT_LEFT and live_entry > HC15_TARGET_ENTRY:
             use_limit = True
-            entry = min(HC15_TARGET_ENTRY, MAX_ENTRY_PRICE)
+            entry = min(HC15_TARGET_ENTRY, max_entry_allowed)
         else:
-            if live_entry <= MAX_ENTRY_PRICE:
+            if live_entry <= max_entry_allowed:
                 entry = live_entry
             elif PULLBACK_LIMIT_ENABLED and pct_remaining >= PULLBACK_LIMIT_MIN_PCT_LEFT:
                 # Don't miss good-payout setups: park a pullback limit at max acceptable entry.
                 use_limit = True
-                entry = MAX_ENTRY_PRICE
+                entry = max_entry_allowed
             else:
                 if LOG_VERBOSE:
-                    print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} > max_entry={MAX_ENTRY_PRICE:.2f}{RS}")
+                    print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} > max_entry={max_entry_allowed:.2f}{RS}")
                 return None
 
         payout_mult = 1.0 / max(entry, 1e-9)
@@ -1428,6 +1432,7 @@ class LiveTrader:
             "onchain_score_adj": onchain_adj, "source_confidence": src_conf,
             "oracle_gap_bps": ((self.prices.get(asset, 0) - cl_now) / cl_now * 10000.0)
                               if self.prices.get(asset, 0) > 0 and cl_now > 0 else 0.0,
+            "max_entry_allowed": max_entry_allowed,
         }
 
     async def _execute_trade(self, sig: dict):
@@ -1475,7 +1480,8 @@ class LiveTrader:
             sig["true_prob"], sig["cl_agree"],
             min_edge_req=sig["min_edge"], force_taker=sig["force_taker"],
             score=sig["score"], pm_book_data=sig.get("pm_book_data"),
-            use_limit=sig.get("use_limit", False)
+            use_limit=sig.get("use_limit", False),
+            max_entry_allowed=sig.get("max_entry_allowed", MAX_ENTRY_PRICE),
         )
         self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
         m = sig["m"]
@@ -1523,7 +1529,7 @@ class LiveTrader:
         if sig and sig["score"] >= MIN_SCORE_GATE:
             await self._execute_trade(sig)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -1680,8 +1686,9 @@ class LiveTrader:
                     f_asks    = sorted(fresh.asks, key=lambda x: float(x.price)) if fresh.asks else []
                     f_tick    = float(fresh.tick_size or tick)
                     fresh_ask = float(f_asks[0].price) if f_asks else best_ask
-                    if use_limit and fresh_ask > MAX_ENTRY_PRICE:
-                        print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={MAX_ENTRY_PRICE:.2f}{RS}")
+                    eff_max_entry = max_entry_allowed if max_entry_allowed is not None else MAX_ENTRY_PRICE
+                    if use_limit and fresh_ask > eff_max_entry:
+                        print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={eff_max_entry:.2f}{RS}")
                         return None
                     fresh_ep  = true_prob - fresh_ask
                     if fresh_ep < edge_floor:
