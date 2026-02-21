@@ -924,6 +924,16 @@ class LiveTrader:
             pass
 
     # ── STATUS ────────────────────────────────────────────────────────────────
+    def _local_position_counts(self):
+        """Local counters for logging: only active open positions and redeem queue size."""
+        now_ts = _time.time()
+        open_local = 0
+        for _, (m, _) in list(self.pending.items()):
+            end_ts = float(m.get("end_ts", 0) or 0)
+            if end_ts <= 0 or end_ts > now_ts:
+                open_local += 1
+        return open_local, len(self.pending_redeem)
+
     def status(self):
         el   = datetime.now(timezone.utc) - self.start_time
         h, m = int(el.total_seconds()//3600), int(el.total_seconds()%3600//60)
@@ -933,6 +943,7 @@ class LiveTrader:
         roi  = pnl / self.start_bank * 100 if self.start_bank > 0 else 0
         pc   = G if pnl >= 0 else R
         rs   = G if self.rtds_ok else R
+        open_local, settling_local = self._local_position_counts()
         price_str = "  ".join(
             f"{B}{a}:{RS} ${p:,.2f}" for a, p in self.prices.items() if p > 0
         )
@@ -944,8 +955,8 @@ class LiveTrader:
             f"  {B}Bankroll:{RS} ${display_bank:.2f}  "
             f"{B}P&L:{RS} {pc}${pnl:+.2f}{RS}  "
             f"{B}Network:{RS} {NETWORK}  "
-            f"{B}Open(local/onchain):{RS} {len(self.pending)}/{self.onchain_open_count}  "
-            f"{Y}Settling(local/onchain):{RS} {len(self.pending_redeem)}/{self.onchain_redeemable_count}\n"
+            f"{B}Open(local/onchain):{RS} {open_local}/{self.onchain_open_count}  "
+            f"{Y}Settling(local/onchain):{RS} {settling_local}/{self.onchain_redeemable_count}\n"
             f"  {price_str}\n"
             f"{W}{'─'*66}{RS}"
         )
@@ -3287,10 +3298,11 @@ class LiveTrader:
             self._reload_copyflow()
             markets = await self.fetch_markets()
             now     = datetime.now(timezone.utc).timestamp()
+            open_local, settling_local = self._local_position_counts()
             print(
                 f"{B}[SCAN]{RS} Live markets: {len(markets)} | "
-                f"Open(local/onchain): {len(self.pending)}/{self.onchain_open_count} | "
-                f"Settling(local/onchain): {len(self.pending_redeem)}/{self.onchain_redeemable_count}"
+                f"Open(local/onchain): {open_local}/{self.onchain_open_count} | "
+                f"Settling(local/onchain): {settling_local}/{self.onchain_redeemable_count}"
             )
 
             # Subscribe new markets to RTDS token price stream
@@ -3479,6 +3491,7 @@ class LiveTrader:
                 open_count = 0
                 settling_claim_val = 0.0
                 settling_claim_count = 0
+                onchain_open_cids = set()
                 if ctf_bal_contract is not None and addr_cs is not None:
                     # Open (unresolved) positions from local tracked cids, valued by token price cache.
                     for cid, (m_o, t_o) in list(self.pending.items()):
@@ -3499,6 +3512,7 @@ class LiveTrader:
                                 px = up_px if t_o.get("side") == "Up" else max(0.0, 1.0 - up_px)
                             open_val += qty * px
                             open_count += 1
+                            onchain_open_cids.add(cid)
                         except Exception:
                             continue
 
@@ -3570,8 +3584,36 @@ class LiveTrader:
                     params={"user": ADDRESS, "sizeThreshold": "0.01"},
                     timeout=10,
                 )
-                # Recover any on-chain positions not tracked in pending (every tick = 30s)
+                if not isinstance(positions, list):
+                    positions = []
+                api_active_cids = {
+                    p.get("conditionId", "")
+                    for p in positions
+                    if not p.get("redeemable", False)
+                    and p.get("outcome", "")
+                    and float(p.get("currentValue", 0) or 0) >= DUST_RECOVER_MIN
+                    and p.get("conditionId", "")
+                }
+                # On-chain-first cleanup: if a local pending CID is neither on-chain nor API-active
+                # after a grace window, it is stale and removed from local state.
+                prune_n = 0
                 now_ts = datetime.now(timezone.utc).timestamp()
+                for cid, (m_p, t_p) in list(self.pending.items()):
+                    if cid in onchain_open_cids or cid in self.pending_redeem or cid in api_active_cids:
+                        continue
+                    placed_ts = float(t_p.get("placed_ts", 0) or 0)
+                    if placed_ts > 0 and (now_ts - placed_ts) < 90:
+                        continue
+                    # Keep very fresh windows briefly even without placed_ts.
+                    end_ts = float(m_p.get("end_ts", 0) or 0)
+                    if end_ts > 0 and (end_ts - now_ts) > 0 and (end_ts - now_ts) < 90:
+                        continue
+                    self.pending.pop(cid, None)
+                    prune_n += 1
+                if prune_n:
+                    self._save_pending()
+                    print(f"{Y}[SYNC] pruned stale local pending: {prune_n} (absent on-chain/API){RS}")
+                # Recover any on-chain positions not tracked in pending (every tick = 30s)
                 for p in positions:
                     cid  = p.get("conditionId", "")
                     rdm  = p.get("redeemable", False)
