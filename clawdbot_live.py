@@ -93,6 +93,7 @@ LOG_FILE       = os.path.join(_DATA_DIR, "clawdbot_live_trades.csv")
 PENDING_FILE   = os.path.join(_DATA_DIR, "clawdbot_pending.json")
 SEEN_FILE      = os.path.join(_DATA_DIR, "clawdbot_seen.json")
 STATS_FILE     = os.path.join(_DATA_DIR, "clawdbot_stats.json")
+METRICS_FILE   = os.path.join(_DATA_DIR, "clawdbot_onchain_metrics.jsonl")
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
@@ -491,6 +492,20 @@ class LiveTrader:
                 t.get("order_id", ""), t.get("token_id", ""),
                 result, f"{pnl:+.2f}", f"{self.bankroll:.2f}",
             ])
+
+    def _log_onchain_event(self, event_type: str, cid: str, payload: dict):
+        """Append a structured event for on-chain-first analytics/backtesting."""
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event_type,
+            "condition_id": cid,
+            **payload,
+        }
+        try:
+            with open(METRICS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        except Exception:
+            pass
 
     # ── STATUS ────────────────────────────────────────────────────────────────
     def status(self):
@@ -917,6 +932,8 @@ class LiveTrader:
 
         # Chainlink current — the resolution oracle
         cl_now = self.cl_prices.get(asset, 0)
+        cl_updated = self.cl_updated.get(asset, 0)
+        cl_age_s = (_time.time() - cl_updated) if cl_updated else None
         cl_move_pct = abs(cl_now - open_price) / open_price if cl_now > 0 and open_price > 0 else 0
         cl_direction = ("Up" if cl_now > open_price else "Down") if cl_move_pct >= 0.0002 else None
 
@@ -977,6 +994,22 @@ class LiveTrader:
                 cl_agree = False
         if cl_agree:  score += 1
         else:         score -= 3
+
+        # On-chain-first confidence: prefer authoritative open-price source + fresh oracle.
+        open_src = self.open_prices_source.get(cid, "?")
+        src_conf = 1.0 if open_src == "PM" else (0.9 if open_src == "CL-exact" else 0.6)
+        onchain_adj = 0
+        if open_src == "PM":
+            onchain_adj += 1
+        elif open_src not in ("CL-exact", "PM"):
+            onchain_adj -= 1
+        if cl_age_s is None:
+            onchain_adj -= 1
+        elif cl_age_s > 90:
+            return None
+        elif cl_age_s > 45:
+            onchain_adj -= 2
+        score += onchain_adj
 
         # ── Binance signals from WS cache (instant) + PM book fetch (async ~36ms) ─
         ob_imbalance               = self._binance_imbalance(asset)
@@ -1045,7 +1078,7 @@ class LiveTrader:
         # Vol-normalized displacement: continuation signal (−2 to +2 pts)
         # 87.7% continuation — extended moves tend to KEEP going, not revert
         sigma_15m = self.vols.get(asset, 0.70) * (15 / (252 * 390)) ** 0.5
-        open_price_disp = self.open_prices.get(asset)
+        open_price_disp = open_price
         if open_price_disp and sigma_15m > 0:
             net_disp = (current - open_price_disp) / open_price_disp * (1 if is_up else -1)
             if   net_disp > sigma_15m * 1.0: score += 2   # extended in direction = strong momentum
@@ -1238,6 +1271,10 @@ class LiveTrader:
             "prev_win_dir": prev_win_dir, "prev_win_move": prev_win_move,
             "is_early_continuation": is_early_continuation,
             "pm_book_data": pm_book_data, "use_limit": use_limit,
+            "open_price_source": open_src, "chainlink_age_s": cl_age_s,
+            "onchain_score_adj": onchain_adj, "source_confidence": src_conf,
+            "oracle_gap_bps": ((self.prices.get(asset, 0) - cl_now) / cl_now * 10000.0)
+                              if self.prices.get(asset, 0) > 0 and cl_now > 0 else 0.0,
         }
 
     async def _execute_trade(self, sig: dict):
@@ -1255,6 +1292,7 @@ class LiveTrader:
         perp_str    = f" perp={sig.get('perp_basis',0)*100:+.3f}%"
         vwap_str    = f" vwap={sig.get('vwap_dev',0)*100:+.3f}%"
         cross_str   = f" cross={sig.get('cross_count',0)}/3"
+        chain_str   = f" cl_age={sig.get('chainlink_age_s', 0) if sig.get('chainlink_age_s') is not None else -1:.1f}s src={sig.get('open_price_source','?')}"
         cont_str    = (f" {G}[CONT {sig['prev_win_dir']} {sig['prev_win_move']*100:.2f}%]{RS}"
                        if sig.get("is_early_continuation") else "")
         tag = f"{G}[CONT-ENTRY]{RS}" if sig.get("is_early_continuation") else f"{G}[EDGE]{RS}"
@@ -1265,7 +1303,7 @@ class LiveTrader:
               f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} "
               f"@{sig['entry']*100:.0f}¢→{(1/sig['entry']):.2f}x ${sig['size']:.2f}"
               f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x"
-              f"{perp_str}{vwap_str}{cross_str}{cont_str}{RS}")
+              f"{perp_str}{vwap_str}{cross_str} {chain_str}{cont_str}{RS}")
 
         self.seen.add(cid)
         self._save_seen()
@@ -1285,7 +1323,30 @@ class LiveTrader:
             "edge": round(sig["edge"], 4), "mins_left": sig["mins_left"],
             "end_ts": m["end_ts"], "asset": sig["asset"], "duration": sig["duration"],
             "token_id": sig["token_id"], "order_id": order_id or "",
+            "score": sig["score"], "cl_agree": sig["cl_agree"],
+            "open_price_source": sig.get("open_price_source", "?"),
+            "chainlink_age_s": sig.get("chainlink_age_s"),
+            "onchain_score_adj": sig.get("onchain_score_adj", 0),
+            "source_confidence": sig.get("source_confidence", 0.0),
+            "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
         }
+        self._log_onchain_event("ENTRY", cid, {
+            "asset": sig["asset"],
+            "side": sig["side"],
+            "score": sig["score"],
+            "size_usdc": sig["size"],
+            "entry_price": sig["entry"],
+            "edge": round(sig["edge"], 4),
+            "true_prob": round(sig["true_prob"], 4),
+            "cl_agree": bool(sig["cl_agree"]),
+            "open_price_source": sig.get("open_price_source", "?"),
+            "chainlink_age_s": sig.get("chainlink_age_s"),
+            "onchain_score_adj": sig.get("onchain_score_adj", 0),
+            "source_confidence": sig.get("source_confidence", 0.0),
+            "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
+            "placed": bool(order_id),
+            "order_id": order_id or "",
+        })
         if order_id:
             self.pending[cid] = (m, trade)
             self._save_pending()
@@ -1529,6 +1590,14 @@ class LiveTrader:
                 # Live: queue for on-chain check — result determined by payoutNumerators
                 self.pending_redeem[k] = (m, trade)
                 self._redeem_queued_ts[k] = _time.time()
+                self._log_onchain_event("QUEUE_REDEEM", k, {
+                    "asset": asset,
+                    "side": trade.get("side", ""),
+                    "size_usdc": trade.get("size", 0),
+                    "entry_price": trade.get("entry", 0),
+                    "open_price_source": trade.get("open_price_source", "?"),
+                    "chainlink_age_s": trade.get("chainlink_age_s"),
+                })
                 print(f"{B}[RESOLVE] {asset} {trade['side']} {trade['duration']}m → on-chain queue (checking in 5s){RS}")
 
     # ── REDEEM LOOP — polls every 30s, determines win/loss on-chain ───────────
@@ -1597,6 +1666,7 @@ class LiveTrader:
 
                     # Determine actual winner — CLOB API first (matches Polymarket UI), fallback to on-chain
                     winner = None
+                    winner_source = "ONCHAIN_NUMERATOR"
                     try:
                         import requests as _req2
                         clob_r = await loop.run_in_executor(
@@ -1607,6 +1677,7 @@ class LiveTrader:
                         for tok in clob_r.get("tokens", []):
                             if tok.get("winner"):
                                 winner = tok.get("outcome")   # "Up" or "Down"
+                                winner_source = "CLOB_API"
                                 break
                     except Exception:
                         pass
@@ -1673,6 +1744,23 @@ class LiveTrader:
                         self.total += 1; self.wins += 1
                         self._record_result(asset, side, True, trade.get("structural", False))
                         self._log(m, trade, "WIN", pnl)
+                        self._log_onchain_event("RESOLVE", cid, {
+                            "asset": asset,
+                            "side": side,
+                            "result": "WIN",
+                            "winner_side": winner,
+                            "winner_source": winner_source,
+                            "size_usdc": size,
+                            "entry_price": entry,
+                            "pnl": round(pnl, 4),
+                            "bankroll_after": round(self.bankroll, 4),
+                            "score": trade.get("score"),
+                            "cl_agree": trade.get("cl_agree"),
+                            "open_price_source": trade.get("open_price_source", "?"),
+                            "chainlink_age_s": trade.get("chainlink_age_s"),
+                            "onchain_score_adj": trade.get("onchain_score_adj", 0),
+                            "source_confidence": trade.get("source_confidence", 0.0),
+                        })
                         wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                         print(f"{G}[WIN]{RS} {asset} {side} {trade.get('duration',0)}m | "
                               f"{G}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr} | {suffix}")
@@ -1685,6 +1773,23 @@ class LiveTrader:
                             self.total += 1
                             self._record_result(asset, side, False, trade.get("structural", False))
                             self._log(m, trade, "LOSS", pnl)
+                            self._log_onchain_event("RESOLVE", cid, {
+                                "asset": asset,
+                                "side": side,
+                                "result": "LOSS",
+                                "winner_side": winner,
+                                "winner_source": winner_source,
+                                "size_usdc": size,
+                                "entry_price": entry,
+                                "pnl": round(pnl, 4),
+                                "bankroll_after": round(self.bankroll, 4),
+                                "score": trade.get("score"),
+                                "cl_agree": trade.get("cl_agree"),
+                                "open_price_source": trade.get("open_price_source", "?"),
+                                "chainlink_age_s": trade.get("chainlink_age_s"),
+                                "onchain_score_adj": trade.get("onchain_score_adj", 0),
+                                "source_confidence": trade.get("source_confidence", 0.0),
+                            })
                             wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                             print(f"{R}[LOSS]{RS} {asset} {side} {trade.get('duration',0)}m | "
                                   f"{R}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr}")
