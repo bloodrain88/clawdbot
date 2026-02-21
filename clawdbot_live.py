@@ -136,6 +136,7 @@ HC15_MIN_TRUE_PROB = float(os.environ.get("HC15_MIN_TRUE_PROB", "0.62"))
 HC15_MIN_EDGE = float(os.environ.get("HC15_MIN_EDGE", "0.10"))
 HC15_TARGET_ENTRY = float(os.environ.get("HC15_TARGET_ENTRY", "0.30"))
 HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
+HC15_FALLBACK_MAX_ENTRY = float(os.environ.get("HC15_FALLBACK_MAX_ENTRY", "0.36"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
 PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
 FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "true").lower() == "true"
@@ -1630,6 +1631,8 @@ class LiveTrader:
                 score=sig["score"], pm_book_data=sig.get("pm_book_data"),
                 use_limit=sig.get("use_limit", False),
                 max_entry_allowed=sig.get("max_entry_allowed", MAX_ENTRY_PRICE),
+                hc15_mode=sig.get("hc15_mode", False),
+                hc15_fallback_cap=HC15_FALLBACK_MAX_ENTRY,
             )
             self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
             order_id = (exec_result or {}).get("order_id", "")
@@ -1695,7 +1698,7 @@ class LiveTrader:
         if sig and sig["score"] >= MIN_SCORE_GATE:
             await self._execute_trade(sig)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None, hc15_mode=False, hc15_fallback_cap=0.36):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -1853,8 +1856,11 @@ class LiveTrader:
                     f_tick    = float(fresh.tick_size or tick)
                     fresh_ask = float(f_asks[0].price) if f_asks else best_ask
                     eff_max_entry = max_entry_allowed if max_entry_allowed is not None else MAX_ENTRY_PRICE
+                    if hc15_mode and use_limit:
+                        eff_max_entry = min(eff_max_entry, hc15_fallback_cap)
                     if use_limit and fresh_ask > eff_max_entry:
-                        print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={eff_max_entry:.2f}{RS}")
+                        reason = "hc15 cap" if hc15_mode and use_limit else "max_entry"
+                        print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > {reason}={eff_max_entry:.2f}{RS}")
                         return None
                     fresh_ep  = true_prob - fresh_ask
                     if fresh_ep < edge_floor:
@@ -2699,8 +2705,8 @@ class LiveTrader:
             self.recent_trades = deque(data.get("recent", []), maxlen=30)
             total = sum(s.get("total",0) for a in self.stats.values() for s in a.values())
             wins  = sum(s.get("wins",0)  for a in self.stats.values() for s in a.values())
-            if total:
-                print(f"{G}[STATS] Loaded {total} trades, WR {wins/total*100:.1f}%{RS}")
+            if total and LOG_VERBOSE:
+                print(f"{B}[STATS-LOCAL]{RS} cache={total} wr={wins/total*100:.1f}% (not on-chain)")
         except Exception:
             self.stats        = {}
             self.recent_trades = deque(maxlen=30)
@@ -3397,7 +3403,7 @@ class LiveTrader:
 {B}╔══════════════════════════════════════════════════════════════╗
 ║       ClawdBot LIVE Trading v1 — Polymarket CLOB            ║
 ║  Network: {NETWORK:<10}  Wallet: {ADDRESS[:10]}...          ║
-║  Bankroll: ${BANKROLL:<8.2f}  Edge ≥ 6%  Stop -5%           ║
+║  Bankroll: sync on-chain at startup                          ║
 ║  {'DRY-RUN (simulated, no real orders)' if DRY_RUN else 'LIVE — ordini reali su Polymarket':<44}║
 ╚══════════════════════════════════════════════════════════════╝{RS}
 """)
