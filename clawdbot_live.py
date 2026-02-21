@@ -183,7 +183,7 @@ CHAINLINK_ABI = [
         {"name":"answeredInRound","type":"uint80"}],
      "stateMutability":"view","type":"function"},
 ]
-SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "1"))
+SCAN_INTERVAL  = float(os.environ.get("SCAN_INTERVAL", "0.5"))
 PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "2"))
 STATUS_INTERVAL= int(os.environ.get("STATUS_INTERVAL", "15"))
 _DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
@@ -236,6 +236,8 @@ FAST_TAKER_SPREAD_MAX_5M = float(os.environ.get("FAST_TAKER_SPREAD_MAX_5M", "0.0
 FAST_TAKER_SPREAD_MAX_15M = float(os.environ.get("FAST_TAKER_SPREAD_MAX_15M", "0.008"))
 FAST_TAKER_SCORE_5M = int(os.environ.get("FAST_TAKER_SCORE_5M", "9"))
 FAST_TAKER_SCORE_15M = int(os.environ.get("FAST_TAKER_SCORE_15M", "11"))
+FAST_TAKER_EARLY_WINDOW_SEC_5M = float(os.environ.get("FAST_TAKER_EARLY_WINDOW_SEC_5M", "45"))
+FAST_TAKER_EARLY_WINDOW_SEC_15M = float(os.environ.get("FAST_TAKER_EARLY_WINDOW_SEC_15M", "75"))
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
 }
@@ -287,6 +289,7 @@ class LiveTrader:
         self._log_ts            = {}   # throttle map for repetitive logs
         self._scan_state_last   = None
         self._bank_state_last   = None
+        self._open_ref_fetch_ts = {}
         self.asset_cur_open     = {}   # asset → current market open price (for inter-market continuity)
         self.asset_prev_open    = {}   # asset → previous market open price
         self.active_mkts = {}
@@ -706,6 +709,7 @@ class LiveTrader:
             f"near_end_fok(5m/15m)={FAST_TAKER_NEAR_END_5M_SEC:.0f}/{FAST_TAKER_NEAR_END_15M_SEC:.0f}s "
             f"fast_spread(5m/15m)<={FAST_TAKER_SPREAD_MAX_5M:.3f}/{FAST_TAKER_SPREAD_MAX_15M:.3f} "
             f"fast_score(5m/15m)>={FAST_TAKER_SCORE_5M}/{FAST_TAKER_SCORE_15M} "
+            f"early_fok(5m/15m)<={FAST_TAKER_EARLY_WINDOW_SEC_5M:.0f}/{FAST_TAKER_EARLY_WINDOW_SEC_15M:.0f}s "
             f"rpc_probe={RPC_PROBE_COUNT} switch_margin={RPC_SWITCH_MARGIN_MS:.0f}ms"
         )
         print(
@@ -1144,31 +1148,9 @@ class LiveTrader:
                 end_ts_m   = m.get("end_ts", 0)
                 dur_m      = int(t.get("duration") or m.get("duration") or 15)
                 if start_ts_m > 0 and end_ts_m > 0:
-                    try:
-                        import requests as _rq
-                        from datetime import datetime as _dt, timezone as _tz
-                        dur_m = 5 if dur_m <= 5 else 15
-                        st_dt = _dt.fromtimestamp(start_ts_m, tz=_tz.utc)
-                        st_floor = st_dt.replace(minute=(st_dt.minute // dur_m) * dur_m, second=0, microsecond=0)
-                        et_floor = st_floor.timestamp() + dur_m * 60
-                        st = st_floor.strftime("%Y-%m-%dT%H:%M:%SZ")
-                        et = _dt.fromtimestamp(et_floor, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        variants = ["five", "fifteen"] if dur_m == 5 else ["fifteen"]
-                        for variant in variants:
-                            _r = _rq.get(
-                                "https://polymarket.com/api/crypto/crypto-price",
-                                params={"symbol": asset, "eventStartTime": st, "variant": variant, "endDate": et},
-                                timeout=3,
-                            )
-                            _p = _r.json().get("openPrice") or 0
-                            if _p:
-                                open_p = float(_p)
-                                self.open_prices[cid] = open_p
-                                self.open_prices_source[cid] = "PM"
-                                src = "PM"
-                                break
-                    except Exception:
-                        pass
+                    # status() is sync: avoid blocking I/O here.
+                    # open price will be refreshed by scan/market loops.
+                    _ = (start_ts_m, end_ts_m, dur_m)
             # Use Chainlink (resolution source) for win/loss; fall back to RTDS if unavailable
             cl_p       = self.cl_prices.get(asset, 0)
             cur_p      = cl_p if cl_p > 0 else self.prices.get(asset, 0)
@@ -2252,6 +2234,8 @@ class LiveTrader:
                     eff_max_entry = max_entry_allowed if max_entry_allowed is not None else 0.99
                     spread_cap = FAST_TAKER_SPREAD_MAX_5M if duration <= 5 else FAST_TAKER_SPREAD_MAX_15M
                     score_cap = FAST_TAKER_SCORE_5M if duration <= 5 else FAST_TAKER_SCORE_15M
+                    secs_elapsed = max(0.0, duration * 60.0 - max(0.0, mins_left * 60.0))
+                    early_cut = FAST_TAKER_EARLY_WINDOW_SEC_5M if duration <= 5 else FAST_TAKER_EARLY_WINDOW_SEC_15M
                     if (
                         score >= score_cap
                         and spread <= spread_cap
@@ -2262,6 +2246,18 @@ class LiveTrader:
                         print(
                             f"{G}[FAST-PATH]{RS} {asset} {side} "
                             f"tight-spread={spread:.3f} score={score} -> instant FOK"
+                        )
+                    elif (
+                        secs_elapsed <= early_cut
+                        and score >= (score_cap + 1)
+                        and spread <= (spread_cap + 0.005)
+                        and best_ask <= eff_max_entry
+                        and taker_edge >= (edge_floor + 0.015)
+                    ):
+                        force_taker = True
+                        print(
+                            f"{G}[FAST-PATH]{RS} {asset} {side} early-window={secs_elapsed:.0f}s "
+                            f"spread={spread:.3f} score={score} -> instant FOK"
                         )
 
                 if force_taker:
