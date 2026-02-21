@@ -58,8 +58,8 @@ BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per recent WR)
 MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to determine direction
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
-DUST_BET       = 10.0     # $10 absolute floor — no dust bets
-MAX_ABS_BET    = 20.0     # $20 hard ceiling regardless of bankroll/WR/Kelly — prevents runaway sizing
+DUST_BET       = 5.0      # $5 floor — at 4.55x payout: $5 → $22.75 win
+MAX_ABS_BET    = 15.0     # $15 hard ceiling
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
 MAX_OPEN       = 4        # 1 per asset (BTC/ETH/SOL/XRP) per window
 MAX_SAME_DIR   = 4        # unified direction check handles limits — allow all same-dir
@@ -1173,20 +1173,14 @@ class LiveTrader:
             live_entry = clob_ask
 
         # ── Entry strategy ────────────────────────────────────────────────────
-        # Data shows 21% WR → profitable only at ≤22¢ (4.5x+).
-        # If market currently expensive, place GTC limit at 22¢ (wait for pullback).
-        # Skip if <55% window left and token still expensive (won't fill in time).
+        # Only bet when token is ALREADY cheap (≤40¢ = 2.5x+ payout).
+        # No GTC speculative limits — adverse selection risk (fills when signal is wrong).
+        # At market open tokens are ~50¢; as window progresses cheap tokens appear.
         use_limit = False
-        if live_entry <= 0.22:
-            entry = live_entry                # immediate — already cheap enough
-        elif live_entry <= 0.40:
-            entry = live_entry                # take it — decent payout, above break-even
-            use_limit = False
-        elif pct_remaining > 0.55:
-            entry = 0.22                      # GTC limit at 22¢ (4.5x), wait for pullback
-            use_limit = True
+        if live_entry <= 0.40:
+            entry = live_entry                # immediate fill at current price
         else:
-            return None                       # expensive + >45% elapsed — skip
+            return None                       # token too expensive — skip this market
 
         # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
         # ≤22¢ = 4.5x+ payout. At 21% WR: EV = 0.21×4.5−1 = −0.055 (near break-even)
