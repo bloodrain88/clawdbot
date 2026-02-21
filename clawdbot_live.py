@@ -196,6 +196,7 @@ METRICS_FILE   = os.path.join(_DATA_DIR, "clawdbot_onchain_metrics.jsonl")
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "false").lower() == "true"
 LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "30"))
+LOG_SCAN_ON_CHANGE_ONLY = os.environ.get("LOG_SCAN_ON_CHANGE_ONLY", "true").lower() == "true"
 LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
@@ -275,6 +276,7 @@ class LiveTrader:
         self.open_prices_source = {}   # cid → "CL-exact" | "CL-fallback"
         self._mkt_log_ts        = {}   # cid → last [MKT] log time
         self._log_ts            = {}   # throttle map for repetitive logs
+        self._scan_state_last   = None
         self.asset_cur_open     = {}   # asset → current market open price (for inter-market continuity)
         self.asset_prev_open    = {}   # asset → previous market open price
         self.active_mkts = {}
@@ -632,6 +634,10 @@ class LiveTrader:
             f"latency<= {MAX_SIGNAL_LATENCY_MS:.0f}ms quote_stale<= {MAX_QUOTE_STALENESS_MS:.0f}ms "
             f"exposure trend(total/side)={EXPOSURE_CAP_TOTAL_TREND:.0%}/{EXPOSURE_CAP_SIDE_TREND:.0%} "
             f"chop(total/side)={EXPOSURE_CAP_TOTAL_CHOP:.0%}/{EXPOSURE_CAP_SIDE_CHOP:.0%}"
+        )
+        print(
+            f"{B}[BOOT]{RS} scan_log_change_only={LOG_SCAN_ON_CHANGE_ONLY} "
+            f"scan_heartbeat={LOG_SCAN_EVERY_SEC}s"
         )
         print(
             f"{B}[BOOT]{RS} redeem_poll={REDEEM_POLL_SEC:.1f}s "
@@ -3537,11 +3543,21 @@ class LiveTrader:
             markets = await self.fetch_markets()
             now     = datetime.now(timezone.utc).timestamp()
             open_local, settling_local = self._local_position_counts()
-            print(
-                f"{B}[SCAN]{RS} Live markets: {len(markets)} | "
-                f"Open(local/onchain): {open_local}/{self.onchain_open_count} | "
-                f"Settling(local/onchain): {settling_local}/{self.onchain_redeemable_count}"
+            scan_state = (
+                len(markets),
+                open_local,
+                int(self.onchain_open_count),
+                settling_local,
+                int(self.onchain_redeemable_count),
             )
+            state_changed = scan_state != self._scan_state_last
+            if (not LOG_SCAN_ON_CHANGE_ONLY) or state_changed or self._should_log("scan-heartbeat", LOG_SCAN_EVERY_SEC):
+                print(
+                    f"{B}[SCAN]{RS} Live markets: {len(markets)} | "
+                    f"Open(local/onchain): {open_local}/{self.onchain_open_count} | "
+                    f"Settling(local/onchain): {settling_local}/{self.onchain_redeemable_count}"
+                )
+            self._scan_state_last = scan_state
 
             # Subscribe new markets to RTDS token price stream
             if self._rtds_ws:
