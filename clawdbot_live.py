@@ -1504,6 +1504,13 @@ class LiveTrader:
             if LOG_VERBOSE:
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={MIN_EV_NET:.3f}{RS}")
             return None
+        fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= 45)
+        if fresh_cl_disagree and duration == 15:
+            # Keep trading broad coverage, but avoid low-quality oracle disagreement entries.
+            if score < 14 or edge < max(0.10, min_edge):
+                if LOG_VERBOSE:
+                    print(f"{Y}[SKIP] {asset} {side} fresh CL disagreement score={score} edge={edge:.3f}{RS}")
+                return None
 
         # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
         # Higher payout (cheaper tokens) gets larger Kelly fraction.
@@ -1530,10 +1537,12 @@ class LiveTrader:
             else:             kelly_frac, bankroll_pct = 0.03, 0.015
 
         wr_scale   = self._wr_bet_scale()
+        oracle_scale = 0.60 if fresh_cl_disagree else (0.80 if not cl_agree else 1.0)
+        bucket_scale = self._bucket_size_scale(duration, score, entry)
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
         max_single = min(100.0, self.bankroll * bankroll_pct)
         abs_cap    = max_single * 1.5 if score >= 12 and entry <= 0.20 else max_single
-        size       = max(DUST_BET, round(min(abs_cap, raw_size * vol_mult * wr_scale), 2))
+        size       = max(DUST_BET, round(min(abs_cap, raw_size * vol_mult * wr_scale * oracle_scale * bucket_scale), 2))
 
         # Immediate fills: FOK on strong signal, GTC limit otherwise
         # Limit orders (use_limit=True) are always GTC — force_taker stays False
@@ -1638,10 +1647,9 @@ class LiveTrader:
             order_id = (exec_result or {}).get("order_id", "")
             fill_price = float((exec_result or {}).get("fill_price", sig["entry"]) or sig["entry"])
             slip_bps = ((fill_price - sig["entry"]) / max(sig["entry"], 1e-9)) * 10000.0
-            score_bucket = "s12+" if sig["score"] >= 12 else ("s9-11" if sig["score"] >= 9 else "s0-8")
-            entry_bucket = "<30c" if sig["entry"] < 0.30 else ("30-50c" if sig["entry"] <= 0.50 else ">50c")
-            stat_bucket = f"{sig['duration']}m|{score_bucket}|{entry_bucket}"
-            self._bucket_stats.add_fill(stat_bucket, slip_bps)
+            stat_bucket = self._bucket_key(sig["duration"], sig["score"], sig["entry"])
+            if order_id:
+                self._bucket_stats.add_fill(stat_bucket, slip_bps)
             m = sig["m"]
             trade = {
                 "side": sig["side"], "size": sig["size"], "entry": sig["entry"],
@@ -1862,9 +1870,17 @@ class LiveTrader:
                         reason = "hc15 cap" if hc15_mode and use_limit else "max_entry"
                         print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > {reason}={eff_max_entry:.2f}{RS}")
                         return None
+                    fresh_payout = 1.0 / max(fresh_ask, 1e-9)
+                    if fresh_payout < MIN_PAYOUT_MULT:
+                        print(f"{Y}[SKIP] {asset} {side} fallback payout={fresh_payout:.2f}x < min={MIN_PAYOUT_MULT:.2f}x{RS}")
+                        return None
                     fresh_ep  = true_prob - fresh_ask
                     if fresh_ep < edge_floor:
                         print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_floor:.2f} — price moved against us{RS}")
+                        return None
+                    fresh_ev_net = (true_prob / max(fresh_ask, 1e-9)) - 1.0 - FEE_RATE_EST
+                    if fresh_ev_net < MIN_EV_NET:
+                        print(f"{Y}[SKIP] {asset} {side} fallback ev_net={fresh_ev_net:.3f} < min={MIN_EV_NET:.3f}{RS}")
                         return None
                     taker_price = round(min(fresh_ask + f_tick, 0.97), 4)
                 except Exception:
@@ -2596,6 +2612,30 @@ class LiveTrader:
             if (cur > op) == is_up:
                 count += 1
         return count
+
+    def _bucket_key(self, duration: int, score: int, entry: float) -> str:
+        score_bucket = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
+        entry_bucket = "<30c" if entry < 0.30 else ("30-50c" if entry <= 0.50 else ">50c")
+        return f"{duration}m|{score_bucket}|{entry_bucket}"
+
+    def _bucket_size_scale(self, duration: int, score: int, entry: float) -> float:
+        """Adaptive size control from realized execution/outcome quality by bucket."""
+        k = self._bucket_key(duration, score, entry)
+        r = self._bucket_stats.rows.get(k)
+        if not r:
+            return 1.0
+        n = int(r.get("n", 0))
+        if n < 8:
+            return 1.0
+        wr = (r.get("wins", 0) / n) if n > 0 else 0.5
+        pnl = float(r.get("pnl", 0.0))
+        if n >= 15 and (wr < 0.40 or pnl < -25):
+            return 0.40
+        if wr < 0.50 or pnl < 0:
+            return 0.65
+        if wr > 0.62 and pnl > 0:
+            return 1.10
+        return 1.0
 
     def _regime_caps(self) -> tuple[float, float]:
         vals = []
