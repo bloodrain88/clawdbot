@@ -3695,10 +3695,18 @@ class LiveTrader:
             else:
                 side, edge, true_prob = "Down", edge_down, prob_down
 
-        # Anti-random guard: require multi-signal confluence before any sizing.
+        # Keep signal components aligned to the effective side.
         side_up = side == "Up"
+        tf_votes = tf_up_votes if side_up else tf_dn_votes
+        ob_sig = dw_ob if side_up else -dw_ob
+        cl_agree = True
+        if cl_now > 0 and open_price > 0:
+            cl_agree = (cl_now > open_price) == side_up
+        imbalance_confirms = ob_sig > 0.10
+
+        # Anti-random guard: require multi-signal confluence before any sizing.
         conf = 0
-        if (side_up and ob_sig > 0.05) or ((not side_up) and ob_sig < -0.05):
+        if ob_sig > 0.05:
             conf += 1
         if (side_up and taker_ratio > 0.52) or ((not side_up) and taker_ratio < 0.48):
             conf += 1
@@ -3851,6 +3859,15 @@ class LiveTrader:
             signal_source = "tech-realtime-no-leader"
             leader_size_scale = min(leader_size_scale, 0.90)
 
+        # Leader/prebid can change side: refresh side-aligned metrics.
+        side_up = side == "Up"
+        tf_votes = tf_up_votes if side_up else tf_dn_votes
+        ob_sig = dw_ob if side_up else -dw_ob
+        cl_agree = True
+        if cl_now > 0 and open_price > 0:
+            cl_agree = (cl_now > open_price) == side_up
+        imbalance_confirms = ob_sig > 0.10
+
         # Source-quality + signal-conviction analysis (real data only).
         # This is the primary anti-random layer: trade only when data is both fresh and coherent.
         cl_fresh = (cl_age_s is not None) and (cl_age_s <= 35.0)
@@ -3867,7 +3884,7 @@ class LiveTrader:
         )
 
         dir_sign = 1.0 if side == "Up" else -1.0
-        ob_c = max(0.0, min(1.0, ((dir_sign * ob_sig) + 0.10) / 0.30))
+        ob_c = max(0.0, min(1.0, (ob_sig + 0.10) / 0.30))
         tk_signed = (taker_ratio - 0.5) * dir_sign
         tk_c = max(0.0, min(1.0, (tk_signed + 0.05) / 0.18))
         tf_c = max(0.0, min(1.0, (float(tf_votes) - 1.0) / 3.0))
@@ -3950,6 +3967,15 @@ class LiveTrader:
                     entry = up_price if side == "Up" else (1 - up_price)
                 score += 2
                 edge += max(0.0, conf - 0.5) * 0.05
+
+        # Pre-bid may override side: refresh aligned metrics for downstream gates/sizing.
+        side_up = side == "Up"
+        tf_votes = tf_up_votes if side_up else tf_dn_votes
+        ob_sig = dw_ob if side_up else -dw_ob
+        cl_agree = True
+        if cl_now > 0 and open_price > 0:
+            cl_agree = (cl_now > open_price) == side_up
+        imbalance_confirms = ob_sig > 0.10
 
         # Bet the signal direction — EV_net and execution quality drive growth.
         entry = up_price if side == "Up" else (1 - up_price)
@@ -4269,16 +4295,16 @@ class LiveTrader:
             if (not MID_BOOSTER_ANYTIME_15M) and (not in_ideal_window):
                 return None
 
-            taker_conf = (is_up and taker_ratio > 0.54) or ((not is_up) and taker_ratio < 0.46)
+            taker_conf = (side_up and taker_ratio > 0.54) or ((not side_up) and taker_ratio < 0.46)
             # Mathematical conviction model (15m intraround):
             # combines microstructure + trend persistence + oracle alignment.
             ob_c = max(-1.0, min(1.0, ob_sig / 0.35))
             tf_c = max(0.0, min(1.0, (tf_votes - 1.0) / 3.0))
-            flow_c = max(-1.0, min(1.0, ((taker_ratio - 0.5) * 2.0) if is_up else ((0.5 - taker_ratio) * 2.0)))
+            flow_c = max(-1.0, min(1.0, ((taker_ratio - 0.5) * 2.0) if side_up else ((0.5 - taker_ratio) * 2.0)))
             vol_c = max(0.0, min(1.0, (vol_ratio - 1.0) / 1.5))
-            basis_signed = perp_basis if is_up else -perp_basis
+            basis_signed = perp_basis if side_up else -perp_basis
             basis_c = max(-1.0, min(1.0, basis_signed / 0.0008))
-            vwap_signed = vwap_dev if is_up else -vwap_dev
+            vwap_signed = vwap_dev if side_up else -vwap_dev
             vwap_c = max(-1.0, min(1.0, vwap_signed / 0.0012))
             oracle_c = 1.0 if cl_agree else -1.0
             booster_conv = (
