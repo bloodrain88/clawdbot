@@ -262,6 +262,7 @@ RUNTIME_JSON_LOG_ROTATE_DAILY = os.environ.get("RUNTIME_JSON_LOG_ROTATE_DAILY", 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 STRICT_ONCHAIN_STATE = os.environ.get("STRICT_ONCHAIN_STATE", "true").lower() == "true"
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "true").lower() == "true"
+LOG_STATS_LOCAL = os.environ.get("LOG_STATS_LOCAL", "false").lower() == "true"
 LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "30"))
 LOG_SCAN_ON_CHANGE_ONLY = os.environ.get("LOG_SCAN_ON_CHANGE_ONLY", "true").lower() == "true"
 LOG_FLOW_EVERY_SEC = int(os.environ.get("LOG_FLOW_EVERY_SEC", "900"))
@@ -283,6 +284,8 @@ SKIP_STATS_TOP_N = int(os.environ.get("SKIP_STATS_TOP_N", "6"))
 WS_HEALTH_REQUIRED = os.environ.get("WS_HEALTH_REQUIRED", "true").lower() == "true"
 WS_HEALTH_MIN_FRESH_RATIO = float(os.environ.get("WS_HEALTH_MIN_FRESH_RATIO", "0.75"))
 WS_HEALTH_MAX_MED_AGE_MS = float(os.environ.get("WS_HEALTH_MAX_MED_AGE_MS", "4500"))
+WS_GATE_WARMUP_SEC = float(os.environ.get("WS_GATE_WARMUP_SEC", "45"))
+SEEN_MAX_KEEP = int(os.environ.get("SEEN_MAX_KEEP", "600"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
@@ -588,6 +591,7 @@ def _install_runtime_json_log():
 
 class LiveTrader:
     def __init__(self):
+        self._boot_ts = _time.time()
         self.prices      = {}
         self.vols        = {"BTC": 0.65, "ETH": 0.80, "SOL": 1.20, "XRP": 0.90}
         # Binance WS cache — populated by _stream_binance_* loops, read by _binance_* helpers
@@ -2198,8 +2202,9 @@ class LiveTrader:
             try:
                 with open(SEEN_FILE) as f:
                     loaded = json.load(f)
-                # Keep only last 200 entries — older conditionIds are from expired markets
-                self.seen = set(loaded[-2000:] if len(loaded) > 2000 else loaded)
+                # Keep a shorter rolling window to reduce false blocked_seen after restarts.
+                keep_n = max(100, int(SEEN_MAX_KEEP))
+                self.seen = set(loaded[-keep_n:] if len(loaded) > keep_n else loaded)
                 print(f"{Y}[RESUME] Loaded {len(self.seen)} seen markets from disk{RS}")
             except Exception:
                 pass
@@ -2784,8 +2789,15 @@ class LiveTrader:
             except Exception as e:
                 self.rtds_ok = False
                 print(f"{R}[RTDS] Reconnect: {e}{RS}")
-                await asyncio.sleep(min(15, 2 * 2 ** getattr(self, "_rtds_fails", 0)))
-                self._rtds_fails = getattr(self, "_rtds_fails", 0) + 1
+                err_s = str(e).lower()
+                fails = int(getattr(self, "_rtds_fails", 0) or 0) + 1
+                self._rtds_fails = fails
+                if "429" in err_s or "too many requests" in err_s:
+                    # Upstream throttling: back off harder to recover stable freshness.
+                    wait_s = min(90.0, 12.0 * (1.6 ** min(6, fails - 1)))
+                else:
+                    wait_s = min(30.0, 2.0 * (2 ** min(5, fails - 1)))
+                await asyncio.sleep(wait_s)
             else:
                 self._rtds_fails = 0
 
@@ -6415,7 +6427,7 @@ class LiveTrader:
             self.side_perf = data.get("side_perf", {})
             total = sum(s.get("total",0) for a in self.stats.values() for s in a.values())
             wins  = sum(s.get("wins",0)  for a in self.stats.values() for s in a.values())
-            if total and LOG_VERBOSE:
+            if total and LOG_STATS_LOCAL:
                 print(f"{B}[STATS-LOCAL]{RS} cache={total} wr={wins/total*100:.1f}% (not on-chain)")
         except Exception:
             self.stats        = {}
@@ -6709,17 +6721,27 @@ class LiveTrader:
             if WS_HEALTH_REQUIRED:
                 ws_ok, hs = self._ws_trade_gate_ok()
                 if not ws_ok:
-                    self._skip_tick("ws_health_gate")
-                    if self._should_log("ws-health-gate", LOG_HEALTH_EVERY_SEC):
-                        at = int(hs.get("active_markets", 0) or 0)
-                        fresh = int(hs.get("fresh_markets", 0) or 0)
-                        ratio = (fresh / max(1, at)) if at > 0 else 0.0
-                        ws_med = float(hs.get("ws_market_med_ms", 9e9) or 9e9)
-                        print(
-                            f"{Y}[WS-GATE]{RS} skip entries: fresh_books={fresh}/{at} "
-                            f"ratio={ratio:.2f} < {WS_HEALTH_MIN_FRESH_RATIO:.2f} "
-                            f"or ws_med={ws_med:.0f}ms > {WS_HEALTH_MAX_MED_AGE_MS:.0f}ms"
-                        )
+                    warmup_left = max(0.0, WS_GATE_WARMUP_SEC - (_time.time() - float(self._boot_ts or 0.0)))
+                    if warmup_left > 0:
+                        if self._should_log("ws-health-warmup", LOG_HEALTH_EVERY_SEC):
+                            at = int(hs.get("active_markets", 0) or 0)
+                            fresh = int(hs.get("fresh_markets", 0) or 0)
+                            print(
+                                f"{Y}[WS-WARMUP]{RS} hold gate for {warmup_left:.0f}s "
+                                f"(fresh_books={fresh}/{at})"
+                            )
+                    else:
+                        self._skip_tick("ws_health_gate")
+                        if self._should_log("ws-health-gate", LOG_HEALTH_EVERY_SEC):
+                            at = int(hs.get("active_markets", 0) or 0)
+                            fresh = int(hs.get("fresh_markets", 0) or 0)
+                            ratio = (fresh / max(1, at)) if at > 0 else 0.0
+                            ws_med = float(hs.get("ws_market_med_ms", 9e9) or 9e9)
+                            print(
+                                f"{Y}[WS-GATE]{RS} skip entries: fresh_books={fresh}/{at} "
+                                f"ratio={ratio:.2f} < {WS_HEALTH_MIN_FRESH_RATIO:.2f} "
+                                f"or ws_med={ws_med:.0f}ms > {WS_HEALTH_MAX_MED_AGE_MS:.0f}ms"
+                            )
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
 

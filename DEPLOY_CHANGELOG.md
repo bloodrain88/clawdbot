@@ -12,6 +12,43 @@ Ogni modifica che impatta trading/runtime deve aggiungere una nuova entry con:
 
 ## 2026-02-22
 
+### Commit `runtime-stability-ws-rtds-seen`
+- Scope: `clawdbot_live.py`
+- Summary:
+  - WS health gate con warmup startup (`WS_GATE_WARMUP_SEC`) per evitare blocchi immediati con feed appena connessi.
+  - Backoff RTDS migliorato su errori `HTTP 429` con attesa progressiva piu' robusta.
+  - Ridotto rumore operativo: `STATS-LOCAL` stampato solo con `LOG_STATS_LOCAL=true`.
+  - `seen` cache ridotta/configurabile (`SEEN_MAX_KEEP`) per limitare `blocked_seen` falsi post-restart.
+- Feed/infra status intent:
+  - Migliora stabilita' ingressi realtime senza cambiare la strategia EV.
+- Rollback:
+  - `git revert <sha-commit>`
+
+### Commit `33684bb`
+- Scope: `clawdbot_live.py`
+- Summary:
+  - Fix matematico di allineamento lato finale (`side`) per confluence/quality.
+  - Rimossi falsi `low confluence` su setup Down dovuti a segno OB non coerente.
+  - Refresh side-aligned metrics dopo `leader-follow` e dopo `prebid`.
+  - Booster usa metrica lato finale (niente variabili direzionali stale).
+- Feed/infra status intent:
+  - Nessun cambio di protocollo feed; solo correzione calcolo decisionale.
+- Risk/position:
+  - Nessun cambio strategia base/risk profile.
+  - Riduzione skip errati da incoerenza matematica.
+- Rollback:
+  - `git revert 33684bb`
+
+### Commit `manual-deploy-script`
+- Scope: `scripts/nf_manual_deploy.sh`, `OPERATIONS_RUNBOOK.md`
+- Summary:
+  - Aggiunto metodo stabile di deploy manuale senza dipendenza da webhook VCS.
+  - Flusso: push -> build per SHA -> deploy per SHA -> verifica `deployedSHA`.
+- Feed/infra status intent:
+  - Nessun impatto runtime sul bot; solo affidabilita' del processo di rilascio.
+- Rollback:
+  - rimuovere script e revert entry runbook/changelog.
+
 ### Commit `753425f`
 - Scope: `clawdbot_live.py`
 - Summary:
