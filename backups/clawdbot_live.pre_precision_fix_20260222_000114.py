@@ -2749,13 +2749,7 @@ class LiveTrader:
                     # Strict instant execution with price cap to keep slippage near zero.
                     px = round(max(0.001, min(exec_price, 0.97)), 4)
                     size_tok, _ = _normalize_order_size(px, size_usdc)
-                    # Pass fixed-precision strings to avoid floating-point over-precision rejections.
-                    order_args = OrderArgs(
-                        token_id=token_id,
-                        price=f"{px:.4f}",
-                        size=f"{size_tok:.2f}",
-                        side="BUY",
-                    )
+                    order_args = OrderArgs(token_id=token_id, price=px, size=size_tok, side="BUY")
                     signed = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
                     resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
                     return resp, px
@@ -2928,12 +2922,8 @@ class LiveTrader:
                       f"ask={best_ask:.3f} spread={spread:.3f} "
                       f"maker_edge={maker_edge:.3f} taker_edge={taker_edge:.3f}{RS}")
 
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=f"{maker_price:.4f}",
-                    size=f"{size_tok_m:.2f}",
-                    side="BUY",
-                )
+                order_args = OrderArgs(token_id=token_id, price=maker_price,
+                                       size=size_tok_m, side="BUY")
                 signed  = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
                 resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.GTC))
                 order_id = resp.get("orderID") or resp.get("id", "")
