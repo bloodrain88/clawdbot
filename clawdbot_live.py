@@ -802,6 +802,26 @@ class LiveTrader:
             if age <= CLOB_MARKET_WS_MAX_AGE_MS:
                 fresh_books += 1
         ws_med = sorted(ws_ages)[len(ws_ages) // 2] if ws_ages else 9e9
+        # Market-level WS health (preferred for trade gate):
+        # one fresh side per active CID is enough to keep realtime decision path alive.
+        active_markets = len(self.active_mkts)
+        fresh_markets = 0
+        ws_market_ages = []
+        for m in self.active_mkts.values():
+            tu = str(m.get("token_up", "") or "").strip()
+            td = str(m.get("token_down", "") or "").strip()
+            if not tu and not td:
+                continue
+            au = self._clob_ws_book_age_ms(tu) if tu else 9e9
+            ad = self._clob_ws_book_age_ms(td) if td else 9e9
+            best_age = min(au, ad)
+            ws_market_ages.append(best_age)
+            if best_age <= CLOB_MARKET_WS_MAX_AGE_MS:
+                fresh_markets += 1
+        ws_market_med = (
+            sorted(ws_market_ages)[len(ws_market_ages) // 2]
+            if ws_market_ages else 9e9
+        )
 
         cids = list(self.active_mkts.keys())
         active_cids = len(cids)
@@ -835,6 +855,9 @@ class LiveTrader:
             "active_tokens": active_tokens,
             "fresh_books": fresh_books,
             "ws_med_ms": ws_med,
+            "active_markets": active_markets,
+            "fresh_markets": fresh_markets,
+            "ws_market_med_ms": ws_market_med,
             "active_cids": active_cids,
             "fresh_leaders": fresh_leaders,
             "leader_med_s": leader_med,
@@ -844,12 +867,12 @@ class LiveTrader:
 
     def _ws_trade_gate_ok(self):
         hs = self._feed_health_snapshot()
-        at = int(hs.get("active_tokens", 0) or 0)
-        if at <= 0:
+        am = int(hs.get("active_markets", 0) or 0)
+        if am <= 0:
             return False, hs
-        fresh = int(hs.get("fresh_books", 0) or 0)
-        ratio = fresh / max(1, at)
-        ws_med = float(hs.get("ws_med_ms", 9e9) or 9e9)
+        fresh = int(hs.get("fresh_markets", 0) or 0)
+        ratio = fresh / max(1, am)
+        ws_med = float(hs.get("ws_market_med_ms", 9e9) or 9e9)
         ok = (ratio >= WS_HEALTH_MIN_FRESH_RATIO) and (ws_med <= WS_HEALTH_MAX_MED_AGE_MS)
         return ok, hs
 
@@ -6637,10 +6660,10 @@ class LiveTrader:
                 if not ws_ok:
                     self._skip_tick("ws_health_gate")
                     if self._should_log("ws-health-gate", LOG_HEALTH_EVERY_SEC):
-                        at = int(hs.get("active_tokens", 0) or 0)
-                        fresh = int(hs.get("fresh_books", 0) or 0)
+                        at = int(hs.get("active_markets", 0) or 0)
+                        fresh = int(hs.get("fresh_markets", 0) or 0)
                         ratio = (fresh / max(1, at)) if at > 0 else 0.0
-                        ws_med = float(hs.get("ws_med_ms", 9e9) or 9e9)
+                        ws_med = float(hs.get("ws_market_med_ms", 9e9) or 9e9)
                         print(
                             f"{Y}[WS-GATE]{RS} skip entries: fresh_books={fresh}/{at} "
                             f"ratio={ratio:.2f} < {WS_HEALTH_MIN_FRESH_RATIO:.2f} "
