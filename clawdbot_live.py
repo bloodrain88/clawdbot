@@ -290,6 +290,7 @@ COPYFLOW_INTEL_WINDOW_SEC = int(os.environ.get("COPYFLOW_INTEL_WINDOW_SEC", "864
 COPYFLOW_INTEL_SETTLE_LAG_SEC = int(os.environ.get("COPYFLOW_INTEL_SETTLE_LAG_SEC", "1200"))
 COPYFLOW_INTEL_MIN_SETTLED_FAMILY_24H = int(os.environ.get("COPYFLOW_INTEL_MIN_SETTLED_FAMILY_24H", "6"))
 COPYFLOW_INTEL_MIN_SETTLED_FAMILY_ALL = int(os.environ.get("COPYFLOW_INTEL_MIN_SETTLED_FAMILY_ALL", "20"))
+COPYFLOW_HTTP_MAX_PARALLEL = int(os.environ.get("COPYFLOW_HTTP_MAX_PARALLEL", "8"))
 PREBID_ARM_ENABLED = os.environ.get("PREBID_ARM_ENABLED", "true").lower() == "true"
 PREBID_MIN_CONF = float(os.environ.get("PREBID_MIN_CONF", "0.58"))
 PREBID_ARM_WINDOW_SEC = float(os.environ.get("PREBID_ARM_WINDOW_SEC", "30"))
@@ -706,6 +707,16 @@ class LiveTrader:
             self._errors.tick("http_get_json", print, err=e, every=20)
             raise
 
+    async def _gather_bounded(self, coros, limit: int):
+        """Run awaitables with bounded concurrency to avoid network bursts."""
+        sem = asyncio.Semaphore(max(1, int(limit)))
+
+        async def _run(coro):
+            async with sem:
+                return await coro
+
+        return await asyncio.gather(*[_run(c) for c in coros], return_exceptions=True)
+
     async def _get_order_book(self, token_id: str, force_fresh: bool = False):
         """Low-latency orderbook fetch with tiny TTL cache to avoid duplicate roundtrips."""
         if not token_id:
@@ -984,7 +995,7 @@ class LiveTrader:
                     )
                     for cid in cids
                 ]
-                rows_list = await asyncio.gather(*tasks, return_exceptions=True)
+                rows_list = await self._gather_bounded(tasks, COPYFLOW_HTTP_MAX_PARALLEL)
                 wallet_rank = {}
                 for rows in rows_list:
                     if isinstance(rows, Exception) or not isinstance(rows, list):
@@ -1016,7 +1027,7 @@ class LiveTrader:
                     )
                     for w, _ in ranked
                 ]
-                acts = await asyncio.gather(*act_tasks, return_exceptions=True)
+                acts = await self._gather_bounded(act_tasks, COPYFLOW_HTTP_MAX_PARALLEL)
                 now_ts = int(_time.time())
                 live_scores = {}
                 family_scores: dict[str, dict[str, float]] = {k: {} for k in target_families}
@@ -1030,7 +1041,10 @@ class LiveTrader:
                             unknown_cids.add(cid)
                 if unknown_cids:
                     lookups = list(unknown_cids)[:300]
-                    looked = await asyncio.gather(*[self._cid_family(cid) for cid in lookups], return_exceptions=True)
+                    looked = await self._gather_bounded(
+                        [self._cid_family(cid) for cid in lookups],
+                        COPYFLOW_HTTP_MAX_PARALLEL,
+                    )
                     for cid, fam in zip(lookups, looked):
                         if isinstance(fam, tuple):
                             cid_family[cid] = fam
@@ -1112,7 +1126,7 @@ class LiveTrader:
                     )
                     for cid in cids
                 ]
-                rows_list = await asyncio.gather(*tasks, return_exceptions=True)
+                rows_list = await self._gather_bounded(tasks, COPYFLOW_HTTP_MAX_PARALLEL)
                 updated = 0
                 for cid, rows in zip(cids, rows_list):
                     if isinstance(rows, Exception) or not isinstance(rows, list):
@@ -1224,7 +1238,8 @@ class LiveTrader:
         print(
             f"{B}[BOOT]{RS} copyflow_live={COPYFLOW_LIVE_ENABLED} "
             f"copy_intel24h={COPYFLOW_INTEL_ENABLED} "
-            f"intel_refresh={COPYFLOW_INTEL_REFRESH_SEC}s"
+            f"intel_refresh={COPYFLOW_INTEL_REFRESH_SEC}s "
+            f"copy_http_parallel={COPYFLOW_HTTP_MAX_PARALLEL}"
         )
         print(
             f"{B}[BOOT]{RS} scan_log_change_only={LOG_SCAN_ON_CHANGE_ONLY} "
@@ -4628,6 +4643,31 @@ class LiveTrader:
                                 except Exception:
                                     pass
 
+            # Prefetch Polymarket open prices in parallel to avoid sequential stalls.
+            pm_open_tasks = {}
+            for cid, m in markets.items():
+                if m.get("start_ts", 0) > now:
+                    continue
+                if (m.get("end_ts", 0) - now) / 60 < 1:
+                    continue
+                src_known = self.open_prices_source.get(cid, "?")
+                need_pm = (cid not in self.open_prices) or (src_known != "PM")
+                if not need_pm:
+                    continue
+                asset = m.get("asset")
+                dur = int(m.get("duration", 0) or 0)
+                start_ts = float(m.get("start_ts", now) or now)
+                end_ts_m = float(m.get("end_ts", now + max(1, dur) * 60) or (now + max(1, dur) * 60))
+                pm_open_tasks[cid] = self._get_polymarket_open_price(asset, start_ts, end_ts_m, dur)
+            pm_open_prefetch = {}
+            if pm_open_tasks:
+                pm_vals = await self._gather_bounded(
+                    list(pm_open_tasks.values()),
+                    limit=max(2, min(12, len(pm_open_tasks))),
+                )
+                for cid, v in zip(pm_open_tasks.keys(), pm_vals):
+                    pm_open_prefetch[cid] = 0.0 if isinstance(v, Exception) else float(v or 0.0)
+
             # Evaluate ALL eligible markets in parallel — no more sequential blocking
             candidates = []
             for cid, m in markets.items():
@@ -4663,9 +4703,8 @@ class LiveTrader:
                 title_s  = m.get("question", "")[:50]
                 if cid not in self.open_prices:
                     start_ts = m.get("start_ts", now)
-                    end_ts_m = m.get("end_ts", now + dur * 60)
                     # Authoritative reference: Polymarket's own price API
-                    ref = await self._get_polymarket_open_price(asset, start_ts, end_ts_m, dur)
+                    ref = float(pm_open_prefetch.get(cid, 0.0) or 0.0)
                     if ref > 0:
                         src = "PM"
                     else:
@@ -4696,9 +4735,7 @@ class LiveTrader:
                     # Already known — but if source isn't PM yet, retry authoritative API
                     src = self.open_prices_source.get(cid, "?")
                     if src != "PM":
-                        start_ts = m.get("start_ts", now)
-                        end_ts_m = m.get("end_ts", now + dur * 60)
-                        pm_ref = await self._get_polymarket_open_price(asset, start_ts, end_ts_m, dur)
+                        pm_ref = float(pm_open_prefetch.get(cid, 0.0) or 0.0)
                         if pm_ref > 0:
                             self.open_prices[cid]        = pm_ref
                             self.open_prices_source[cid] = "PM"
