@@ -4978,7 +4978,9 @@ class LiveTrader:
 
                 if force_taker:
                     taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
-                    slip_now = _slip_bps(taker_price, price)
+                    # Execution slippage must be measured against current executable ask,
+                    # not signal/model entry price from scoring time.
+                    slip_now = _slip_bps(taker_price, best_ask)
                     needed_notional = _normalize_buy_amount(size_usdc) * FAST_FOK_MIN_DEPTH_RATIO
                     depth_now = _book_depth_usdc(asks, taker_price)
                     if depth_now < needed_notional:
@@ -4997,7 +4999,7 @@ class LiveTrader:
                     elif slip_now > slip_cap_bps:
                         print(
                             f"{Y}[SLIP-GUARD]{RS} {asset} {side} fast-taker blocked: "
-                            f"slip={slip_now:.1f}bps > cap={slip_cap_bps:.0f}bps"
+                            f"slip={slip_now:.1f}bps(ref_ask={best_ask:.3f}) > cap={slip_cap_bps:.0f}bps"
                         )
                         force_taker = False
                     else:
@@ -5024,7 +5026,7 @@ class LiveTrader:
                     if secs_left <= near_end_cut and taker_edge >= edge_floor and best_ask <= (max_entry_allowed or 0.99):
                         force_taker = True
                         taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
-                        slip_now = _slip_bps(taker_price, price)
+                        slip_now = _slip_bps(taker_price, best_ask)
                         needed_notional = _normalize_buy_amount(size_usdc) * FAST_FOK_MIN_DEPTH_RATIO
                         depth_now = _book_depth_usdc(asks, taker_price)
                         if depth_now < needed_notional:
@@ -5043,7 +5045,7 @@ class LiveTrader:
                         elif slip_now > slip_cap_bps:
                             print(
                                 f"{Y}[SLIP-GUARD]{RS} {asset} {side} near-end taker blocked: "
-                                f"slip={slip_now:.1f}bps > cap={slip_cap_bps:.0f}bps"
+                                f"slip={slip_now:.1f}bps(ref_ask={best_ask:.3f}) > cap={slip_cap_bps:.0f}bps"
                             )
                             force_taker = False
                         else:
@@ -5235,11 +5237,11 @@ class LiveTrader:
                         self._skip_tick("fallback_ev_below")
                         return None
                     taker_price = round(min(fresh_ask, eff_max_entry, 0.97), 4)
-                    slip_now = _slip_bps(taker_price, price)
+                    slip_now = _slip_bps(taker_price, fresh_ask)
                     if slip_now > slip_cap_bps:
                         print(
                             f"{Y}[SLIP-GUARD]{RS} {asset} {side} fallback taker blocked: "
-                            f"slip={slip_now:.1f}bps > cap={slip_cap_bps:.0f}bps"
+                            f"slip={slip_now:.1f}bps(ref_ask={fresh_ask:.3f}) > cap={slip_cap_bps:.0f}bps"
                         )
                         self._skip_tick("fallback_slip_guard")
                         print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=fallback_slip_guard")
