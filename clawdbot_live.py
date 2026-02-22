@@ -295,6 +295,9 @@ CLOB_HEARTBEAT_SEC = float(os.environ.get("CLOB_HEARTBEAT_SEC", "6"))
 USER_EVENTS_ENABLED = os.environ.get("USER_EVENTS_ENABLED", "true").lower() == "true"
 USER_EVENTS_POLL_SEC = float(os.environ.get("USER_EVENTS_POLL_SEC", "0.8"))
 USER_EVENTS_CACHE_TTL_SEC = float(os.environ.get("USER_EVENTS_CACHE_TTL_SEC", "180"))
+CLOB_MARKET_WS_ENABLED = os.environ.get("CLOB_MARKET_WS_ENABLED", "true").lower() == "true"
+CLOB_MARKET_WS_SYNC_SEC = float(os.environ.get("CLOB_MARKET_WS_SYNC_SEC", "2.0"))
+CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "500"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
 COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
@@ -323,6 +326,9 @@ MARKET_LEADER_MIN_NET = float(os.environ.get("MARKET_LEADER_MIN_NET", "0.15"))
 MARKET_LEADER_MIN_N = int(os.environ.get("MARKET_LEADER_MIN_N", "30"))
 MARKET_LEADER_SCORE_BONUS = int(os.environ.get("MARKET_LEADER_SCORE_BONUS", "2"))
 MARKET_LEADER_EDGE_BONUS = float(os.environ.get("MARKET_LEADER_EDGE_BONUS", "0.010"))
+REQUIRE_LEADER_FLOW = os.environ.get("REQUIRE_LEADER_FLOW", "true").lower() == "true"
+REQUIRE_ORDERBOOK_WS = os.environ.get("REQUIRE_ORDERBOOK_WS", "true").lower() == "true"
+REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
 # Dynamic sizing guardrail for cheap-entry tails:
 # - keep default risk around LOW_ENTRY_BASE_SOFT_MAX
 # - allow growth toward LOW_ENTRY_HIGH_CONV_SOFT_MAX only on strong conviction
@@ -395,6 +401,7 @@ if ENABLE_5M:
 
 GAMMA = "https://gamma-api.polymarket.com"
 RTDS  = "wss://ws-live-data.polymarket.com"
+CLOB_MARKET_WSS = os.environ.get("CLOB_MARKET_WSS", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
 
 # Binance symbols per asset (spot + futures share same symbol)
 BNB_SYM = {info["asset"]: info["asset"].lower() + "usdt" for info in SERIES.values()}
@@ -548,6 +555,9 @@ class LiveTrader:
         self._session        = None   # persistent aiohttp session
         self._book_cache     = {}     # token_id -> {"ts_ms": float, "book": OrderBook}
         self._book_sem       = asyncio.Semaphore(max(1, BOOK_FETCH_CONCURRENCY))
+        self._clob_market_ws = None
+        self._clob_ws_books  = {}     # token_id -> {"ts_ms": float, "best_bid": float, "best_ask": float, "tick": float, "asks": [(p,s)]}
+        self._clob_ws_assets_subscribed = set()
         self._heartbeat_last_ok = 0.0
         self._heartbeat_id   = ""
         self._order_event_cache = {}  # order_id -> {"status": str, "filled_size": float, "ts": float}
@@ -1507,6 +1517,10 @@ class LiveTrader:
             f"leader_bonus(score/edge)={MARKET_LEADER_SCORE_BONUS}/{MARKET_LEADER_EDGE_BONUS:.3f}"
         )
         print(
+            f"{B}[BOOT]{RS} require(leader/book/vol)="
+            f"{REQUIRE_LEADER_FLOW}/{REQUIRE_ORDERBOOK_WS}/{REQUIRE_VOLUME_SIGNAL}"
+        )
+        print(
             f"{B}[BOOT]{RS} "
             f"max_win_mode={MAX_WIN_MODE} "
             f"win_prob_min(5m/15m)={WINMODE_MIN_TRUE_PROB_5M:.2f}/{WINMODE_MIN_TRUE_PROB_15M:.2f} "
@@ -1542,6 +1556,11 @@ class LiveTrader:
             f"live_max_age={COPYFLOW_LIVE_MAX_AGE_SEC:.0f}s "
             f"intel_refresh={COPYFLOW_INTEL_REFRESH_SEC}s "
             f"copy_http_parallel={COPYFLOW_HTTP_MAX_PARALLEL}"
+        )
+        print(
+            f"{B}[BOOT]{RS} clob_market_ws={CLOB_MARKET_WS_ENABLED} "
+            f"sync={CLOB_MARKET_WS_SYNC_SEC:.1f}s "
+            f"book_ws_age<={CLOB_MARKET_WS_MAX_AGE_MS:.0f}ms"
         )
         print(
             f"{B}[BOOT]{RS} scan_log_change_only={LOG_SCAN_ON_CHANGE_ONLY} "
@@ -2529,11 +2548,204 @@ class LiveTrader:
         self.active_mkts = found
         return found
 
+    def _active_token_ids(self) -> set[str]:
+        toks = set()
+        for m in self.active_mkts.values():
+            tu = str(m.get("token_up", "") or "").strip()
+            td = str(m.get("token_down", "") or "").strip()
+            if tu:
+                toks.add(tu)
+            if td:
+                toks.add(td)
+        return toks
+
+    def _normalize_book_levels(self, levels) -> list[tuple[float, float]]:
+        out = []
+        if not isinstance(levels, list):
+            return out
+        for lv in levels:
+            p = s = 0.0
+            try:
+                if isinstance(lv, dict):
+                    p = float(lv.get("price", lv.get("p", 0.0)) or 0.0)
+                    s = float(lv.get("size", lv.get("s", lv.get("quantity", 0.0))) or 0.0)
+                elif isinstance(lv, (list, tuple)) and len(lv) >= 2:
+                    p = float(lv[0] or 0.0)
+                    s = float(lv[1] or 0.0)
+            except Exception:
+                p = s = 0.0
+            if p > 0 and s > 0:
+                out.append((p, s))
+        return out
+
+    def _ingest_clob_ws_event(self, row: dict):
+        if not isinstance(row, dict):
+            return
+        aid = str(
+            row.get("asset_id")
+            or row.get("assetId")
+            or row.get("token_id")
+            or row.get("tokenId")
+            or row.get("market")
+            or ""
+        ).strip()
+        if not aid:
+            return
+        prev = self._clob_ws_books.get(aid, {})
+        asks = self._normalize_book_levels(
+            row.get("asks", row.get("sells", row.get("sell", [])))
+        )
+        bids = self._normalize_book_levels(
+            row.get("bids", row.get("buys", row.get("buy", [])))
+        )
+        best_ask = 0.0
+        best_bid = 0.0
+        if asks:
+            asks = sorted(asks, key=lambda x: x[0])[:20]
+            best_ask = asks[0][0]
+        else:
+            try:
+                best_ask = float(
+                    row.get("best_ask", row.get("bestAsk", row.get("ask", 0.0))) or 0.0
+                )
+            except Exception:
+                best_ask = 0.0
+            asks = list(prev.get("asks") or [])
+        if bids:
+            bids = sorted(bids, key=lambda x: x[0], reverse=True)
+            best_bid = bids[0][0]
+        else:
+            try:
+                best_bid = float(
+                    row.get("best_bid", row.get("bestBid", row.get("bid", 0.0))) or 0.0
+                )
+            except Exception:
+                best_bid = 0.0
+            if best_bid <= 0:
+                best_bid = float(prev.get("best_bid", 0.0) or 0.0)
+        if best_ask <= 0:
+            best_ask = float(prev.get("best_ask", 0.0) or 0.0)
+        tick = float(row.get("tick_size", row.get("tick", prev.get("tick", 0.01))) or 0.01)
+        if best_ask > 0:
+            self._clob_ws_books[aid] = {
+                "ts_ms": _time.time() * 1000.0,
+                "best_bid": best_bid if best_bid > 0 else max(0.0, best_ask - tick),
+                "best_ask": best_ask,
+                "tick": tick,
+                "asks": asks,
+            }
+            if len(self._clob_ws_books) > max(64, BOOK_CACHE_MAX * 2):
+                keys = sorted(
+                    self._clob_ws_books.items(),
+                    key=lambda kv: kv[1].get("ts_ms", 0.0),
+                    reverse=True,
+                )[: max(1, BOOK_CACHE_MAX * 2)]
+                keep = {k for k, _ in keys}
+                for k in list(self._clob_ws_books.keys()):
+                    if k not in keep:
+                        self._clob_ws_books.pop(k, None)
+
+    def _get_clob_ws_book(self, token_id: str, max_age_ms: float | None = None):
+        if not token_id:
+            return None
+        row = self._clob_ws_books.get(token_id)
+        if not row:
+            return None
+        age_cap = float(max_age_ms if max_age_ms is not None else CLOB_MARKET_WS_MAX_AGE_MS)
+        age_ms = (_time.time() * 1000.0) - float(row.get("ts_ms", 0.0) or 0.0)
+        if age_ms > age_cap:
+            return None
+        best_ask = float(row.get("best_ask", 0.0) or 0.0)
+        if best_ask <= 0:
+            return None
+        return {
+            "best_bid": float(row.get("best_bid", max(0.0, best_ask - 0.01)) or 0.0),
+            "best_ask": best_ask,
+            "tick": float(row.get("tick", 0.01) or 0.01),
+            "asks": list(row.get("asks") or []),
+            "ts": float(row.get("ts_ms", 0.0) or 0.0) / 1000.0,
+        }
+
+    async def _stream_clob_market_book(self):
+        """Realtime CLOB market channel: keep per-token best bid/ask + shallow asks in memory."""
+        if DRY_RUN or (not CLOB_MARKET_WS_ENABLED):
+            return
+        import websockets as _ws
+        delay = 2
+        while True:
+            try:
+                async with _ws.connect(
+                    CLOB_MARKET_WSS,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_size=2**22,
+                ) as ws:
+                    self._clob_market_ws = ws
+                    self._clob_ws_assets_subscribed = set()
+                    print(f"{G}[CLOB-WS] market connected{RS}")
+                    delay = 2
+                    while True:
+                        desired = self._active_token_ids()
+                        add = desired - self._clob_ws_assets_subscribed
+                        rem = self._clob_ws_assets_subscribed - desired
+                        if add:
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "assets_ids": sorted(add),
+                                        "type": "market",
+                                        "custom_feature_enabled": True,
+                                    }
+                                )
+                            )
+                            self._clob_ws_assets_subscribed |= set(add)
+                        if rem:
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "assets_ids": sorted(rem),
+                                        "type": "market",
+                                        "operation": "unsubscribe",
+                                    }
+                                )
+                            )
+                            self._clob_ws_assets_subscribed -= set(rem)
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, CLOB_MARKET_WS_SYNC_SEC))
+                        except asyncio.TimeoutError:
+                            continue
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        rows = msg if isinstance(msg, list) else [msg]
+                        for row in rows:
+                            if isinstance(row, dict) and isinstance(row.get("data"), (list, dict)):
+                                sub = row.get("data")
+                                if isinstance(sub, list):
+                                    for r2 in sub:
+                                        self._ingest_clob_ws_event(r2)
+                                else:
+                                    self._ingest_clob_ws_event(sub)
+                            else:
+                                self._ingest_clob_ws_event(row)
+            except Exception as e:
+                self._errors.tick("clob_market_ws", print, err=e, every=8)
+                print(f"{Y}[CLOB-WS] {e} — reconnect in {delay}s{RS}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 20)
+            finally:
+                self._clob_market_ws = None
+                self._clob_ws_assets_subscribed = set()
+
     # ── SCORE + EXECUTE ───────────────────────────────────────────────────────
     async def _fetch_pm_book_safe(self, token_id: str):
         """Fetch Polymarket CLOB book; return compact snapshot or None."""
         if not token_id:
             return None
+        ws_book = self._get_clob_ws_book(token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+        if ws_book is not None:
+            return ws_book
         loop = asyncio.get_event_loop()
         try:
             book     = await self._get_order_book(token_id, force_fresh=False)
@@ -2704,6 +2916,13 @@ class LiveTrader:
         (perp_basis, funding_rate) = self._binance_perp_signals(asset)
         (vwap_dev, vol_mult)       = self._binance_window_stats(asset, m["start_ts"])
         _pm_book = await self._fetch_pm_book_safe(prefetch_token)
+        ws_book_now = self._get_clob_ws_book(prefetch_token, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+
+        # Realtime triad gating: orderbook + leader + volume signals.
+        if REQUIRE_ORDERBOOK_WS and ws_book_now is None:
+            if self._noisy_log_enabled(f"skip-no-ws-book:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(f"{Y}[SKIP] {asset} {duration}m missing fresh CLOB WS book{RS}")
+            return None
 
         # Additional instant signals from Binance cache (zero latency)
         dw_ob     = self._ob_depth_weighted(asset)
@@ -2711,6 +2930,12 @@ class LiveTrader:
         vr_ratio  = self._variance_ratio(asset)
         is_jump, jump_dir, jump_z = self._jump_detect(asset)
         btc_lead_p = self._btc_lead_signal(asset)
+        cache_a = self.binance_cache.get(asset, {})
+        volume_ready = bool(cache_a.get("depth_bids")) and bool(cache_a.get("depth_asks")) and (len(cache_a.get("klines", [])) >= 10)
+        if REQUIRE_VOLUME_SIGNAL and not volume_ready:
+            if self._noisy_log_enabled(f"skip-no-vol:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(f"{Y}[SKIP] {asset} {duration}m missing live Binance depth/volume cache{RS}")
+            return None
 
         # Jump detection: sudden move against our direction = hard abort
         if is_jump and jump_dir is not None and jump_dir != direction:
@@ -2919,6 +3144,7 @@ class LiveTrader:
         # Optional copyflow signal from externally ranked leader wallets on same market.
         copy_adj = 0
         copy_net = 0.0
+        leader_ready = False
         flow = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
         if isinstance(flow, dict):
             up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
@@ -2928,6 +3154,7 @@ class LiveTrader:
             flow_age_s = (_time.time() - flow_ts) if flow_ts > 0 else 9e9
             flow_fresh = flow_age_s <= COPYFLOW_LIVE_MAX_AGE_SEC
             leader_net = up_conf - dn_conf
+            leader_ready = flow_fresh and (flow_n >= MARKET_LEADER_MIN_N)
             # Strong per-market leader consensus: follow the market leaders on this CID.
             if (
                 MARKET_LEADER_FOLLOW_ENABLED
@@ -2978,6 +3205,10 @@ class LiveTrader:
                 # Winners buying low-cents but market now expensive: fade confidence.
                 score -= 1
                 edge -= 0.005
+        if REQUIRE_LEADER_FLOW and (not leader_ready):
+            if self._noisy_log_enabled(f"skip-no-leader:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(f"{Y}[SKIP] {asset} {duration}m missing fresh leader-flow for this CID{RS}")
+            return None
 
         # Pre-bid arm: for first seconds after open, bias side/execution to pre-planned signal.
         arm = self._prebid_plan.get(cid, {})
@@ -3563,6 +3794,16 @@ class LiveTrader:
                         spread = best_ask - best_bid
                     else:
                         pm_book_data = None
+                if pm_book_data is None:
+                    ws_book = self._get_clob_ws_book(token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+                    if ws_book is not None:
+                        best_bid = float(ws_book.get("best_bid", 0.0) or 0.0)
+                        best_ask = float(ws_book.get("best_ask", 0.0) or 0.0)
+                        tick = float(ws_book.get("tick", 0.01) or 0.01)
+                        asks = list(ws_book.get("asks") or [])
+                        bids = []
+                        spread = (best_ask - best_bid) if best_ask > 0 else 0.0
+                        pm_book_data = ws_book
                 if pm_book_data is None:
                     book     = await self._get_order_book(token_id, force_fresh=False)
                     tick     = float(book.tick_size or "0.01")
@@ -6335,6 +6576,7 @@ class LiveTrader:
             _guard("stream_rtds",           self.stream_rtds),
             _guard("_stream_binance_spot",  self._stream_binance_spot),
             _guard("_stream_binance_futures", self._stream_binance_futures),
+            _guard("_stream_clob_market_book", self._stream_clob_market_book),
             _guard("vol_loop",              self.vol_loop),
             _guard("scan_loop",             self.scan_loop),
             _guard("_status_loop",          self._status_loop),
