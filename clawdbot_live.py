@@ -415,6 +415,7 @@ class LiveTrader:
         self.onchain_redeemable_count = 0
         self.onchain_open_cids = set()
         self.onchain_open_usdc_by_cid = {}
+        self.onchain_open_stake_by_cid = {}
         self.onchain_open_meta_by_cid = {}
         self.onchain_settling_usdc_by_cid = {}
         self.onchain_total_equity = BANKROLL
@@ -532,6 +533,59 @@ class LiveTrader:
         if not cid:
             return "n/a"
         return f"{cid[:10]}..."
+
+    def _as_float(self, v, default: float = 0.0) -> float:
+        try:
+            if v is None:
+                return float(default)
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _extract_usdc_in_from_tx(self, tx_hash: str) -> float:
+        """Exact USDC amount received by wallet from tx receipt Transfer logs."""
+        if not tx_hash or not self.w3:
+            return 0.0
+        try:
+            rcpt = self.w3.eth.get_transaction_receipt(tx_hash)
+            logs = list(getattr(rcpt, "logs", None) or rcpt.get("logs", []) or [])
+            transfer_sig = Web3.keccak(text="Transfer(address,address,uint256)").hex().lower()
+            usdc_addr = Web3.to_checksum_address(USDC_E_ADDR).lower()
+            me = Web3.to_checksum_address(ADDRESS).lower()
+            got = 0
+            for lg in logs:
+                lg_addr = str(lg.get("address", "")).lower()
+                if lg_addr != usdc_addr:
+                    continue
+                topics = lg.get("topics", []) or []
+                if len(topics) < 3:
+                    continue
+                t0 = str(topics[0].hex() if hasattr(topics[0], "hex") else topics[0]).lower()
+                if t0 != transfer_sig:
+                    continue
+                to_topic = str(topics[2].hex() if hasattr(topics[2], "hex") else topics[2]).lower()
+                to_addr = "0x" + to_topic[-40:]
+                if to_addr.lower() != me:
+                    continue
+                data = lg.get("data", "0x0")
+                raw = int(data.hex(), 16) if hasattr(data, "hex") else int(str(data), 16)
+                got += raw
+            return got / 1e6
+        except Exception:
+            return 0.0
+
+    def _count_pending_redeem_by_rk(self, rk: str) -> int:
+        n = 0
+        for cid_x, val_x in list(self.pending_redeem.items()):
+            if isinstance(val_x[0], dict):
+                m_x, t_x = val_x
+            else:
+                side_x, asset_x = val_x
+                m_x = {"conditionId": cid_x, "asset": asset_x}
+                t_x = {"side": side_x, "asset": asset_x, "duration": 0}
+            if self._round_key(cid=cid_x, m=m_x, t=t_x) == rk:
+                n += 1
+        return n
 
     def _token_id_from_cid_side(self, cid: str, side: str) -> str:
         """Derive ERC1155 position token_id from (conditionId, side) for binary markets."""
@@ -1768,6 +1822,7 @@ class LiveTrader:
         # Show each open position with current win/loss status
         now_ts = _time.time()
         shown_live_cids = set()
+        live_by_rk = {}
         for cid, (m, t) in list(self.pending.items()):
             if self.onchain_snapshot_ts > 0 and cid not in self.onchain_open_cids:
                 continue
@@ -1775,10 +1830,13 @@ class LiveTrader:
             self._apply_exact_window_from_question(m, t)
             asset      = t.get("asset", "?")
             side       = t.get("side", "?")
-            size = float(self.onchain_open_usdc_by_cid.get(cid, 0.0))
-            if size <= 0:
-                if size <= 0:
-                    continue
+            stake = float(t.get("size", 0.0) or 0.0)
+            if stake <= 0:
+                stake = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
+            if stake <= 0:
+                stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
+            if stake <= 0:
+                continue
             rk         = self._round_key(cid=cid, m=m, t=t)
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
             # NOT the bot's trade entry price — market determines outcome from its own start
@@ -1807,7 +1865,7 @@ class LiveTrader:
                 move_pct   = (cur_p - open_p) / open_p * 100
                 c          = Y
                 status_str = "LIVE"
-                payout_est = size / t.get("entry", 0.5) if projected_win else 0
+                payout_est = stake / t.get("entry", 0.5) if projected_win else 0
                 move_str   = f"({move_pct:+.2f}%)"
                 proj_str   = "LEAD" if projected_win else "TRAIL"
             else:
@@ -1820,16 +1878,26 @@ class LiveTrader:
             tok_str   = f"@{tok_price*100:.0f}¢→{(1/tok_price):.2f}x" if tok_price > 0 else "@?¢"
             print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
                   f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
-                  f"bet=${size:.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
+                  f"bet=${stake:.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
                   f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
             shown_live_cids.add(cid)
+            agg = live_by_rk.setdefault(rk, {"n": 0, "stake": 0.0, "est": 0.0, "lead": 0})
+            agg["n"] += 1
+            agg["stake"] += float(stake)
+            agg["est"] += float(payout_est)
+            if proj_str == "LEAD":
+                agg["lead"] += 1
         # On-chain open positions not yet hydrated into local pending.
         # Keep visibility strictly on-chain to avoid "missing live trade" blind spots.
         for cid, meta in list(self.onchain_open_meta_by_cid.items()):
             if cid in shown_live_cids:
                 continue
-            size = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
-            if size <= 0:
+            stake = float(meta.get("stake_usdc", 0.0) or 0.0)
+            if stake <= 0:
+                stake = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
+            if stake <= 0:
+                stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
+            if stake <= 0:
                 continue
             asset = str(meta.get("asset", "?") or "?")
             side = str(meta.get("side", "?") or "?")
@@ -1844,7 +1912,7 @@ class LiveTrader:
                 pred_winner = "Up" if cur_p >= open_p else "Down"
                 projected_win = (side == pred_winner)
                 move_pct = (cur_p - open_p) / open_p * 100.0
-                payout_est = size / max(float(meta.get("entry", 0.5) or 0.5), 1e-9) if projected_win else 0.0
+                payout_est = stake / max(float(meta.get("entry", 0.5) or 0.5), 1e-9) if projected_win else 0.0
                 move_str = f"({move_pct:+.2f}%)"
                 proj_str = "LEAD" if projected_win else "TRAIL"
             else:
@@ -1859,9 +1927,22 @@ class LiveTrader:
             print(
                 f"  {Y}[LIVE-PENDING]{RS} {asset} {side} | {title} | "
                 f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
-                f"bet=${size:.2f} est=${payout_est:.2f} proj={proj_str} | "
+                f"bet=${stake:.2f} est=${payout_est:.2f} proj={proj_str} | "
                 f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}"
             )
+            agg = live_by_rk.setdefault(rk, {"n": 0, "stake": 0.0, "est": 0.0, "lead": 0})
+            agg["n"] += 1
+            agg["stake"] += float(stake)
+            agg["est"] += float(payout_est)
+            if proj_str == "LEAD":
+                agg["lead"] += 1
+        if live_by_rk:
+            for rk, row in sorted(live_by_rk.items(), key=lambda kv: kv[0])[:10]:
+                print(
+                    f"  {B}[LIVE-RK]{RS} {rk} | trades={row['n']} "
+                    f"stake=${row['stake']:.2f} est_win=${row['est']:.2f} "
+                    f"lead={row['lead']}/{row['n']}"
+                )
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
             if isinstance(val[0], dict):
@@ -3627,14 +3708,15 @@ class LiveTrader:
                     won = (winner == side)
                     size   = trade.get("size", 0)
                     entry  = trade.get("entry", 0.5)
+                    size_f = float(size or 0.0)
 
                     # For CLOB positions: CTF tokens are held by the exchange contract,
                     # not the user wallet. Always try redeemPositions — if Polymarket
                     # already auto-redeemed, the tx reverts harmlessly; if not, we collect.
-                    if won and size > 0:
-                        fee    = size * 0.0156 * (1 - abs(trade.get("mkt_price", 0.5) - 0.5) * 2)
-                        payout = size / entry - fee
-                        pnl    = payout - size
+                    if won and size_f > 0:
+                        fee    = size_f * 0.0156 * (1 - abs(trade.get("mkt_price", 0.5) - 0.5) * 2)
+                        payout = size_f / max(float(entry or 0.5), 1e-9) - fee
+                        pnl    = payout - size_f
 
                         # Try redeemPositions from wallet first; if unclaimable, settle as auto-redeemed.
                         suffix = "auto-redeemed"
@@ -3733,6 +3815,14 @@ class LiveTrader:
                             pass
                         if usdc_after <= 0:
                             usdc_after = usdc_before
+                        stake_out = size_f
+                        redeem_in = 0.0
+                        if tx_hash_full:
+                            redeem_in = self._extract_usdc_in_from_tx(tx_hash_full)
+                        if redeem_in <= 0:
+                            usdc_delta = usdc_after - usdc_before
+                            redeem_in = usdc_delta if usdc_delta > 0 else float(payout)
+                        pnl = redeem_in - stake_out
                         self.daily_pnl += pnl
                         self.total += 1; self.wins += 1
                         self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
@@ -3744,8 +3834,10 @@ class LiveTrader:
                             "result": "WIN",
                             "winner_side": winner,
                             "winner_source": winner_source,
-                            "size_usdc": size,
+                            "size_usdc": size_f,
                             "entry_price": entry,
+                            "stake_out_usdc": round(stake_out, 6),
+                            "redeem_in_usdc": round(redeem_in, 6),
                             "pnl": round(pnl, 4),
                             "bankroll_after": round(self.bankroll, 4),
                             "score": trade.get("score"),
@@ -3757,9 +3849,11 @@ class LiveTrader:
                             "round_key": rk,
                         })
                         wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
+                        rk_n = self._count_pending_redeem_by_rk(rk)
                         usdc_delta = usdc_after - usdc_before
                         print(f"{G}[WIN]{RS} {asset} {side} {trade.get('duration',0)}m | "
-                              f"{G}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr} | "
+                              f"{G}${pnl:+.2f}{RS} | stake=${stake_out:.2f} redeem=${redeem_in:.2f} "
+                              f"| rk_trades={rk_n} | Bank ${self.bankroll:.2f} | WR {wr} | "
                               f"{suffix} | rk={rk} cid={self._short_cid(cid)}")
                         if tx_hash_full:
                             print(
@@ -3775,8 +3869,8 @@ class LiveTrader:
                         done.append(cid)
                     else:
                         # Lost on-chain (on-chain is authoritative)
-                        if size > 0:
-                            pnl = -size
+                        if size_f > 0:
+                            pnl = -size_f
                             self.daily_pnl += pnl
                             self.total += 1
                             self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
@@ -3788,8 +3882,10 @@ class LiveTrader:
                                 "result": "LOSS",
                                 "winner_side": winner,
                                 "winner_source": winner_source,
-                                "size_usdc": size,
+                                "size_usdc": size_f,
                                 "entry_price": entry,
+                                "stake_out_usdc": round(size_f, 6),
+                                "redeem_in_usdc": 0.0,
                                 "pnl": round(pnl, 4),
                                 "bankroll_after": round(self.bankroll, 4),
                                 "score": trade.get("score"),
@@ -3801,8 +3897,10 @@ class LiveTrader:
                                 "round_key": rk,
                             })
                             wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
+                            rk_n = self._count_pending_redeem_by_rk(rk)
                             print(f"{R}[LOSS]{RS} {asset} {side} {trade.get('duration',0)}m | "
-                                  f"{R}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr} | "
+                                  f"{R}${pnl:+.2f}{RS} | stake=${size_f:.2f} redeem=$0.00 "
+                                  f"| rk_trades={rk_n} | Bank ${self.bankroll:.2f} | WR {wr} | "
                                   f"rk={rk} cid={self._short_cid(cid)}")
                         done.append(cid)
                 except Exception as e:
@@ -5032,6 +5130,7 @@ class LiveTrader:
                 settling_claim_count = 0
                 onchain_open_cids = set()
                 onchain_open_usdc_by_cid = {}
+                onchain_open_stake_by_cid = {}
                 onchain_open_meta_by_cid = {}
                 onchain_settling_usdc_by_cid = {}
                 for p in positions:
@@ -5057,6 +5156,21 @@ class LiveTrader:
                     onchain_open_usdc_by_cid[cid] = round(
                         float(onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0) + val, 6
                     )
+                    size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
+                    stake_guess = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            stake_guess = vv
+                            break
+                    if stake_guess <= 0 and size_tok > 0 and avg_px > 0:
+                        stake_guess = size_tok * avg_px
+                    if stake_guess <= 0:
+                        stake_guess = val
+                    onchain_open_stake_by_cid[cid] = round(
+                        float(onchain_open_stake_by_cid.get(cid, 0.0) or 0.0) + stake_guess, 6
+                    )
                     prev_meta = onchain_open_meta_by_cid.get(cid) or {}
                     if (not prev_meta) or (val >= float(prev_meta.get("value", 0.0) or 0.0)):
                         asset = (
@@ -5074,6 +5188,7 @@ class LiveTrader:
                             "side": side,
                             "asset": asset,
                             "entry": float(p.get("avgPrice", 0.5) or 0.5),
+                            "stake_usdc": round(stake_guess, 6),
                             "duration": dur_guess,
                             "end_ts": float(q_et if q_et > 0 else 0.0),
                             "value": val,
@@ -5085,6 +5200,7 @@ class LiveTrader:
                 self.onchain_open_count = int(open_count)
                 self.onchain_open_cids = set(onchain_open_cids)
                 self.onchain_open_usdc_by_cid = dict(onchain_open_usdc_by_cid)
+                self.onchain_open_stake_by_cid = dict(onchain_open_stake_by_cid)
                 self.onchain_open_meta_by_cid = dict(onchain_open_meta_by_cid)
                 self.onchain_redeemable_count = int(settling_claim_count)
                 self.onchain_settling_usdc_by_cid = dict(onchain_settling_usdc_by_cid)
