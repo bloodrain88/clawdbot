@@ -4341,6 +4341,21 @@ class LiveTrader:
             2,
         )
         dyn_floor  = min(hard_cap, max(MIN_BET_ABS, self.bankroll * MIN_BET_PCT))
+        # Mid-entry high-conviction floor:
+        # avoid dust-size core bets on solid 15m setups around 30c-55c.
+        if (
+            duration >= 15
+            and (not booster_eval)
+            and 0.30 <= entry <= 0.55
+            and score >= 12
+            and true_prob >= 0.70
+            and execution_ev >= max(min_ev_req + 0.008, 0.020)
+            and cl_agree
+        ):
+            dyn_floor = max(
+                dyn_floor,
+                min(hard_cap, max(4.0, self.bankroll * 0.012)),
+            )
         # Never force a big floor size on ultra-cheap tails or near-expiry entries.
         if entry <= 0.10 or (duration >= 15 and mins_left <= 3.5):
             dyn_floor = min(dyn_floor, MIN_BET_ABS)
