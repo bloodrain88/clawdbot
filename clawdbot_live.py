@@ -4867,11 +4867,6 @@ class LiveTrader:
                 taker_edge     = true_prob - best_ask
                 mid_est        = (best_bid + best_ask) / 2
                 maker_edge_est = true_prob - mid_est
-                strong_exec = (
-                    (score >= 12)
-                    and cl_agree
-                    and (taker_edge >= (edge_floor + 0.01 if min_edge_req is not None else 0.05))
-                )
                 # Ensure order notional always satisfies CLOB minimum size in shares.
                 _, min_notional = _normalize_order_size(best_ask, 0.0)
                 if size_usdc < min_notional:
@@ -4890,6 +4885,11 @@ class LiveTrader:
                 edge_floor = min_edge_req if min_edge_req is not None else 0.04
                 if not cl_agree:
                     edge_floor += 0.02
+                strong_exec = (
+                    (score >= 12)
+                    and cl_agree
+                    and (taker_edge >= (edge_floor + 0.01))
+                )
                 base_spread_cap = MAX_BOOK_SPREAD_5M if duration <= 5 else MAX_BOOK_SPREAD_15M
                 if (spread - base_spread_cap) > 1e-6 and not use_limit:
                     print(
