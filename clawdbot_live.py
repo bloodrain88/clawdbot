@@ -5572,7 +5572,14 @@ class LiveTrader:
             self.seen.add(cid)
 
             # Keep all materially present on-chain positions for sync/reconcile.
-            if val < OPEN_PRESENCE_MIN:
+            size_tok = self._as_float(pos.get("size", 0.0), 0.0)
+            spent_probe = 0.0
+            for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                vv = self._as_float(pos.get(k_st, 0.0), 0.0)
+                if vv > 0:
+                    spent_probe = vv
+                    break
+            if not ((size_tok > 0) or (spent_probe >= OPEN_PRESENCE_MIN) or (val >= OPEN_PRESENCE_MIN)):
                 continue
 
             # Fetch real market data from Gamma API — always, even if already in pending
@@ -6816,7 +6823,20 @@ class LiveTrader:
                         continue
                     side = str(p.get("outcome", "") or "")
                     val = float(p.get("currentValue", 0) or 0.0)
-                    if not side or val < OPEN_PRESENCE_MIN:
+                    size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    spent_probe = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            spent_probe = vv
+                            break
+                    # Open position presence must be on-chain truth (shares/spent), not mark-only.
+                    has_open_presence = (
+                        size_tok > 0
+                        or spent_probe >= OPEN_PRESENCE_MIN
+                        or val >= OPEN_PRESENCE_MIN
+                    )
+                    if not side or not has_open_presence:
                         continue
                     title = str(p.get("title", "") or "")
                     redeemable = bool(p.get("redeemable", False))
@@ -7016,14 +7036,24 @@ class LiveTrader:
                         )
 
                 # 3. API recovery/stats only (does not drive bankroll valuation)
-                api_active_cids = {
-                    p.get("conditionId", "")
-                    for p in positions
-                    if not p.get("redeemable", False)
-                    and p.get("outcome", "")
-                    and float(p.get("currentValue", 0) or 0) >= OPEN_PRESENCE_MIN
-                    and p.get("conditionId", "")
-                }
+                api_active_cids = set()
+                for p in positions:
+                    if p.get("redeemable", False):
+                        continue
+                    cid_p = p.get("conditionId", "")
+                    side_p = p.get("outcome", "")
+                    if not cid_p or not side_p:
+                        continue
+                    val_p = float(p.get("currentValue", 0) or 0.0)
+                    size_p = self._as_float(p.get("size", 0.0), 0.0)
+                    spent_p = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            spent_p = vv
+                            break
+                    if (size_p > 0) or (spent_p >= OPEN_PRESENCE_MIN) or (val_p >= OPEN_PRESENCE_MIN):
+                        api_active_cids.add(cid_p)
                 # On-chain-first cleanup: if a local pending CID is neither on-chain nor API-active
                 # after a grace window, it is stale and removed from local state.
                 prune_n = 0
@@ -7064,7 +7094,19 @@ class LiveTrader:
                     val  = float(p.get("currentValue", 0))
                     side = p.get("outcome", "")
                     title = p.get("title", "")
-                    if rdm or not side or not cid or val < OPEN_PRESENCE_MIN:
+                    rec_size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    rec_spent_probe = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            rec_spent_probe = vv
+                            break
+                    rec_present = (
+                        rec_size_tok > 0
+                        or rec_spent_probe >= OPEN_PRESENCE_MIN
+                        or val >= OPEN_PRESENCE_MIN
+                    )
+                    if rdm or not side or not cid or not rec_present:
                         continue
                     if cid in self.pending or cid in self.pending_redeem:
                         continue
@@ -7381,7 +7423,15 @@ class LiveTrader:
                     if rdm or not side or not cid:
                         continue
                     self.seen.add(cid)
-                    if val < OPEN_PRESENCE_MIN:   # tiny dust — mark seen only, don't track
+                    size_tok = self._as_float(pos.get("size", 0.0), 0.0)
+                    spent_probe = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(pos.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            spent_probe = vv
+                            break
+                    # Presence is based on open shares/spent, not only mark value.
+                    if not ((size_tok > 0) or (spent_probe >= OPEN_PRESENCE_MIN) or (val >= OPEN_PRESENCE_MIN)):
                         continue
                     if cid in self.redeemed_cids:
                         continue   # already processed — don't re-add
