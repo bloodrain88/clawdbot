@@ -419,6 +419,10 @@ class LiveTrader:
         self._pnl_baseline_ts = ""
         self.onchain_wallet_usdc = BANKROLL
         self.onchain_open_positions = 0.0
+        # Canonical aliases used by status/log renderer.
+        self.onchain_usdc_balance = BANKROLL
+        self.onchain_open_stake_total = 0.0
+        self.onchain_redeemable_usdc = 0.0
         self.onchain_open_mark_value = 0.0
         self.onchain_open_count = 0
         self.onchain_redeemable_count = 0
@@ -1689,6 +1693,9 @@ class LiveTrader:
             self.peak_bankroll = BANKROLL
             self.onchain_wallet_usdc = BANKROLL
             self.onchain_open_positions = 0.0
+            self.onchain_usdc_balance = BANKROLL
+            self.onchain_open_stake_total = 0.0
+            self.onchain_redeemable_usdc = 0.0
             self.onchain_open_count = 0
             self.onchain_redeemable_count = 0
             self.onchain_total_equity = BANKROLL
@@ -5358,6 +5365,9 @@ class LiveTrader:
                 total = round(usdc + open_stake_total + settling_claim_val, 2)
                 self.onchain_wallet_usdc = round(usdc, 2)
                 self.onchain_open_positions = round(open_stake_total, 2)
+                self.onchain_usdc_balance = round(usdc, 2)
+                self.onchain_open_stake_total = round(open_stake_total, 2)
+                self.onchain_redeemable_usdc = round(settling_claim_val, 2)
                 self.onchain_open_mark_value = round(open_val, 2)
                 self.onchain_open_count = int(open_count)
                 self.onchain_open_cids = set(onchain_open_cids)
