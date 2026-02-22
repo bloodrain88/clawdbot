@@ -2748,18 +2748,17 @@ class LiveTrader:
                 async def _post_limit_fok(exec_price: float) -> tuple[dict, float]:
                     # Strict instant execution with price cap to keep slippage near zero.
                     px = round(max(0.001, min(exec_price, 0.97)), 4)
-                    # Keep maker(share) precision <=2 and taker(notional) precision <=4.
-                    px_order = round(px, 2)
-                    size_tok, _ = _normalize_order_size(px_order, size_usdc)
+                    size_tok, _ = _normalize_order_size(px, size_usdc)
+                    # Pass fixed-precision strings to avoid floating-point over-precision rejections.
                     order_args = OrderArgs(
                         token_id=token_id,
-                        price=float(px_order),
-                        size=float(round(size_tok, 2)),
+                        price=f"{px:.4f}",
+                        size=f"{size_tok:.2f}",
                         side="BUY",
                     )
                     signed = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
                     resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
-                    return resp, float(px_order)
+                    return resp, px
 
                 # Use pre-fetched book from scoring phase (free — ran in parallel with Binance signals)
                 # or fetch fresh if not cached (~36ms)
@@ -2922,8 +2921,7 @@ class LiveTrader:
                     if maker_price > entry_cap:
                         maker_price = max(tick, entry_cap)
                 maker_edge   = true_prob - maker_price
-                maker_price_order = round(maker_price, 2)
-                size_tok_m, maker_notional = _normalize_order_size(maker_price_order, size_usdc)
+                size_tok_m, maker_notional = _normalize_order_size(maker_price, size_usdc)
                 size_usdc = maker_notional
 
                 print(f"{G}[MAKER] {asset} {side}: bid={maker_price:.3f} "
@@ -2932,8 +2930,8 @@ class LiveTrader:
 
                 order_args = OrderArgs(
                     token_id=token_id,
-                    price=float(maker_price_order),
-                    size=float(round(size_tok_m, 2)),
+                    price=f"{maker_price:.4f}",
+                    size=f"{size_tok_m:.2f}",
                     side="BUY",
                 )
                 signed  = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
