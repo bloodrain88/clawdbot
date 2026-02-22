@@ -275,6 +275,9 @@ LOG_EDGE_EVERY_SEC = int(os.environ.get("LOG_EDGE_EVERY_SEC", "30"))
 LOG_EXEC_EVERY_SEC = int(os.environ.get("LOG_EXEC_EVERY_SEC", "30"))
 SKIP_STATS_WINDOW_SEC = int(os.environ.get("SKIP_STATS_WINDOW_SEC", "900"))
 SKIP_STATS_TOP_N = int(os.environ.get("SKIP_STATS_TOP_N", "6"))
+WS_HEALTH_REQUIRED = os.environ.get("WS_HEALTH_REQUIRED", "true").lower() == "true"
+WS_HEALTH_MIN_FRESH_RATIO = float(os.environ.get("WS_HEALTH_MIN_FRESH_RATIO", "0.75"))
+WS_HEALTH_MAX_MED_AGE_MS = float(os.environ.get("WS_HEALTH_MAX_MED_AGE_MS", "4500"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
@@ -812,6 +815,17 @@ class LiveTrader:
             "rtds_med_s": rtds_med,
             "cl_med_s": cl_med,
         }
+
+    def _ws_trade_gate_ok(self):
+        hs = self._feed_health_snapshot()
+        at = int(hs.get("active_tokens", 0) or 0)
+        if at <= 0:
+            return False, hs
+        fresh = int(hs.get("fresh_books", 0) or 0)
+        ratio = fresh / max(1, at)
+        ws_med = float(hs.get("ws_med_ms", 9e9) or 9e9)
+        ok = (ratio >= WS_HEALTH_MIN_FRESH_RATIO) and (ws_med <= WS_HEALTH_MAX_MED_AGE_MS)
+        return ok, hs
 
     def _booster_locked(self) -> bool:
         return _time.time() < float(self._booster_lock_until or 0.0)
@@ -1701,7 +1715,9 @@ class LiveTrader:
             f"sync={CLOB_MARKET_WS_SYNC_SEC:.1f}s "
             f"book_ws_age(strict/soft)<={CLOB_MARKET_WS_MAX_AGE_MS:.0f}/{CLOB_MARKET_WS_SOFT_AGE_MS:.0f}ms "
             f"heal(hits/cooldown)={CLOB_WS_STALE_HEAL_HITS}/{CLOB_WS_STALE_HEAL_COOLDOWN_SEC:.0f}s "
-            f"pm_fallback={PM_BOOK_FALLBACK_ENABLED}"
+            f"pm_fallback={PM_BOOK_FALLBACK_ENABLED} "
+            f"ws_gate={WS_HEALTH_REQUIRED} ratio>={WS_HEALTH_MIN_FRESH_RATIO:.2f} "
+            f"ws_med<={WS_HEALTH_MAX_MED_AGE_MS:.0f}ms"
         )
         print(
             f"{B}[BOOT]{RS} scan_log_change_only={LOG_SCAN_ON_CHANGE_ONLY} "
@@ -6040,6 +6056,24 @@ class LiveTrader:
                     f"Settling(onchain): {self.onchain_redeemable_count}"
                 )
             self._scan_state_last = scan_state
+
+            # Hard pre-trade gate: require healthy WS books before evaluating/placing new entries.
+            if WS_HEALTH_REQUIRED:
+                ws_ok, hs = self._ws_trade_gate_ok()
+                if not ws_ok:
+                    self._skip_tick("ws_health_gate")
+                    if self._should_log("ws-health-gate", LOG_HEALTH_EVERY_SEC):
+                        at = int(hs.get("active_tokens", 0) or 0)
+                        fresh = int(hs.get("fresh_books", 0) or 0)
+                        ratio = (fresh / max(1, at)) if at > 0 else 0.0
+                        ws_med = float(hs.get("ws_med_ms", 9e9) or 9e9)
+                        print(
+                            f"{Y}[WS-GATE]{RS} skip entries: fresh_books={fresh}/{at} "
+                            f"ratio={ratio:.2f} < {WS_HEALTH_MIN_FRESH_RATIO:.2f} "
+                            f"or ws_med={ws_med:.0f}ms > {WS_HEALTH_MAX_MED_AGE_MS:.0f}ms"
+                        )
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    continue
 
             # Subscribe new markets to RTDS token price stream
             if self._rtds_ws:
