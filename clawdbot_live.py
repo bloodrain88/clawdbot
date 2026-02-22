@@ -297,7 +297,7 @@ USER_EVENTS_POLL_SEC = float(os.environ.get("USER_EVENTS_POLL_SEC", "0.8"))
 USER_EVENTS_CACHE_TTL_SEC = float(os.environ.get("USER_EVENTS_CACHE_TTL_SEC", "180"))
 CLOB_MARKET_WS_ENABLED = os.environ.get("CLOB_MARKET_WS_ENABLED", "true").lower() == "true"
 CLOB_MARKET_WS_SYNC_SEC = float(os.environ.get("CLOB_MARKET_WS_SYNC_SEC", "2.0"))
-CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "500"))
+CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "2000"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
 COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
@@ -328,6 +328,10 @@ MARKET_LEADER_SCORE_BONUS = int(os.environ.get("MARKET_LEADER_SCORE_BONUS", "2")
 MARKET_LEADER_EDGE_BONUS = float(os.environ.get("MARKET_LEADER_EDGE_BONUS", "0.010"))
 REQUIRE_LEADER_FLOW = os.environ.get("REQUIRE_LEADER_FLOW", "true").lower() == "true"
 REQUIRE_ORDERBOOK_WS = os.environ.get("REQUIRE_ORDERBOOK_WS", "true").lower() == "true"
+WS_BOOK_FALLBACK_ENABLED = os.environ.get("WS_BOOK_FALLBACK_ENABLED", "true").lower() == "true"
+WS_BOOK_FALLBACK_MAX_AGE_MS = float(os.environ.get("WS_BOOK_FALLBACK_MAX_AGE_MS", "2500"))
+LEADER_FLOW_FALLBACK_ENABLED = os.environ.get("LEADER_FLOW_FALLBACK_ENABLED", "true").lower() == "true"
+LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MAX_AGE_SEC", "90"))
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
 # Dynamic sizing guardrail for cheap-entry tails:
 # - keep default risk around LOW_ENTRY_BASE_SOFT_MAX
@@ -2666,6 +2670,13 @@ class LiveTrader:
             "ts": float(row.get("ts_ms", 0.0) or 0.0) / 1000.0,
         }
 
+    def _clob_ws_book_age_ms(self, token_id: str) -> float:
+        """Best-effort age for diagnostics; returns large number if missing."""
+        row = self._clob_ws_books.get(token_id or "")
+        if not row:
+            return 9e9
+        return (_time.time() * 1000.0) - float(row.get("ts_ms", 0.0) or 0.0)
+
     async def _stream_clob_market_book(self):
         """Realtime CLOB market channel: keep per-token best bid/ask + shallow asks in memory."""
         if DRY_RUN or (not CLOB_MARKET_WS_ENABLED):
@@ -2917,12 +2928,41 @@ class LiveTrader:
         (vwap_dev, vol_mult)       = self._binance_window_stats(asset, m["start_ts"])
         _pm_book = await self._fetch_pm_book_safe(prefetch_token)
         ws_book_now = self._get_clob_ws_book(prefetch_token, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+        if ws_book_now is None:
+            # Try alternate side token before declaring WS missing.
+            tok_u = str(m.get("token_up", "") or "")
+            tok_d = str(m.get("token_down", "") or "")
+            alt = tok_d if prefetch_token == tok_u else tok_u
+            if alt:
+                ws_book_now = self._get_clob_ws_book(alt, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
 
         # Realtime triad gating: orderbook + leader + volume signals.
         if REQUIRE_ORDERBOOK_WS and ws_book_now is None:
-            if self._noisy_log_enabled(f"skip-no-ws-book:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                print(f"{Y}[SKIP] {asset} {duration}m missing fresh CLOB WS book{RS}")
-            return None
+            # Soft fallback: if REST/PM book is fresh enough, continue with a small quality penalty.
+            pm_ok = False
+            pm_age_ms = 9e9
+            if isinstance(_pm_book, dict):
+                pm_ts = float(_pm_book.get("ts", 0.0) or 0.0)
+                pm_age_ms = ((_time.time() - pm_ts) * 1000.0) if pm_ts > 0 else 9e9
+                pm_best_ask = float(_pm_book.get("best_ask", 0.0) or 0.0)
+                pm_ok = pm_best_ask > 0 and pm_age_ms <= WS_BOOK_FALLBACK_MAX_AGE_MS
+            if WS_BOOK_FALLBACK_ENABLED and pm_ok:
+                score -= 1
+                edge -= 0.005
+                ws_book_now = _pm_book
+                if self._noisy_log_enabled(f"ws-fallback:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[WS-FALLBACK]{RS} {asset} {duration}m using PM book "
+                        f"(age={pm_age_ms:.0f}ms) — no fresh CLOB WS"
+                    )
+            else:
+                if self._noisy_log_enabled(f"skip-no-ws-book:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    ws_age_pref = self._clob_ws_book_age_ms(prefetch_token)
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m missing fresh CLOB WS book "
+                        f"(ws_age={ws_age_pref:.0f}ms pm_age={pm_age_ms:.0f}ms){RS}"
+                    )
+                return None
 
         # Additional instant signals from Binance cache (zero latency)
         dw_ob     = self._ob_depth_weighted(asset)
@@ -3145,6 +3185,7 @@ class LiveTrader:
         copy_adj = 0
         copy_net = 0.0
         leader_ready = False
+        leader_soft_ready = False
         flow = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
         if isinstance(flow, dict):
             up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
@@ -3154,7 +3195,12 @@ class LiveTrader:
             flow_age_s = (_time.time() - flow_ts) if flow_ts > 0 else 9e9
             flow_fresh = flow_age_s <= COPYFLOW_LIVE_MAX_AGE_SEC
             leader_net = up_conf - dn_conf
-            leader_ready = flow_fresh and (flow_n >= MARKET_LEADER_MIN_N)
+            # "Leader-flow present" should reflect data availability, not strict sample quality.
+            # Keep MARKET_LEADER_MIN_N only for force-follow logic below.
+            leader_ready = flow_fresh and (flow_n >= 1)
+            leader_soft_ready = (flow_n >= MARKET_LEADER_MIN_N) and (
+                flow_age_s <= LEADER_FLOW_FALLBACK_MAX_AGE_SEC
+            )
             # Strong per-market leader consensus: follow the market leaders on this CID.
             if (
                 MARKET_LEADER_FOLLOW_ENABLED
@@ -3206,9 +3252,21 @@ class LiveTrader:
                 score -= 1
                 edge -= 0.005
         if REQUIRE_LEADER_FLOW and (not leader_ready):
-            if self._noisy_log_enabled(f"skip-no-leader:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                print(f"{Y}[SKIP] {asset} {duration}m missing fresh leader-flow for this CID{RS}")
-            return None
+            if LEADER_FLOW_FALLBACK_ENABLED and leader_soft_ready:
+                score -= 1
+                edge -= 0.005
+                if self._noisy_log_enabled(f"leader-fallback:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[LEADER-FALLBACK]{RS} {asset} {duration}m using stale leader-flow "
+                        f"(age={flow_age_s:.1f}s n={flow_n})"
+                    )
+            else:
+                if self._noisy_log_enabled(f"skip-no-leader:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m missing fresh leader-flow for this CID "
+                        f"(age={flow_age_s:.1f}s n={flow_n}){RS}"
+                    )
+                return None
 
         # Pre-bid arm: for first seconds after open, bias side/execution to pre-planned signal.
         arm = self._prebid_plan.get(cid, {})
