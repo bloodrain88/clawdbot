@@ -307,6 +307,11 @@ COPYFLOW_INTEL_SETTLE_LAG_SEC = int(os.environ.get("COPYFLOW_INTEL_SETTLE_LAG_SE
 COPYFLOW_INTEL_MIN_SETTLED_FAMILY_24H = int(os.environ.get("COPYFLOW_INTEL_MIN_SETTLED_FAMILY_24H", "6"))
 COPYFLOW_INTEL_MIN_SETTLED_FAMILY_ALL = int(os.environ.get("COPYFLOW_INTEL_MIN_SETTLED_FAMILY_ALL", "20"))
 COPYFLOW_HTTP_MAX_PARALLEL = int(os.environ.get("COPYFLOW_HTTP_MAX_PARALLEL", "8"))
+MARKET_LEADER_FOLLOW_ENABLED = os.environ.get("MARKET_LEADER_FOLLOW_ENABLED", "true").lower() == "true"
+MARKET_LEADER_MIN_NET = float(os.environ.get("MARKET_LEADER_MIN_NET", "0.15"))
+MARKET_LEADER_MIN_N = int(os.environ.get("MARKET_LEADER_MIN_N", "30"))
+MARKET_LEADER_SCORE_BONUS = int(os.environ.get("MARKET_LEADER_SCORE_BONUS", "2"))
+MARKET_LEADER_EDGE_BONUS = float(os.environ.get("MARKET_LEADER_EDGE_BONUS", "0.010"))
 PREBID_ARM_ENABLED = os.environ.get("PREBID_ARM_ENABLED", "true").lower() == "true"
 PREBID_MIN_CONF = float(os.environ.get("PREBID_MIN_CONF", "0.58"))
 PREBID_ARM_WINDOW_SEC = float(os.environ.get("PREBID_ARM_WINDOW_SEC", "30"))
@@ -1364,6 +1369,11 @@ class LiveTrader:
             f"ev_net>={MIN_EV_NET:.3f} fee={FEE_RATE_EST:.4f} "
             f"risk(max_open/same_dir/cid)={MAX_OPEN}/{MAX_SAME_DIR}/{MAX_CID_EXPOSURE_PCT:.0%} "
             f"block_opp(cid/round)={BLOCK_OPPOSITE_SIDE_SAME_CID}/{BLOCK_OPPOSITE_SIDE_SAME_ROUND}"
+        )
+        print(
+            f"{B}[BOOT]{RS} leader_follow={MARKET_LEADER_FOLLOW_ENABLED} "
+            f"leader_min_net={MARKET_LEADER_MIN_NET:.2f} leader_min_n={MARKET_LEADER_MIN_N} "
+            f"leader_bonus(score/edge)={MARKET_LEADER_SCORE_BONUS}/{MARKET_LEADER_EDGE_BONUS:.3f}"
         )
         print(
             f"{B}[BOOT]{RS} "
@@ -2772,6 +2782,24 @@ class LiveTrader:
         if isinstance(flow, dict):
             up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
             dn_conf = float(flow.get("Down", flow.get("down", 0.0)) or 0.0)
+            flow_n = int(flow.get("n", 0) or 0)
+            leader_net = up_conf - dn_conf
+            # Strong per-market leader consensus: follow the market leaders on this CID.
+            if (
+                MARKET_LEADER_FOLLOW_ENABLED
+                and flow_n >= MARKET_LEADER_MIN_N
+                and abs(leader_net) >= MARKET_LEADER_MIN_NET
+            ):
+                leader_side = "Up" if leader_net > 0 else "Down"
+                if side != leader_side:
+                    if self._noisy_log_enabled(f"leader-follow:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{B}[LEADER-FOLLOW]{RS} {asset} {duration}m force {side}->{leader_side} "
+                            f"(up={up_conf:.2f} down={dn_conf:.2f} n={flow_n})"
+                        )
+                    side = leader_side
+                score += MARKET_LEADER_SCORE_BONUS
+                edge += MARKET_LEADER_EDGE_BONUS
             pref = up_conf if side == "Up" else dn_conf
             opp = dn_conf if side == "Up" else up_conf
             copy_net = pref - opp
