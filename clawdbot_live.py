@@ -2494,7 +2494,7 @@ class LiveTrader:
                 recently_filled_local = (
                     placed_ts > 0
                     and (now_ts - placed_ts) <= LIVE_LOCAL_GRACE_SEC
-                    and bool((t or {}).get("order_id", ""))
+                    and float((t or {}).get("size", 0.0) or 0.0) > 0
                 )
                 if not recently_filled_local:
                     continue
