@@ -117,6 +117,7 @@ POLYGON_RPCS = [
     "https://polygon.drpc.org",
     "https://rpc.ankr.com/polygon",
 ]
+USDC_E_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_ABI = [
     {"inputs":[{"name":"collateralToken","type":"address"},
                {"name":"parentCollectionId","type":"bytes32"},
@@ -506,6 +507,25 @@ class LiveTrader:
         if not cid:
             return "n/a"
         return f"{cid[:10]}..."
+
+    def _token_id_from_cid_side(self, cid: str, side: str) -> str:
+        """Derive ERC1155 position token_id from (conditionId, side) for binary markets."""
+        try:
+            h = str(cid or "").lower().replace("0x", "")
+            if len(h) != 64:
+                return ""
+            idx = 1 if side == "Up" else (2 if side == "Down" else 0)
+            if idx == 0:
+                return ""
+            cid_b = bytes.fromhex(h)
+            collection_id = Web3.solidity_keccak(["bytes32", "uint256"], [cid_b, idx])
+            position_id = Web3.solidity_keccak(
+                ["address", "bytes32"],
+                [Web3.to_checksum_address(USDC_E_ADDR), collection_id],
+            )
+            return str(int.from_bytes(position_id, "big"))
+        except Exception:
+            return ""
 
     def _is_exact_round_bounds(self, start_ts: float, end_ts: float, dur: int) -> bool:
         if start_ts <= 0 or end_ts <= 0 or dur <= 0:
@@ -4600,7 +4620,7 @@ class LiveTrader:
     async def _refresh_balance(self):
         """Always sync bankroll, trades and win rate from on-chain truth.
         Never skips — no local accounting assumptions."""
-        USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        USDC_E = USDC_E_ADDR
         ERC20_ABI = [{"inputs":[{"name":"account","type":"address"}],
                       "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
                       "stateMutability":"view","type":"function"}]
@@ -4660,6 +4680,8 @@ class LiveTrader:
                     for cid, (m_o, t_o) in list(self.pending.items()):
                         tok = str(t_o.get("token_id", "") or "").strip()
                         if not tok.isdigit():
+                            tok = self._token_id_from_cid_side(cid, str(t_o.get("side", "")))
+                        if not tok.isdigit():
                             continue
                         try:
                             bal_raw = await loop.run_in_executor(
@@ -4689,6 +4711,8 @@ class LiveTrader:
                             side_s, _ = val
                             m_s = {"conditionId": cid}
                             tok = ""
+                        if not tok.isdigit():
+                            tok = self._token_id_from_cid_side(cid, str(side_s))
                         if not tok.isdigit():
                             continue
                         try:
