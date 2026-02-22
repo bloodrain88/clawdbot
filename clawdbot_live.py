@@ -327,6 +327,13 @@ MARKET_LEADER_MIN_N = int(os.environ.get("MARKET_LEADER_MIN_N", "30"))
 MARKET_LEADER_SCORE_BONUS = int(os.environ.get("MARKET_LEADER_SCORE_BONUS", "2"))
 MARKET_LEADER_EDGE_BONUS = float(os.environ.get("MARKET_LEADER_EDGE_BONUS", "0.010"))
 REQUIRE_LEADER_FLOW = os.environ.get("REQUIRE_LEADER_FLOW", "true").lower() == "true"
+LEADER_SYNTHETIC_ENABLED = os.environ.get("LEADER_SYNTHETIC_ENABLED", "true").lower() == "true"
+LEADER_SYNTH_MIN_NET = float(os.environ.get("LEADER_SYNTH_MIN_NET", "0.08"))
+LEADER_SYNTH_SCORE_PENALTY = int(os.environ.get("LEADER_SYNTH_SCORE_PENALTY", "1"))
+LEADER_SYNTH_EDGE_PENALTY = float(os.environ.get("LEADER_SYNTH_EDGE_PENALTY", "0.005"))
+LEADER_FRESH_SIZE_SCALE = float(os.environ.get("LEADER_FRESH_SIZE_SCALE", "1.00"))
+LEADER_STALE_SIZE_SCALE = float(os.environ.get("LEADER_STALE_SIZE_SCALE", "0.75"))
+LEADER_SYNTH_SIZE_SCALE = float(os.environ.get("LEADER_SYNTH_SIZE_SCALE", "0.55"))
 REQUIRE_ORDERBOOK_WS = os.environ.get("REQUIRE_ORDERBOOK_WS", "true").lower() == "true"
 WS_BOOK_FALLBACK_ENABLED = os.environ.get("WS_BOOK_FALLBACK_ENABLED", "true").lower() == "true"
 WS_BOOK_FALLBACK_MAX_AGE_MS = float(os.environ.get("WS_BOOK_FALLBACK_MAX_AGE_MS", "2500"))
@@ -1560,6 +1567,15 @@ class LiveTrader:
             f"live_max_age={COPYFLOW_LIVE_MAX_AGE_SEC:.0f}s "
             f"intel_refresh={COPYFLOW_INTEL_REFRESH_SEC}s "
             f"copy_http_parallel={COPYFLOW_HTTP_MAX_PARALLEL}"
+        )
+        print(
+            f"{B}[BOOT]{RS} leader_tiers "
+            f"require={REQUIRE_LEADER_FLOW} "
+            f"synth={LEADER_SYNTHETIC_ENABLED} "
+            f"synth_min_net={LEADER_SYNTH_MIN_NET:.2f} "
+            f"penalty(score/edge)={LEADER_SYNTH_SCORE_PENALTY}/{LEADER_SYNTH_EDGE_PENALTY:.3f} "
+            f"size_scale(fresh/stale/synth)="
+            f"{LEADER_FRESH_SIZE_SCALE:.2f}/{LEADER_STALE_SIZE_SCALE:.2f}/{LEADER_SYNTH_SIZE_SCALE:.2f}"
         )
         print(
             f"{B}[BOOT]{RS} clob_market_ws={CLOB_MARKET_WS_ENABLED} "
@@ -3187,6 +3203,13 @@ class LiveTrader:
         copy_net = 0.0
         leader_ready = False
         leader_soft_ready = False
+        signal_tier = "TIER-C"
+        signal_source = "synthetic"
+        leader_size_scale = LEADER_SYNTH_SIZE_SCALE
+        flow_n = 0
+        flow_age_s = 9e9
+        up_conf = 0.0
+        dn_conf = 0.0
         flow = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
         if isinstance(flow, dict):
             up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
@@ -3222,6 +3245,9 @@ class LiveTrader:
                         side = leader_side
                     score += MARKET_LEADER_SCORE_BONUS
                     edge += MARKET_LEADER_EDGE_BONUS
+                    signal_tier = "TIER-A"
+                    signal_source = "leader-fresh"
+                    leader_size_scale = LEADER_FRESH_SIZE_SCALE
                 elif self._noisy_log_enabled(f"leader-follow-bypass:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                     print(
                         f"{Y}[LEADER-BYPASS]{RS} {asset} {duration}m leader={leader_side} "
@@ -3252,11 +3278,49 @@ class LiveTrader:
                 # Winners buying low-cents but market now expensive: fade confidence.
                 score -= 1
                 edge -= 0.005
+        if leader_ready and signal_source != "leader-fresh":
+            signal_tier = "TIER-A"
+            signal_source = "leader-live"
+            leader_size_scale = LEADER_FRESH_SIZE_SCALE
         if REQUIRE_LEADER_FLOW and (not leader_ready):
-            if LEADER_FLOW_FALLBACK_ENABLED:
+            if leader_soft_ready and LEADER_FLOW_FALLBACK_ENABLED:
+                signal_tier = "TIER-B"
+                signal_source = "leader-stale"
+                leader_size_scale = LEADER_STALE_SIZE_SCALE
+                score -= 1
+                edge -= 0.005
+                if self._noisy_log_enabled(f"leader-soft:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[LEADER-SOFT]{RS} {asset} {duration}m stale leader-flow "
+                        f"(age={flow_age_s:.1f}s n={flow_n})"
+                    )
+            elif LEADER_SYNTHETIC_ENABLED:
+                # Synthetic leader proxy from realtime microstructure when CID flow is missing.
+                # This keeps coverage without hard-blocking on sparse wallet flow.
+                synth_net = max(-1.0, min(1.0, 0.75 * ob_sig + 0.90 * ((taker_ratio - 0.5) * 2.0)))
+                if abs(synth_net) >= LEADER_SYNTH_MIN_NET:
+                    pref_s = synth_net if side == "Up" else -synth_net
+                    copy_net = max(copy_net, pref_s)
+                    copy_adj_s = int(round(max(-1, min(1, copy_net * COPYFLOW_BONUS_MAX))))
+                    score += copy_adj_s
+                    edge += copy_net * 0.006
+                score -= LEADER_SYNTH_SCORE_PENALTY
+                edge -= LEADER_SYNTH_EDGE_PENALTY
+                signal_tier = "TIER-C"
+                signal_source = "synthetic-obflow"
+                leader_size_scale = LEADER_SYNTH_SIZE_SCALE
+                if self._noisy_log_enabled(f"leader-synth:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[LEADER-SYNTH]{RS} {asset} {duration}m no fresh leader-flow "
+                        f"(n={flow_n} age={flow_age_s:.1f}s) -> synth_net={synth_net:+.2f}"
+                    )
+            elif LEADER_FLOW_FALLBACK_ENABLED:
                 # Keep trading with a quality penalty when leader-flow is unavailable/stale.
                 score -= 2
                 edge -= 0.01
+                signal_tier = "TIER-C"
+                signal_source = "fallback-no-leader"
+                leader_size_scale = LEADER_SYNTH_SIZE_SCALE
                 if self._noisy_log_enabled(f"leader-fallback:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     if flow_n <= 0:
                         print(
@@ -3485,7 +3549,7 @@ class LiveTrader:
         model_size = round(
             min(
                 hard_cap,
-                raw_size * vol_mult * wr_scale * oracle_scale * bucket_scale * cents_scale * time_scale,
+                raw_size * vol_mult * wr_scale * oracle_scale * bucket_scale * cents_scale * time_scale * leader_size_scale,
             ),
             2,
         )
@@ -3541,6 +3605,9 @@ class LiveTrader:
             "min_entry_allowed": min_entry_allowed,
             "copy_adj": copy_adj,
             "copy_net": copy_net,
+            "signal_tier": signal_tier,
+            "signal_source": signal_source,
+            "leader_size_scale": leader_size_scale,
             "book_age_ms": book_age_ms,
             "quote_age_ms": quote_age_ms,
             "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
@@ -3611,10 +3678,13 @@ class LiveTrader:
         else:
             hc_tag = " hc15" if sig.get("hc15_mode") else ""
             cp_tag = f" copy={sig.get('copy_adj',0):+d}" if sig.get("copy_adj", 0) else ""
+            tier_tag = f" {sig.get('signal_tier','TIER-?')}/{sig.get('signal_source','na')}"
+            scale_tag = f" szx={float(sig.get('leader_size_scale', 1.0) or 1.0):.2f}"
             print(f"{tag} {sig['asset']} {sig['duration']}m {sig['side']} | "
                   f"score={score} edge={sig['edge']:+.3f} size=${sig['size']:.2f} "
                   f"entry={sig['entry']:.3f} src={sig.get('open_price_source','?')} "
-                  f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{hc_tag}{cp_tag}{agree_str}{RS}")
+                  f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{tier_tag}{scale_tag}"
+                  f"{hc_tag}{cp_tag}{agree_str}{RS}")
 
         try:
             duration = int(sig.get("duration", 0) or 0)
