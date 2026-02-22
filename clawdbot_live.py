@@ -157,6 +157,9 @@ MIN_ORDER_SIZE_SHARES = float(os.environ.get("MIN_ORDER_SIZE_SHARES", "5.0"))
 ORDER_SIZE_PAD_SHARES = float(os.environ.get("ORDER_SIZE_PAD_SHARES", "0.02"))
 MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.025"))
 DUST_RECOVER_MIN = float(os.environ.get("DUST_RECOVER_MIN", "0.50"))
+# Presence threshold for on-chain position visibility/sync.
+# Keep this low and independent from recovery sizing thresholds.
+OPEN_PRESENCE_MIN = float(os.environ.get("OPEN_PRESENCE_MIN", "0.01"))
 MAX_ABS_BET    = float(os.environ.get("MAX_ABS_BET", "14.0"))     # hard ceiling
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
 MAX_OPEN       = int(os.environ.get("MAX_OPEN", "8"))
@@ -4270,8 +4273,8 @@ class LiveTrader:
 
             self.seen.add(cid)
 
-            # Skip dust positions — too small to be a real bot bet
-            if val < DUST_BET:
+            # Keep all materially present on-chain positions for sync/reconcile.
+            if val < OPEN_PRESENCE_MIN:
                 continue
 
             # Fetch real market data from Gamma API — always, even if already in pending
@@ -5407,7 +5410,7 @@ class LiveTrader:
                         continue
                     side = str(p.get("outcome", "") or "")
                     val = float(p.get("currentValue", 0) or 0.0)
-                    if not side or val < DUST_RECOVER_MIN:
+                    if not side or val < OPEN_PRESENCE_MIN:
                         continue
                     title = str(p.get("title", "") or "")
                     redeemable = bool(p.get("redeemable", False))
@@ -5569,7 +5572,7 @@ class LiveTrader:
                     for p in positions
                     if not p.get("redeemable", False)
                     and p.get("outcome", "")
-                    and float(p.get("currentValue", 0) or 0) >= DUST_RECOVER_MIN
+                    and float(p.get("currentValue", 0) or 0) >= OPEN_PRESENCE_MIN
                     and p.get("conditionId", "")
                 }
                 # On-chain-first cleanup: if a local pending CID is neither on-chain nor API-active
@@ -5612,7 +5615,7 @@ class LiveTrader:
                     val  = float(p.get("currentValue", 0))
                     side = p.get("outcome", "")
                     title = p.get("title", "")
-                    if rdm or not side or not cid or val < DUST_RECOVER_MIN:
+                    if rdm or not side or not cid or val < OPEN_PRESENCE_MIN:
                         continue
                     if cid in self.pending or cid in self.pending_redeem:
                         continue
@@ -5929,7 +5932,7 @@ class LiveTrader:
                     if rdm or not side or not cid:
                         continue
                     self.seen.add(cid)
-                    if val < DUST_RECOVER_MIN:   # tiny dust — mark seen only, don't track
+                    if val < OPEN_PRESENCE_MIN:   # tiny dust — mark seen only, don't track
                         continue
                     if cid in self.redeemed_cids:
                         continue   # already processed — don't re-add
