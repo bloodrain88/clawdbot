@@ -4008,18 +4008,26 @@ class LiveTrader:
         score_slack = 0.02 if score >= 12 else (0.01 if score >= 9 else 0.0)
         max_entry_allowed = min(0.97, MAX_ENTRY_PRICE + MAX_ENTRY_TOL + score_slack)
         min_entry_allowed = 0.01
+        base_min_entry_allowed = 0.01
+        base_max_entry_allowed = max_entry_allowed
         if duration <= 5:
             max_entry_allowed = min(max_entry_allowed, MAX_ENTRY_PRICE_5M)
             min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_5M)
+            base_min_entry_allowed = min_entry_allowed
+            base_max_entry_allowed = max_entry_allowed
             if MAX_WIN_MODE:
                 max_entry_allowed = min(max_entry_allowed, WINMODE_MAX_ENTRY_5M)
         else:
             min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_15M)
+            base_min_entry_allowed = min_entry_allowed
+            base_max_entry_allowed = max_entry_allowed
             if MAX_WIN_MODE:
                 max_entry_allowed = min(max_entry_allowed, WINMODE_MAX_ENTRY_15M)
         # Adaptive model-consistent cap: if conviction is high, allow higher entry as long
         # expected value after fees remains positive.
         min_ev_base = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
+        base_min_ev_req = float(min_ev_base)
+        base_min_payout_req = float(MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT)
         model_cap = true_prob / max(1.0 + FEE_RATE_EST + max(0.003, min_ev_base), 1e-9)
         if score >= 9:
             max_entry_allowed = max(max_entry_allowed, min(0.85, model_cap))
@@ -4033,6 +4041,21 @@ class LiveTrader:
         if ws_fresh and cl_fresh and vol_fresh and mins_left >= (4.0 if duration >= 15 else 2.0):
             max_entry_allowed = min(0.90, max_entry_allowed + 0.02)
         max_entry_allowed = min(max_entry_allowed, adaptive_hard_cap)
+        # Dynamic min-entry (not fixed hard floor): adapt to setup quality + microstructure.
+        # High-quality setup can dip lower for super-payout entries; weaker setup is stricter.
+        min_entry_dyn = float(base_min_entry_allowed)
+        if setup_q >= 0.72 and vol_ratio >= 1.10 and tf_votes >= 2:
+            relax = min(0.08, (setup_q - 0.72) * 0.20)  # up to -8c
+            min_entry_dyn = max(0.01, min_entry_dyn - relax)
+        elif setup_q <= 0.58:
+            tighten = min(0.06, (0.58 - setup_q) * 0.25)  # up to +6c
+            min_entry_dyn = min(0.45, min_entry_dyn + tighten)
+        if mins_left <= (3.5 if duration >= 15 else 1.8):
+            # Near expiry, avoid ultra-low entries that are mostly noise/fill artifacts.
+            min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + 0.01)
+        if not ws_fresh:
+            min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + 0.01)
+        min_entry_allowed = max(0.01, min(min_entry_dyn, max_entry_allowed - 0.01))
         # High-conviction 15m mode: target lower cents early for better payout.
         hc15 = (
             HC15_ENABLED and duration == 15 and
@@ -4108,8 +4131,10 @@ class LiveTrader:
         if self._noisy_log_enabled("flow-thresholds", LOG_FLOW_EVERY_SEC):
             print(
                 f"{B}[FLOW]{RS} "
-                f"payout>={min_payout_req:.2f}x ev>={min_ev_req:.3f} "
-                f"entry=[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]"
+                f"payout>={base_min_payout_req:.2f}x→{min_payout_req:.2f}x "
+                f"ev>={base_min_ev_req:.3f}→{min_ev_req:.3f} "
+                f"entry=[{base_min_entry_allowed:.2f},{base_max_entry_allowed:.2f}]→"
+                f"[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]"
             )
         booster_mode = False
         booster_note = ""
