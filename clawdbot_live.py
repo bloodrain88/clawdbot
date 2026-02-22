@@ -168,13 +168,14 @@ TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "8"))
-MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "6"))
-MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.58"))
+MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "8"))
+MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
 MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.015"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.35"))
 MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.52"))
-MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "1.85"))
-MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.018"))
+MIN_ENTRY_PRICE_15M = float(os.environ.get("MIN_ENTRY_PRICE_15M", "0.30"))
+MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "2.20"))
+MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.040"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
 HC15_ENABLED = os.environ.get("HC15_ENABLED", "false").lower() == "true"
 HC15_MIN_SCORE = int(os.environ.get("HC15_MIN_SCORE", "10"))
@@ -198,7 +199,7 @@ STRICT_PM_SOURCE = os.environ.get("STRICT_PM_SOURCE", "true").lower() == "true"
 MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "1200"))
 MAX_QUOTE_STALENESS_MS = float(os.environ.get("MAX_QUOTE_STALENESS_MS", "1200"))
 MIN_MINS_LEFT_5M = float(os.environ.get("MIN_MINS_LEFT_5M", "1.2"))
-MIN_MINS_LEFT_15M = float(os.environ.get("MIN_MINS_LEFT_15M", "1.2"))
+MIN_MINS_LEFT_15M = float(os.environ.get("MIN_MINS_LEFT_15M", "3.0"))
 LATE_DIR_LOCK_ENABLED = os.environ.get("LATE_DIR_LOCK_ENABLED", "true").lower() == "true"
 LATE_DIR_LOCK_MIN_LEFT_5M = float(os.environ.get("LATE_DIR_LOCK_MIN_LEFT_5M", "2.2"))
 LATE_DIR_LOCK_MIN_LEFT_15M = float(os.environ.get("LATE_DIR_LOCK_MIN_LEFT_15M", "6.0"))
@@ -2861,8 +2862,10 @@ class LiveTrader:
             min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_5M)
             if MAX_WIN_MODE:
                 max_entry_allowed = min(max_entry_allowed, WINMODE_MAX_ENTRY_5M)
-        elif MAX_WIN_MODE:
-            max_entry_allowed = min(max_entry_allowed, WINMODE_MAX_ENTRY_15M)
+        else:
+            min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_15M)
+            if MAX_WIN_MODE:
+                max_entry_allowed = min(max_entry_allowed, WINMODE_MAX_ENTRY_15M)
         # Adaptive model-consistent cap: if conviction is high, allow higher entry as long
         # expected value after fees remains positive.
         min_ev_base = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
