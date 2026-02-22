@@ -4706,8 +4706,10 @@ class LiveTrader:
                     # Open (unresolved) positions from local tracked cids, valued by token price cache.
                     for cid, (m_o, t_o) in list(self.pending.items()):
                         tok = str(t_o.get("token_id", "") or "").strip()
+                        side_o = str(t_o.get("side", ""))
+                        derived_tok = self._token_id_from_cid_side(cid, side_o)
                         if not tok.isdigit():
-                            tok = self._token_id_from_cid_side(cid, str(t_o.get("side", "")))
+                            tok = derived_tok
                         if not tok.isdigit():
                             continue
                         try:
@@ -4716,6 +4718,17 @@ class LiveTrader:
                                 lambda ti=int(tok): ctf_bal_contract.functions.balanceOf(addr_cs, ti).call(),
                             )
                             qty = bal_raw / 1e6
+                            # Fallback: if saved token_id is stale/wrong, retry with deterministic on-chain token_id.
+                            if qty <= 0 and derived_tok.isdigit() and derived_tok != tok:
+                                bal_raw2 = await loop.run_in_executor(
+                                    None,
+                                    lambda ti=int(derived_tok): ctf_bal_contract.functions.balanceOf(addr_cs, ti).call(),
+                                )
+                                qty2 = bal_raw2 / 1e6
+                                if qty2 > 0:
+                                    tok = derived_tok
+                                    qty = qty2
+                                    t_o["token_id"] = tok
                             if qty <= 0:
                                 continue
                             px = float(self.token_prices.get(tok) or 0.0)
@@ -4739,8 +4752,9 @@ class LiveTrader:
                             side_s, _ = val
                             m_s = {"conditionId": cid}
                             tok = ""
+                        derived_tok = self._token_id_from_cid_side(cid, str(side_s))
                         if not tok.isdigit():
-                            tok = self._token_id_from_cid_side(cid, str(side_s))
+                            tok = derived_tok
                         if not tok.isdigit():
                             continue
                         try:
@@ -4764,6 +4778,15 @@ class LiveTrader:
                                 lambda ti=int(tok): ctf_bal_contract.functions.balanceOf(addr_cs, ti).call(),
                             )
                             qty = bal_raw / 1e6
+                            if qty <= 0 and derived_tok.isdigit() and derived_tok != tok:
+                                bal_raw2 = await loop.run_in_executor(
+                                    None,
+                                    lambda ti=int(derived_tok): ctf_bal_contract.functions.balanceOf(addr_cs, ti).call(),
+                                )
+                                qty2 = bal_raw2 / 1e6
+                                if qty2 > 0:
+                                    tok = derived_tok
+                                    qty = qty2
                             if qty <= 0:
                                 continue
                             settling_claim_val += qty
