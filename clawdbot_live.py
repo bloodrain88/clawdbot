@@ -429,6 +429,8 @@ MAX_BOOK_SPREAD_15M = float(os.environ.get("MAX_BOOK_SPREAD_15M", "0.120"))
 MAKER_ENTRY_TICK_TOL = int(os.environ.get("MAKER_ENTRY_TICK_TOL", "1"))
 ORDER_RETRY_MAX = int(os.environ.get("ORDER_RETRY_MAX", "4"))
 ORDER_RETRY_BASE_SEC = float(os.environ.get("ORDER_RETRY_BASE_SEC", "0.35"))
+MAKER_PULLBACK_MAX_GAP_TICKS_5M = int(os.environ.get("MAKER_PULLBACK_MAX_GAP_TICKS_5M", "4"))
+MAKER_PULLBACK_MAX_GAP_TICKS_15M = int(os.environ.get("MAKER_PULLBACK_MAX_GAP_TICKS_15M", "6"))
 
 # Entry timing optimizer (15m):
 # keep initial strong thesis, but allow a short wait for better pricing.
@@ -5216,6 +5218,39 @@ class LiveTrader:
                         maker_price = max(tick, entry_cap)
                 maker_edge   = true_prob - maker_price
                 maker_price_order = round(maker_price, 2)
+                # If maker pullback target is too far from current book, skip futile maker post.
+                # In that case try immediate taker only if still executable and +edge.
+                if (not use_limit) and (not force_taker):
+                    gap_ticks = 0.0
+                    if tick > 0:
+                        gap_ticks = max(0.0, (best_bid - maker_price) / tick)
+                    max_gap_ticks = MAKER_PULLBACK_MAX_GAP_TICKS_5M if duration <= 5 else MAKER_PULLBACK_MAX_GAP_TICKS_15M
+                    if gap_ticks > float(max_gap_ticks):
+                        eff_max_entry = max_entry_allowed if max_entry_allowed is not None else 0.99
+                        if best_ask <= eff_max_entry and taker_edge >= edge_floor:
+                            taker_price = round(min(best_ask, eff_max_entry, 0.97), 4)
+                            slip_now = _slip_bps(taker_price, best_ask)
+                            needed_notional = _normalize_buy_amount(size_usdc) * FAST_FOK_MIN_DEPTH_RATIO
+                            depth_now = _book_depth_usdc(asks, taker_price)
+                            if depth_now >= needed_notional and slip_now <= slip_cap_bps:
+                                print(
+                                    f"{Y}[MAKER-BYPASS]{RS} {asset} {side} pullback too far "
+                                    f"(gap={gap_ticks:.1f} ticks>{max_gap_ticks}) -> FOK @ {taker_price:.3f}"
+                                )
+                                resp, _ = await _post_limit_fok(taker_price)
+                                order_id = resp.get("orderID") or resp.get("id", "")
+                                if resp.get("status") in ("matched", "filled"):
+                                    self.bankroll -= size_usdc
+                                    print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                                    return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_maker_bypass", "notional_usdc": size_usdc}
+                                print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=maker_bypass_fok_unfilled")
+                                return None
+                        print(
+                            f"{Y}[SKIP]{RS} {asset} {side} maker pullback too far "
+                            f"(gap={gap_ticks:.1f} ticks>{max_gap_ticks})"
+                        )
+                        self._skip_tick("maker_pullback_too_far")
+                        return None
                 size_tok_m, maker_notional = _normalize_order_size(maker_price_order, size_usdc)
                 size_usdc = maker_notional
                 if size_usdc < hard_min_notional:
