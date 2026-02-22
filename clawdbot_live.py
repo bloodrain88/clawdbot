@@ -2912,12 +2912,40 @@ class LiveTrader:
         wr_scale   = self._wr_bet_scale()
         oracle_scale = 0.60 if fresh_cl_disagree else (0.80 if not cl_agree else 1.0)
         bucket_scale = self._bucket_size_scale(duration, score, entry)
+        # Risk-aware size decay for tail-priced entries and near-expiry windows.
+        # This preserves signal direction while preventing oversized bets on 2c/7c tails.
+        cents_scale = 1.0
+        if entry <= 0.03:
+            cents_scale = 0.12
+        elif entry <= 0.05:
+            cents_scale = 0.18
+        elif entry <= 0.10:
+            cents_scale = 0.28
+        elif entry <= 0.20:
+            cents_scale = 0.45
+        time_scale = 1.0
+        if duration >= 15:
+            if mins_left <= 2.5:
+                time_scale = 0.20
+            elif mins_left <= 3.5:
+                time_scale = 0.35
+            elif mins_left <= 5.0:
+                time_scale = 0.55
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
         max_single = min(100.0, self.bankroll * bankroll_pct)
         cid_cap    = max(0.50, self.bankroll * MAX_CID_EXPOSURE_PCT)
         hard_cap   = max(0.50, min(max_single, cid_cap, self.bankroll * MAX_BANKROLL_PCT))
-        model_size = round(min(hard_cap, raw_size * vol_mult * wr_scale * oracle_scale * bucket_scale), 2)
+        model_size = round(
+            min(
+                hard_cap,
+                raw_size * vol_mult * wr_scale * oracle_scale * bucket_scale * cents_scale * time_scale,
+            ),
+            2,
+        )
         dyn_floor  = min(hard_cap, max(MIN_BET_ABS, self.bankroll * MIN_BET_PCT))
+        # Never force a big floor size on ultra-cheap tails or near-expiry entries.
+        if entry <= 0.10 or (duration >= 15 and mins_left <= 3.5):
+            dyn_floor = min(dyn_floor, MIN_BET_ABS)
         # If model size is too small and setup is not top quality, skip instead of forcing a noisy tiny bet.
         if model_size < dyn_floor:
             hi_conf = (score >= 12 and true_prob >= 0.62 and edge >= 0.03)
