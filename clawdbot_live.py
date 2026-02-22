@@ -238,6 +238,7 @@ CHAINLINK_ABI = [
 SCAN_INTERVAL  = float(os.environ.get("SCAN_INTERVAL", "0.5"))
 PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "2"))
 STATUS_INTERVAL= int(os.environ.get("STATUS_INTERVAL", "15"))
+ONCHAIN_SYNC_SEC = float(os.environ.get("ONCHAIN_SYNC_SEC", "2.0"))
 _DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
 LOG_FILE       = os.path.join(_DATA_DIR, "clawdbot_live_trades.csv")
 PENDING_FILE   = os.path.join(_DATA_DIR, "clawdbot_pending.json")
@@ -1429,6 +1430,7 @@ class LiveTrader:
         print(
             f"{B}[BOOT]{RS} redeem_poll={REDEEM_POLL_SEC:.1f}s "
             f"force_redeem_scan={FORCE_REDEEM_SCAN_SEC}s "
+            f"onchain_sync={ONCHAIN_SYNC_SEC:.1f}s "
             f"heartbeat={CLOB_HEARTBEAT_SEC:.1f}s "
             f"book_cache={BOOK_CACHE_TTL_MS:.0f}ms/{BOOK_CACHE_MAX}"
         )
@@ -5367,7 +5369,7 @@ class LiveTrader:
 
         tick = 0
         while True:
-            await asyncio.sleep(STATUS_INTERVAL)
+            await asyncio.sleep(max(0.8, ONCHAIN_SYNC_SEC))
             if DRY_RUN or self.w3 is None:
                 continue
             tick += 1
@@ -5518,12 +5520,15 @@ class LiveTrader:
                 self.onchain_open_stake_total = round(open_stake_total, 2)
                 self.onchain_redeemable_usdc = round(settling_claim_val, 2)
                 self.onchain_open_mark_value = round(open_val, 2)
-                self.onchain_open_count = int(open_count)
                 self.onchain_open_cids = set(onchain_open_cids)
                 self.onchain_open_usdc_by_cid = dict(onchain_open_usdc_by_cid)
                 self.onchain_open_stake_by_cid = dict(onchain_open_stake_by_cid)
                 self.onchain_open_shares_by_cid = dict(onchain_open_shares_by_cid)
                 self.onchain_open_meta_by_cid = dict(onchain_open_meta_by_cid)
+                # Count unique CIDs for stable on-chain open/settling counters.
+                open_count = len(onchain_open_cids)
+                settling_claim_count = len(onchain_settling_usdc_by_cid)
+                self.onchain_open_count = int(open_count)
                 self.onchain_redeemable_count = int(settling_claim_count)
                 self.onchain_settling_usdc_by_cid = dict(onchain_settling_usdc_by_cid)
                 self.onchain_total_equity = total
