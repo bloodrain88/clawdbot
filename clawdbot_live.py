@@ -269,6 +269,9 @@ BOOK_CACHE_TTL_MS = float(os.environ.get("BOOK_CACHE_TTL_MS", "180"))
 BOOK_CACHE_MAX = int(os.environ.get("BOOK_CACHE_MAX", "256"))
 BOOK_FETCH_CONCURRENCY = int(os.environ.get("BOOK_FETCH_CONCURRENCY", "16"))
 CLOB_HEARTBEAT_SEC = float(os.environ.get("CLOB_HEARTBEAT_SEC", "6"))
+USER_EVENTS_ENABLED = os.environ.get("USER_EVENTS_ENABLED", "true").lower() == "true"
+USER_EVENTS_POLL_SEC = float(os.environ.get("USER_EVENTS_POLL_SEC", "0.8"))
+USER_EVENTS_CACHE_TTL_SEC = float(os.environ.get("USER_EVENTS_CACHE_TTL_SEC", "180"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
 COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
@@ -399,6 +402,7 @@ class LiveTrader:
         self._book_sem       = asyncio.Semaphore(max(1, BOOK_FETCH_CONCURRENCY))
         self._heartbeat_last_ok = 0.0
         self._heartbeat_id   = ""
+        self._order_event_cache = {}  # order_id -> {"status": str, "filled_size": float, "ts": float}
         self.cl_prices       = {}    # Chainlink oracle prices (resolution source)
         self.cl_updated      = {}    # Chainlink last update timestamp per asset
         self.bankroll        = BANKROLL
@@ -716,6 +720,77 @@ class LiveTrader:
                 return await coro
 
         return await asyncio.gather(*[_run(c) for c in coros], return_exceptions=True)
+
+    def _prune_order_event_cache(self):
+        cutoff = _time.time() - max(10.0, USER_EVENTS_CACHE_TTL_SEC)
+        for oid, ev in list(self._order_event_cache.items()):
+            if float(ev.get("ts", 0.0) or 0.0) < cutoff:
+                self._order_event_cache.pop(oid, None)
+
+    def _cache_order_event(self, oid: str, status: str = "", filled_size: float = 0.0):
+        oid = (oid or "").strip()
+        if not oid:
+            return
+        st = (status or "").lower().strip()
+        prev = self._order_event_cache.get(oid, {})
+        fs_prev = float(prev.get("filled_size", 0.0) or 0.0)
+        self._order_event_cache[oid] = {
+            "status": st or str(prev.get("status", "")),
+            "filled_size": max(fs_prev, float(filled_size or 0.0)),
+            "ts": _time.time(),
+        }
+
+    def _extract_order_event(self, row: dict):
+        """Best-effort normalize notifications row into (order_id, status, filled_size)."""
+        if not isinstance(row, dict):
+            return "", "", 0.0
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        o = row.get("order") if isinstance(row.get("order"), dict) else {}
+        oid = (
+            row.get("order_id")
+            or row.get("orderID")
+            or row.get("orderId")
+            or payload.get("order_id")
+            or payload.get("orderID")
+            or payload.get("orderId")
+            or o.get("id")
+            or o.get("order_id")
+            or ""
+        )
+        status = (
+            row.get("status")
+            or row.get("event_type")
+            or row.get("type")
+            or payload.get("status")
+            or payload.get("event_type")
+            or payload.get("type")
+            or o.get("status")
+            or ""
+        )
+        filled_size = (
+            row.get("filled_size")
+            or row.get("filledSize")
+            or payload.get("filled_size")
+            or payload.get("filledSize")
+            or o.get("filled_size")
+            or o.get("filledSize")
+            or 0.0
+        )
+        try:
+            filled_size = float(filled_size or 0.0)
+        except Exception:
+            filled_size = 0.0
+        st = str(status or "").lower()
+        # Normalize common variants.
+        if st in ("match", "matched", "fill", "filled", "trade"):
+            st = "filled"
+        elif st in ("cancel", "canceled", "cancelled", "killed", "rejected"):
+            st = "canceled"
+        elif st in ("open", "live", "placed", "created"):
+            st = "live"
+        return str(oid or ""), st, filled_size
 
     async def _get_order_book(self, token_id: str, force_fresh: bool = False):
         """Low-latency orderbook fetch with tiny TTL cache to avoid duplicate roundtrips."""
@@ -1256,6 +1331,10 @@ class LiveTrader:
             f"force_redeem_scan={FORCE_REDEEM_SCAN_SEC}s "
             f"heartbeat={CLOB_HEARTBEAT_SEC:.1f}s "
             f"book_cache={BOOK_CACHE_TTL_MS:.0f}ms/{BOOK_CACHE_MAX}"
+        )
+        print(
+            f"{B}[BOOT]{RS} user_events={USER_EVENTS_ENABLED} "
+            f"poll={USER_EVENTS_POLL_SEC:.2f}s cache_ttl={USER_EVENTS_CACHE_TTL_SEC:.0f}s"
         )
         print(f"{B}[BOOT]{RS} rpc={self._rpc_url or 'none'} | top={rpc_str}")
 
@@ -3171,12 +3250,28 @@ class LiveTrader:
                       f"waiting up to {polls*poll_interval}s for fill...{RS}")
 
                 filled = False
-                for _ in range(polls):
+                for i in range(polls):
                     await asyncio.sleep(poll_interval)
+                    ev = self._order_event_cache.get(order_id, {})
+                    ev_status = str(ev.get("status", "") or "").lower()
+                    if ev_status == "filled":
+                        filled = True
+                        break
+                    if ev_status == "canceled":
+                        break
                     try:
-                        info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                        # Poll fallback only every other tick when user-events cache is active.
+                        if i % 2 == 0:
+                            info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                        else:
+                            info = None
                         if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
                             filled = True
+                            self._cache_order_event(
+                                order_id,
+                                "filled",
+                                float(info.get("filled_size") or info.get("filledSize") or 0.0),
+                            )
                             break
                     except Exception:
                         pass
@@ -3192,16 +3287,23 @@ class LiveTrader:
                 # Partial maker fill protection:
                 # status may remain "live" while filled_size > 0. Track it so position is not missed.
                 try:
-                    info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                    ev = self._order_event_cache.get(order_id, {})
+                    ev_fill = float(ev.get("filled_size", 0.0) or 0.0)
+                    info = None
+                    if ev_fill <= 0:
+                        info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
                     if isinstance(info, dict):
                         filled_sz = float(info.get("filled_size") or info.get("filledSize") or 0.0)
-                        if filled_sz > 0:
-                            fill_usdc = filled_sz * maker_price
-                            if fill_usdc >= DUST_RECOVER_MIN:
-                                self.bankroll -= min(size_usdc, fill_usdc)
-                                print(f"{Y}[PARTIAL]{RS} {side} {asset} {duration}m | "
-                                      f"filled≈${fill_usdc:.2f} @ {maker_price:.3f} | tracking open position")
-                                return {"order_id": order_id, "fill_price": maker_price, "mode": "maker_partial", "notional_usdc": min(size_usdc, fill_usdc)}
+                    else:
+                        filled_sz = ev_fill
+                    if filled_sz > 0:
+                        self._cache_order_event(order_id, "live", filled_sz)
+                        fill_usdc = filled_sz * maker_price
+                        if fill_usdc >= DUST_RECOVER_MIN:
+                            self.bankroll -= min(size_usdc, fill_usdc)
+                            print(f"{Y}[PARTIAL]{RS} {side} {asset} {duration}m | "
+                                  f"filled≈${fill_usdc:.2f} @ {maker_price:.3f} | tracking open position")
+                            return {"order_id": order_id, "fill_price": maker_price, "mode": "maker_partial", "notional_usdc": min(size_usdc, fill_usdc)}
                 except Exception:
                     self._errors.tick("order_partial_check", print, every=50)
 
@@ -3269,6 +3371,7 @@ class LiveTrader:
 
                 if order_id and status in ("matched", "filled"):
                     self.bankroll -= size_usdc
+                    self._cache_order_event(order_id, "filled", 0.0)
                     print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
                           f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
                     return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_fallback", "notional_usdc": size_usdc}
@@ -3276,9 +3379,15 @@ class LiveTrader:
                 # FOK should not partially fill, but keep single state-check for exchange race.
                 if order_id:
                     try:
-                        info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                        ev = self._order_event_cache.get(order_id, {})
+                        ev_status = str(ev.get("status", "") or "").lower()
+                        if ev_status == "filled":
+                            info = {"status": "filled"}
+                        else:
+                            info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
                         if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
                             self.bankroll -= size_usdc
+                            self._cache_order_event(order_id, "filled", 0.0)
                             print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
                                   f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
                             return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_fallback", "notional_usdc": size_usdc}
@@ -5475,6 +5584,33 @@ class LiveTrader:
                     print(f"{Y}[HEARTBEAT] failed: {e}{RS}")
             await asyncio.sleep(max(2.0, CLOB_HEARTBEAT_SEC))
 
+    async def _user_events_loop(self):
+        """Near-realtime order status cache from CLOB notifications."""
+        if DRY_RUN or (not USER_EVENTS_ENABLED):
+            return
+        while True:
+            try:
+                loop = asyncio.get_event_loop()
+                rows = await loop.run_in_executor(None, self.clob.get_notifications)
+                if isinstance(rows, dict):
+                    # Different wrappers sometimes return {"data":[...]}
+                    rows = rows.get("data", []) or rows.get("notifications", [])
+                if isinstance(rows, list) and rows:
+                    for r in rows:
+                        oid, st, fs = self._extract_order_event(r)
+                        if oid:
+                            self._cache_order_event(oid, st, fs)
+                    # Acknowledge consumed notifications to keep payload light.
+                    try:
+                        await loop.run_in_executor(None, self.clob.drop_notifications)
+                    except Exception:
+                        pass
+                if len(self._order_event_cache) > 2000:
+                    self._prune_order_event_cache()
+            except Exception as e:
+                self._errors.tick("user_events_loop", print, err=e, every=20)
+            await asyncio.sleep(max(0.25, USER_EVENTS_POLL_SEC))
+
     async def _status_loop(self):
         while True:
             await asyncio.sleep(STATUS_INTERVAL)
@@ -5522,6 +5658,7 @@ class LiveTrader:
             _guard("_refresh_balance",      self._refresh_balance),
             _guard("_redeem_loop",          self._redeem_loop),
             _guard("_heartbeat_loop",       self._heartbeat_loop),
+            _guard("_user_events_loop",     self._user_events_loop),
             _guard("_force_redeem_backfill_loop", self._force_redeem_backfill_loop),
             _guard("chainlink_loop",        self.chainlink_loop),
             _guard("_copyflow_refresh_loop", self._copyflow_refresh_loop),
