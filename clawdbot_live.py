@@ -345,12 +345,14 @@ LEADER_FRESH_SIZE_SCALE = float(os.environ.get("LEADER_FRESH_SIZE_SCALE", "1.00"
 LEADER_STALE_SIZE_SCALE = float(os.environ.get("LEADER_STALE_SIZE_SCALE", "0.75"))
 LEADER_SYNTH_SIZE_SCALE = float(os.environ.get("LEADER_SYNTH_SIZE_SCALE", "0.55"))
 REQUIRE_ORDERBOOK_WS = os.environ.get("REQUIRE_ORDERBOOK_WS", "true").lower() == "true"
-WS_BOOK_FALLBACK_ENABLED = os.environ.get("WS_BOOK_FALLBACK_ENABLED", "true").lower() == "true"
+WS_BOOK_FALLBACK_ENABLED = os.environ.get("WS_BOOK_FALLBACK_ENABLED", "false").lower() == "true"
 WS_BOOK_FALLBACK_MAX_AGE_MS = float(os.environ.get("WS_BOOK_FALLBACK_MAX_AGE_MS", "2500"))
 PM_BOOK_FALLBACK_ENABLED = os.environ.get("PM_BOOK_FALLBACK_ENABLED", "false").lower() == "true"
 LEADER_FLOW_FALLBACK_ENABLED = os.environ.get("LEADER_FLOW_FALLBACK_ENABLED", "true").lower() == "true"
 LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MAX_AGE_SEC", "90"))
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
+STRICT_REQUIRE_FRESH_LEADER = os.environ.get("STRICT_REQUIRE_FRESH_LEADER", "false").lower() == "true"
+STRICT_REQUIRE_FRESH_BOOK_WS = os.environ.get("STRICT_REQUIRE_FRESH_BOOK_WS", "true").lower() == "true"
 # Small tolerance for payout threshold to avoid dead-zone misses (e.g. 1.98x vs 2.00x).
 PAYOUT_NEAR_MISS_TOL = float(os.environ.get("PAYOUT_NEAR_MISS_TOL", "0.03"))
 ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M", "0.05"))
@@ -768,7 +770,7 @@ class LiveTrader:
 
     def _feed_health_snapshot(self):
         now = _time.time()
-        tids = list(self._active_token_ids())
+        tids = list(self._trade_focus_token_ids() or self._active_token_ids())
         active_tokens = len(tids)
         fresh_books = 0
         ws_ages = []
@@ -2732,6 +2734,36 @@ class LiveTrader:
                 toks.add(td)
         return toks
 
+    def _trade_focus_token_ids(self) -> set[str]:
+        """Token set optimized for execution freshness (not full market coverage)."""
+        toks = set()
+        for cid, m in self.active_mkts.items():
+            tu = str(m.get("token_up", "") or "").strip()
+            td = str(m.get("token_down", "") or "").strip()
+            if not tu and not td:
+                continue
+            up_p = float(m.get("up_price", 0.5) or 0.5)
+            # Keep both sides only around parity where direction can flip quickly.
+            if abs(up_p - 0.5) <= 0.03:
+                if tu:
+                    toks.add(tu)
+                if td:
+                    toks.add(td)
+            else:
+                chosen = tu if up_p <= 0.5 else td
+                other = td if chosen == tu else tu
+                if chosen:
+                    toks.add(chosen)
+                elif other:
+                    toks.add(other)
+            # Always keep both sides for markets we already hold.
+            if cid in self.pending:
+                if tu:
+                    toks.add(tu)
+                if td:
+                    toks.add(td)
+        return toks
+
     def _normalize_book_levels(self, levels) -> list[tuple[float, float]]:
         out = []
         if not isinstance(levels, list):
@@ -2865,7 +2897,7 @@ class LiveTrader:
                     print(f"{G}[CLOB-WS] market connected{RS}")
                     delay = 2
                     while True:
-                        desired = self._active_token_ids()
+                        desired = self._trade_focus_token_ids() or self._active_token_ids()
                         add = desired - self._clob_ws_assets_subscribed
                         rem = self._clob_ws_assets_subscribed - desired
                         if add:
@@ -3112,6 +3144,7 @@ class LiveTrader:
         (vwap_dev, vol_mult)       = self._binance_window_stats(asset, m["start_ts"])
         _pm_book = await self._fetch_pm_book_safe(prefetch_token)
         ws_book_now = self._get_clob_ws_book(prefetch_token, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+        ws_book_strict = ws_book_now
         if ws_book_now is None:
             # Try alternate side token before declaring WS missing.
             tok_u = str(m.get("token_up", "") or "")
@@ -3119,6 +3152,7 @@ class LiveTrader:
             alt = tok_d if prefetch_token == tok_u else tok_u
             if alt:
                 ws_book_now = self._get_clob_ws_book(alt, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+                ws_book_strict = ws_book_now
         # Soft WS fallback: if strict-fresh missing, accept slightly older WS book before REST fallback.
         if ws_book_now is None and CLOB_MARKET_WS_SOFT_AGE_MS > CLOB_MARKET_WS_MAX_AGE_MS:
             ws_book_now = self._get_clob_ws_book(prefetch_token, max_age_ms=CLOB_MARKET_WS_SOFT_AGE_MS)
@@ -3164,6 +3198,13 @@ class LiveTrader:
                     )
                 self._skip_tick("book_ws_missing")
                 return None
+        if REQUIRE_ORDERBOOK_WS and STRICT_REQUIRE_FRESH_BOOK_WS and ws_book_strict is None:
+            if self._noisy_log_enabled(f"skip-strict-ws:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP] {asset} {duration}m strict WS required (no fresh strict book){RS}"
+                )
+            self._skip_tick("book_ws_strict_required")
+            return None
 
         # Additional instant signals from Binance cache (zero latency)
         dw_ob     = self._ob_depth_weighted(asset)
@@ -3469,6 +3510,14 @@ class LiveTrader:
             signal_source = "leader-live"
             leader_size_scale = LEADER_FRESH_SIZE_SCALE
         if REQUIRE_LEADER_FLOW and (not leader_ready):
+            if STRICT_REQUIRE_FRESH_LEADER:
+                if self._noisy_log_enabled(f"skip-no-leader-strict:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m strict leader required "
+                        f"(age={flow_age_s:.1f}s n={flow_n}){RS}"
+                    )
+                self._skip_tick("leader_strict_required")
+                return None
             if leader_soft_ready and LEADER_FLOW_FALLBACK_ENABLED:
                 signal_tier = "TIER-B"
                 signal_source = "leader-stale"
@@ -7100,7 +7149,7 @@ class LiveTrader:
 
         # CLOB-WS health: if all active tokens are stale for several checks, force reconnect.
         if CLOB_MARKET_WS_ENABLED and self.active_mkts:
-            tids = list(self._active_token_ids())
+            tids = list(self._trade_focus_token_ids() or self._active_token_ids())
             if tids:
                 stale = [tid for tid in tids if self._clob_ws_book_age_ms(tid) > CLOB_MARKET_WS_MAX_AGE_MS]
                 if len(stale) == len(tids):
