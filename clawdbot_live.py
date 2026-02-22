@@ -1438,10 +1438,8 @@ class LiveTrader:
                     cid_family[cid] = fam
                     target_families.add(f"{fam[0]}-{fam[1]}m")
                 tasks = [
-                    self._http_get_json(
-                        "https://data-api.polymarket.com/trades",
-                        params={"market": cid, "limit": str(COPYFLOW_INTEL_TRADES_PER_MARKET)},
-                        timeout=10,
+                    self._fetch_condition_trades(
+                        cid, COPYFLOW_INTEL_TRADES_PER_MARKET, timeout=10
                     )
                     for cid in cids
                 ]
@@ -1578,10 +1576,8 @@ class LiveTrader:
             boot_count = {}
             for cid in cids:
                 try:
-                    rows_boot = await self._http_get_json(
-                        "https://data-api.polymarket.com/trades",
-                        params={"market": cid, "limit": str(max(30, COPYFLOW_LIVE_TRADES_LIMIT // 2))},
-                        timeout=6,
+                    rows_boot = await self._fetch_condition_trades(
+                        cid, max(30, COPYFLOW_LIVE_TRADES_LIMIT // 2), timeout=6
                     )
                 except Exception:
                     rows_boot = []
@@ -1602,10 +1598,8 @@ class LiveTrader:
             return 0
 
         tasks = [
-            self._http_get_json(
-                "https://data-api.polymarket.com/trades",
-                params={"market": cid, "limit": str(COPYFLOW_LIVE_TRADES_LIMIT)},
-                timeout=8,
+            self._fetch_condition_trades(
+                cid, COPYFLOW_LIVE_TRADES_LIMIT, timeout=8
             )
             for cid in cids
         ]
@@ -1683,6 +1677,122 @@ class LiveTrader:
             else:
                 print(f"{B}[COPY-LIVE]{RS} refreshed {updated} active markets | reason={reason}")
         return updated
+
+    async def _fetch_condition_trades(self, cid: str, limit: int, timeout: int = 8):
+        """Fetch trades for a specific conditionId and hard-filter by conditionId.
+        Data API may return unrelated rows when params are malformed; never trust unfiltered output.
+        """
+        cid_l = str(cid or "").lower().strip()
+        if not cid_l:
+            return []
+        try:
+            rows = await self._http_get_json(
+                "https://data-api.polymarket.com/trades",
+                params={"conditionId": cid, "limit": str(max(1, int(limit)))},
+                timeout=timeout,
+            )
+        except Exception:
+            rows = []
+        if not isinstance(rows, list):
+            return []
+        out = []
+        for tr in rows:
+            c = str((tr or {}).get("conditionId", "")).lower().strip()
+            if c == cid_l:
+                out.append(tr)
+        return out
+
+    async def _copyflow_refresh_cid_once(self, cid: str, reason: str = "cid") -> int:
+        """Targeted leader-flow refresh for one CID used by scorer on missing/stale leader data."""
+        cid = str(cid or "").strip()
+        if not cid:
+            return 0
+        leaders = dict(self._copyflow_leaders)
+        for w, s in self._copyflow_leaders_live.items():
+            leaders[w] = max(float(s), float(leaders.get(w, 0.0) or 0.0))
+
+        # Fallback: bootstrap candidate leaders directly from the same CID recent buys.
+        if not leaders:
+            boot_count = {}
+            rows_boot = await self._fetch_condition_trades(
+                cid, max(30, COPYFLOW_LIVE_TRADES_LIMIT // 2), timeout=6
+            )
+            for tr in rows_boot:
+                if (tr.get("side") or "").upper() != "BUY":
+                    continue
+                w = (tr.get("proxyWallet") or "").lower().strip()
+                if not w:
+                    continue
+                boot_count[w] = int(boot_count.get(w, 0)) + 1
+            for w, c in boot_count.items():
+                if c >= 2:
+                    leaders[w] = max(float(leaders.get(w, 0.0) or 0.0), min(0.25, 0.08 + 0.02 * c))
+        if not leaders:
+            self._copyflow_live_zero_streak += 1
+            return 0
+
+        rows = await self._fetch_condition_trades(cid, COPYFLOW_LIVE_TRADES_LIMIT, timeout=8)
+        if not rows:
+            self._copyflow_live_zero_streak += 1
+            return 0
+
+        fam = self.active_mkts.get(cid, {})
+        fam_key = f"{(fam.get('asset') or '?').upper()}-{int(fam.get('duration') or 0)}m"
+        up = down = 0.0
+        low_w = mid_w = high_w = 0.0
+        px_w_sum = px_w_den = 0.0
+        wallet_buy_n = {}
+        for tr in rows:
+            if (tr.get("side") or "").upper() != "BUY":
+                continue
+            w = (tr.get("proxyWallet") or "").lower().strip()
+            fam_boost = float(self._copyflow_leaders_family.get(fam_key, {}).get(w, 0.0) or 0.0)
+            wt = max(float(leaders.get(w, 0.0) or 0.0), fam_boost * 1.35)
+            if wt <= 0:
+                continue
+            wallet_buy_n[w] = wallet_buy_n.get(w, 0) + 1
+            px = float(tr.get("price") or 0.0)
+            if px > 0:
+                px_w_sum += px * wt
+                px_w_den += wt
+                if px <= 0.30:
+                    low_w += wt
+                elif px >= 0.70:
+                    high_w += wt
+                else:
+                    mid_w += wt
+            out = tr.get("outcome") or ""
+            if out == "Up":
+                up += wt
+            elif out == "Down":
+                down += wt
+        s = up + down
+        if s <= 0:
+            self._copyflow_live_zero_streak += 1
+            return 0
+        self._copyflow_live[cid] = {
+            "Up": round(up / s, 4),
+            "Down": round(down / s, 4),
+            "n": int(round(s * 10)),
+            "avg_entry_c": round((px_w_sum / px_w_den) * 100.0, 1) if px_w_den > 0 else 0.0,
+            "low_c_share": round(low_w / max(1e-9, (low_w + mid_w + high_w)), 4),
+            "high_c_share": round(high_w / max(1e-9, (low_w + mid_w + high_w)), 4),
+            "multibet_ratio": round(
+                (sum(1 for n in wallet_buy_n.values() if n >= 2) / max(1, len(wallet_buy_n))), 4
+            ),
+            "ts": _time.time(),
+            "src": "live",
+        }
+        self._copyflow_live_last_update_ts = _time.time()
+        self._copyflow_live_zero_streak = 0
+        if self._should_log(f"copyflow-cid-refresh:{cid}", 20):
+            row = self._copyflow_live.get(cid, {})
+            print(
+                f"{B}[COPY-LIVE]{RS} cid refresh ok | cid={self._short_cid(cid)} "
+                f"n={int(row.get('n',0) or 0)} up={float(row.get('Up',0.0) or 0.0):.2f} "
+                f"dn={float(row.get('Down',0.0) or 0.0):.2f} | reason={reason}"
+            )
+        return 1
 
     async def _copyflow_live_loop(self):
         """Build per-market leader side-flow from latest PM trades for active markets."""
@@ -3575,67 +3685,46 @@ class LiveTrader:
                 # Winners buying low-cents but market now expensive: fade confidence.
                 score -= 1
                 edge -= 0.005
+
+        # Real-time CID refresh on missing/stale leader-flow before any gating decision.
+        if COPYFLOW_CID_ONDEMAND_ENABLED and (
+            flow_n <= 0 or flow_age_s > COPYFLOW_LIVE_MAX_AGE_SEC
+        ):
+            now_ts = _time.time()
+            last_ts = float(self._copyflow_cid_on_demand_ts.get(cid, 0.0) or 0.0)
+            if (now_ts - last_ts) >= COPYFLOW_CID_ONDEMAND_COOLDOWN_SEC:
+                self._copyflow_cid_on_demand_ts[cid] = now_ts
+                try:
+                    await self._copyflow_refresh_cid_once(cid, reason="score-miss")
+                except Exception:
+                    pass
+                flow = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
+                if isinstance(flow, dict):
+                    up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
+                    dn_conf = float(flow.get("Down", flow.get("down", 0.0)) or 0.0)
+                    flow_n = int(flow.get("n", 0) or 0)
+                    flow_ts = float(flow.get("ts", 0.0) or 0.0)
+                    flow_age_s = (_time.time() - flow_ts) if flow_ts > 0 else 9e9
+                    leader_net = up_conf - dn_conf
+                    leader_ready = flow_age_s <= COPYFLOW_LIVE_MAX_AGE_SEC and flow_n >= 1
+                    leader_soft_ready = (flow_n >= MARKET_LEADER_MIN_N) and (
+                        flow_age_s <= LEADER_FLOW_FALLBACK_MAX_AGE_SEC
+                    )
+                    pref = up_conf if side == "Up" else dn_conf
+                    opp = dn_conf if side == "Up" else up_conf
+                    copy_net = pref - opp
         if leader_ready and signal_source != "leader-fresh":
             signal_tier = "TIER-A"
             signal_source = "leader-live"
             leader_size_scale = LEADER_FRESH_SIZE_SCALE
         if REQUIRE_LEADER_FLOW and (not leader_ready):
-            if STRICT_REQUIRE_FRESH_LEADER:
-                if self._noisy_log_enabled(f"skip-no-leader-strict:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    print(
-                        f"{Y}[SKIP] {asset} {duration}m strict leader required "
-                        f"(age={flow_age_s:.1f}s n={flow_n}){RS}"
-                    )
-                self._skip_tick("leader_strict_required")
-                return None
-            if leader_soft_ready and LEADER_FLOW_FALLBACK_ENABLED:
-                signal_tier = "TIER-B"
-                signal_source = "leader-stale"
-                leader_size_scale = LEADER_STALE_SIZE_SCALE
-                score -= 1
-                edge -= 0.005
-                if self._noisy_log_enabled(f"leader-soft:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    print(
-                        f"{Y}[LEADER-SOFT]{RS} {asset} {duration}m stale leader-flow "
-                        f"(age={flow_age_s:.1f}s n={flow_n})"
-                    )
-            elif LEADER_SYNTHETIC_ENABLED:
-                # Keep this branch for backward compatibility, but do not synthesize leader signal.
-                # Continue with pure intraround technical stack (orderbook/taker/perp/vwap/CL).
-                signal_tier = "TIER-C"
-                signal_source = "tech-intraround"
-                leader_size_scale = LEADER_SYNTH_SIZE_SCALE
-                if self._noisy_log_enabled(f"leader-tech-only:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
-                    print(
-                        f"{Y}[LEADER-MISS]{RS} {asset} {duration}m no fresh leader-flow "
-                        f"(n={flow_n} age={flow_age_s:.1f}s) -> tech-only intraround"
-                    )
-            elif LEADER_FLOW_FALLBACK_ENABLED:
-                # Keep trading with a quality penalty when leader-flow is unavailable/stale.
-                score -= 2
-                edge -= 0.01
-                signal_tier = "TIER-C"
-                signal_source = "fallback-no-leader"
-                leader_size_scale = LEADER_SYNTH_SIZE_SCALE
-                if self._noisy_log_enabled(f"leader-fallback:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    if flow_n <= 0:
-                        print(
-                            f"{Y}[LEADER-MISS-FALLBACK]{RS} {asset} {duration}m "
-                            f"no CID leader-flow yet (n=0) — applying penalty"
-                        )
-                    else:
-                        print(
-                            f"{Y}[LEADER-FALLBACK]{RS} {asset} {duration}m using stale leader-flow "
-                            f"(age={flow_age_s:.1f}s n={flow_n})"
-                        )
-            else:
-                if self._noisy_log_enabled(f"skip-no-leader:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    print(
-                        f"{Y}[SKIP] {asset} {duration}m missing fresh leader-flow for this CID "
-                        f"(age={flow_age_s:.1f}s n={flow_n}){RS}"
-                    )
-                self._skip_tick("leader_missing")
-                return None
+            if self._noisy_log_enabled(f"skip-no-leader:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP] {asset} {duration}m missing fresh leader-flow for this CID "
+                    f"(age={flow_age_s:.1f}s n={flow_n}){RS}"
+                )
+            self._skip_tick("leader_missing")
+            return None
 
         # Pre-bid arm: for first seconds after open, bias side/execution to pre-planned signal.
         arm = self._prebid_plan.get(cid, {})
