@@ -411,6 +411,7 @@ class LiveTrader:
         self._pnl_baseline_ts = ""
         self.onchain_wallet_usdc = BANKROLL
         self.onchain_open_positions = 0.0
+        self.onchain_open_mark_value = 0.0
         self.onchain_open_count = 0
         self.onchain_redeemable_count = 0
         self.onchain_open_cids = set()
@@ -1787,8 +1788,8 @@ class LiveTrader:
             f"  {B}Bankroll:{RS} ${display_bank:.2f}  "
             f"{B}P&L:{RS} {pc}${pnl:+.2f}{RS}  "
             f"{B}Network:{RS} {NETWORK}  "
-            f"{B}Open(local/onchain):{RS} {open_local}/{self.onchain_open_count}  "
-            f"{Y}Settling(local/onchain):{RS} {settling_local}/{self.onchain_redeemable_count}\n"
+            f"{B}Open(onchain):{RS} {self.onchain_open_count}  "
+            f"{Y}Settling(onchain):{RS} {self.onchain_redeemable_count}\n"
             f"  {price_str}\n"
             f"{W}{'─'*66}{RS}"
         )
@@ -1831,15 +1832,13 @@ class LiveTrader:
             self._apply_exact_window_from_question(m, t)
             asset      = t.get("asset", "?")
             side       = t.get("side", "?")
-            stake = float(t.get("size", 0.0) or 0.0)
-            if stake <= 0:
-                stake = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
+            stake = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
             if stake <= 0:
                 stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
             if stake <= 0:
                 continue
             meta_cid = self.onchain_open_meta_by_cid.get(cid, {}) if isinstance(self.onchain_open_meta_by_cid, dict) else {}
-            stake_src = str(meta_cid.get("stake_source", "local"))
+            stake_src = str(meta_cid.get("stake_source", "onchain"))
             value_now = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
             shares = float(self.onchain_open_shares_by_cid.get(cid, 0.0) or 0.0)
             rk         = self._round_key(cid=cid, m=m, t=t)
@@ -1870,7 +1869,7 @@ class LiveTrader:
                 move_pct   = (cur_p - open_p) / open_p * 100
                 c          = Y
                 status_str = "LIVE"
-                payout_est = shares if (projected_win and shares > 0) else (stake / max(float(t.get("entry", 0.5) or 0.5), 1e-9) if projected_win else 0)
+                payout_est = shares if (projected_win and shares > 0) else (stake / max(float(meta_cid.get("entry", t.get("entry", 0.5)) or 0.5), 1e-9) if projected_win else 0)
                 move_str   = f"({move_pct:+.2f}%)"
                 proj_str   = "LEAD" if projected_win else "TRAIL"
             else:
@@ -1879,7 +1878,7 @@ class LiveTrader:
                 payout_est = 0
                 move_str   = "(no ref)"
                 proj_str   = "NA"
-            eff_entry = (stake / shares) if shares > 0 else float(t.get("entry", 0.0) or 0.0)
+            eff_entry = (stake / shares) if shares > 0 else float(meta_cid.get("entry", t.get("entry", 0.0)) or 0.0)
             tok_str   = f"@{eff_entry*100:.0f}¢→{(shares/max(stake,1e-9)):.2f}x" if shares > 0 and stake > 0 else (f"@{eff_entry*100:.0f}¢→{(1/eff_entry):.2f}x" if eff_entry > 0 else "@?¢")
             stake_label = "bet"
             if stake_src == "value_fallback":
@@ -4897,8 +4896,8 @@ class LiveTrader:
             if (not LOG_SCAN_ON_CHANGE_ONLY) or state_changed or self._should_log("scan-heartbeat", LOG_SCAN_EVERY_SEC):
                 print(
                     f"{B}[SCAN]{RS} Live markets: {len(markets)} | "
-                    f"Open(local/onchain): {open_local}/{self.onchain_open_count} | "
-                    f"Settling(local/onchain): {settling_local}/{self.onchain_redeemable_count}"
+                    f"Open(onchain): {self.onchain_open_count} | "
+                    f"Settling(onchain): {self.onchain_redeemable_count}"
                 )
             self._scan_state_last = scan_state
 
@@ -5147,6 +5146,7 @@ class LiveTrader:
 
                 # 2) On-chain-backed open/settling valuation from positions feed.
                 open_val = 0.0
+                open_stake_total = 0.0
                 open_count = 0
                 settling_claim_val = 0.0
                 settling_claim_count = 0
@@ -5199,6 +5199,7 @@ class LiveTrader:
                     if stake_guess <= 0:
                         stake_guess = val
                         stake_src = "value_fallback"
+                    open_stake_total += stake_guess
                     onchain_open_stake_by_cid[cid] = round(
                         float(onchain_open_stake_by_cid.get(cid, 0.0) or 0.0) + stake_guess, 6
                     )
@@ -5259,9 +5260,13 @@ class LiveTrader:
                             "value": val,
                         }
 
-                total = round(usdc + open_val + settling_claim_val, 2)
+                # On-chain accounting view:
+                # - open_positions tracks total stake still at risk (spent, not settled)
+                # - open_mark tracks current mark-to-market value of those positions
+                total = round(usdc + open_stake_total + settling_claim_val, 2)
                 self.onchain_wallet_usdc = round(usdc, 2)
-                self.onchain_open_positions = round(open_val, 2)
+                self.onchain_open_positions = round(open_stake_total, 2)
+                self.onchain_open_mark_value = round(open_val, 2)
                 self.onchain_open_count = int(open_count)
                 self.onchain_open_cids = set(onchain_open_cids)
                 self.onchain_open_usdc_by_cid = dict(onchain_open_usdc_by_cid)
@@ -5274,7 +5279,7 @@ class LiveTrader:
                 self.onchain_snapshot_ts = _time.time()
                 bank_state = (
                     round(usdc, 2),
-                    round(open_val, 2),
+                    round(open_stake_total, 2),
                     int(open_count),
                     round(settling_claim_val, 2),
                     int(settling_claim_count),
@@ -5290,7 +5295,8 @@ class LiveTrader:
                 if state_changed or self._should_log("bank-heartbeat", LOG_BANK_EVERY_SEC):
                     print(
                         f"{B}[BANK]{RS} on-chain USDC=${usdc:.2f}  "
-                        f"open_positions=${open_val:.2f} ({open_count})  "
+                        f"open_positions(stake)=${open_stake_total:.2f} ({open_count})  "
+                        f"open_mark=${open_val:.2f}  "
                         f"settling_claimable=${settling_claim_val:.2f} ({settling_claim_count})  "
                         f"total=${total:.2f}"
                     )
