@@ -265,8 +265,8 @@ LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "true").lower() == "true"
 LOG_STATS_LOCAL = os.environ.get("LOG_STATS_LOCAL", "false").lower() == "true"
 LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "30"))
 LOG_SCAN_ON_CHANGE_ONLY = os.environ.get("LOG_SCAN_ON_CHANGE_ONLY", "true").lower() == "true"
-LOG_FLOW_EVERY_SEC = int(os.environ.get("LOG_FLOW_EVERY_SEC", "900"))
-LOG_ROUND_EMPTY_EVERY_SEC = int(os.environ.get("LOG_ROUND_EMPTY_EVERY_SEC", "900"))
+LOG_FLOW_EVERY_SEC = int(os.environ.get("LOG_FLOW_EVERY_SEC", "300"))
+LOG_ROUND_EMPTY_EVERY_SEC = int(os.environ.get("LOG_ROUND_EMPTY_EVERY_SEC", "30"))
 LOG_SETTLE_FIRST_EVERY_SEC = int(os.environ.get("LOG_SETTLE_FIRST_EVERY_SEC", "20"))
 LOG_BANK_EVERY_SEC = int(os.environ.get("LOG_BANK_EVERY_SEC", "45"))
 LOG_BANK_MIN_DELTA = float(os.environ.get("LOG_BANK_MIN_DELTA", "0.50"))
@@ -6812,7 +6812,6 @@ class LiveTrader:
                                 f"(fresh_books={fresh}/{at})"
                             )
                     else:
-                        self._skip_tick("ws_health_soft")
                         if self._should_log("ws-health-gate", LOG_HEALTH_EVERY_SEC):
                             at = int(hs.get("active_markets", 0) or 0)
                             fresh = int(hs.get("fresh_markets", 0) or 0)
