@@ -7155,6 +7155,7 @@ class LiveTrader:
                 if not isinstance(positions_redeem, list):
                     positions_redeem = []
                 positions = positions_open + positions_redeem
+                now_ts = datetime.now(timezone.utc).timestamp()
 
                 # 2) On-chain-backed open/settling valuation from positions feed.
                 open_val = 0.0
@@ -7428,7 +7429,6 @@ class LiveTrader:
                 # On-chain-first cleanup: if a local pending CID is neither on-chain nor API-active
                 # after a grace window, it is stale and removed from local state.
                 prune_n = 0
-                now_ts = datetime.now(timezone.utc).timestamp()
                 for cid, (m_p, t_p) in list(self.pending.items()):
                     if cid in onchain_open_cids or cid in self.pending_redeem or cid in api_active_cids:
                         self._pending_absent_counts.pop(cid, None)
