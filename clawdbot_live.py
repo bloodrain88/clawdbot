@@ -1838,6 +1838,9 @@ class LiveTrader:
                 stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
             if stake <= 0:
                 continue
+            meta_cid = self.onchain_open_meta_by_cid.get(cid, {}) if isinstance(self.onchain_open_meta_by_cid, dict) else {}
+            stake_src = str(meta_cid.get("stake_source", "local"))
+            value_now = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
             shares = float(self.onchain_open_shares_by_cid.get(cid, 0.0) or 0.0)
             rk         = self._round_key(cid=cid, m=m, t=t)
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
@@ -1878,9 +1881,13 @@ class LiveTrader:
                 proj_str   = "NA"
             eff_entry = (stake / shares) if shares > 0 else float(t.get("entry", 0.0) or 0.0)
             tok_str   = f"@{eff_entry*100:.0f}¢→{(shares/max(stake,1e-9)):.2f}x" if shares > 0 and stake > 0 else (f"@{eff_entry*100:.0f}¢→{(1/eff_entry):.2f}x" if eff_entry > 0 else "@?¢")
+            stake_label = "bet"
+            if stake_src == "value_fallback":
+                stake_label = "value_now"
+                tok_str = "@n/a"
             print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
                   f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
-                  f"bet=${stake:.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
+                  f"{stake_label}=${(value_now if stake_label=='value_now' else stake):.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
                   f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
             shown_live_cids.add(cid)
             agg = live_by_rk.setdefault(rk, {"n": 0, "stake": 0.0, "est": 0.0, "lead": 0})
@@ -1901,6 +1908,8 @@ class LiveTrader:
                 stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
             if stake <= 0:
                 continue
+            stake_src = str(meta.get("stake_source", "local"))
+            value_now = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
             shares = float(meta.get("shares", 0.0) or 0.0)
             if shares <= 0:
                 shares = float(self.onchain_open_shares_by_cid.get(cid, 0.0) or 0.0)
@@ -1934,7 +1943,8 @@ class LiveTrader:
             print(
                 f"  {Y}[LIVE-PENDING]{RS} {asset} {side} | {title} | "
                 f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
-                f"bet=${stake:.2f} est=${payout_est:.2f} proj={proj_str} | "
+                f"{('value_now' if stake_src=='value_fallback' else 'bet')}=${(value_now if stake_src=='value_fallback' else stake):.2f} "
+                f"{('@n/a' if stake_src=='value_fallback' else '')} est=${payout_est:.2f} proj={proj_str} | "
                 f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}"
             )
             agg = live_by_rk.setdefault(rk, {"n": 0, "stake": 0.0, "est": 0.0, "lead": 0})
@@ -5175,16 +5185,20 @@ class LiveTrader:
                             float(onchain_open_shares_by_cid.get(cid, 0.0) or 0.0) + size_tok, 6
                         )
                     avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
-                    stake_guess = 0.0
-                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
-                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
-                        if vv > 0:
-                            stake_guess = vv
-                            break
-                    if stake_guess <= 0 and size_tok > 0 and avg_px > 0:
-                        stake_guess = size_tok * avg_px
-                    if stake_guess <= 0:
-                        stake_guess = val
+                        stake_guess = 0.0
+                        stake_src = "value_fallback"
+                        for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                            vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                            if vv > 0:
+                                stake_guess = vv
+                                stake_src = k_st
+                                break
+                        if stake_guess <= 0 and size_tok > 0 and avg_px > 0:
+                            stake_guess = size_tok * avg_px
+                            stake_src = "size_x_avgPrice"
+                        if stake_guess <= 0:
+                            stake_guess = val
+                            stake_src = "value_fallback"
                     onchain_open_stake_by_cid[cid] = round(
                         float(onchain_open_stake_by_cid.get(cid, 0.0) or 0.0) + stake_guess, 6
                     )
@@ -5237,6 +5251,7 @@ class LiveTrader:
                             "asset": asset,
                             "entry": float(p.get("avgPrice", 0.5) or 0.5),
                             "stake_usdc": round(stable_stake, 6),
+                            "stake_source": stake_src,
                             "shares": round(size_tok, 6),
                             "duration": dur_guess,
                             "start_ts": float(start_ts if start_ts > 0 else 0.0),
