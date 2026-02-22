@@ -1788,17 +1788,18 @@ class LiveTrader:
             f"{B}{a}:{RS} ${p:,.2f}" for a, p in self.prices.items() if p > 0
         )
         print(
-            f"\n{W}{'─'*66}{RS}\n"
-            f"  {B}Time:{RS} {h}h{m}m  {rs}RTDS{'✓' if self.rtds_ok else '✗'}{RS}  "
-            f"{B}Trades:{RS} {self.total}  {B}Win:{RS} {wr}  "
-            f"{B}ROI:{RS} {pc}{roi:+.1f}%{RS}\n"
-            f"  {B}Bankroll:{RS} ${display_bank:.2f}  "
-            f"{B}P&L:{RS} {pc}${pnl:+.2f}{RS}  "
-            f"{B}Network:{RS} {NETWORK}  "
-            f"{B}Open(onchain):{RS} {self.onchain_open_count}  "
-            f"{Y}Settling(onchain):{RS} {self.onchain_redeemable_count}\n"
+            f"\n{W}{'─'*72}{RS}\n"
+            f"  {B}SESSION{RS}  {B}Time:{RS} {h}h{m}m  {rs}RTDS{'✓' if self.rtds_ok else '✗'}{RS}  "
+            f"{B}Network:{RS} {NETWORK}\n"
+            f"  {B}PERF{RS}     {B}Trades:{RS} {self.total}  {B}Win:{RS} {wr}  "
+            f"{B}ROI:{RS} {pc}{roi:+.1f}%{RS}  {B}P&L:{RS} {pc}${pnl:+.2f}{RS}\n"
+            f"  {B}ONCHAIN{RS}  {B}USDC:{RS} ${self.onchain_usdc_balance:.2f}  "
+            f"{Y}OPEN_STAKE:{RS} ${self.onchain_open_stake_total:.2f} ({self.onchain_open_count})  "
+            f"{B}OPEN_MARK:{RS} ${self.onchain_open_mark_value:.2f}  "
+            f"{Y}SETTLING:{RS} ${self.onchain_redeemable_usdc:.2f} ({self.onchain_redeemable_count})  "
+            f"{B}TOTAL:{RS} ${display_bank:.2f}\n"
             f"  {price_str}\n"
-            f"{W}{'─'*66}{RS}"
+            f"{W}{'─'*72}{RS}"
         )
         show_debug = LOG_VERBOSE or self._should_log("debug-status", LOG_DEBUG_EVERY_SEC)
         if show_debug and (self._perf_stats.get("score_n", 0) > 0 or self._perf_stats.get("order_n", 0) > 0):
@@ -1978,11 +1979,15 @@ class LiveTrader:
                 lead = int(row.get("lead", 0) or 0)
                 n = int(row.get("n", 0) or 0)
                 c_pl = G if win_profit > 0 else (R if win_profit < 0 else Y)
+                c_lead = G if lead > 0 else R
                 print(
-                    f"  {B}[LIVE-RK]{RS} {rk} | trades={n} "
-                    f"spent=${spent:.2f} value_now=${value_now:.2f} "
-                    f"win_payout=${win_payout:.2f} win_profit={c_pl}${win_profit:+.2f}{RS} "
-                    f"mult={mult:.2f}x lead={lead}/{n}"
+                    f"  {B}[LIVE-RK]{RS} {rk} | trades={n} | "
+                    f"{Y}SPENT{RS}=${spent:.2f} | "
+                    f"{B}MARK{RS}=${value_now:.2f} | "
+                    f"{G}IF_WIN{RS}=${win_payout:.2f} | "
+                    f"{c_pl}PROFIT_IF_WIN{RS}={c_pl}${win_profit:+.2f}{RS} | "
+                    f"{B}x{mult:.2f}{RS} | "
+                    f"{c_lead}LEAD{RS}={lead}/{n}"
                 )
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
