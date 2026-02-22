@@ -298,6 +298,8 @@ USER_EVENTS_CACHE_TTL_SEC = float(os.environ.get("USER_EVENTS_CACHE_TTL_SEC", "1
 CLOB_MARKET_WS_ENABLED = os.environ.get("CLOB_MARKET_WS_ENABLED", "true").lower() == "true"
 CLOB_MARKET_WS_SYNC_SEC = float(os.environ.get("CLOB_MARKET_WS_SYNC_SEC", "2.0"))
 CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "2000"))
+CLOB_WS_STALE_HEAL_HITS = int(os.environ.get("CLOB_WS_STALE_HEAL_HITS", "3"))
+CLOB_WS_STALE_HEAL_COOLDOWN_SEC = float(os.environ.get("CLOB_WS_STALE_HEAL_COOLDOWN_SEC", "20"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
 COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
@@ -309,6 +311,8 @@ COPYFLOW_LIVE_REFRESH_SEC = int(os.environ.get("COPYFLOW_LIVE_REFRESH_SEC", "5")
 COPYFLOW_LIVE_TRADES_LIMIT = int(os.environ.get("COPYFLOW_LIVE_TRADES_LIMIT", "80"))
 COPYFLOW_LIVE_MAX_MARKETS = int(os.environ.get("COPYFLOW_LIVE_MAX_MARKETS", "8"))
 COPYFLOW_LIVE_MAX_AGE_SEC = float(os.environ.get("COPYFLOW_LIVE_MAX_AGE_SEC", "20"))
+COPYFLOW_HEALTH_FORCE_REFRESH_SEC = float(os.environ.get("COPYFLOW_HEALTH_FORCE_REFRESH_SEC", "12"))
+LOG_HEALTH_EVERY_SEC = int(os.environ.get("LOG_HEALTH_EVERY_SEC", "30"))
 COPYFLOW_INTEL_ENABLED = os.environ.get("COPYFLOW_INTEL_ENABLED", "true").lower() == "true"
 COPYFLOW_INTEL_REFRESH_SEC = int(os.environ.get("COPYFLOW_INTEL_REFRESH_SEC", "60"))
 COPYFLOW_INTEL_TRADES_PER_MARKET = int(os.environ.get("COPYFLOW_INTEL_TRADES_PER_MARKET", "120"))
@@ -652,6 +656,11 @@ class LiveTrader:
         self._copyflow_leaders_live = {}
         self._copyflow_leaders_family = {}
         self._copyflow_live     = {}
+        self._copyflow_live_last_update_ts = 0.0
+        self._copyflow_live_zero_streak = 0
+        self._copyflow_force_refresh_ts = 0.0
+        self._ws_stale_hits = 0
+        self._ws_last_heal_ts = 0.0
         self._cid_family_cache  = {}
         self._prebid_plan       = {}
         self._copyflow_mtime    = 0.0
@@ -1438,6 +1447,101 @@ class LiveTrader:
             except Exception as e:
                 self._errors.tick("copyflow_intel_loop", print, err=e, every=10)
 
+    async def _copyflow_live_refresh_once(self, reason: str = "loop") -> int:
+        leaders = dict(self._copyflow_leaders)
+        for w, s in self._copyflow_leaders_live.items():
+            leaders[w] = max(float(s), float(leaders.get(w, 0.0) or 0.0))
+        if not leaders:
+            self._copyflow_live_zero_streak += 1
+            return 0
+        cids = list(self.active_mkts.keys())[: max(1, COPYFLOW_LIVE_MAX_MARKETS)]
+        if not cids:
+            self._copyflow_live_zero_streak += 1
+            return 0
+
+        tasks = [
+            self._http_get_json(
+                "https://data-api.polymarket.com/trades",
+                params={"market": cid, "limit": str(COPYFLOW_LIVE_TRADES_LIMIT)},
+                timeout=8,
+            )
+            for cid in cids
+        ]
+        rows_list = await self._gather_bounded(tasks, COPYFLOW_HTTP_MAX_PARALLEL)
+        updated = 0
+        for cid, rows in zip(cids, rows_list):
+            if isinstance(rows, Exception) or not isinstance(rows, list):
+                continue
+            fam = self.active_mkts.get(cid, {})
+            fam_key = f"{(fam.get('asset') or '?').upper()}-{int(fam.get('duration') or 0)}m"
+            up = down = 0.0
+            low_w = mid_w = high_w = 0.0
+            px_w_sum = px_w_den = 0.0
+            wallet_buy_n = {}
+            for tr in rows:
+                if (tr.get("side") or "").upper() != "BUY":
+                    continue
+                w = (tr.get("proxyWallet") or "").lower().strip()
+                fam_boost = float(self._copyflow_leaders_family.get(fam_key, {}).get(w, 0.0) or 0.0)
+                wt = max(float(leaders.get(w, 0.0) or 0.0), fam_boost * 1.35)
+                if wt <= 0:
+                    continue
+                wallet_buy_n[w] = wallet_buy_n.get(w, 0) + 1
+                px = float(tr.get("price") or 0.0)
+                if px > 0:
+                    px_w_sum += px * wt
+                    px_w_den += wt
+                    if px <= 0.30:
+                        low_w += wt
+                    elif px >= 0.70:
+                        high_w += wt
+                    else:
+                        mid_w += wt
+                out = tr.get("outcome") or ""
+                if out == "Up":
+                    up += wt
+                elif out == "Down":
+                    down += wt
+            s = up + down
+            if s <= 0:
+                continue
+            self._copyflow_live[cid] = {
+                "Up": round(up / s, 4),
+                "Down": round(down / s, 4),
+                "n": int(round(s * 10)),
+                "avg_entry_c": round((px_w_sum / px_w_den) * 100.0, 1) if px_w_den > 0 else 0.0,
+                "low_c_share": round(low_w / max(1e-9, (low_w + mid_w + high_w)), 4),
+                "high_c_share": round(high_w / max(1e-9, (low_w + mid_w + high_w)), 4),
+                "multibet_ratio": round(
+                    (
+                        sum(1 for n in wallet_buy_n.values() if n >= 2)
+                        / max(1, len(wallet_buy_n))
+                    ),
+                    4,
+                ),
+                "ts": _time.time(),
+                "src": "live",
+            }
+            updated += 1
+        if updated > 0:
+            self._copyflow_live_last_update_ts = _time.time()
+            self._copyflow_live_zero_streak = 0
+        else:
+            self._copyflow_live_zero_streak += 1
+        if updated and self._should_log("copyflow-live", 60):
+            sample_cid = cids[0]
+            sm = self._copyflow_live.get(sample_cid, {})
+            if sm:
+                print(
+                    f"{B}[COPY-LIVE]{RS} refreshed {updated} mkts | "
+                    f"avg_entry={sm.get('avg_entry_c',0):.1f}c "
+                    f"low/high={sm.get('low_c_share',0):.0%}/{sm.get('high_c_share',0):.0%} "
+                    f"multibet={sm.get('multibet_ratio',0):.0%} | reason={reason}"
+                )
+            else:
+                print(f"{B}[COPY-LIVE]{RS} refreshed {updated} active markets | reason={reason}")
+        return updated
+
     async def _copyflow_live_loop(self):
         """Build per-market leader side-flow from latest PM trades for active markets."""
         if not COPYFLOW_LIVE_ENABLED or DRY_RUN:
@@ -1445,92 +1549,7 @@ class LiveTrader:
         while True:
             await asyncio.sleep(COPYFLOW_LIVE_REFRESH_SEC)
             try:
-                leaders = dict(self._copyflow_leaders)
-                for w, s in self._copyflow_leaders_live.items():
-                    leaders[w] = max(float(s), float(leaders.get(w, 0.0) or 0.0))
-                if not leaders:
-                    continue
-                cids = list(self.active_mkts.keys())[: max(1, COPYFLOW_LIVE_MAX_MARKETS)]
-                if not cids:
-                    continue
-
-                tasks = [
-                    self._http_get_json(
-                        "https://data-api.polymarket.com/trades",
-                        params={"market": cid, "limit": str(COPYFLOW_LIVE_TRADES_LIMIT)},
-                        timeout=8,
-                    )
-                    for cid in cids
-                ]
-                rows_list = await self._gather_bounded(tasks, COPYFLOW_HTTP_MAX_PARALLEL)
-                updated = 0
-                for cid, rows in zip(cids, rows_list):
-                    if isinstance(rows, Exception) or not isinstance(rows, list):
-                        continue
-                    fam = self.active_mkts.get(cid, {})
-                    fam_key = f"{(fam.get('asset') or '?').upper()}-{int(fam.get('duration') or 0)}m"
-                    up = down = 0.0
-                    low_w = mid_w = high_w = 0.0
-                    px_w_sum = px_w_den = 0.0
-                    wallet_buy_n = {}
-                    for tr in rows:
-                        if (tr.get("side") or "").upper() != "BUY":
-                            continue
-                        w = (tr.get("proxyWallet") or "").lower().strip()
-                        fam_boost = float(self._copyflow_leaders_family.get(fam_key, {}).get(w, 0.0) or 0.0)
-                        wt = max(float(leaders.get(w, 0.0) or 0.0), fam_boost * 1.35)
-                        if wt <= 0:
-                            continue
-                        wallet_buy_n[w] = wallet_buy_n.get(w, 0) + 1
-                        px = float(tr.get("price") or 0.0)
-                        if px > 0:
-                            px_w_sum += px * wt
-                            px_w_den += wt
-                            if px <= 0.30:
-                                low_w += wt
-                            elif px >= 0.70:
-                                high_w += wt
-                            else:
-                                mid_w += wt
-                        out = tr.get("outcome") or ""
-                        if out == "Up":
-                            up += wt
-                        elif out == "Down":
-                            down += wt
-                    s = up + down
-                    if s <= 0:
-                        continue
-                    self._copyflow_live[cid] = {
-                        "Up": round(up / s, 4),
-                        "Down": round(down / s, 4),
-                        "n": int(round(s * 10)),
-                        "avg_entry_c": round((px_w_sum / px_w_den) * 100.0, 1) if px_w_den > 0 else 0.0,
-                        "low_c_share": round(low_w / max(1e-9, (low_w + mid_w + high_w)), 4),
-                        "high_c_share": round(high_w / max(1e-9, (low_w + mid_w + high_w)), 4),
-                        "multibet_ratio": round(
-                            (
-                                sum(1 for n in wallet_buy_n.values() if n >= 2)
-                                / max(1, len(wallet_buy_n))
-                            ),
-                            4,
-                        ),
-                        "ts": _time.time(),
-                        "src": "live",
-                    }
-                    updated += 1
-                if updated and self._should_log("copyflow-live", 60):
-                    # Show one sample behavior snapshot to keep logs concise.
-                    sample_cid = cids[0]
-                    sm = self._copyflow_live.get(sample_cid, {})
-                    if sm:
-                        print(
-                            f"{B}[COPY-LIVE]{RS} refreshed {updated} mkts | "
-                            f"avg_entry={sm.get('avg_entry_c',0):.1f}c "
-                            f"low/high={sm.get('low_c_share',0):.0%}/{sm.get('high_c_share',0):.0%} "
-                            f"multibet={sm.get('multibet_ratio',0):.0%}"
-                        )
-                    else:
-                        print(f"{B}[COPY-LIVE]{RS} refreshed {updated} active markets")
+                await self._copyflow_live_refresh_once(reason="loop")
             except Exception as e:
                 self._errors.tick("copyflow_live_loop", print, err=e, every=10)
 
@@ -1590,6 +1609,7 @@ class LiveTrader:
             f"copy_intel24h={COPYFLOW_INTEL_ENABLED} "
             f"live_refresh={COPYFLOW_LIVE_REFRESH_SEC}s "
             f"live_max_age={COPYFLOW_LIVE_MAX_AGE_SEC:.0f}s "
+            f"health_refresh={COPYFLOW_HEALTH_FORCE_REFRESH_SEC:.0f}s "
             f"intel_refresh={COPYFLOW_INTEL_REFRESH_SEC}s "
             f"copy_http_parallel={COPYFLOW_HTTP_MAX_PARALLEL}"
         )
@@ -1605,7 +1625,8 @@ class LiveTrader:
         print(
             f"{B}[BOOT]{RS} clob_market_ws={CLOB_MARKET_WS_ENABLED} "
             f"sync={CLOB_MARKET_WS_SYNC_SEC:.1f}s "
-            f"book_ws_age<={CLOB_MARKET_WS_MAX_AGE_MS:.0f}ms"
+            f"book_ws_age<={CLOB_MARKET_WS_MAX_AGE_MS:.0f}ms "
+            f"heal(hits/cooldown)={CLOB_WS_STALE_HEAL_HITS}/{CLOB_WS_STALE_HEAL_COOLDOWN_SEC:.0f}s"
         )
         print(
             f"{B}[BOOT]{RS} scan_log_change_only={LOG_SCAN_ON_CHANGE_ONLY} "
@@ -3003,7 +3024,7 @@ class LiveTrader:
             if WS_BOOK_FALLBACK_ENABLED and pm_ok:
                 score -= 1
                 ws_book_now = _pm_book
-                if self._noisy_log_enabled(f"ws-fallback:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                if self._noisy_log_enabled(f"ws-fallback:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
                     print(
                         f"{Y}[WS-FALLBACK]{RS} {asset} {duration}m using PM book "
                         f"(age={pm_age_ms:.0f}ms) — no fresh CLOB WS"
@@ -3289,8 +3310,8 @@ class LiveTrader:
                         f"{Y}[LEADER-BYPASS]{RS} {asset} {duration}m leader={leader_side} "
                         f"entry={leader_entry:.3f} > cap={leader_entry_cap:.3f}"
                     )
-            elif MARKET_LEADER_FOLLOW_ENABLED and (not flow_fresh):
-                if self._noisy_log_enabled(f"leader-stale:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+            elif MARKET_LEADER_FOLLOW_ENABLED and (not flow_fresh) and flow_n > 0:
+                if self._noisy_log_enabled(f"leader-stale:{asset}:{duration}", LOG_FLOW_EVERY_SEC):
                     print(
                         f"{Y}[LEADER-STALE]{RS} {asset} {duration}m "
                         f"age={flow_age_s:.1f}s > {COPYFLOW_LIVE_MAX_AGE_SEC:.1f}s "
@@ -3345,7 +3366,7 @@ class LiveTrader:
                 signal_tier = "TIER-C"
                 signal_source = "synthetic-obflow"
                 leader_size_scale = LEADER_SYNTH_SIZE_SCALE
-                if self._noisy_log_enabled(f"leader-synth:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                if self._noisy_log_enabled(f"leader-synth:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
                     print(
                         f"{Y}[LEADER-SYNTH]{RS} {asset} {duration}m no fresh leader-flow "
                         f"(n={flow_n} age={flow_age_s:.1f}s) -> synth_net={synth_net:+.2f}"
@@ -6911,9 +6932,72 @@ class LiveTrader:
                 self._errors.tick("user_events_loop", print, err=e, every=20)
             await asyncio.sleep(max(0.25, USER_EVENTS_POLL_SEC))
 
+    async def _health_check(self):
+        now = _time.time()
+
+        # CLOB-WS health: if all active tokens are stale for several checks, force reconnect.
+        if CLOB_MARKET_WS_ENABLED and self.active_mkts:
+            tids = list(self._active_token_ids())
+            if tids:
+                stale = [tid for tid in tids if self._clob_ws_book_age_ms(tid) > CLOB_MARKET_WS_MAX_AGE_MS]
+                if len(stale) == len(tids):
+                    self._ws_stale_hits += 1
+                    if self._should_log("health-ws-stale", LOG_HEALTH_EVERY_SEC):
+                        age_samples = [self._clob_ws_book_age_ms(t) for t in tids[:3]]
+                        age_s = ", ".join(f"{a:.0f}ms" for a in age_samples)
+                        print(
+                            f"{Y}[HEALTH]{RS} CLOB-WS stale {len(stale)}/{len(tids)} tokens "
+                            f"(samples={age_s}) hits={self._ws_stale_hits}"
+                        )
+                    if (
+                        self._ws_stale_hits >= max(1, CLOB_WS_STALE_HEAL_HITS)
+                        and (now - float(self._ws_last_heal_ts or 0.0)) >= CLOB_WS_STALE_HEAL_COOLDOWN_SEC
+                    ):
+                        self._ws_last_heal_ts = now
+                        self._ws_stale_hits = 0
+                        print(f"{Y}[HEALTH]{RS} forcing CLOB-WS reconnect (all books stale)")
+                        try:
+                            if self._clob_market_ws is not None:
+                                await self._clob_market_ws.close(code=1012, reason="stale-books")
+                        except Exception:
+                            pass
+                else:
+                    self._ws_stale_hits = 0
+
+        # Leader-flow health: if no fresh leader-flow for active CIDs, force immediate refresh.
+        if COPYFLOW_LIVE_ENABLED and self.active_mkts:
+            cids = list(self.active_mkts.keys())
+            fresh = 0
+            for cid in cids:
+                row = self._copyflow_live.get(cid, {})
+                ts = float(row.get("ts", 0.0) or 0.0)
+                n = int(row.get("n", 0) or 0)
+                if ts > 0 and (now - ts) <= COPYFLOW_LIVE_MAX_AGE_SEC and n > 0:
+                    fresh += 1
+            if fresh == 0 and cids:
+                if self._should_log("health-leader-empty", LOG_HEALTH_EVERY_SEC):
+                    age = (now - self._copyflow_live_last_update_ts) if self._copyflow_live_last_update_ts > 0 else 9e9
+                    print(
+                        f"{Y}[HEALTH]{RS} no fresh leader-flow (active={len(cids)} "
+                        f"last_live={age:.1f}s zero_streak={self._copyflow_live_zero_streak})"
+                    )
+                if (now - float(self._copyflow_force_refresh_ts or 0.0)) >= COPYFLOW_HEALTH_FORCE_REFRESH_SEC:
+                    self._copyflow_force_refresh_ts = now
+                    updated = 0
+                    try:
+                        updated = await self._copyflow_live_refresh_once(reason="health")
+                    except Exception:
+                        updated = 0
+                    if updated <= 0:
+                        self._reload_copyflow()
+
     async def _status_loop(self):
         while True:
             await asyncio.sleep(STATUS_INTERVAL)
+            try:
+                await self._health_check()
+            except Exception as e:
+                self._errors.tick("health_check", print, err=e, every=20)
             self.status()
 
     # ── MAIN ──────────────────────────────────────────────────────────────────
