@@ -5365,13 +5365,21 @@ class LiveTrader:
                             usdc_delta = usdc_after - usdc_before
                             redeem_in = usdc_delta if usdc_delta > 0 else float(payout)
                         pnl = redeem_in - stake_out
+                        order_id_u = str(trade.get("order_id", "") or "").upper()
+                        reconcile_only = (
+                            bool(trade.get("historical_sync"))
+                            or order_id_u.startswith("SYNC")
+                            or order_id_u.startswith("RECOVER")
+                            or order_id_u.startswith("ONCHAIN-REDEEM-QUEUE")
+                        )
                         if int(trade.get("booster_count", 0) or 0) > 0:
                             self._booster_consec_losses = 0
                             self._booster_lock_until = 0.0
-                        self.daily_pnl += pnl
-                        self.total += 1; self.wins += 1
-                        self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
-                        self._record_result(asset, side, True, trade.get("structural", False), pnl=pnl)
+                        if not reconcile_only:
+                            self.daily_pnl += pnl
+                            self.total += 1; self.wins += 1
+                            self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
+                            self._record_result(asset, side, True, trade.get("structural", False), pnl=pnl)
                         self._log(m, trade, "WIN", pnl)
                         self._log_onchain_event("RESOLVE", cid, {
                             "asset": asset,
@@ -5396,7 +5404,8 @@ class LiveTrader:
                         wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                         rk_n = self._count_pending_redeem_by_rk(rk)
                         usdc_delta = usdc_after - usdc_before
-                        print(f"{G}[WIN]{RS} {asset} {side} {trade.get('duration',0)}m | "
+                        tag = "[WIN-RECONCILE]" if reconcile_only else "[WIN]"
+                        print(f"{G}{tag}{RS} {asset} {side} {trade.get('duration',0)}m | "
                               f"{G}${pnl:+.2f}{RS} | stake=${stake_out:.2f} redeem=${redeem_in:.2f} "
                               f"| rk_trades={rk_n} | Bank ${self.bankroll:.2f} | WR {wr} | "
                               f"{suffix} | rk={rk} cid={self._short_cid(cid)}")
@@ -5417,6 +5426,13 @@ class LiveTrader:
                         if size_f > 0:
                             stake_loss = max(size_f, float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0))
                             pnl = -stake_loss
+                            order_id_u = str(trade.get("order_id", "") or "").upper()
+                            reconcile_only = (
+                                bool(trade.get("historical_sync"))
+                                or order_id_u.startswith("SYNC")
+                                or order_id_u.startswith("RECOVER")
+                                or order_id_u.startswith("ONCHAIN-REDEEM-QUEUE")
+                            )
                             if int(trade.get("booster_count", 0) or 0) > 0:
                                 self._booster_consec_losses = int(self._booster_consec_losses or 0) + 1
                                 lock_n = max(1, MID_BOOSTER_LOSS_STREAK_LOCK)
@@ -5427,10 +5443,11 @@ class LiveTrader:
                                         f"{Y}[BOOST-LOCK]{RS} disabled for {rem_h:.1f}h "
                                         f"after {self._booster_consec_losses} booster losses"
                                     )
-                            self.daily_pnl += pnl
-                            self.total += 1
-                            self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
-                            self._record_result(asset, side, False, trade.get("structural", False), pnl=pnl)
+                            if not reconcile_only:
+                                self.daily_pnl += pnl
+                                self.total += 1
+                                self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
+                                self._record_result(asset, side, False, trade.get("structural", False), pnl=pnl)
                             self._log(m, trade, "LOSS", pnl)
                             self._log_onchain_event("RESOLVE", cid, {
                                 "asset": asset,
@@ -5454,7 +5471,8 @@ class LiveTrader:
                             })
                             wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                             rk_n = self._count_pending_redeem_by_rk(rk)
-                            print(f"{R}[LOSS]{RS} {asset} {side} {trade.get('duration',0)}m | "
+                            tag = "[LOSS-RECONCILE]" if reconcile_only else "[LOSS]"
+                            print(f"{R}{tag}{RS} {asset} {side} {trade.get('duration',0)}m | "
                                   f"{R}${pnl:+.2f}{RS} | stake=${stake_loss:.2f} redeem=$0.00 "
                                   f"| rk_trades={rk_n} | Bank ${self.bankroll:.2f} | WR {wr} | "
                                   f"rk={rk} cid={self._short_cid(cid)}")
@@ -5569,11 +5587,12 @@ class LiveTrader:
                     print(f"{G}[SYNC] Resolved→redeem: {title_p} {side_p} ~${val:.2f}{RS}")
                 else:
                     print(f"{Y}[SYNC] Resolved→loss: {title_p} {side_p} (${val:.2f}){RS}")
-                    # Record the loss
-                    size_p = t_p.get("size", 0)
-                    if size_p > 0:
-                        self.total += 1
-                        self._record_result(asset_p, side_p, False, t_p.get("structural", False), pnl=-size_p)
+                    # Record loss only for non-historical rows; skip replaying old history as live loss.
+                    if not self._is_historical_expired_position(pos_data, now, grace_sec=1800.0):
+                        size_p = t_p.get("size", 0)
+                        if size_p > 0:
+                            self.total += 1
+                            self._record_result(asset_p, side_p, False, t_p.get("structural", False), pnl=-size_p)
                 self._save_pending()
 
         for pos in positions:
