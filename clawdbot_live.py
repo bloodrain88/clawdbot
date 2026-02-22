@@ -2219,7 +2219,7 @@ class LiveTrader:
             import requests as _req
             positions = _req.get(
                 "https://data-api.polymarket.com/positions",
-                params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "false"},
                 timeout=8
             ).json()
             added_open = 0
@@ -5403,7 +5403,7 @@ class LiveTrader:
             try:
                 pos_rows = await self._http_get_json(
                     "https://data-api.polymarket.com/positions",
-                    params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "true"},
                     timeout=8,
                 )
                 if isinstance(pos_rows, list):
@@ -5779,7 +5779,7 @@ class LiveTrader:
             import requests as _req
             positions = _req.get(
                 "https://data-api.polymarket.com/positions",
-                params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "false"},
                 timeout=10
             ).json()
         except Exception as e:
@@ -5976,7 +5976,7 @@ class LiveTrader:
             import requests as _req
             r = _req.get(
                 "https://data-api.polymarket.com/positions",
-                params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "true"},
                 timeout=10
             )
             positions = r.json()
@@ -7074,15 +7074,25 @@ class LiveTrader:
                     if usdc_contract and addr_cs
                     else asyncio.sleep(0, result=0)
                 )
-                positions_task = self._http_get_json(
+                positions_open_task = self._http_get_json(
                     "https://data-api.polymarket.com/positions",
-                    params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "false"},
                     timeout=10,
                 )
-                usdc_raw, positions = await asyncio.gather(usdc_task, positions_task)
+                positions_redeem_task = self._http_get_json(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "true"},
+                    timeout=10,
+                )
+                usdc_raw, positions_open, positions_redeem = await asyncio.gather(
+                    usdc_task, positions_open_task, positions_redeem_task
+                )
                 usdc = float(usdc_raw or 0) / 1e6
-                if not isinstance(positions, list):
-                    positions = []
+                if not isinstance(positions_open, list):
+                    positions_open = []
+                if not isinstance(positions_redeem, list):
+                    positions_redeem = []
+                positions = positions_open + positions_redeem
 
                 # 2) On-chain-backed open/settling valuation from positions feed.
                 open_val = 0.0
@@ -7577,7 +7587,7 @@ class LiveTrader:
             try:
                 positions = await self._http_get_json(
                     "https://data-api.polymarket.com/positions",
-                    params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "true"},
                     timeout=10,
                 )
                 for pos in positions:
@@ -7718,7 +7728,7 @@ class LiveTrader:
                 loop = asyncio.get_event_loop()
                 positions = await loop.run_in_executor(None, lambda: _req.get(
                     "https://data-api.polymarket.com/positions",
-                    params={"user": ADDRESS, "sizeThreshold": "0.01"}, timeout=10
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "false"}, timeout=10
                 ).json())
                 now = datetime.now(timezone.utc).timestamp()
                 added = 0
