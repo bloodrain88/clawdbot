@@ -203,7 +203,7 @@ QUALITY_MODE = os.environ.get("QUALITY_MODE", "true").lower() == "true"
 STRICT_PM_SOURCE = os.environ.get("STRICT_PM_SOURCE", "true").lower() == "true"
 MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "1200"))
 MAX_QUOTE_STALENESS_MS = float(os.environ.get("MAX_QUOTE_STALENESS_MS", "1200"))
-MAX_ORDERBOOK_AGE_MS = float(os.environ.get("MAX_ORDERBOOK_AGE_MS", "1200"))
+MAX_ORDERBOOK_AGE_MS = float(os.environ.get("MAX_ORDERBOOK_AGE_MS", "500"))
 MIN_MINS_LEFT_5M = float(os.environ.get("MIN_MINS_LEFT_5M", "1.2"))
 MIN_MINS_LEFT_15M = float(os.environ.get("MIN_MINS_LEFT_15M", "3.0"))
 LATE_DIR_LOCK_ENABLED = os.environ.get("LATE_DIR_LOCK_ENABLED", "true").lower() == "true"
