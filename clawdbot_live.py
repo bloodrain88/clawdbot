@@ -261,6 +261,14 @@ ROUND_RETRY_COOLDOWN_SEC = float(os.environ.get("ROUND_RETRY_COOLDOWN_SEC", "12"
 RPC_OPTIMIZE_SEC = int(os.environ.get("RPC_OPTIMIZE_SEC", "45"))
 RPC_PROBE_COUNT = int(os.environ.get("RPC_PROBE_COUNT", "3"))
 RPC_SWITCH_MARGIN_MS = float(os.environ.get("RPC_SWITCH_MARGIN_MS", "15"))
+HTTP_CONN_LIMIT = int(os.environ.get("HTTP_CONN_LIMIT", "80"))
+HTTP_CONN_PER_HOST = int(os.environ.get("HTTP_CONN_PER_HOST", "30"))
+HTTP_DNS_TTL_SEC = int(os.environ.get("HTTP_DNS_TTL_SEC", "300"))
+HTTP_KEEPALIVE_SEC = float(os.environ.get("HTTP_KEEPALIVE_SEC", "30"))
+BOOK_CACHE_TTL_MS = float(os.environ.get("BOOK_CACHE_TTL_MS", "180"))
+BOOK_CACHE_MAX = int(os.environ.get("BOOK_CACHE_MAX", "256"))
+BOOK_FETCH_CONCURRENCY = int(os.environ.get("BOOK_FETCH_CONCURRENCY", "16"))
+CLOB_HEARTBEAT_SEC = float(os.environ.get("CLOB_HEARTBEAT_SEC", "6"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
 COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
@@ -386,6 +394,9 @@ class LiveTrader:
         self._redeem_verify_counts = {}  # cid → non-claimable verification cycles before auto-close
         self.seen            = set()
         self._session        = None   # persistent aiohttp session
+        self._book_cache     = {}     # token_id -> {"ts_ms": float, "book": OrderBook}
+        self._book_sem       = asyncio.Semaphore(max(1, BOOK_FETCH_CONCURRENCY))
+        self._heartbeat_last_ok = 0.0
         self.cl_prices       = {}    # Chainlink oracle prices (resolution source)
         self.cl_updated      = {}    # Chainlink last update timestamp per asset
         self.bankroll        = BANKROLL
@@ -670,7 +681,17 @@ class LiveTrader:
 
     async def _http_get_json(self, url: str, params: dict | None = None, timeout: float = 8.0):
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            connector = aiohttp.TCPConnector(
+                limit=max(1, HTTP_CONN_LIMIT),
+                limit_per_host=max(1, HTTP_CONN_PER_HOST),
+                ttl_dns_cache=max(0, HTTP_DNS_TTL_SEC),
+                enable_cleanup_closed=True,
+                keepalive_timeout=max(5.0, HTTP_KEEPALIVE_SEC),
+            )
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                headers={"User-Agent": "clawdbot-live/1.0"},
+            )
         try:
             async with self._session.get(
                 url,
@@ -683,6 +704,34 @@ class LiveTrader:
         except Exception as e:
             self._errors.tick("http_get_json", print, err=e, every=20)
             raise
+
+    async def _get_order_book(self, token_id: str, force_fresh: bool = False):
+        """Low-latency orderbook fetch with tiny TTL cache to avoid duplicate roundtrips."""
+        if not token_id:
+            return None
+        now_ms = _time.time() * 1000.0
+        if not force_fresh:
+            cached = self._book_cache.get(token_id)
+            if cached and (now_ms - float(cached.get("ts_ms", 0.0))) <= BOOK_CACHE_TTL_MS:
+                return cached.get("book")
+        loop = asyncio.get_event_loop()
+        async with self._book_sem:
+            if not force_fresh:
+                now_ms = _time.time() * 1000.0
+                cached = self._book_cache.get(token_id)
+                if cached and (now_ms - float(cached.get("ts_ms", 0.0))) <= BOOK_CACHE_TTL_MS:
+                    return cached.get("book")
+            book = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+            self._book_cache[token_id] = {"ts_ms": _time.time() * 1000.0, "book": book}
+            if len(self._book_cache) > max(16, BOOK_CACHE_MAX):
+                # Evict oldest entries to cap memory/lookup overhead.
+                oldest = sorted(
+                    self._book_cache.items(),
+                    key=lambda kv: float(kv[1].get("ts_ms", 0.0))
+                )[: max(1, len(self._book_cache) - BOOK_CACHE_MAX)]
+                for k, _ in oldest:
+                    self._book_cache.pop(k, None)
+            return book
 
     def _reload_copyflow(self):
         now = _time.time()
@@ -1188,7 +1237,9 @@ class LiveTrader:
         )
         print(
             f"{B}[BOOT]{RS} redeem_poll={REDEEM_POLL_SEC:.1f}s "
-            f"force_redeem_scan={FORCE_REDEEM_SCAN_SEC}s"
+            f"force_redeem_scan={FORCE_REDEEM_SCAN_SEC}s "
+            f"heartbeat={CLOB_HEARTBEAT_SEC:.1f}s "
+            f"book_cache={BOOK_CACHE_TTL_MS:.0f}ms/{BOOK_CACHE_MAX}"
         )
         print(f"{B}[BOOT]{RS} rpc={self._rpc_url or 'none'} | top={rpc_str}")
 
@@ -1903,7 +1954,17 @@ class LiveTrader:
         result = {}
         try:
             if self._session is None or self._session.closed:
-                self._session = aiohttp.ClientSession()
+                connector = aiohttp.TCPConnector(
+                    limit=max(1, HTTP_CONN_LIMIT),
+                    limit_per_host=max(1, HTTP_CONN_PER_HOST),
+                    ttl_dns_cache=max(0, HTTP_DNS_TTL_SEC),
+                    enable_cleanup_closed=True,
+                    keepalive_timeout=max(5.0, HTTP_KEEPALIVE_SEC),
+                )
+                self._session = aiohttp.ClientSession(
+                    connector=connector,
+                    headers={"User-Agent": "clawdbot-live/1.0"},
+                )
             async with self._session.get(
                 f"{GAMMA}/events",
                 params={
@@ -1986,7 +2047,7 @@ class LiveTrader:
             return None
         loop = asyncio.get_event_loop()
         try:
-            book     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+            book     = await self._get_order_book(token_id, force_fresh=False)
             tick     = float(book.tick_size or "0.01")
             asks     = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
             bids     = sorted(book.bids, key=lambda x: float(x.price), reverse=True) if book.bids else []
@@ -2867,7 +2928,7 @@ class LiveTrader:
                     else:
                         pm_book_data = None
                 if pm_book_data is None:
-                    book     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                    book     = await self._get_order_book(token_id, force_fresh=False)
                     tick     = float(book.tick_size or "0.01")
                     asks     = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
                     bids     = sorted(book.bids, key=lambda x: float(x.price), reverse=True) if book.bids else []
@@ -2965,7 +3026,7 @@ class LiveTrader:
                     depth_now = _book_depth_usdc(asks, taker_price)
                     if depth_now < needed_notional:
                         try:
-                            ob2 = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                            ob2 = await self._get_order_book(token_id, force_fresh=True)
                             asks2 = sorted(ob2.asks, key=lambda x: float(x.price)) if ob2.asks else []
                             depth_now = _book_depth_usdc(asks2, taker_price)
                         except Exception:
@@ -3011,7 +3072,7 @@ class LiveTrader:
                         depth_now = _book_depth_usdc(asks, taker_price)
                         if depth_now < needed_notional:
                             try:
-                                ob2 = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                                ob2 = await self._get_order_book(token_id, force_fresh=True)
                                 asks2 = sorted(ob2.asks, key=lambda x: float(x.price)) if ob2.asks else []
                                 depth_now = _book_depth_usdc(asks2, taker_price)
                             except Exception:
@@ -3136,7 +3197,7 @@ class LiveTrader:
 
                 # ── PHASE 2: price-capped FOK fallback — re-fetch book for fresh ask ──
                 try:
-                    fresh     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                    fresh     = await self._get_order_book(token_id, force_fresh=True)
                     f_asks    = sorted(fresh.asks, key=lambda x: float(x.price)) if fresh.asks else []
                     f_bids    = sorted(fresh.bids, key=lambda x: float(x.price), reverse=True) if fresh.bids else []
                     f_tick    = float(fresh.tick_size or tick)
@@ -5348,6 +5409,21 @@ class LiveTrader:
             except Exception as e:
                 print(f"{Y}[SYNC] position_sync_loop error: {e}{RS}")
 
+    async def _heartbeat_loop(self):
+        """Keep CLOB session warm and open orders alive."""
+        if DRY_RUN:
+            return
+        while True:
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: self.clob.post_heartbeat())
+                self._heartbeat_last_ok = _time.time()
+            except Exception as e:
+                self._errors.tick("clob_heartbeat", print, err=e, every=10)
+                if self._should_log("heartbeat-fail", 30):
+                    print(f"{Y}[HEARTBEAT] failed: {e}{RS}")
+            await asyncio.sleep(max(2.0, CLOB_HEARTBEAT_SEC))
+
     async def _status_loop(self):
         while True:
             await asyncio.sleep(STATUS_INTERVAL)
@@ -5394,6 +5470,7 @@ class LiveTrader:
             _guard("_status_loop",          self._status_loop),
             _guard("_refresh_balance",      self._refresh_balance),
             _guard("_redeem_loop",          self._redeem_loop),
+            _guard("_heartbeat_loop",       self._heartbeat_loop),
             _guard("_force_redeem_backfill_loop", self._force_redeem_backfill_loop),
             _guard("chainlink_loop",        self.chainlink_loop),
             _guard("_copyflow_refresh_loop", self._copyflow_refresh_loop),
