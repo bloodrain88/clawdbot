@@ -1591,7 +1591,7 @@ class LiveTrader:
                         continue
                     boot_count[w] = int(boot_count.get(w, 0)) + 1
             for w, c in boot_count.items():
-                if c >= 2:
+                if c >= 1:
                     leaders[w] = max(float(leaders.get(w, 0.0) or 0.0), min(0.25, 0.08 + 0.02 * c))
         if not leaders:
             self._copyflow_live_zero_streak += 1
@@ -1725,7 +1725,7 @@ class LiveTrader:
                     continue
                 boot_count[w] = int(boot_count.get(w, 0)) + 1
             for w, c in boot_count.items():
-                if c >= 2:
+                if c >= 1:
                     leaders[w] = max(float(leaders.get(w, 0.0) or 0.0), min(0.25, 0.08 + 0.02 * c))
         if not leaders:
             self._copyflow_live_zero_streak += 1
@@ -3313,23 +3313,8 @@ class LiveTrader:
             if alt:
                 ws_book_now = self._get_clob_ws_book(alt, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
                 ws_book_strict = ws_book_now
-        # Soft WS fallback: if strict-fresh missing, accept slightly older WS book before REST fallback.
-        if ws_book_now is None and CLOB_MARKET_WS_SOFT_AGE_MS > CLOB_MARKET_WS_MAX_AGE_MS:
-            ws_book_now = self._get_clob_ws_book(prefetch_token, max_age_ms=CLOB_MARKET_WS_SOFT_AGE_MS)
-            if ws_book_now is None:
-                tok_u = str(m.get("token_up", "") or "")
-                tok_d = str(m.get("token_down", "") or "")
-                alt = tok_d if prefetch_token == tok_u else tok_u
-                if alt:
-                    ws_book_now = self._get_clob_ws_book(alt, max_age_ms=CLOB_MARKET_WS_SOFT_AGE_MS)
-            if ws_book_now is not None:
-                score -= 1
-                if self._noisy_log_enabled(f"ws-soft:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
-                    book_age_ms = ((_time.time() - float(ws_book_now.get("ts", 0.0) or 0.0)) * 1000.0)
-                    print(
-                        f"{Y}[WS-SOFT]{RS} {asset} {duration}m using older CLOB WS book "
-                        f"(age={book_age_ms:.0f}ms)"
-                    )
+        # Never trade on soft-stale WS books: keep strict-fresh only for entries.
+        # Older books can still be observed by health checker, but not used in scoring/execution.
 
         # Realtime triad gating: orderbook + leader + volume signals.
         if REQUIRE_ORDERBOOK_WS and ws_book_now is None:
@@ -3718,13 +3703,10 @@ class LiveTrader:
             signal_source = "leader-live"
             leader_size_scale = LEADER_FRESH_SIZE_SCALE
         if REQUIRE_LEADER_FLOW and (not leader_ready):
-            if self._noisy_log_enabled(f"skip-no-leader:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                print(
-                    f"{Y}[SKIP] {asset} {duration}m missing fresh leader-flow for this CID "
-                    f"(age={flow_age_s:.1f}s n={flow_n}){RS}"
-                )
-            self._skip_tick("leader_missing")
-            return None
+                if self._noisy_log_enabled(f"skip-no-leader:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(f"{Y}[SKIP] {asset} {duration}m leader-flow realtime unavailable{RS}")
+                self._skip_tick("leader_missing")
+                return None
 
         # Pre-bid arm: for first seconds after open, bias side/execution to pre-planned signal.
         arm = self._prebid_plan.get(cid, {})
