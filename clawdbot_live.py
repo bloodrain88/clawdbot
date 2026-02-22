@@ -353,6 +353,8 @@ LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MA
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
 # Small tolerance for payout threshold to avoid dead-zone misses (e.g. 1.98x vs 2.00x).
 PAYOUT_NEAR_MISS_TOL = float(os.environ.get("PAYOUT_NEAR_MISS_TOL", "0.03"))
+ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M", "0.05"))
+ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M", "0.05"))
 # Mid-round booster (15m only): small additive bet at high payout/high conviction.
 MID_BOOSTER_ENABLED = os.environ.get("MID_BOOSTER_ENABLED", "true").lower() == "true"
 MID_BOOSTER_ANYTIME_15M = os.environ.get("MID_BOOSTER_ANYTIME_15M", "true").lower() == "true"
@@ -5623,6 +5625,11 @@ class LiveTrader:
         base_payout = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
         base_ev = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
         hard_cap = ENTRY_HARD_CAP_5M if duration <= 5 else ENTRY_HARD_CAP_15M
+        payout_upshift_cap = (
+            ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M
+            if duration <= 5
+            else ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M
+        )
 
         snap = self._growth_snapshot()
         tightness = 0.0
@@ -5638,7 +5645,8 @@ class LiveTrader:
             tightness -= 0.35
         tightness = min(1.8, max(-0.5, tightness))
 
-        min_payout = max(1.55, base_payout + (0.20 * tightness))
+        min_payout_raw = base_payout + (0.20 * tightness)
+        min_payout = max(1.55, min(base_payout + payout_upshift_cap, min_payout_raw))
         min_ev = max(0.005, base_ev + (0.015 * tightness))
         max_entry_hard = max(0.33, min(0.80, hard_cap - (0.06 * tightness)))
 
