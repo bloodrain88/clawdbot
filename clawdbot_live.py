@@ -4925,9 +4925,13 @@ class LiveTrader:
 
                 def _normalize_order_size(exec_price: float, intended_usdc: float) -> tuple[float, float]:
                     min_shares = max(0.01, MIN_ORDER_SIZE_SHARES + ORDER_SIZE_PAD_SHARES)
-                    raw_shares = max(0.0, intended_usdc) / max(exec_price, 1e-9)
-                    shares = round(max(raw_shares, min_shares), 2)
-                    notional = round(shares * exec_price, 2)
+                    px = max(exec_price, 1e-9)
+                    raw_shares = max(0.0, intended_usdc) / px
+                    # Execution hard-min is in USDC, not only in shares.
+                    min_notional = max(hard_min_notional, min_shares * px)
+                    shares_floor = min_notional / px
+                    shares = round(max(raw_shares, shares_floor), 2)
+                    notional = round(shares * px, 2)
                     return shares, notional
 
                 def _normalize_buy_amount(intended_usdc: float) -> float:
@@ -5214,6 +5218,12 @@ class LiveTrader:
                 maker_price_order = round(maker_price, 2)
                 size_tok_m, maker_notional = _normalize_order_size(maker_price_order, size_usdc)
                 size_usdc = maker_notional
+                if size_usdc < hard_min_notional:
+                    print(
+                        f"{Y}[SKIP]{RS} {asset} {side} normalized size=${size_usdc:.2f} "
+                        f"< hard_min=${hard_min_notional:.2f} (post-normalize)"
+                    )
+                    return None
 
                 print(f"{G}[MAKER] {asset} {side}: px={maker_price:.3f} "
                       f"book_bid={best_bid:.3f} book_ask={best_ask:.3f} spread={spread:.3f} "
