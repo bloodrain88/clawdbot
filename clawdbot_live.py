@@ -240,7 +240,7 @@ CHAINLINK_ABI = [
      "stateMutability":"view","type":"function"},
 ]
 SCAN_INTERVAL  = float(os.environ.get("SCAN_INTERVAL", "0.5"))
-PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "2"))
+PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "5"))
 STATUS_INTERVAL= int(os.environ.get("STATUS_INTERVAL", "15"))
 ONCHAIN_SYNC_SEC = float(os.environ.get("ONCHAIN_SYNC_SEC", "2.0"))
 _DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
@@ -282,8 +282,8 @@ LOG_EXEC_EVERY_SEC = int(os.environ.get("LOG_EXEC_EVERY_SEC", "30"))
 SKIP_STATS_WINDOW_SEC = int(os.environ.get("SKIP_STATS_WINDOW_SEC", "900"))
 SKIP_STATS_TOP_N = int(os.environ.get("SKIP_STATS_TOP_N", "6"))
 WS_HEALTH_REQUIRED = os.environ.get("WS_HEALTH_REQUIRED", "true").lower() == "true"
-WS_HEALTH_MIN_FRESH_RATIO = float(os.environ.get("WS_HEALTH_MIN_FRESH_RATIO", "0.75"))
-WS_HEALTH_MAX_MED_AGE_MS = float(os.environ.get("WS_HEALTH_MAX_MED_AGE_MS", "4500"))
+WS_HEALTH_MIN_FRESH_RATIO = float(os.environ.get("WS_HEALTH_MIN_FRESH_RATIO", "0.50"))
+WS_HEALTH_MAX_MED_AGE_MS = float(os.environ.get("WS_HEALTH_MAX_MED_AGE_MS", "7000"))
 WS_GATE_WARMUP_SEC = float(os.environ.get("WS_GATE_WARMUP_SEC", "45"))
 SEEN_MAX_KEEP = int(os.environ.get("SEEN_MAX_KEEP", "600"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
@@ -2739,7 +2739,7 @@ class LiveTrader:
                     async def pinger():
                         while True:
                             await asyncio.sleep(PING_INTERVAL)
-                            try: await ws.send(json.dumps({"action": "ping"}))
+                            try: await ws.send("PING")
                             except: break
                     asyncio.create_task(pinger())
 
@@ -3174,51 +3174,66 @@ class LiveTrader:
                     self._clob_ws_assets_subscribed = set()
                     print(f"{G}[CLOB-WS] market connected{RS}")
                     delay = 2
-                    while True:
-                        desired = self._trade_focus_token_ids() or self._active_token_ids()
-                        add = desired - self._clob_ws_assets_subscribed
-                        rem = self._clob_ws_assets_subscribed - desired
-                        if add:
-                            await ws.send(
-                                json.dumps(
-                                    {
-                                        "assets_ids": sorted(add),
-                                        "type": "market",
-                                        "custom_feature_enabled": True,
-                                    }
+                    async def _app_heartbeat():
+                        # Polymarket market WS expects app-level "PING" heartbeat every ~10s.
+                        while True:
+                            await asyncio.sleep(10.0)
+                            try:
+                                await ws.send("PING")
+                            except Exception:
+                                break
+                    hb_task = asyncio.create_task(_app_heartbeat())
+                    try:
+                        while True:
+                            desired = self._trade_focus_token_ids() or self._active_token_ids()
+                            add = desired - self._clob_ws_assets_subscribed
+                            rem = self._clob_ws_assets_subscribed - desired
+                            if add:
+                                await ws.send(
+                                    json.dumps(
+                                        {
+                                            "assets_ids": sorted(add),
+                                            "type": "market",
+                                            "custom_feature_enabled": True,
+                                        }
+                                    )
                                 )
-                            )
-                            self._clob_ws_assets_subscribed |= set(add)
-                        if rem:
-                            await ws.send(
-                                json.dumps(
-                                    {
-                                        "assets_ids": sorted(rem),
-                                        "type": "market",
-                                        "operation": "unsubscribe",
-                                    }
+                                self._clob_ws_assets_subscribed |= set(add)
+                            if rem:
+                                await ws.send(
+                                    json.dumps(
+                                        {
+                                            "assets_ids": sorted(rem),
+                                            "type": "market",
+                                            "operation": "unsubscribe",
+                                        }
+                                    )
                                 )
-                            )
-                            self._clob_ws_assets_subscribed -= set(rem)
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, CLOB_MARKET_WS_SYNC_SEC))
-                        except asyncio.TimeoutError:
-                            continue
-                        try:
-                            msg = json.loads(raw)
-                        except Exception:
-                            continue
-                        rows = msg if isinstance(msg, list) else [msg]
-                        for row in rows:
-                            if isinstance(row, dict) and isinstance(row.get("data"), (list, dict)):
-                                sub = row.get("data")
-                                if isinstance(sub, list):
-                                    for r2 in sub:
-                                        self._ingest_clob_ws_event(r2)
+                                self._clob_ws_assets_subscribed -= set(rem)
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, CLOB_MARKET_WS_SYNC_SEC))
+                            except asyncio.TimeoutError:
+                                continue
+                            try:
+                                msg = json.loads(raw)
+                            except Exception:
+                                # Server may return plain-text PONG to app heartbeat.
+                                if str(raw).strip().upper() == "PONG":
+                                    continue
+                                continue
+                            rows = msg if isinstance(msg, list) else [msg]
+                            for row in rows:
+                                if isinstance(row, dict) and isinstance(row.get("data"), (list, dict)):
+                                    sub = row.get("data")
+                                    if isinstance(sub, list):
+                                        for r2 in sub:
+                                            self._ingest_clob_ws_event(r2)
+                                    else:
+                                        self._ingest_clob_ws_event(sub)
                                 else:
-                                    self._ingest_clob_ws_event(sub)
-                            else:
-                                self._ingest_clob_ws_event(row)
+                                    self._ingest_clob_ws_event(row)
+                    finally:
+                        hb_task.cancel()
             except Exception as e:
                 self._errors.tick("clob_market_ws", print, err=e, every=8)
                 print(f"{Y}[CLOB-WS] {e} — reconnect in {delay}s{RS}")
@@ -6717,7 +6732,8 @@ class LiveTrader:
                 )
             self._scan_state_last = scan_state
 
-            # Hard pre-trade gate: require healthy WS books before evaluating/placing new entries.
+            # Global WS health is advisory only: per-market scorer enforces freshness-first
+            # (strict WS when available, otherwise fresh REST fallback).
             if WS_HEALTH_REQUIRED:
                 ws_ok, hs = self._ws_trade_gate_ok()
                 if not ws_ok:
@@ -6731,19 +6747,18 @@ class LiveTrader:
                                 f"(fresh_books={fresh}/{at})"
                             )
                     else:
-                        self._skip_tick("ws_health_gate")
+                        self._skip_tick("ws_health_soft")
                         if self._should_log("ws-health-gate", LOG_HEALTH_EVERY_SEC):
                             at = int(hs.get("active_markets", 0) or 0)
                             fresh = int(hs.get("fresh_markets", 0) or 0)
                             ratio = (fresh / max(1, at)) if at > 0 else 0.0
                             ws_med = float(hs.get("ws_market_med_ms", 9e9) or 9e9)
                             print(
-                                f"{Y}[WS-GATE]{RS} skip entries: fresh_books={fresh}/{at} "
+                                f"{Y}[WS-GATE-SOFT]{RS} degraded ws: fresh_books={fresh}/{at} "
                                 f"ratio={ratio:.2f} < {WS_HEALTH_MIN_FRESH_RATIO:.2f} "
-                                f"or ws_med={ws_med:.0f}ms > {WS_HEALTH_MAX_MED_AGE_MS:.0f}ms"
+                                f"or ws_med={ws_med:.0f}ms > {WS_HEALTH_MAX_MED_AGE_MS:.0f}ms "
+                                f"— continuing with per-market freshness checks"
                             )
-                    await asyncio.sleep(SCAN_INTERVAL)
-                    continue
 
             # Subscribe new markets to RTDS token price stream
             if self._rtds_ws:

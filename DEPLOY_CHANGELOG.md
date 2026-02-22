@@ -12,6 +12,17 @@ Ogni modifica che impatta trading/runtime deve aggiungere una nuova entry con:
 
 ## 2026-02-22
 
+### Commit `heartbeat-docs-align`
+- Scope: `clawdbot_live.py`
+- Summary:
+  - RTDS heartbeat allineato a docs ufficiali: invio `PING` testuale ogni 5s.
+  - Market CLOB WS heartbeat applicativo aggiunto: invio `PING` ogni 10s + gestione `PONG`.
+  - Obiettivo: ridurre stale books e disconnect silenziosi lato feed realtime.
+- Feed/infra status intent:
+  - Nessun cambio strategia trading; solo stabilita' e freshness trasporto dati.
+- Rollback:
+  - `git revert <sha-commit>`
+
 ### Commit `runtime-stability-ws-rtds-seen`
 - Scope: `clawdbot_live.py`
 - Summary:

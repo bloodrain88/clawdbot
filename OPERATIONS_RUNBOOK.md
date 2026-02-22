@@ -119,3 +119,25 @@ Quando c'e' un problema, rispondere sempre con:
 3. Causa tecnica precisa.
 4. Fix applicato.
 5. Verifica post-fix.
+
+## 9) Deploy manuale stabile (senza webhook VCS)
+Quando l'integrazione VCS e' instabile/non disponibile, usare sempre questo metodo.
+
+Script versionato:
+- `scripts/nf_manual_deploy.sh`
+
+Comando:
+```bash
+cd /Users/alessandro/clawdbot
+./scripts/nf_manual_deploy.sh
+```
+
+Cosa fa:
+1. push su `origin/main`
+2. trigger build Northflank con SHA esplicita (`start service build --input {"sha":...}`)
+3. polling fino a `SUCCESS/FAILED`
+4. request deploy su stessa SHA
+5. verifica finale `deployedSHA == git rev-parse HEAD`
+
+Regola operativa:
+- Se il deploy automatico non parte, non usare fix ad-hoc: rilanciare solo questo script.
