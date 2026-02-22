@@ -300,6 +300,7 @@ USER_EVENTS_CACHE_TTL_SEC = float(os.environ.get("USER_EVENTS_CACHE_TTL_SEC", "1
 CLOB_MARKET_WS_ENABLED = os.environ.get("CLOB_MARKET_WS_ENABLED", "true").lower() == "true"
 CLOB_MARKET_WS_SYNC_SEC = float(os.environ.get("CLOB_MARKET_WS_SYNC_SEC", "2.0"))
 CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "2000"))
+CLOB_MARKET_WS_SOFT_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_SOFT_AGE_MS", "6000"))
 CLOB_WS_STALE_HEAL_HITS = int(os.environ.get("CLOB_WS_STALE_HEAL_HITS", "3"))
 CLOB_WS_STALE_HEAL_COOLDOWN_SEC = float(os.environ.get("CLOB_WS_STALE_HEAL_COOLDOWN_SEC", "20"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
@@ -1697,7 +1698,7 @@ class LiveTrader:
         print(
             f"{B}[BOOT]{RS} clob_market_ws={CLOB_MARKET_WS_ENABLED} "
             f"sync={CLOB_MARKET_WS_SYNC_SEC:.1f}s "
-            f"book_ws_age<={CLOB_MARKET_WS_MAX_AGE_MS:.0f}ms "
+            f"book_ws_age(strict/soft)<={CLOB_MARKET_WS_MAX_AGE_MS:.0f}/{CLOB_MARKET_WS_SOFT_AGE_MS:.0f}ms "
             f"heal(hits/cooldown)={CLOB_WS_STALE_HEAL_HITS}/{CLOB_WS_STALE_HEAL_COOLDOWN_SEC:.0f}s"
         )
         print(
@@ -3096,6 +3097,23 @@ class LiveTrader:
             alt = tok_d if prefetch_token == tok_u else tok_u
             if alt:
                 ws_book_now = self._get_clob_ws_book(alt, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+        # Soft WS fallback: if strict-fresh missing, accept slightly older WS book before REST fallback.
+        if ws_book_now is None and CLOB_MARKET_WS_SOFT_AGE_MS > CLOB_MARKET_WS_MAX_AGE_MS:
+            ws_book_now = self._get_clob_ws_book(prefetch_token, max_age_ms=CLOB_MARKET_WS_SOFT_AGE_MS)
+            if ws_book_now is None:
+                tok_u = str(m.get("token_up", "") or "")
+                tok_d = str(m.get("token_down", "") or "")
+                alt = tok_d if prefetch_token == tok_u else tok_u
+                if alt:
+                    ws_book_now = self._get_clob_ws_book(alt, max_age_ms=CLOB_MARKET_WS_SOFT_AGE_MS)
+            if ws_book_now is not None:
+                score -= 1
+                if self._noisy_log_enabled(f"ws-soft:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
+                    book_age_ms = ((_time.time() - float(ws_book_now.get("ts", 0.0) or 0.0)) * 1000.0)
+                    print(
+                        f"{Y}[WS-SOFT]{RS} {asset} {duration}m using older CLOB WS book "
+                        f"(age={book_age_ms:.0f}ms)"
+                    )
 
         # Realtime triad gating: orderbook + leader + volume signals.
         if REQUIRE_ORDERBOOK_WS and ws_book_now is None:
