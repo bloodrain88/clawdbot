@@ -3241,7 +3241,9 @@ class LiveTrader:
             if MID_BOOSTER_ENABLED and cid in self.pending:
                 _pm, _pt = self.pending.get(cid, ({}, {}))
                 _pside = str((_pt or {}).get("side", "") or "")
-                if _pside in ("Up", "Down"):
+                _is_core = bool((_pt or {}).get("core_position", True))
+                _stake_onchain = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
+                if _pside in ("Up", "Down") and _is_core and _stake_onchain > 0:
                     booster_eval = True
                     booster_side_locked = _pside
                 else:
@@ -3862,19 +3864,39 @@ class LiveTrader:
             + 0.10 * leader_c
         )
 
-        if analysis_quality < MIN_ANALYSIS_QUALITY:
+        quality_floor = float(MIN_ANALYSIS_QUALITY)
+        conviction_floor = float(MIN_ANALYSIS_CONVICTION)
+        # Dynamic gates by realtime data quality and timing (position-aware, not fixed-only).
+        if ws_fresh and cl_fresh and vol_fresh:
+            quality_floor -= 0.03
+        if (not leader_fresh) and ws_fresh and cl_fresh:
+            quality_floor -= 0.02
+        if mins_left <= (3.5 if duration >= 15 else 1.8):
+            quality_floor -= 0.02
+            conviction_floor -= 0.01
+        if quote_age_ms > 900:
+            quality_floor += 0.02
+        if not ws_fresh:
+            quality_floor += 0.03
+            conviction_floor += 0.02
+        if not cl_fresh:
+            conviction_floor += 0.03
+        quality_floor = max(0.45, min(0.75, quality_floor))
+        conviction_floor = max(0.45, min(0.72, conviction_floor))
+
+        if analysis_quality < quality_floor:
             if self._noisy_log_enabled(f"skip-analysis-quality:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
                     f"{Y}[SKIP] {asset} {duration}m low analysis quality "
-                    f"q={analysis_quality:.2f}<{MIN_ANALYSIS_QUALITY:.2f}{RS}"
+                    f"q={analysis_quality:.2f}<{quality_floor:.2f}{RS}"
                 )
             self._skip_tick("analysis_quality_low")
             return None
-        if analysis_conviction < MIN_ANALYSIS_CONVICTION:
+        if analysis_conviction < conviction_floor:
             if self._noisy_log_enabled(f"skip-analysis-conv:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
                     f"{Y}[SKIP] {asset} {duration}m low analysis conviction "
-                    f"c={analysis_conviction:.2f}<{MIN_ANALYSIS_CONVICTION:.2f}{RS}"
+                    f"c={analysis_conviction:.2f}<{conviction_floor:.2f}{RS}"
                 )
             self._skip_tick("analysis_conviction_low")
             return None
@@ -3980,6 +4002,13 @@ class LiveTrader:
             max_entry_allowed = max(max_entry_allowed, min(0.85, model_cap))
         # Adaptive protection against poor payout fills from realized outcomes.
         min_payout_req, min_ev_req, adaptive_hard_cap = self._adaptive_thresholds(duration)
+        # Dynamic flow constraints by current setup quality (avoid static hardcoded behavior).
+        setup_q = max(0.0, min(1.0, (analysis_quality * 0.55) + (analysis_conviction * 0.45)))
+        q_relax = max(0.0, setup_q - 0.55)
+        min_payout_req = max(1.55, min_payout_req - (0.20 * q_relax))
+        min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
+        if ws_fresh and cl_fresh and vol_fresh and mins_left >= (4.0 if duration >= 15 else 2.0):
+            max_entry_allowed = min(0.90, max_entry_allowed + 0.02)
         max_entry_allowed = min(max_entry_allowed, adaptive_hard_cap)
         # High-conviction 15m mode: target lower cents early for better payout.
         hc15 = (
@@ -4506,6 +4535,12 @@ class LiveTrader:
                 "booster_note": sig.get("booster_note", ""),
                 "booster_count": 1 if is_booster else 0,
                 "booster_stake_usdc": actual_size_usdc if is_booster else 0.0,
+                "addon_count": 1 if is_booster else 0,
+                "addon_stake_usdc": actual_size_usdc if is_booster else 0.0,
+                "core_position": (not is_booster),
+                "core_entry_locked": (not is_booster),
+                "core_entry": (fill_price if (not is_booster) else 0.0),
+                "core_size_usdc": (actual_size_usdc if (not is_booster) else 0.0),
             }
             self._log_onchain_event("ENTRY", cid, {
                 "asset": sig["asset"],
@@ -4536,12 +4571,10 @@ class LiveTrader:
                 if is_booster and cid in self.pending:
                     old_m, old_t = self.pending.get(cid, (m, {}))
                     old_size = float((old_t or {}).get("size", 0.0) or 0.0)
-                    old_entry = float((old_t or {}).get("entry", sig["entry"]) or sig["entry"])
                     new_size = float(actual_size_usdc or 0.0)
-                    merged_size = max(0.0, old_size + new_size)
-                    merged_entry = ((old_entry * old_size) + (fill_price * new_size)) / max(merged_size, 1e-9)
-                    old_t["size"] = round(merged_size, 6)
-                    old_t["entry"] = round(merged_entry, 6)
+                    # Keep core position immutable locally: no weighted-average assimilation.
+                    # Add-ons are tracked in separate fields while on-chain remains aggregate truth.
+                    old_t["size"] = round(old_size, 6)
                     old_t["fill_price"] = round(fill_price, 6)
                     old_t["slip_bps"] = round(float(trade.get("slip_bps", 0.0) or 0.0), 2)
                     old_t["placed_ts"] = _time.time()
@@ -4549,12 +4582,17 @@ class LiveTrader:
                     old_t["booster_note"] = sig.get("booster_note", "")
                     old_t["booster_count"] = int(old_t.get("booster_count", 0) or 0) + 1
                     old_t["booster_stake_usdc"] = round(float(old_t.get("booster_stake_usdc", 0.0) or 0.0) + new_size, 6)
+                    old_t["addon_count"] = int(old_t.get("addon_count", 0) or 0) + 1
+                    old_t["addon_stake_usdc"] = round(float(old_t.get("addon_stake_usdc", 0.0) or 0.0) + new_size, 6)
+                    old_t["core_position"] = bool(old_t.get("core_position", True))
+                    old_t["core_entry_locked"] = bool(old_t.get("core_entry_locked", True))
                     self.pending[cid] = (old_m, old_t)
                     self._booster_used_by_cid[cid] = int(self._booster_used_by_cid.get(cid, 0) or 0) + 1
                     self._save_pending()
                     print(
                         f"{G}[BOOST-FILL]{RS} {sig['asset']} {sig['duration']}m {side} "
-                        f"| +${new_size:.2f} @ {fill_price:.3f} | total=${merged_size:.2f} "
+                        f"| +${new_size:.2f} @ {fill_price:.3f} | core=${old_size:.2f} "
+                        f"| addon_total=${old_t.get('addon_stake_usdc', 0.0):.2f} "
                         f"| cid={self._short_cid(cid)}"
                     )
                 else:
@@ -5728,10 +5766,14 @@ class LiveTrader:
                                "asset": asset, "token_up": token_up, "token_down": token_down})
                 old_t.update({"end_ts": end_ts, "asset": asset, "duration": duration,
                                "token_id": token_up if outcome == "Up" else token_down})
-                if rec_spent > 0:
-                    old_t["size"] = rec_spent
-                if entry > 0:
-                    old_t["entry"] = entry
+                # Keep local core parameters stable once locked (no local average overwrite).
+                if not bool(old_t.get("core_entry_locked", False)):
+                    if rec_spent > 0:
+                        old_t["size"] = rec_spent
+                    if entry > 0:
+                        old_t["entry"] = entry
+                old_t["onchain_stake_usdc"] = round(rec_spent, 6)
+                old_t["onchain_entry"] = round(entry, 6)
                 print(f"{Y}[SYNC] Updated: {title[:40]} {outcome} | spent=${old_t.get('size',0):.2f} mark=${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
             else:
                 trade = {"side": outcome, "size": rec_spent, "entry": entry,
@@ -5739,7 +5781,13 @@ class LiveTrader:
                          "mkt_price": entry, "edge": 0, "mins_left": mins_left,
                          "end_ts": end_ts, "asset": asset, "duration": duration,
                          "token_id": token_up if outcome == "Up" else token_down,
-                         "order_id": "SYNCED"}
+                         "order_id": "SYNCED",
+                         "core_position": True,
+                         "core_entry_locked": True,
+                         "core_entry": entry,
+                         "core_size_usdc": rec_spent,
+                         "addon_count": 0,
+                         "addon_stake_usdc": 0.0}
                 if mins_left <= 0:
                     self.pending_redeem[cid] = (m, trade)
                     print(f"{Y}[SYNC] Restored->settling: {title[:40]} {outcome} | spent=${rec_spent:.2f} mark=${val:.2f} | {duration}m ended {abs(mins_left):.1f}min ago{RS}")
@@ -7256,7 +7304,13 @@ class LiveTrader:
                            "mkt_price": 0.5, "edge": 0, "mins_left": mins_left,
                            "end_ts": end_ts, "asset": asset, "duration": duration,
                            "token_id": token_up if side == "Up" else token_down,
-                           "order_id": "RECOVERED"}
+                           "order_id": "RECOVERED",
+                           "core_position": True,
+                           "core_entry_locked": True,
+                           "core_entry": rec_entry,
+                           "core_size_usdc": rec_spent,
+                           "addon_count": 0,
+                           "addon_stake_usdc": 0.0}
                     self.pending[cid] = (m_r, t_r)
                     self.seen.add(cid)
                     self._save_pending()
@@ -7584,7 +7638,13 @@ class LiveTrader:
                            "mkt_price": 0.5, "edge": 0, "mins_left": mins_left,
                            "end_ts": end_ts, "asset": asset, "duration": duration,
                            "token_id": token_up if side == "Up" else token_down,
-                           "order_id": "SYNC-PERIODIC"}
+                           "order_id": "SYNC-PERIODIC",
+                           "core_position": True,
+                           "core_entry_locked": True,
+                           "core_entry": rec_entry,
+                           "core_size_usdc": rec_spent,
+                           "addon_count": 0,
+                           "addon_stake_usdc": 0.0}
                     # Verify on-chain before adding — don't trust API alone
                     _token_id_str = token_up if side == "Up" else token_down
                     _onchain_bal  = 0
