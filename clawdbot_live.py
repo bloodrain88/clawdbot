@@ -4100,6 +4100,17 @@ class LiveTrader:
         setup_q = max(0.0, min(1.0, (analysis_quality * 0.55) + (analysis_conviction * 0.45)))
         q_relax = max(0.0, setup_q - 0.55)
         min_payout_req = max(1.55, min_payout_req - (0.20 * q_relax))
+        # Additional payout relaxation only for strong, side-aligned 15m setups.
+        # This reduces "no-trade" dead-zones without opening weak entries.
+        if (
+            duration >= 15
+            and score >= 12
+            and true_prob >= 0.82
+            and setup_q >= 0.70
+            and cl_agree
+        ):
+            extra_relax = min(0.06, max(0.0, setup_q - 0.70) * 0.30)
+            min_payout_req = max(1.70, min_payout_req - extra_relax)
         min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
         if ws_fresh and cl_fresh and vol_fresh and mins_left >= (4.0 if duration >= 15 else 2.0):
             max_entry_allowed = min(0.90, max_entry_allowed + 0.02)
@@ -4154,7 +4165,10 @@ class LiveTrader:
                     )
             else:
                 if self._noisy_log_enabled(f"skip-score-payout:{asset}:{side}", LOG_SKIP_EVERY_SEC):
-                    print(f"{Y}[SKIP] {asset} {side} payout={payout_mult:.2f}x < min={min_payout_req:.2f}x{RS}")
+                    print(
+                        f"{Y}[SKIP] {asset} {side} payout={payout_mult:.3f}x "
+                        f"< min={min_payout_req:.3f}x{RS}"
+                    )
                 self._skip_tick("payout_below")
                 return None
         ev_net = (true_prob / max(entry, 1e-9)) - 1.0 - FEE_RATE_EST
@@ -4194,7 +4208,7 @@ class LiveTrader:
         if self._noisy_log_enabled("flow-thresholds", LOG_FLOW_EVERY_SEC):
             print(
                 f"{B}[FLOW]{RS} "
-                f"payout>={base_min_payout_req:.2f}x→{min_payout_req:.2f}x "
+                f"payout>={base_min_payout_req:.3f}x→{min_payout_req:.3f}x "
                 f"ev>={base_min_ev_req:.3f}→{min_ev_req:.3f} "
                 f"entry=[{base_min_entry_allowed:.2f},{base_max_entry_allowed:.2f}]→"
                 f"[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]"
@@ -5027,8 +5041,8 @@ class LiveTrader:
                 size_tok_m, maker_notional = _normalize_order_size(maker_price_order, size_usdc)
                 size_usdc = maker_notional
 
-                print(f"{G}[MAKER] {asset} {side}: bid={maker_price:.3f} "
-                      f"ask={best_ask:.3f} spread={spread:.3f} "
+                print(f"{G}[MAKER] {asset} {side}: px={maker_price:.3f} "
+                      f"book_bid={best_bid:.3f} book_ask={best_ask:.3f} spread={spread:.3f} "
                       f"maker_edge={maker_edge:.3f} taker_edge={taker_edge:.3f}{RS}")
 
                 order_args = OrderArgs(
