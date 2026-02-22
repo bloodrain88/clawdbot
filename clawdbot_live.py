@@ -108,7 +108,7 @@ load_dotenv(os.path.expanduser("~/.clawdbot.env"))
 
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON, AMOY
-from py_clob_client.clob_types import OrderArgs, OrderType, AssetType, BalanceAllowanceParams, ApiCreds
+from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType, AssetType, BalanceAllowanceParams, ApiCreds
 from py_clob_client.config import get_contract_config
 
 POLYGON_RPCS = [
@@ -2745,19 +2745,23 @@ class LiveTrader:
                     notional = round(shares * exec_price, 2)
                     return shares, notional
 
+                def _normalize_buy_amount(intended_usdc: float) -> float:
+                    # Market BUY maker amount is USDC and must stay at 2 decimals.
+                    return float(round(max(0.0, intended_usdc), 2))
+
                 async def _post_limit_fok(exec_price: float) -> tuple[dict, float]:
                     # Strict instant execution with price cap to keep slippage near zero.
                     px = round(max(0.001, min(exec_price, 0.97)), 4)
-                    # Keep maker(share) precision <=2 and taker(notional) precision <=4.
                     px_order = round(px, 2)
-                    size_tok, _ = _normalize_order_size(px_order, size_usdc)
-                    order_args = OrderArgs(
+                    amount_usdc = _normalize_buy_amount(size_usdc)
+                    order_args = MarketOrderArgs(
                         token_id=token_id,
-                        price=float(px_order),
-                        size=float(round(size_tok, 2)),
+                        amount=float(amount_usdc),
                         side="BUY",
+                        price=float(px_order),
+                        order_type=OrderType.FOK,
                     )
-                    signed = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
+                    signed = await loop.run_in_executor(None, lambda: self.clob.create_market_order(order_args))
                     resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
                     return resp, float(px_order)
 
