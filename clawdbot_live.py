@@ -309,6 +309,8 @@ CLOB_MARKET_WS_ENABLED = os.environ.get("CLOB_MARKET_WS_ENABLED", "true").lower(
 CLOB_MARKET_WS_SYNC_SEC = float(os.environ.get("CLOB_MARKET_WS_SYNC_SEC", "2.0"))
 CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "2000"))
 CLOB_MARKET_WS_SOFT_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_SOFT_AGE_MS", "6000"))
+CLOB_REST_FALLBACK_ENABLED = os.environ.get("CLOB_REST_FALLBACK_ENABLED", "true").lower() == "true"
+CLOB_REST_FRESH_MAX_AGE_MS = float(os.environ.get("CLOB_REST_FRESH_MAX_AGE_MS", "1500"))
 CLOB_WS_STALE_HEAL_HITS = int(os.environ.get("CLOB_WS_STALE_HEAL_HITS", "3"))
 CLOB_WS_STALE_HEAL_COOLDOWN_SEC = float(os.environ.get("CLOB_WS_STALE_HEAL_COOLDOWN_SEC", "20"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
@@ -2940,33 +2942,17 @@ class LiveTrader:
         return toks
 
     def _trade_focus_token_ids(self) -> set[str]:
-        """Token set optimized for execution freshness (not full market coverage)."""
+        """Token set for execution freshness: subscribe both sides for every active market."""
         toks = set()
         for cid, m in self.active_mkts.items():
             tu = str(m.get("token_up", "") or "").strip()
             td = str(m.get("token_down", "") or "").strip()
             if not tu and not td:
                 continue
-            up_p = float(m.get("up_price", 0.5) or 0.5)
-            # Keep both sides only around parity where direction can flip quickly.
-            if abs(up_p - 0.5) <= 0.03:
-                if tu:
-                    toks.add(tu)
-                if td:
-                    toks.add(td)
-            else:
-                chosen = tu if up_p <= 0.5 else td
-                other = td if chosen == tu else tu
-                if chosen:
-                    toks.add(chosen)
-                elif other:
-                    toks.add(other)
-            # Always keep both sides for markets we already hold.
-            if cid in self.pending:
-                if tu:
-                    toks.add(tu)
-                if td:
-                    toks.add(td)
+            if tu:
+                toks.add(tu)
+            if td:
+                toks.add(td)
         return toks
 
     def _normalize_book_levels(self, levels) -> list[tuple[float, float]]:
@@ -3074,6 +3060,7 @@ class LiveTrader:
             "tick": float(row.get("tick", 0.01) or 0.01),
             "asks": list(row.get("asks") or []),
             "ts": float(row.get("ts_ms", 0.0) or 0.0) / 1000.0,
+            "source": "clob-ws",
         }
 
     def _clob_ws_book_age_ms(self, token_id: str) -> float:
@@ -3157,17 +3144,17 @@ class LiveTrader:
 
     # ── SCORE + EXECUTE ───────────────────────────────────────────────────────
     async def _fetch_pm_book_safe(self, token_id: str):
-        """Fetch Polymarket CLOB book; return compact snapshot or None."""
+        """Fetch Polymarket CLOB book; prefer WS, fallback to fresh CLOB REST snapshot."""
         if not token_id:
             return None
         ws_book = self._get_clob_ws_book(token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
         if ws_book is not None:
             return ws_book
-        if not PM_BOOK_FALLBACK_ENABLED:
+        if not CLOB_REST_FALLBACK_ENABLED:
             return None
         loop = asyncio.get_event_loop()
         try:
-            book     = await self._get_order_book(token_id, force_fresh=False)
+            book     = await self._get_order_book(token_id, force_fresh=True)
             tick     = float(book.tick_size or "0.01")
             asks     = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
             bids     = sorted(book.bids, key=lambda x: float(x.price), reverse=True) if book.bids else []
@@ -3187,6 +3174,7 @@ class LiveTrader:
                 "tick": tick,
                 "asks": asks_compact,
                 "ts": _time.time(),
+                "source": "clob-rest",
             }
         except Exception:
             return None
@@ -3363,20 +3351,33 @@ class LiveTrader:
         if REQUIRE_ORDERBOOK_WS and ws_book_now is None:
             # Soft fallback: if REST/PM book is fresh enough, continue with a small quality penalty.
             pm_ok = False
+            clob_rest_ok = False
             pm_age_ms = 9e9
             if isinstance(_pm_book, dict):
                 pm_ts = float(_pm_book.get("ts", 0.0) or 0.0)
                 pm_age_ms = ((_time.time() - pm_ts) * 1000.0) if pm_ts > 0 else 9e9
                 pm_best_ask = float(_pm_book.get("best_ask", 0.0) or 0.0)
+                pm_src = str(_pm_book.get("source", "") or "")
                 pm_ok = pm_best_ask > 0 and pm_age_ms <= WS_BOOK_FALLBACK_MAX_AGE_MS
-            if WS_BOOK_FALLBACK_ENABLED and PM_BOOK_FALLBACK_ENABLED and pm_ok:
+                clob_rest_ok = (
+                    pm_src == "clob-rest"
+                    and pm_best_ask > 0
+                    and pm_age_ms <= CLOB_REST_FRESH_MAX_AGE_MS
+                )
+            if clob_rest_ok or (WS_BOOK_FALLBACK_ENABLED and PM_BOOK_FALLBACK_ENABLED and pm_ok):
                 score -= 1
                 ws_book_now = _pm_book
                 if self._noisy_log_enabled(f"ws-fallback:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
-                    print(
-                        f"{Y}[WS-FALLBACK]{RS} {asset} {duration}m using PM book "
-                        f"(age={pm_age_ms:.0f}ms) — no fresh CLOB WS"
-                    )
+                    if clob_rest_ok:
+                        print(
+                            f"{B}[CLOB-REST]{RS} {asset} {duration}m using fresh CLOB REST book "
+                            f"(age={pm_age_ms:.0f}ms) — WS stale"
+                        )
+                    else:
+                        print(
+                            f"{Y}[WS-FALLBACK]{RS} {asset} {duration}m using PM book "
+                            f"(age={pm_age_ms:.0f}ms) — no fresh CLOB WS"
+                        )
             else:
                 if self._noisy_log_enabled(f"skip-no-ws-book:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     ws_age_pref = self._clob_ws_book_age_ms(prefetch_token)
@@ -3387,12 +3388,18 @@ class LiveTrader:
                 self._skip_tick("book_ws_missing")
                 return None
         if REQUIRE_ORDERBOOK_WS and STRICT_REQUIRE_FRESH_BOOK_WS and ws_book_strict is None:
-            if self._noisy_log_enabled(f"skip-strict-ws:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                print(
-                    f"{Y}[SKIP] {asset} {duration}m strict WS required (no fresh strict book){RS}"
-                )
-            self._skip_tick("book_ws_strict_required")
-            return None
+            allow_strict_rest = (
+                isinstance(ws_book_now, dict)
+                and str(ws_book_now.get("source", "") or "") == "clob-rest"
+                and ((_time.time() - float(ws_book_now.get("ts", 0.0) or 0.0)) * 1000.0) <= CLOB_REST_FRESH_MAX_AGE_MS
+            )
+            if not allow_strict_rest:
+                if self._noisy_log_enabled(f"skip-strict-ws:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m strict WS required (no fresh strict book){RS}"
+                    )
+                self._skip_tick("book_ws_strict_required")
+                return None
 
         # Additional instant signals from Binance cache (zero latency)
         dw_ob     = self._ob_depth_weighted(asset)
