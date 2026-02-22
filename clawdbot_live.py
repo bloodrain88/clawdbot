@@ -240,6 +240,7 @@ PNL_BASELINE_FILE = os.path.join(_DATA_DIR, "clawdbot_pnl_baseline.json")
 PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false").lower() == "true"
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
+STRICT_ONCHAIN_STATE = os.environ.get("STRICT_ONCHAIN_STATE", "true").lower() == "true"
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "false").lower() == "true"
 LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "30"))
 LOG_SCAN_ON_CHANGE_ONLY = os.environ.get("LOG_SCAN_ON_CHANGE_ONLY", "true").lower() == "true"
@@ -1389,6 +1390,8 @@ class LiveTrader:
         except Exception:
             pass
         # Load pending trades
+        if STRICT_ONCHAIN_STATE:
+            return
         if not os.path.exists(PENDING_FILE):
             return
         try:
@@ -1615,20 +1618,14 @@ class LiveTrader:
         # Show each open position with current win/loss status
         now_ts = _time.time()
         for cid, (m, t) in list(self.pending.items()):
-            onchain_confirmed = (self.onchain_snapshot_ts <= 0) or (cid in self.onchain_open_cids)
+            if self.onchain_snapshot_ts > 0 and cid not in self.onchain_open_cids:
+                continue
             self._force_expired_from_question_if_needed(m, t)
             self._apply_exact_window_from_question(m, t)
             asset      = t.get("asset", "?")
             side       = t.get("side", "?")
-            if onchain_confirmed:
-                size = float(self.onchain_open_usdc_by_cid.get(cid, 0.0))
-                if size <= 0:
-                    # Keep visibility on recently placed fills while on-chain value cache catches up.
-                    size = float(t.get("size", 0.0) or 0.0)
-                    if size <= 0:
-                        continue
-            else:
-                size = float(t.get("size", 0.0) or 0.0)
+            size = float(self.onchain_open_usdc_by_cid.get(cid, 0.0))
+            if size <= 0:
                 if size <= 0:
                     continue
             rk         = self._round_key(cid=cid, m=m, t=t)
@@ -1658,13 +1655,13 @@ class LiveTrader:
                 projected_win = (side == pred_winner)
                 move_pct   = (cur_p - open_p) / open_p * 100
                 c          = Y
-                status_str = "LIVE" if onchain_confirmed else "LIVE-PENDING"
+                status_str = "LIVE"
                 payout_est = size / t.get("entry", 0.5) if projected_win else 0
                 move_str   = f"({move_pct:+.2f}%)"
                 proj_str   = "LEAD" if projected_win else "TRAIL"
             else:
                 c          = Y
-                status_str = "UNSETTLED" if onchain_confirmed else "PENDING"
+                status_str = "UNSETTLED"
                 payout_est = 0
                 move_str   = "(no ref)"
                 proj_str   = "NA"
