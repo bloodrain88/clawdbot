@@ -273,6 +273,8 @@ LOG_BANK_MIN_DELTA = float(os.environ.get("LOG_BANK_MIN_DELTA", "0.50"))
 LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
 LOG_LIVE_DETAIL = os.environ.get("LOG_LIVE_DETAIL", "true").lower() == "true"
 LOG_LIVE_RK_MAX = int(os.environ.get("LOG_LIVE_RK_MAX", "12"))
+# Keep freshly-filled local positions visible while on-chain position APIs catch up.
+LIVE_LOCAL_GRACE_SEC = float(os.environ.get("LIVE_LOCAL_GRACE_SEC", "120"))
 LOG_ROUND_SIGNAL_MIN_SEC = float(os.environ.get("LOG_ROUND_SIGNAL_MIN_SEC", "5"))
 LOG_DEBUG_EVERY_SEC = int(os.environ.get("LOG_DEBUG_EVERY_SEC", "60"))
 LOG_ROUND_SIGNAL_EVERY_SEC = int(os.environ.get("LOG_ROUND_SIGNAL_EVERY_SEC", "30"))
@@ -2486,8 +2488,16 @@ class LiveTrader:
         shown_live_cids = set()
         live_by_rk = {}
         for cid, (m, t) in list(self.pending.items()):
+            recently_filled_local = False
             if self.onchain_snapshot_ts > 0 and cid not in self.onchain_open_cids:
-                continue
+                placed_ts = float((t or {}).get("placed_ts", 0.0) or 0.0)
+                recently_filled_local = (
+                    placed_ts > 0
+                    and (now_ts - placed_ts) <= LIVE_LOCAL_GRACE_SEC
+                    and bool((t or {}).get("order_id", ""))
+                )
+                if not recently_filled_local:
+                    continue
             self._force_expired_from_question_if_needed(m, t)
             self._apply_exact_window_from_question(m, t)
             asset      = t.get("asset", "?")
@@ -2495,12 +2505,22 @@ class LiveTrader:
             stake = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
             if stake <= 0:
                 stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
+            if stake <= 0 and recently_filled_local:
+                stake = float((t or {}).get("size", 0.0) or 0.0)
             if stake <= 0:
                 continue
             meta_cid = self.onchain_open_meta_by_cid.get(cid, {}) if isinstance(self.onchain_open_meta_by_cid, dict) else {}
             stake_src = str(meta_cid.get("stake_source", "onchain"))
+            if recently_filled_local and cid not in self.onchain_open_cids:
+                stake_src = "local_fill_grace"
             value_now = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
+            if value_now <= 0 and recently_filled_local:
+                value_now = float((t or {}).get("size", 0.0) or 0.0)
             shares = float(self.onchain_open_shares_by_cid.get(cid, 0.0) or 0.0)
+            if shares <= 0 and recently_filled_local:
+                fill_px = float((t or {}).get("fill_price", (t or {}).get("entry", 0.0)) or 0.0)
+                if fill_px > 0 and stake > 0:
+                    shares = stake / max(fill_px, 1e-9)
             rk         = self._round_key(cid=cid, m=m, t=t)
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
             # NOT the bot's trade entry price — market determines outcome from its own start
