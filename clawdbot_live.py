@@ -24,7 +24,7 @@ import re
 import sys
 import threading
 import time as _time
-from collections import deque
+from collections import deque, defaultdict
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from scipy.stats import norm
@@ -273,6 +273,8 @@ LOG_ROUND_SIGNAL_EVERY_SEC = int(os.environ.get("LOG_ROUND_SIGNAL_EVERY_SEC", "3
 LOG_SKIP_EVERY_SEC = int(os.environ.get("LOG_SKIP_EVERY_SEC", "30"))
 LOG_EDGE_EVERY_SEC = int(os.environ.get("LOG_EDGE_EVERY_SEC", "30"))
 LOG_EXEC_EVERY_SEC = int(os.environ.get("LOG_EXEC_EVERY_SEC", "30"))
+SKIP_STATS_WINDOW_SEC = int(os.environ.get("SKIP_STATS_WINDOW_SEC", "900"))
+SKIP_STATS_TOP_N = int(os.environ.get("SKIP_STATS_TOP_N", "6"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
@@ -661,6 +663,7 @@ class LiveTrader:
         self._copyflow_force_refresh_ts = 0.0
         self._ws_stale_hits = 0
         self._ws_last_heal_ts = 0.0
+        self._skip_events = deque(maxlen=8000)  # (ts, reason)
         self._cid_family_cache  = {}
         self._prebid_plan       = {}
         self._copyflow_mtime    = 0.0
@@ -738,6 +741,75 @@ class LiveTrader:
     def _noisy_log_enabled(self, key: str, every_sec: float = LOG_DEBUG_EVERY_SEC) -> bool:
         # Operator mode: keep logs clean by default; show extra diagnostics sparsely.
         return LOG_VERBOSE or LOG_LIVE_DETAIL or self._should_log(key, every_sec)
+
+    def _skip_tick(self, reason: str):
+        try:
+            self._skip_events.append((_time.time(), str(reason or "unknown")))
+        except Exception:
+            pass
+
+    def _skip_top(self, window_sec: int = SKIP_STATS_WINDOW_SEC, top_n: int = SKIP_STATS_TOP_N):
+        now = _time.time()
+        while self._skip_events and (now - float(self._skip_events[0][0] or 0.0)) > max(60, int(window_sec)):
+            self._skip_events.popleft()
+        counts = defaultdict(int)
+        for _, r in self._skip_events:
+            counts[r] += 1
+        total = sum(counts.values())
+        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[: max(1, int(top_n))]
+        return total, top
+
+    def _feed_health_snapshot(self):
+        now = _time.time()
+        tids = list(self._active_token_ids())
+        active_tokens = len(tids)
+        fresh_books = 0
+        ws_ages = []
+        for tid in tids:
+            age = self._clob_ws_book_age_ms(tid)
+            ws_ages.append(age)
+            if age <= CLOB_MARKET_WS_MAX_AGE_MS:
+                fresh_books += 1
+        ws_med = sorted(ws_ages)[len(ws_ages) // 2] if ws_ages else 9e9
+
+        cids = list(self.active_mkts.keys())
+        active_cids = len(cids)
+        fresh_leaders = 0
+        leader_ages = []
+        for cid in cids:
+            row = self._copyflow_live.get(cid, {}) if isinstance(self._copyflow_live, dict) else {}
+            ts = float(row.get("ts", 0.0) or 0.0)
+            n = int(row.get("n", 0) or 0)
+            age = (now - ts) if ts > 0 else 9e9
+            leader_ages.append(age)
+            if ts > 0 and n > 0 and age <= COPYFLOW_LIVE_MAX_AGE_SEC:
+                fresh_leaders += 1
+        leader_med = sorted(leader_ages)[len(leader_ages) // 2] if leader_ages else 9e9
+
+        rtds_ages = []
+        for a in ("BTC", "ETH", "SOL", "XRP"):
+            ts = float(self._ema_ts.get(a, 0.0) or 0.0)
+            if ts > 0:
+                rtds_ages.append(now - ts)
+        rtds_med = sorted(rtds_ages)[len(rtds_ages) // 2] if rtds_ages else 9e9
+
+        cl_ages = []
+        for a in ("BTC", "ETH", "SOL", "XRP"):
+            ts = float(self.cl_updated.get(a, 0.0) or 0.0)
+            if ts > 0:
+                cl_ages.append(now - ts)
+        cl_med = sorted(cl_ages)[len(cl_ages) // 2] if cl_ages else 9e9
+
+        return {
+            "active_tokens": active_tokens,
+            "fresh_books": fresh_books,
+            "ws_med_ms": ws_med,
+            "active_cids": active_cids,
+            "fresh_leaders": fresh_leaders,
+            "leader_med_s": leader_med,
+            "rtds_med_s": rtds_med,
+            "cl_med_s": cl_med,
+        }
 
     def _booster_locked(self) -> bool:
         return _time.time() < float(self._booster_lock_until or 0.0)
@@ -2088,6 +2160,20 @@ class LiveTrader:
                 f"  {B}ExecQ:{RS} top={k} fills/outcomes={fills}/{outcomes} pf={pf_b:.2f} exp={exp_b:+.2f} "
                 f"wr={wr_b:.1f}% avg_slip={avg_slip:.1f}bps pnl={v['pnl']:+.2f}"
             )
+        if show_debug and self._should_log("status-health", LOG_HEALTH_EVERY_SEC):
+            hs = self._feed_health_snapshot()
+            print(
+                f"  {B}Health:{RS} book_fresh={hs['fresh_books']}/{hs['active_tokens']} "
+                f"leader_fresh={hs['fresh_leaders']}/{hs['active_cids']} "
+                f"ws_med={hs['ws_med_ms']:.0f}ms rtds_med={hs['rtds_med_s']:.1f}s cl_med={hs['cl_med_s']:.1f}s"
+            )
+        if show_debug and self._should_log("status-skip-top", LOG_HEALTH_EVERY_SEC):
+            sk_total, sk_top = self._skip_top(SKIP_STATS_WINDOW_SEC, SKIP_STATS_TOP_N)
+            if sk_total > 0 and sk_top:
+                sk_str = ", ".join(f"{k}:{v}" for k, v in sk_top)
+                print(
+                    f"  {B}SkipTop:{RS} last{SKIP_STATS_WINDOW_SEC//60}m total={sk_total} | {sk_str}"
+                )
         # Show each open position with current win/loss status
         now_ts = _time.time()
         shown_live_cids = set()
@@ -3036,6 +3122,7 @@ class LiveTrader:
                         f"{Y}[SKIP] {asset} {duration}m missing fresh CLOB WS book "
                         f"(ws_age={ws_age_pref:.0f}ms pm_age={pm_age_ms:.0f}ms){RS}"
                     )
+                self._skip_tick("book_ws_missing")
                 return None
 
         # Additional instant signals from Binance cache (zero latency)
@@ -3049,6 +3136,7 @@ class LiveTrader:
         if REQUIRE_VOLUME_SIGNAL and not volume_ready:
             if self._noisy_log_enabled(f"skip-no-vol:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(f"{Y}[SKIP] {asset} {duration}m missing live Binance depth/volume cache{RS}")
+            self._skip_tick("volume_missing")
             return None
 
         # Jump detection: sudden move against our direction = hard abort
@@ -3253,6 +3341,7 @@ class LiveTrader:
                             f"{Y}[SKIP]{RS} {asset} {duration}m {side} late-lock: "
                             f"beat_dir={beat_dir} mins_left={mins_left:.1f} move={move_abs*100:.2f}%"
                         )
+                    self._skip_tick("late_lock")
                     return None
 
         # Optional copyflow signal from externally ranked leader wallets on same market.
@@ -3395,6 +3484,7 @@ class LiveTrader:
                         f"{Y}[SKIP] {asset} {duration}m missing fresh leader-flow for this CID "
                         f"(age={flow_age_s:.1f}s n={flow_n}){RS}"
                     )
+                self._skip_tick("leader_missing")
                 return None
 
         # Pre-bid arm: for first seconds after open, bias side/execution to pre-planned signal.
@@ -3510,6 +3600,7 @@ class LiveTrader:
             else:
                 if self._noisy_log_enabled(f"skip-score-entry:{asset}:{side}", LOG_SKIP_EVERY_SEC):
                     print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} outside [{min_entry_allowed:.2f},{max_entry_allowed:.2f}]{RS}")
+                self._skip_tick("entry_outside")
                 return None
 
         payout_mult = 1.0 / max(entry, 1e-9)
@@ -3523,11 +3614,13 @@ class LiveTrader:
             else:
                 if self._noisy_log_enabled(f"skip-score-payout:{asset}:{side}", LOG_SKIP_EVERY_SEC):
                     print(f"{Y}[SKIP] {asset} {side} payout={payout_mult:.2f}x < min={min_payout_req:.2f}x{RS}")
+                self._skip_tick("payout_below")
                 return None
         ev_net = (true_prob / max(entry, 1e-9)) - 1.0 - FEE_RATE_EST
         if ev_net < min_ev_req:
             if self._noisy_log_enabled(f"skip-score-ev:{asset}:{side}", LOG_SKIP_EVERY_SEC):
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={min_ev_req:.3f}{RS}")
+            self._skip_tick("ev_below")
             return None
         if self._noisy_log_enabled("flow-thresholds", LOG_FLOW_EVERY_SEC):
             print(
@@ -4445,6 +4538,7 @@ class LiveTrader:
                             f"{Y}[SKIP]{RS} {asset} {side} fallback spread too wide: "
                             f"{fresh_spread:.3f} > cap={base_spread_cap:.3f}"
                         )
+                        self._skip_tick("fallback_spread")
                         return None
                     eff_max_entry = max_entry_allowed if max_entry_allowed is not None else MAX_ENTRY_PRICE
                     if fresh_ask > eff_max_entry:
@@ -4457,6 +4551,7 @@ class LiveTrader:
                                 )
                         else:
                             print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={eff_max_entry:.2f}{RS}")
+                            self._skip_tick("pullback_missed")
                             return None
                     fresh_payout = 1.0 / max(fresh_ask, 1e-9)
                     min_payout_fb, min_ev_fb, _ = self._adaptive_thresholds(duration)
@@ -4469,14 +4564,17 @@ class LiveTrader:
                                 )
                         else:
                             print(f"{Y}[SKIP] {asset} {side} fallback payout={fresh_payout:.2f}x < min={min_payout_fb:.2f}x{RS}")
+                            self._skip_tick("fallback_payout_below")
                             return None
                     fresh_ep  = true_prob - fresh_ask
                     if fresh_ep < edge_floor:
                         print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_floor:.2f} — price moved against us{RS}")
+                        self._skip_tick("fallback_edge_below")
                         return None
                     fresh_ev_net = (true_prob / max(fresh_ask, 1e-9)) - 1.0 - FEE_RATE_EST
                     if fresh_ev_net < min_ev_fb:
                         print(f"{Y}[SKIP] {asset} {side} fallback ev_net={fresh_ev_net:.3f} < min={min_ev_fb:.3f}{RS}")
+                        self._skip_tick("fallback_ev_below")
                         return None
                     taker_price = round(min(fresh_ask, eff_max_entry, 0.97), 4)
                     slip_now = _slip_bps(taker_price, price)
@@ -4485,6 +4583,7 @@ class LiveTrader:
                             f"{Y}[SLIP-GUARD]{RS} {asset} {side} fallback taker blocked: "
                             f"slip={slip_now:.1f}bps > cap={slip_cap_bps:.0f}bps"
                         )
+                        self._skip_tick("fallback_slip_guard")
                         return None
                 except Exception:
                     taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
