@@ -203,6 +203,7 @@ QUALITY_MODE = os.environ.get("QUALITY_MODE", "true").lower() == "true"
 STRICT_PM_SOURCE = os.environ.get("STRICT_PM_SOURCE", "true").lower() == "true"
 MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "1200"))
 MAX_QUOTE_STALENESS_MS = float(os.environ.get("MAX_QUOTE_STALENESS_MS", "1200"))
+MAX_ORDERBOOK_AGE_MS = float(os.environ.get("MAX_ORDERBOOK_AGE_MS", "1200"))
 MIN_MINS_LEFT_5M = float(os.environ.get("MIN_MINS_LEFT_5M", "1.2"))
 MIN_MINS_LEFT_15M = float(os.environ.get("MIN_MINS_LEFT_15M", "3.0"))
 LATE_DIR_LOCK_ENABLED = os.environ.get("LATE_DIR_LOCK_ENABLED", "true").lower() == "true"
@@ -301,11 +302,12 @@ COPYFLOW_REFRESH_ENABLED = os.environ.get("COPYFLOW_REFRESH_ENABLED", "true").lo
 COPYFLOW_REFRESH_SEC = int(os.environ.get("COPYFLOW_REFRESH_SEC", "300"))
 COPYFLOW_MIN_ROI = float(os.environ.get("COPYFLOW_MIN_ROI", "-0.03"))
 COPYFLOW_LIVE_ENABLED = os.environ.get("COPYFLOW_LIVE_ENABLED", "true").lower() == "true"
-COPYFLOW_LIVE_REFRESH_SEC = int(os.environ.get("COPYFLOW_LIVE_REFRESH_SEC", "12"))
+COPYFLOW_LIVE_REFRESH_SEC = int(os.environ.get("COPYFLOW_LIVE_REFRESH_SEC", "5"))
 COPYFLOW_LIVE_TRADES_LIMIT = int(os.environ.get("COPYFLOW_LIVE_TRADES_LIMIT", "80"))
 COPYFLOW_LIVE_MAX_MARKETS = int(os.environ.get("COPYFLOW_LIVE_MAX_MARKETS", "8"))
+COPYFLOW_LIVE_MAX_AGE_SEC = float(os.environ.get("COPYFLOW_LIVE_MAX_AGE_SEC", "20"))
 COPYFLOW_INTEL_ENABLED = os.environ.get("COPYFLOW_INTEL_ENABLED", "true").lower() == "true"
-COPYFLOW_INTEL_REFRESH_SEC = int(os.environ.get("COPYFLOW_INTEL_REFRESH_SEC", "90"))
+COPYFLOW_INTEL_REFRESH_SEC = int(os.environ.get("COPYFLOW_INTEL_REFRESH_SEC", "60"))
 COPYFLOW_INTEL_TRADES_PER_MARKET = int(os.environ.get("COPYFLOW_INTEL_TRADES_PER_MARKET", "120"))
 COPYFLOW_INTEL_MAX_WALLETS = int(os.environ.get("COPYFLOW_INTEL_MAX_WALLETS", "40"))
 COPYFLOW_INTEL_ACTIVITY_LIMIT = int(os.environ.get("COPYFLOW_INTEL_ACTIVITY_LIMIT", "250"))
@@ -1466,6 +1468,7 @@ class LiveTrader:
                             ),
                             4,
                         ),
+                        "ts": _time.time(),
                         "src": "live",
                     }
                     updated += 1
@@ -1523,6 +1526,7 @@ class LiveTrader:
         print(
             f"{B}[BOOT]{RS} "
             f"latency<= {MAX_SIGNAL_LATENCY_MS:.0f}ms quote_stale<= {MAX_QUOTE_STALENESS_MS:.0f}ms "
+            f"book_stale<= {MAX_ORDERBOOK_AGE_MS:.0f}ms "
             f"min_mins_left(5m/15m)={MIN_MINS_LEFT_5M:.1f}/{MIN_MINS_LEFT_15M:.1f} "
             f"late_dir_lock={LATE_DIR_LOCK_ENABLED} "
             f"lock_mins(5m/15m)={LATE_DIR_LOCK_MIN_LEFT_5M:.1f}/{LATE_DIR_LOCK_MIN_LEFT_15M:.1f} "
@@ -1534,6 +1538,8 @@ class LiveTrader:
         print(
             f"{B}[BOOT]{RS} copyflow_live={COPYFLOW_LIVE_ENABLED} "
             f"copy_intel24h={COPYFLOW_INTEL_ENABLED} "
+            f"live_refresh={COPYFLOW_LIVE_REFRESH_SEC}s "
+            f"live_max_age={COPYFLOW_LIVE_MAX_AGE_SEC:.0f}s "
             f"intel_refresh={COPYFLOW_INTEL_REFRESH_SEC}s "
             f"copy_http_parallel={COPYFLOW_HTTP_MAX_PARALLEL}"
         )
@@ -2549,6 +2555,7 @@ class LiveTrader:
                 "best_ask": best_ask,
                 "tick": tick,
                 "asks": asks_compact,
+                "ts": _time.time(),
             }
         except Exception:
             return None
@@ -2917,10 +2924,14 @@ class LiveTrader:
             up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
             dn_conf = float(flow.get("Down", flow.get("down", 0.0)) or 0.0)
             flow_n = int(flow.get("n", 0) or 0)
+            flow_ts = float(flow.get("ts", 0.0) or 0.0)
+            flow_age_s = (_time.time() - flow_ts) if flow_ts > 0 else 9e9
+            flow_fresh = flow_age_s <= COPYFLOW_LIVE_MAX_AGE_SEC
             leader_net = up_conf - dn_conf
             # Strong per-market leader consensus: follow the market leaders on this CID.
             if (
                 MARKET_LEADER_FOLLOW_ENABLED
+                and flow_fresh
                 and flow_n >= MARKET_LEADER_MIN_N
                 and abs(leader_net) >= MARKET_LEADER_MIN_NET
             ):
@@ -2941,6 +2952,13 @@ class LiveTrader:
                     print(
                         f"{Y}[LEADER-BYPASS]{RS} {asset} {duration}m leader={leader_side} "
                         f"entry={leader_entry:.3f} > cap={leader_entry_cap:.3f}"
+                    )
+            elif MARKET_LEADER_FOLLOW_ENABLED and (not flow_fresh):
+                if self._noisy_log_enabled(f"leader-stale:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[LEADER-STALE]{RS} {asset} {duration}m "
+                        f"age={flow_age_s:.1f}s > {COPYFLOW_LIVE_MAX_AGE_SEC:.1f}s "
+                        f"(skip force)"
                     )
             pref = up_conf if side == "Up" else dn_conf
             opp = dn_conf if side == "Up" else up_conf
@@ -3012,13 +3030,20 @@ class LiveTrader:
 
         # ── Live CLOB price (more accurate than Gamma up_price) ──────────────
         live_entry = entry
+        book_age_ms = 0.0
         if pm_book_data is not None:
             if isinstance(pm_book_data, dict):
-                clob_ask = float(pm_book_data.get("best_ask", 0.0) or 0.0)
+                book_ts = float(pm_book_data.get("ts", 0.0) or 0.0)
+                book_age_ms = ((_time.time() - book_ts) * 1000.0) if book_ts > 0 else 9e9
+                if book_age_ms > MAX_ORDERBOOK_AGE_MS:
+                    pm_book_data = None
+                else:
+                    clob_ask = float(pm_book_data.get("best_ask", 0.0) or 0.0)
+                    live_entry = clob_ask
             else:
                 # Backward compatibility with old tuple format.
                 _, clob_ask, _ = pm_book_data
-            live_entry = clob_ask
+                live_entry = clob_ask
 
         # ── Entry strategy ────────────────────────────────────────────────────
         # Trade every eligible market while still preferring higher-payout entries.
@@ -3219,6 +3244,7 @@ class LiveTrader:
             "min_entry_allowed": min_entry_allowed,
             "copy_adj": copy_adj,
             "copy_net": copy_net,
+            "book_age_ms": book_age_ms,
             "quote_age_ms": quote_age_ms,
             "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
             "prebid_arm": arm_active,
@@ -3518,17 +3544,22 @@ class LiveTrader:
                 # or fetch fresh if not cached (~36ms)
                 if pm_book_data is not None:
                     if isinstance(pm_book_data, dict):
-                        best_bid = float(pm_book_data.get("best_bid", 0.0) or 0.0)
-                        best_ask = float(pm_book_data.get("best_ask", 0.0) or 0.0)
-                        tick = float(pm_book_data.get("tick", 0.01) or 0.01)
-                        asks = list(pm_book_data.get("asks") or [])
-                        bids = []
+                        bts = float(pm_book_data.get("ts", 0.0) or 0.0)
+                        bage_ms = ((_time.time() - bts) * 1000.0) if bts > 0 else 9e9
+                        if bage_ms > MAX_ORDERBOOK_AGE_MS:
+                            pm_book_data = None
+                        else:
+                            best_bid = float(pm_book_data.get("best_bid", 0.0) or 0.0)
+                            best_ask = float(pm_book_data.get("best_ask", 0.0) or 0.0)
+                            tick = float(pm_book_data.get("tick", 0.01) or 0.01)
+                            asks = list(pm_book_data.get("asks") or [])
+                            bids = []
                     else:
                         # Backward compatibility with old tuple format.
                         best_bid, best_ask, tick = pm_book_data
                         asks = []
                         bids = []
-                    if best_ask > 0:
+                    if pm_book_data is not None and best_ask > 0:
                         spread = best_ask - best_bid
                     else:
                         pm_book_data = None
