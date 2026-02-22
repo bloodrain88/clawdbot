@@ -385,6 +385,7 @@ MID_BOOSTER_SIZE_PCT_HIGH = float(os.environ.get("MID_BOOSTER_SIZE_PCT_HIGH", "0
 MID_BOOSTER_MAX_PER_CID = int(os.environ.get("MID_BOOSTER_MAX_PER_CID", "1"))
 MID_BOOSTER_LOSS_STREAK_LOCK = int(os.environ.get("MID_BOOSTER_LOSS_STREAK_LOCK", "4"))
 MID_BOOSTER_LOCK_HOURS = float(os.environ.get("MID_BOOSTER_LOCK_HOURS", "24"))
+CONTINUATION_PRIOR_MAX_BOOST = float(os.environ.get("CONTINUATION_PRIOR_MAX_BOOST", "0.06"))
 LOW_CENT_ONLY_ON_EXISTING_POSITION = os.environ.get("LOW_CENT_ONLY_ON_EXISTING_POSITION", "true").lower() == "true"
 LOW_CENT_ENTRY_THRESHOLD = float(os.environ.get("LOW_CENT_ENTRY_THRESHOLD", "0.10"))
 # Dynamic sizing guardrail for cheap-entry tails:
@@ -3239,9 +3240,7 @@ class LiveTrader:
         if pct_remaining < 0.15:
             return None   # last ~2 min — too late to fill at good price
 
-        # Previous window direction from CL prices — the mapleghost signal.
-        # At window open AMM applies mean-reversion discount (prices 8-40¢ for continuation)
-        # but on-chain data shows 87.7% continuation. Exploiting this is the key edge.
+        # Previous window direction from CL prices (used as one signal among others).
         prev_open     = self.asset_prev_open.get(asset, 0)
         prev_win_move = abs((open_price - prev_open) / prev_open) if prev_open > 0 and open_price > 0 else 0.0
         prev_win_dir  = None
@@ -3449,8 +3448,7 @@ class LiveTrader:
         elif (is_up     and funding_rate >  0.0010): score -= 1  # extremely crowded long + bet Up
         elif (not is_up and funding_rate < -0.0005): score -= 1  # crowded shorts + bet Down risky
 
-        # VWAP: momentum continuation signal (−2 to +2 pts)
-        # Data: 87.7% of 15-min markets CONTINUE the mid-window direction — NOT mean reversion
+        # VWAP: momentum signal (−2 to +2 pts)
         # Price ABOVE window VWAP in our direction = momentum confirms = good
         # Price BELOW window VWAP in our direction = momentum weak = bad
         vwap_net = vwap_dev if is_up else -vwap_dev   # positive = price above VWAP in bet direction
@@ -3459,8 +3457,7 @@ class LiveTrader:
         elif vwap_net < -0.0015: score -= 2   # strongly below VWAP → momentum against bet
         elif vwap_net < -0.0008: score -= 1
 
-        # Vol-normalized displacement: continuation signal (−2 to +2 pts)
-        # 87.7% continuation — extended moves tend to KEEP going, not revert
+        # Vol-normalized displacement signal (−2 to +2 pts)
         sigma_15m = self.vols.get(asset, 0.70) * (15 / (252 * 390)) ** 0.5
         open_price_disp = open_price
         if open_price_disp and sigma_15m > 0:
@@ -3481,17 +3478,18 @@ class LiveTrader:
             elif (is_up and btc_lead_p > 0.55) or (not is_up and btc_lead_p < 0.45): score += 1
             elif (is_up and btc_lead_p < 0.40) or (not is_up and btc_lead_p > 0.60): score -= 1
 
-        # Previous window continuation — mapleghost strategy (0–5 pts or −2 pts)
-        # AMM prices continuation at 8–40¢ (mean-reversion model) but true rate is 87.7%.
-        # Early entry (first 3 min of window) exploits the biggest mispricing.
+        # Previous-window continuation (data-driven, low weight).
+        # Never use a fixed global continuation prior; require realtime corroboration.
         if prev_win_dir is not None:
             if prev_win_dir == direction:
-                if   pct_remaining > 0.85: score += 5  # first ~90s: AMM hasn't repriced yet
-                elif pct_remaining > 0.80: score += 4  # still very early
-                elif pct_remaining > 0.70: score += 2  # early but some repricing happened
-                else:                      score += 1  # later: normal continuation bonus
+                conf_hits = 0
+                conf_hits += 1 if tf_votes >= 3 else 0
+                conf_hits += 1 if ((is_up and taker_ratio > 0.53) or ((not is_up) and taker_ratio < 0.47)) else 0
+                conf_hits += 1 if ((is_up and ob_sig > 0.08) or ((not is_up) and ob_sig < -0.08)) else 0
+                if conf_hits >= 2:
+                    score += 2 if pct_remaining > 0.80 else 1
             else:
-                score -= 2  # betting against continuation direction — risky
+                score -= 1
 
         # Autocorr + Variance Ratio regime: trending boosts momentum confidence
         if vr_ratio > 1.05 and autocorr > 0.05:
@@ -3541,16 +3539,23 @@ class LiveTrader:
         prob_up   = max(0.05, min(0.95, p_up_ll + bias_up))
         prob_down = max(0.05, min(0.95, 1.0 - p_up_ll + bias_down))
 
-        # Early continuation prior: at window open BS/momentum ≈ 0.50 (no current-window move yet).
-        # Apply 87.7% continuation prior: prior scales 70–80% with prev move size.
-        # This is why mapleghost can buy at 15¢ — true prob is 75%, not 50%.
+        # Early continuation prior boost (bounded, realtime-confirmed).
         if prev_win_dir == direction and pct_remaining > 0.80:
-            prior = min(0.68, 0.58 + prev_win_move * 10)   # conservative continuation prior
+            prior_boost = 0.0
+            if tf_votes >= 3:
+                prior_boost += 0.015
+            if ((is_up and taker_ratio > 0.54) or ((not is_up) and taker_ratio < 0.46)):
+                prior_boost += 0.015
+            if ((is_up and ob_sig > 0.10) or ((not is_up) and ob_sig < -0.10)):
+                prior_boost += 0.010
+            if cl_agree:
+                prior_boost += 0.010
+            prior_boost = max(0.0, min(CONTINUATION_PRIOR_MAX_BOOST, prior_boost))
             if direction == "Up":
-                prob_up   = max(prob_up, prior)
+                prob_up = max(prob_up, min(0.95, prob_up + prior_boost))
                 prob_down = 1 - prob_up
             else:
-                prob_down = max(prob_down, prior)
+                prob_down = max(prob_down, min(0.95, prob_down + prior_boost))
                 prob_up   = 1 - prob_down
 
         # Online calibration: shrink overconfident probabilities toward 50% when live WR degrades.
@@ -3564,7 +3569,7 @@ class LiveTrader:
         min_edge   = self._adaptive_min_edge()
         pre_filter = max(0.02, min_edge * 0.25)   # loose pre-filter vs AMM
 
-        # Lock side to price direction when move is clear — 87.7% continuation on 15-min markets
+        # Lock side to price direction when move is clear.
         # AMM edge comparison only used when price is flat (no clear directional signal)
         if move_pct >= 0.0005:
             forced_side = "Up" if current > open_price else "Down"
@@ -3579,7 +3584,7 @@ class LiveTrader:
         else:
             # Flat price: side MUST match direction (CL/momentum consensus).
             # AMM edge only used to reject extreme mispricing (< -15%).
-            # 86% continuation means momentum direction >> AMM edge comparison.
+            # Momentum/CL direction wins over weak market-pricing noise.
             dir_edge = edge_up if direction == "Up" else edge_down
             dir_prob = prob_up if direction == "Up" else prob_down
             if dir_edge < -0.15:
@@ -3963,9 +3968,15 @@ class LiveTrader:
                 self._skip_tick("payout_below")
                 return None
         ev_net = (true_prob / max(entry, 1e-9)) - 1.0 - FEE_RATE_EST
-        if ev_net < min_ev_req:
+        exec_slip_cost, exec_nofill_penalty, exec_fill_ratio = self._execution_penalties(duration, score, entry)
+        execution_ev = ev_net - exec_slip_cost - exec_nofill_penalty
+        if execution_ev < min_ev_req:
             if self._noisy_log_enabled(f"skip-score-ev:{asset}:{side}", LOG_SKIP_EVERY_SEC):
-                print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={min_ev_req:.3f}{RS}")
+                print(
+                    f"{Y}[SKIP] {asset} {side} exec_ev={execution_ev:.3f} "
+                    f"(ev={ev_net:.3f} slip={exec_slip_cost:.3f} nofill={exec_nofill_penalty:.3f}) "
+                    f"< min={min_ev_req:.3f}{RS}"
+                )
             self._skip_tick("ev_below")
             return None
         if LOW_CENT_ONLY_ON_EXISTING_POSITION and entry <= LOW_CENT_ENTRY_THRESHOLD:
@@ -4154,7 +4165,7 @@ class LiveTrader:
                 score >= MID_BOOSTER_MIN_SCORE
                 and true_prob >= MID_BOOSTER_MIN_TRUE_PROB
                 and edge >= MID_BOOSTER_MIN_EDGE
-                and ev_net >= MID_BOOSTER_MIN_EV_NET
+                and execution_ev >= MID_BOOSTER_MIN_EV_NET
                 and payout_mult >= MID_BOOSTER_MIN_PAYOUT
                 and entry <= MID_BOOSTER_MAX_ENTRY
                 and cl_agree
@@ -4170,7 +4181,7 @@ class LiveTrader:
                 if not (
                     score >= (MID_BOOSTER_MIN_SCORE + 2)
                     and true_prob >= (MID_BOOSTER_MIN_TRUE_PROB + 0.02)
-                    and ev_net >= (MID_BOOSTER_MIN_EV_NET + 0.015)
+                    and execution_ev >= (MID_BOOSTER_MIN_EV_NET + 0.015)
                     and booster_conv >= 0.66
                 ):
                     return None
@@ -4191,7 +4202,7 @@ class LiveTrader:
             if self._noisy_log_enabled(f"booster-conv:{asset}:{cid}", LOG_EDGE_EVERY_SEC):
                 print(
                     f"{B}[BOOST-CHECK]{RS} {asset} 15m {side} "
-                    f"conv={booster_conv:.2f} score={score} ev={ev_net:.3f} "
+                    f"conv={booster_conv:.2f} score={score} ev={execution_ev:.3f} "
                     f"payout={payout_mult:.2f}x entry={entry:.3f} "
                     f"tf={tf_votes} ob={ob_sig:+.2f} tk={taker_ratio:.2f} vol={vol_ratio:.2f}x"
                 )
@@ -4232,6 +4243,11 @@ class LiveTrader:
                               if self.prices.get(asset, 0) > 0 and cl_now > 0 else 0.0,
             "max_entry_allowed": max_entry_allowed,
             "min_entry_allowed": min_entry_allowed,
+            "ev_net": ev_net,
+            "execution_ev": execution_ev,
+            "execution_slip_cost": exec_slip_cost,
+            "execution_nofill_penalty": exec_nofill_penalty,
+            "execution_fill_ratio": exec_fill_ratio,
             "copy_adj": copy_adj,
             "copy_net": copy_net,
             "analysis_quality": analysis_quality,
@@ -6000,6 +6016,24 @@ class LiveTrader:
 
         return min_payout, min_ev, max_entry_hard
 
+    def _execution_penalties(self, duration: int, score: int, entry: float) -> tuple[float, float, float]:
+        """Estimate execution frictions from realized bucket stats.
+        Returns (slip_cost, nofill_penalty, fill_ratio)."""
+        k = self._bucket_key(duration, score, entry)
+        r = self._bucket_stats.rows.get(k)
+        if not r:
+            # Conservative cold-start defaults.
+            return 0.003, 0.006, 0.90
+        fills = int(r.get("fills", 0) or 0)
+        outcomes = int(r.get("outcomes", 0) or 0)
+        avg_slip_bps = float(r.get("slip_bps", 0.0) or 0.0) / max(1, fills)
+        # Convert bps into expected probability-cost space.
+        slip_cost = max(0.0, min(0.03, (avg_slip_bps / 10000.0) * max(0.05, float(entry or 0.0))))
+        fill_ratio = fills / max(1, outcomes) if outcomes > 0 else min(1.0, fills / 12.0)
+        # Penalize low historical fill reliability on this bucket.
+        nofill_penalty = max(0.0, min(0.02, (1.0 - max(0.0, min(1.0, fill_ratio))) * 0.02))
+        return slip_cost, nofill_penalty, max(0.0, min(1.0, fill_ratio))
+
     def _prob_shrink_factor(self) -> float:
         """Calibrate model confidence to realized PnL quality (anti-overconfidence)."""
         snap = self._growth_snapshot()
@@ -6025,7 +6059,7 @@ class LiveTrader:
         edge = float(sig.get("edge", 0.0))
         cl_bonus = 0.02 if sig.get("cl_agree", True) else -0.03
         payout = (1.0 / entry) - 1.0
-        ev_net = (float(sig.get("true_prob", 0.5)) / entry) - 1.0 - FEE_RATE_EST
+        ev_net = float(sig.get("execution_ev", (float(sig.get("true_prob", 0.5)) / entry) - 1.0 - FEE_RATE_EST))
         q_age = float(sig.get("quote_age_ms", 0.0) or 0.0)
         s_lat = float(sig.get("signal_latency_ms", 0.0) or 0.0)
         lag_penalty = 0.0
