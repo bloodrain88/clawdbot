@@ -250,7 +250,11 @@ STATS_FILE     = os.path.join(_DATA_DIR, "clawdbot_stats.json")
 METRICS_FILE   = os.path.join(_DATA_DIR, "clawdbot_onchain_metrics.jsonl")
 RUNTIME_JSON_LOG_FILE = os.path.join(_DATA_DIR, "clawdbot_runtime_logs.jsonl")
 PNL_BASELINE_FILE = os.path.join(_DATA_DIR, "clawdbot_pnl_baseline.json")
+SETTLED_FILE   = os.path.join(_DATA_DIR, "clawdbot_settled_cids.json")
 PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false").lower() == "true"
+LOSS_STREAK_PAUSE_ENABLED = os.environ.get("LOSS_STREAK_PAUSE_ENABLED", "true").lower() == "true"
+LOSS_STREAK_PAUSE_N = int(os.environ.get("LOSS_STREAK_PAUSE_N", "4"))
+LOSS_STREAK_PAUSE_SEC = float(os.environ.get("LOSS_STREAK_PAUSE_SEC", "900"))
 RUNTIME_JSON_LOG_ENABLED = os.environ.get("RUNTIME_JSON_LOG_ENABLED", "true").lower() == "true"
 RUNTIME_JSON_LOG_ROTATE_DAILY = os.environ.get("RUNTIME_JSON_LOG_ROTATE_DAILY", "true").lower() == "true"
 
@@ -679,6 +683,8 @@ class LiveTrader:
         self._copyflow_last_try = 0.0
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
+        self._pause_entries_until = 0.0
+        self._settled_outcomes = {}
         self._last_round_best   = ""
         self._last_round_pick   = ""
         self._last_round_best_ts = 0.0
@@ -694,6 +700,7 @@ class LiveTrader:
         self._load_pending()
         self._load_stats()
         self._load_pnl_baseline()
+        self._load_settled_outcomes()
         self._init_w3()
 
     def _build_w3(self, rpc: str, timeout: int = 6):
@@ -3794,6 +3801,19 @@ class LiveTrader:
                 (LOW_ENTRY_HIGH_CONV_SOFT_MAX - LOW_ENTRY_BASE_SOFT_MAX) * conviction
             )
             hard_cap = min(hard_cap, max(MIN_BET_ABS, soft_cap))
+        # Risk cap when leader flow is not fresh: avoid oversized bets on cheap entries.
+        # Deterministic cap from signal quality (score/prob/edge), no random guard.
+        if duration >= 15 and entry <= 0.40 and (not leader_ready):
+            score_q = max(0.0, min(1.0, (float(score) - 9.0) / 9.0))
+            prob_q = max(0.0, min(1.0, (float(true_prob) - 0.58) / 0.20))
+            edge_q = max(0.0, min(1.0, (float(edge) - 0.02) / 0.10))
+            qual = 0.45 * score_q + 0.35 * prob_q + 0.20 * edge_q
+            # Cap range: ~$6 (weak) .. ~$12 (strong but no fresh leaders).
+            no_leader_cap = 6.0 + (6.0 * qual)
+            # Near expiry tighten further.
+            if mins_left <= 3.5:
+                no_leader_cap = min(no_leader_cap, 8.0)
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, no_leader_cap))
         model_size = round(
             min(
                 hard_cap,
@@ -5935,6 +5955,41 @@ class LiveTrader:
         except Exception:
             pass
 
+    def _load_settled_outcomes(self):
+        """Load settled CID cache to keep settle accounting idempotent across restarts."""
+        self._settled_outcomes = {}
+        try:
+            with open(SETTLED_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            now = _time.time()
+            keep = {}
+            for cid, row in data.items():
+                if not isinstance(row, dict):
+                    continue
+                ts = float(row.get("ts", 0.0) or 0.0)
+                # Keep 36h of settle cache (covers restart/redeploy overlaps).
+                if ts > 0 and (now - ts) <= 36 * 3600:
+                    keep[str(cid)] = row
+            self._settled_outcomes = keep
+        except Exception:
+            self._settled_outcomes = {}
+
+    def _save_settled_outcomes(self):
+        try:
+            now = _time.time()
+            pruned = {}
+            for cid, row in self._settled_outcomes.items():
+                ts = float((row or {}).get("ts", 0.0) or 0.0)
+                if ts > 0 and (now - ts) <= 36 * 3600:
+                    pruned[cid] = row
+            self._settled_outcomes = pruned
+            with open(SETTLED_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._settled_outcomes, f)
+        except Exception:
+            pass
+
     def _record_result(self, asset: str, side: str, won: bool, structural: bool = False, pnl: float = 0.0):
         if asset not in self.stats:
             self.stats[asset] = {}
@@ -5957,8 +6012,17 @@ class LiveTrader:
         # Track consecutive losses for adaptive signals (no pause — trade every cycle)
         if won:
             self.consec_losses = 0
+            self._pause_entries_until = 0.0
         else:
             self.consec_losses += 1
+            if (
+                LOSS_STREAK_PAUSE_ENABLED
+                and self.consec_losses >= max(1, int(LOSS_STREAK_PAUSE_N))
+            ):
+                self._pause_entries_until = max(
+                    float(self._pause_entries_until or 0.0),
+                    _time.time() + max(30.0, float(LOSS_STREAK_PAUSE_SEC)),
+                )
         # Update peak bankroll
         if self.bankroll > self.peak_bankroll:
             self.peak_bankroll = self.bankroll
@@ -5975,6 +6039,12 @@ class LiveTrader:
             f"Exp={sum(last5)/max(1,len(last5)):+.2f} MinEdge={me:.2f} "
             f"Streak={self.consec_losses}L DrawdownScale={self._kelly_drawdown_scale():.0%}{wr_str}"
         )
+        if self._pause_entries_until > _time.time():
+            rem_s = max(0.0, self._pause_entries_until - _time.time())
+            print(
+                f"{Y}[PAUSE]{RS} entries paused for {rem_s:.0f}s "
+                f"(loss_streak={self.consec_losses} >= {LOSS_STREAK_PAUSE_N})"
+            )
 
     # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
     async def _get_polymarket_open_price(self, asset: str, start_ts: float, end_ts: float, duration: int = 15) -> float:
@@ -6093,6 +6163,12 @@ class LiveTrader:
                         f"{Y}[SETTLE-FIRST]{RS} pending_redeem={len(self.pending_redeem)} "
                         f"— skipping new entries until win/loss is finalized on-chain"
                     )
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
+            if self._pause_entries_until > _time.time():
+                if self._should_log("pause-entries", LOG_SETTLE_FIRST_EVERY_SEC):
+                    rem_s = max(0.0, self._pause_entries_until - _time.time())
+                    print(f"{Y}[PAUSE]{RS} skipping new entries for {rem_s:.0f}s (loss streak guard)")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
             markets = await self.fetch_markets()
