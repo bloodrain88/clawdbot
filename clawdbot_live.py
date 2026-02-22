@@ -155,6 +155,7 @@ MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to de
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 DUST_BET       = 5.0      # $5 floor — at 4.55x payout: $5 → $22.75 win
 MIN_BET_ABS    = float(os.environ.get("MIN_BET_ABS", "2.50"))
+MIN_EXEC_NOTIONAL_USDC = float(os.environ.get("MIN_EXEC_NOTIONAL_USDC", "5.0"))
 MIN_ORDER_SIZE_SHARES = float(os.environ.get("MIN_ORDER_SIZE_SHARES", "5.0"))
 ORDER_SIZE_PAD_SHARES = float(os.environ.get("ORDER_SIZE_PAD_SHARES", "0.02"))
 MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.025"))
@@ -321,6 +322,8 @@ COPYFLOW_LIVE_REFRESH_SEC = int(os.environ.get("COPYFLOW_LIVE_REFRESH_SEC", "5")
 COPYFLOW_LIVE_TRADES_LIMIT = int(os.environ.get("COPYFLOW_LIVE_TRADES_LIMIT", "80"))
 COPYFLOW_LIVE_MAX_MARKETS = int(os.environ.get("COPYFLOW_LIVE_MAX_MARKETS", "8"))
 COPYFLOW_LIVE_MAX_AGE_SEC = float(os.environ.get("COPYFLOW_LIVE_MAX_AGE_SEC", "20"))
+COPYFLOW_CID_ONDEMAND_ENABLED = os.environ.get("COPYFLOW_CID_ONDEMAND_ENABLED", "true").lower() == "true"
+COPYFLOW_CID_ONDEMAND_COOLDOWN_SEC = float(os.environ.get("COPYFLOW_CID_ONDEMAND_COOLDOWN_SEC", "4"))
 COPYFLOW_HEALTH_FORCE_REFRESH_SEC = float(os.environ.get("COPYFLOW_HEALTH_FORCE_REFRESH_SEC", "12"))
 LOG_HEALTH_EVERY_SEC = int(os.environ.get("LOG_HEALTH_EVERY_SEC", "30"))
 COPYFLOW_INTEL_ENABLED = os.environ.get("COPYFLOW_INTEL_ENABLED", "true").lower() == "true"
@@ -341,7 +344,7 @@ MARKET_LEADER_MIN_N = int(os.environ.get("MARKET_LEADER_MIN_N", "30"))
 MARKET_LEADER_SCORE_BONUS = int(os.environ.get("MARKET_LEADER_SCORE_BONUS", "2"))
 MARKET_LEADER_EDGE_BONUS = float(os.environ.get("MARKET_LEADER_EDGE_BONUS", "0.010"))
 REQUIRE_LEADER_FLOW = os.environ.get("REQUIRE_LEADER_FLOW", "true").lower() == "true"
-LEADER_SYNTHETIC_ENABLED = os.environ.get("LEADER_SYNTHETIC_ENABLED", "true").lower() == "true"
+LEADER_SYNTHETIC_ENABLED = os.environ.get("LEADER_SYNTHETIC_ENABLED", "false").lower() == "true"
 LEADER_SYNTH_MIN_NET = float(os.environ.get("LEADER_SYNTH_MIN_NET", "0.08"))
 LEADER_SYNTH_SCORE_PENALTY = int(os.environ.get("LEADER_SYNTH_SCORE_PENALTY", "1"))
 LEADER_SYNTH_EDGE_PENALTY = float(os.environ.get("LEADER_SYNTH_EDGE_PENALTY", "0.005"))
@@ -378,6 +381,8 @@ MID_BOOSTER_SIZE_PCT_HIGH = float(os.environ.get("MID_BOOSTER_SIZE_PCT_HIGH", "0
 MID_BOOSTER_MAX_PER_CID = int(os.environ.get("MID_BOOSTER_MAX_PER_CID", "1"))
 MID_BOOSTER_LOSS_STREAK_LOCK = int(os.environ.get("MID_BOOSTER_LOSS_STREAK_LOCK", "4"))
 MID_BOOSTER_LOCK_HOURS = float(os.environ.get("MID_BOOSTER_LOCK_HOURS", "24"))
+LOW_CENT_ONLY_ON_EXISTING_POSITION = os.environ.get("LOW_CENT_ONLY_ON_EXISTING_POSITION", "true").lower() == "true"
+LOW_CENT_ENTRY_THRESHOLD = float(os.environ.get("LOW_CENT_ENTRY_THRESHOLD", "0.10"))
 # Dynamic sizing guardrail for cheap-entry tails:
 # - keep default risk around LOW_ENTRY_BASE_SOFT_MAX
 # - allow growth toward LOW_ENTRY_HIGH_CONV_SOFT_MAX only on strong conviction
@@ -674,6 +679,7 @@ class LiveTrader:
         self._copyflow_live_last_update_ts = 0.0
         self._copyflow_live_zero_streak = 0
         self._copyflow_force_refresh_ts = 0.0
+        self._copyflow_cid_on_demand_ts = {}
         self._ws_stale_hits = 0
         self._ws_last_heal_ts = 0.0
         self._skip_events = deque(maxlen=8000)  # (ts, reason)
@@ -1550,11 +1556,48 @@ class LiveTrader:
         leaders = dict(self._copyflow_leaders)
         for w, s in self._copyflow_leaders_live.items():
             leaders[w] = max(float(s), float(leaders.get(w, 0.0) or 0.0))
-        if not leaders:
-            self._copyflow_live_zero_streak += 1
-            return 0
         cids = list(self.active_mkts.keys())[: max(1, COPYFLOW_LIVE_MAX_MARKETS)]
         if not cids:
+            self._copyflow_live_zero_streak += 1
+            return 0
+        if not leaders:
+            # Fallback 1: seed from family leaders (asset-duration specialists).
+            for cid in cids:
+                fam = self.active_mkts.get(cid, {})
+                fam_key = f"{(fam.get('asset') or '?').upper()}-{int(fam.get('duration') or 0)}m"
+                fam_map = self._copyflow_leaders_family.get(fam_key, {})
+                if not isinstance(fam_map, dict):
+                    continue
+                for w, s in fam_map.items():
+                    try:
+                        leaders[w] = max(float(leaders.get(w, 0.0) or 0.0), float(s or 0.0) * 0.90)
+                    except Exception:
+                        continue
+        if not leaders:
+            # Fallback 2: bootstrap recent active wallets from current market flow.
+            boot_count = {}
+            for cid in cids:
+                try:
+                    rows_boot = await self._http_get_json(
+                        "https://data-api.polymarket.com/trades",
+                        params={"market": cid, "limit": str(max(30, COPYFLOW_LIVE_TRADES_LIMIT // 2))},
+                        timeout=6,
+                    )
+                except Exception:
+                    rows_boot = []
+                if not isinstance(rows_boot, list):
+                    continue
+                for tr in rows_boot:
+                    if (tr.get("side") or "").upper() != "BUY":
+                        continue
+                    w = (tr.get("proxyWallet") or "").lower().strip()
+                    if not w:
+                        continue
+                    boot_count[w] = int(boot_count.get(w, 0)) + 1
+            for w, c in boot_count.items():
+                if c >= 2:
+                    leaders[w] = max(float(leaders.get(w, 0.0) or 0.0), min(0.25, 0.08 + 0.02 * c))
+        if not leaders:
             self._copyflow_live_zero_streak += 1
             return 0
 
@@ -3411,6 +3454,26 @@ class LiveTrader:
             else:
                 side, edge, true_prob = "Down", edge_down, prob_down
 
+        # Anti-random guard: require multi-signal confluence before any sizing.
+        side_up = side == "Up"
+        conf = 0
+        if (side_up and ob_sig > 0.05) or ((not side_up) and ob_sig < -0.05):
+            conf += 1
+        if (side_up and taker_ratio > 0.52) or ((not side_up) and taker_ratio < 0.48):
+            conf += 1
+        if tf_votes >= 2:
+            conf += 1
+        if cl_agree:
+            conf += 1
+        if conf < 2:
+            if self._noisy_log_enabled(f"skip-low-confluence:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP]{RS} {asset} {duration}m low confluence "
+                    f"(conf={conf}/4 side={side})"
+                )
+            self._skip_tick("low_confluence")
+            return None
+
         # Late-window direction lock: avoid betting against the beat direction
         # when the move is already clear near expiry.
         if (
@@ -3537,24 +3600,15 @@ class LiveTrader:
                         f"(age={flow_age_s:.1f}s n={flow_n})"
                     )
             elif LEADER_SYNTHETIC_ENABLED:
-                # Synthetic leader proxy from realtime microstructure when CID flow is missing.
-                # This keeps coverage without hard-blocking on sparse wallet flow.
-                synth_net = max(-1.0, min(1.0, 0.75 * ob_sig + 0.90 * ((taker_ratio - 0.5) * 2.0)))
-                if abs(synth_net) >= LEADER_SYNTH_MIN_NET:
-                    pref_s = synth_net if side == "Up" else -synth_net
-                    copy_net = max(copy_net, pref_s)
-                    copy_adj_s = int(round(max(-1, min(1, copy_net * COPYFLOW_BONUS_MAX))))
-                    score += copy_adj_s
-                    edge += copy_net * 0.006
-                score -= LEADER_SYNTH_SCORE_PENALTY
-                edge -= LEADER_SYNTH_EDGE_PENALTY
+                # Keep this branch for backward compatibility, but do not synthesize leader signal.
+                # Continue with pure intraround technical stack (orderbook/taker/perp/vwap/CL).
                 signal_tier = "TIER-C"
-                signal_source = "synthetic-obflow"
+                signal_source = "tech-intraround"
                 leader_size_scale = LEADER_SYNTH_SIZE_SCALE
-                if self._noisy_log_enabled(f"leader-synth:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
+                if self._noisy_log_enabled(f"leader-tech-only:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
                     print(
-                        f"{Y}[LEADER-SYNTH]{RS} {asset} {duration}m no fresh leader-flow "
-                        f"(n={flow_n} age={flow_age_s:.1f}s) -> synth_net={synth_net:+.2f}"
+                        f"{Y}[LEADER-MISS]{RS} {asset} {duration}m no fresh leader-flow "
+                        f"(n={flow_n} age={flow_age_s:.1f}s) -> tech-only intraround"
                     )
             elif LEADER_FLOW_FALLBACK_ENABLED:
                 # Keep trading with a quality penalty when leader-flow is unavailable/stale.
@@ -3718,6 +3772,28 @@ class LiveTrader:
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={min_ev_req:.3f}{RS}")
             self._skip_tick("ev_below")
             return None
+        if LOW_CENT_ONLY_ON_EXISTING_POSITION and entry <= LOW_CENT_ENTRY_THRESHOLD:
+            if not booster_eval:
+                if self._noisy_log_enabled(f"skip-lowcent-new:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP]{RS} {asset} {duration}m low-cent entry={entry:.3f} "
+                        f"allowed only as add-on to existing position"
+                    )
+                self._skip_tick("lowcent_requires_existing")
+                return None
+            # Add-on low-cent requires that current side is already leading.
+            is_leading_now = (
+                (side == "Up" and current > open_price) or
+                (side == "Down" and current < open_price)
+            )
+            if not is_leading_now:
+                if self._noisy_log_enabled(f"skip-lowcent-notlead:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP]{RS} {asset} {duration}m low-cent add-on blocked "
+                        f"(not leading now)"
+                    )
+                self._skip_tick("lowcent_not_leading")
+                return None
         if self._noisy_log_enabled("flow-thresholds", LOG_FLOW_EVERY_SEC):
             print(
                 f"{B}[FLOW]{RS} "
@@ -3834,6 +3910,8 @@ class LiveTrader:
         else:
             size = model_size
         size = max(0.50, min(hard_cap, size))
+        if size < MIN_EXEC_NOTIONAL_USDC:
+            return None
 
         # Mid-round (or anytime) additive booster on existing same-side position.
         # This is intentionally a separate, small bet with stricter quality filters.
