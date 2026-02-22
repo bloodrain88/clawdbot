@@ -5185,20 +5185,20 @@ class LiveTrader:
                             float(onchain_open_shares_by_cid.get(cid, 0.0) or 0.0) + size_tok, 6
                         )
                     avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
-                        stake_guess = 0.0
+                    stake_guess = 0.0
+                    stake_src = "value_fallback"
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            stake_guess = vv
+                            stake_src = k_st
+                            break
+                    if stake_guess <= 0 and size_tok > 0 and avg_px > 0:
+                        stake_guess = size_tok * avg_px
+                        stake_src = "size_x_avgPrice"
+                    if stake_guess <= 0:
+                        stake_guess = val
                         stake_src = "value_fallback"
-                        for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
-                            vv = self._as_float(p.get(k_st, 0.0), 0.0)
-                            if vv > 0:
-                                stake_guess = vv
-                                stake_src = k_st
-                                break
-                        if stake_guess <= 0 and size_tok > 0 and avg_px > 0:
-                            stake_guess = size_tok * avg_px
-                            stake_src = "size_x_avgPrice"
-                        if stake_guess <= 0:
-                            stake_guess = val
-                            stake_src = "value_fallback"
                     onchain_open_stake_by_cid[cid] = round(
                         float(onchain_open_stake_by_cid.get(cid, 0.0) or 0.0) + stake_guess, 6
                     )
