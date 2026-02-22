@@ -199,6 +199,10 @@ MAX_SIGNAL_LATENCY_MS = float(os.environ.get("MAX_SIGNAL_LATENCY_MS", "1200"))
 MAX_QUOTE_STALENESS_MS = float(os.environ.get("MAX_QUOTE_STALENESS_MS", "1200"))
 MIN_MINS_LEFT_5M = float(os.environ.get("MIN_MINS_LEFT_5M", "1.2"))
 MIN_MINS_LEFT_15M = float(os.environ.get("MIN_MINS_LEFT_15M", "1.2"))
+LATE_DIR_LOCK_ENABLED = os.environ.get("LATE_DIR_LOCK_ENABLED", "true").lower() == "true"
+LATE_DIR_LOCK_MIN_LEFT_5M = float(os.environ.get("LATE_DIR_LOCK_MIN_LEFT_5M", "2.2"))
+LATE_DIR_LOCK_MIN_LEFT_15M = float(os.environ.get("LATE_DIR_LOCK_MIN_LEFT_15M", "6.0"))
+LATE_DIR_LOCK_MIN_MOVE_PCT = float(os.environ.get("LATE_DIR_LOCK_MIN_MOVE_PCT", "0.0002"))
 EXTRA_SCORE_GATE_BTC_5M = int(os.environ.get("EXTRA_SCORE_GATE_BTC_5M", "1"))
 EXTRA_SCORE_GATE_XRP_15M = int(os.environ.get("EXTRA_SCORE_GATE_XRP_15M", "0"))
 EXPOSURE_CAP_TOTAL_TREND = float(os.environ.get("EXPOSURE_CAP_TOTAL_TREND", "0.80"))
@@ -5876,11 +5880,11 @@ class LiveTrader:
                            "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
                            "up_price": 0.5, "mins_left": mins_left,
                            "token_up": token_up, "token_down": token_down}
-                    rec_avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
-                    rec_size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    rec_avg_px = self._as_float(pos.get("avgPrice", 0.0), 0.0)
+                    rec_size_tok = self._as_float(pos.get("size", 0.0), 0.0)
                     rec_spent = 0.0
                     for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
-                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        vv = self._as_float(pos.get(k_st, 0.0), 0.0)
                         if vv > 0:
                             rec_spent = vv
                             break
