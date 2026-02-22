@@ -414,6 +414,7 @@ class LiveTrader:
         self._rtds_ws        = None   # live WebSocket handle for dynamic subscriptions
         self._redeem_queued_ts = {}  # cid → timestamp when queued for redeem
         self._redeem_verify_counts = {}  # cid → non-claimable verification cycles before auto-close
+        self._pending_absent_counts = {}  # cid -> consecutive sync cycles absent from on-chain/API
         self.seen            = set()
         self._session        = None   # persistent aiohttp session
         self._book_cache     = {}     # token_id -> {"ts_ms": float, "book": OrderBook}
@@ -5569,15 +5570,29 @@ class LiveTrader:
                 now_ts = datetime.now(timezone.utc).timestamp()
                 for cid, (m_p, t_p) in list(self.pending.items()):
                     if cid in onchain_open_cids or cid in self.pending_redeem or cid in api_active_cids:
+                        self._pending_absent_counts.pop(cid, None)
                         continue
                     placed_ts = float(t_p.get("placed_ts", 0) or 0)
                     if placed_ts > 0 and (now_ts - placed_ts) < 90:
+                        self._pending_absent_counts.pop(cid, None)
                         continue
                     # Keep very fresh windows briefly even without placed_ts.
                     end_ts = float(m_p.get("end_ts", 0) or 0)
                     if end_ts > 0 and (end_ts - now_ts) > 0 and (end_ts - now_ts) < 90:
+                        self._pending_absent_counts.pop(cid, None)
+                        continue
+                    # On-chain/API indexers can lag; never prune immediately around expiry.
+                    # Require the market to be clearly stale in wall-clock terms first.
+                    if end_ts > 0 and now_ts < (end_ts + 600):
+                        self._pending_absent_counts.pop(cid, None)
+                        continue
+                    miss_n = int(self._pending_absent_counts.get(cid, 0)) + 1
+                    self._pending_absent_counts[cid] = miss_n
+                    # Only prune after multiple consecutive absent checks.
+                    if miss_n < 3:
                         continue
                     self.pending.pop(cid, None)
+                    self._pending_absent_counts.pop(cid, None)
                     prune_n += 1
                 if prune_n:
                     self._save_pending()
