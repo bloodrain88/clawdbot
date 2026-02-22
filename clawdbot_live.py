@@ -344,6 +344,7 @@ LEADER_SYNTH_SIZE_SCALE = float(os.environ.get("LEADER_SYNTH_SIZE_SCALE", "0.55"
 REQUIRE_ORDERBOOK_WS = os.environ.get("REQUIRE_ORDERBOOK_WS", "true").lower() == "true"
 WS_BOOK_FALLBACK_ENABLED = os.environ.get("WS_BOOK_FALLBACK_ENABLED", "true").lower() == "true"
 WS_BOOK_FALLBACK_MAX_AGE_MS = float(os.environ.get("WS_BOOK_FALLBACK_MAX_AGE_MS", "2500"))
+PM_BOOK_FALLBACK_ENABLED = os.environ.get("PM_BOOK_FALLBACK_ENABLED", "false").lower() == "true"
 LEADER_FLOW_FALLBACK_ENABLED = os.environ.get("LEADER_FLOW_FALLBACK_ENABLED", "true").lower() == "true"
 LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MAX_AGE_SEC", "90"))
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
@@ -1699,7 +1700,8 @@ class LiveTrader:
             f"{B}[BOOT]{RS} clob_market_ws={CLOB_MARKET_WS_ENABLED} "
             f"sync={CLOB_MARKET_WS_SYNC_SEC:.1f}s "
             f"book_ws_age(strict/soft)<={CLOB_MARKET_WS_MAX_AGE_MS:.0f}/{CLOB_MARKET_WS_SOFT_AGE_MS:.0f}ms "
-            f"heal(hits/cooldown)={CLOB_WS_STALE_HEAL_HITS}/{CLOB_WS_STALE_HEAL_COOLDOWN_SEC:.0f}s"
+            f"heal(hits/cooldown)={CLOB_WS_STALE_HEAL_HITS}/{CLOB_WS_STALE_HEAL_COOLDOWN_SEC:.0f}s "
+            f"pm_fallback={PM_BOOK_FALLBACK_ENABLED}"
         )
         print(
             f"{B}[BOOT]{RS} scan_log_change_only={LOG_SCAN_ON_CHANGE_ONLY} "
@@ -2906,6 +2908,8 @@ class LiveTrader:
         ws_book = self._get_clob_ws_book(token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
         if ws_book is not None:
             return ws_book
+        if not PM_BOOK_FALLBACK_ENABLED:
+            return None
         loop = asyncio.get_event_loop()
         try:
             book     = await self._get_order_book(token_id, force_fresh=False)
@@ -3125,7 +3129,7 @@ class LiveTrader:
                 pm_age_ms = ((_time.time() - pm_ts) * 1000.0) if pm_ts > 0 else 9e9
                 pm_best_ask = float(_pm_book.get("best_ask", 0.0) or 0.0)
                 pm_ok = pm_best_ask > 0 and pm_age_ms <= WS_BOOK_FALLBACK_MAX_AGE_MS
-            if WS_BOOK_FALLBACK_ENABLED and pm_ok:
+            if WS_BOOK_FALLBACK_ENABLED and PM_BOOK_FALLBACK_ENABLED and pm_ok:
                 score -= 1
                 ws_book_now = _pm_book
                 if self._noisy_log_enabled(f"ws-fallback:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
