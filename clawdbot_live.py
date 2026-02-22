@@ -168,13 +168,14 @@ TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "8"))
-MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "6"))
+MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "8"))
 MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
 MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.015"))
+MIN_ENTRY_PRICE_15M = float(os.environ.get("MIN_ENTRY_PRICE_15M", "0.30"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.35"))
 MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.52"))
-MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "1.85"))
-MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.018"))
+MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "2.20"))
+MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.040"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
 HC15_ENABLED = os.environ.get("HC15_ENABLED", "false").lower() == "true"
 HC15_MIN_SCORE = int(os.environ.get("HC15_MIN_SCORE", "10"))
@@ -334,7 +335,7 @@ ORDER_RETRY_MAX = int(os.environ.get("ORDER_RETRY_MAX", "4"))
 ORDER_RETRY_BASE_SEC = float(os.environ.get("ORDER_RETRY_BASE_SEC", "0.35"))
 MAX_WIN_MODE = os.environ.get("MAX_WIN_MODE", "true").lower() == "true"
 WINMODE_MIN_TRUE_PROB_5M = float(os.environ.get("WINMODE_MIN_TRUE_PROB_5M", "0.58"))
-WINMODE_MIN_TRUE_PROB_15M = float(os.environ.get("WINMODE_MIN_TRUE_PROB_15M", "0.60"))
+WINMODE_MIN_TRUE_PROB_15M = float(os.environ.get("WINMODE_MIN_TRUE_PROB_15M", "0.62"))
 WINMODE_MIN_EDGE = float(os.environ.get("WINMODE_MIN_EDGE", "0.015"))
 WINMODE_MAX_ENTRY_5M = float(os.environ.get("WINMODE_MAX_ENTRY_5M", "0.60"))
 WINMODE_MAX_ENTRY_15M = float(os.environ.get("WINMODE_MAX_ENTRY_15M", "0.56"))
@@ -2861,8 +2862,10 @@ class LiveTrader:
             min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_5M)
             if MAX_WIN_MODE:
                 max_entry_allowed = min(max_entry_allowed, WINMODE_MAX_ENTRY_5M)
-        elif MAX_WIN_MODE:
-            max_entry_allowed = min(max_entry_allowed, WINMODE_MAX_ENTRY_15M)
+        else:
+            min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_15M)
+            if MAX_WIN_MODE:
+                max_entry_allowed = min(max_entry_allowed, WINMODE_MAX_ENTRY_15M)
         # Adaptive model-consistent cap: if conviction is high, allow higher entry as long
         # expected value after fees remains positive.
         min_ev_base = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
@@ -2885,7 +2888,9 @@ class LiveTrader:
         else:
             if min_entry_allowed <= live_entry <= max_entry_allowed:
                 entry = live_entry
-            elif PULLBACK_LIMIT_ENABLED and pct_remaining >= PULLBACK_LIMIT_MIN_PCT_LEFT:
+            elif PULLBACK_LIMIT_ENABLED and pct_remaining >= (
+                PULLBACK_LIMIT_MIN_PCT_LEFT if duration <= 5 else max(PULLBACK_LIMIT_MIN_PCT_LEFT, 0.45)
+            ):
                 # Don't miss good-payout setups: park a pullback limit at max acceptable entry.
                 use_limit = True
                 entry = max_entry_allowed
@@ -2962,6 +2967,11 @@ class LiveTrader:
         max_single = min(100.0, self.bankroll * bankroll_pct)
         cid_cap    = max(0.50, self.bankroll * MAX_CID_EXPOSURE_PCT)
         hard_cap   = max(0.50, min(max_single, cid_cap, self.bankroll * MAX_BANKROLL_PCT))
+        # Avoid oversized tail bets: these entries can look high-multiple but are low-quality fills.
+        if entry <= 0.05:
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.02))
+        elif entry <= 0.10:
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.03))
         model_size = round(
             min(
                 hard_cap,
