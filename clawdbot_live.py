@@ -180,8 +180,8 @@ MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.015"))
 MIN_ENTRY_PRICE_15M = float(os.environ.get("MIN_ENTRY_PRICE_15M", "0.20"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.35"))
 MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.52"))
-MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "2.00"))
-MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.025"))
+MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "1.85"))
+MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.018"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
 HC15_ENABLED = os.environ.get("HC15_ENABLED", "false").lower() == "true"
 HC15_MIN_SCORE = int(os.environ.get("HC15_MIN_SCORE", "10"))
@@ -363,8 +363,9 @@ LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MA
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
 STRICT_REQUIRE_FRESH_LEADER = os.environ.get("STRICT_REQUIRE_FRESH_LEADER", "false").lower() == "true"
 STRICT_REQUIRE_FRESH_BOOK_WS = os.environ.get("STRICT_REQUIRE_FRESH_BOOK_WS", "true").lower() == "true"
-MIN_ANALYSIS_QUALITY = float(os.environ.get("MIN_ANALYSIS_QUALITY", "0.72"))
-MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.58"))
+MIN_ANALYSIS_QUALITY = float(os.environ.get("MIN_ANALYSIS_QUALITY", "0.65"))
+MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.53"))
+WS_BOOK_SOFT_MAX_AGE_MS = float(os.environ.get("WS_BOOK_SOFT_MAX_AGE_MS", "20000"))
 ANALYSIS_PROB_SCALE_MIN = float(os.environ.get("ANALYSIS_PROB_SCALE_MIN", "0.65"))
 ANALYSIS_PROB_SCALE_MAX = float(os.environ.get("ANALYSIS_PROB_SCALE_MAX", "1.20"))
 # Small tolerance for payout threshold to avoid dead-zone misses (e.g. 1.98x vs 2.00x).
@@ -3385,6 +3386,7 @@ class LiveTrader:
         (vwap_dev, vol_mult)       = self._binance_window_stats(asset, m["start_ts"])
         _pm_book = await self._fetch_pm_book_safe(prefetch_token)
         ws_book_now = self._get_clob_ws_book(prefetch_token, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+        ws_book_soft = self._get_clob_ws_book(prefetch_token, max_age_ms=WS_BOOK_SOFT_MAX_AGE_MS)
         ws_book_strict = ws_book_now
         if ws_book_now is None:
             # Try alternate side token before declaring WS missing.
@@ -3394,6 +3396,8 @@ class LiveTrader:
             if alt:
                 ws_book_now = self._get_clob_ws_book(alt, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
                 ws_book_strict = ws_book_now
+                if ws_book_soft is None:
+                    ws_book_soft = self._get_clob_ws_book(alt, max_age_ms=WS_BOOK_SOFT_MAX_AGE_MS)
         # Never trade on soft-stale WS books: keep strict-fresh only for entries.
         # Older books can still be observed by health checker, but not used in scoring/execution.
 
@@ -3429,14 +3433,25 @@ class LiveTrader:
                             f"(age={pm_age_ms:.0f}ms) — no fresh CLOB WS"
                         )
             else:
-                if self._noisy_log_enabled(f"skip-no-ws-book:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    ws_age_pref = self._clob_ws_book_age_ms(prefetch_token)
-                    print(
-                        f"{Y}[SKIP] {asset} {duration}m missing fresh CLOB WS book "
-                        f"(ws_age={ws_age_pref:.0f}ms pm_age={pm_age_ms:.0f}ms){RS}"
-                    )
-                self._skip_tick("book_ws_missing")
-                return None
+                # Last-resort soft WS fallback (short stale window) to avoid hard stalls.
+                if isinstance(ws_book_soft, dict):
+                    ws_book_now = ws_book_soft
+                    score -= 2
+                    if self._noisy_log_enabled(f"ws-soft:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
+                        ws_age_pref = self._clob_ws_book_age_ms(prefetch_token)
+                        print(
+                            f"{Y}[WS-SOFT]{RS} {asset} {duration}m using older CLOB WS book "
+                            f"(age={ws_age_pref:.0f}ms) — strict/REST unavailable"
+                        )
+                else:
+                    if self._noisy_log_enabled(f"skip-no-ws-book:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                        ws_age_pref = self._clob_ws_book_age_ms(prefetch_token)
+                        print(
+                            f"{Y}[SKIP] {asset} {duration}m missing fresh CLOB WS book "
+                            f"(ws_age={ws_age_pref:.0f}ms pm_age={pm_age_ms:.0f}ms){RS}"
+                        )
+                    self._skip_tick("book_ws_missing")
+                    return None
         if REQUIRE_ORDERBOOK_WS and STRICT_REQUIRE_FRESH_BOOK_WS and ws_book_strict is None:
             allow_strict_rest = (
                 isinstance(ws_book_now, dict)
@@ -6883,6 +6898,9 @@ class LiveTrader:
                     if (not redeemable) and self._is_historical_expired_position(p, now_ts) and val < OPEN_PRESENCE_MIN:
                         continue
                     if redeemable:
+                        # Ignore dust/zero redeemables to avoid huge stale settling queues.
+                        if val < 0.01:
+                            continue
                         settling_claim_val += val
                         settling_claim_count += 1
                         onchain_settling_usdc_by_cid[cid] = round(
@@ -7031,6 +7049,19 @@ class LiveTrader:
                 self.onchain_open_stake_by_cid = dict(onchain_open_stake_by_cid)
                 self.onchain_open_shares_by_cid = dict(onchain_open_shares_by_cid)
                 self.onchain_open_meta_by_cid = dict(onchain_open_meta_by_cid)
+                # Prune stale/zero-value pending redeem entries that are not claimable on-chain now.
+                stale_redeem = 0
+                for cid_q, val_q in list(self.pending_redeem.items()):
+                    if cid_q in onchain_settling_usdc_by_cid:
+                        continue
+                    t_q = val_q[1] if isinstance(val_q, tuple) and len(val_q) > 1 and isinstance(val_q[1], dict) else {}
+                    q_size = self._as_float(t_q.get("size", 0.0), 0.0)
+                    if q_size > 0.0:
+                        continue
+                    self.pending_redeem.pop(cid_q, None)
+                    stale_redeem += 1
+                if stale_redeem:
+                    print(f"{Y}[SYNC]{RS} pruned stale pending_redeem: {stale_redeem}")
                 # Count unique CIDs for stable on-chain open/settling counters.
                 open_count = len(onchain_open_cids)
                 settling_claim_count = len(onchain_settling_usdc_by_cid)
