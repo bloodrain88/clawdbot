@@ -360,6 +360,10 @@ LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MA
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
 STRICT_REQUIRE_FRESH_LEADER = os.environ.get("STRICT_REQUIRE_FRESH_LEADER", "false").lower() == "true"
 STRICT_REQUIRE_FRESH_BOOK_WS = os.environ.get("STRICT_REQUIRE_FRESH_BOOK_WS", "true").lower() == "true"
+MIN_ANALYSIS_QUALITY = float(os.environ.get("MIN_ANALYSIS_QUALITY", "0.72"))
+MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.58"))
+ANALYSIS_PROB_SCALE_MIN = float(os.environ.get("ANALYSIS_PROB_SCALE_MIN", "0.65"))
+ANALYSIS_PROB_SCALE_MAX = float(os.environ.get("ANALYSIS_PROB_SCALE_MAX", "1.20"))
 # Small tolerance for payout threshold to avoid dead-zone misses (e.g. 1.98x vs 2.00x).
 PAYOUT_NEAR_MISS_TOL = float(os.environ.get("PAYOUT_NEAR_MISS_TOL", "0.03"))
 ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M", "0.05"))
@@ -1736,6 +1740,7 @@ class LiveTrader:
         leaders = dict(self._copyflow_leaders)
         for w, s in self._copyflow_leaders_live.items():
             leaders[w] = max(float(s), float(leaders.get(w, 0.0) or 0.0))
+        use_unweighted_flow = False
 
         # Fallback: bootstrap candidate leaders directly from the same CID recent buys.
         if not leaders:
@@ -1754,8 +1759,8 @@ class LiveTrader:
                 if c >= 1:
                     leaders[w] = max(float(leaders.get(w, 0.0) or 0.0), min(0.25, 0.08 + 0.02 * c))
         if not leaders:
-            self._copyflow_live_zero_streak += 1
-            return 0
+            # No ranked leaders available right now: continue with real market flow (unweighted).
+            use_unweighted_flow = True
 
         rows = await self._fetch_condition_trades(cid, COPYFLOW_LIVE_TRADES_LIMIT, timeout=8)
         if not rows:
@@ -1783,7 +1788,10 @@ class LiveTrader:
                 continue
             w = (tr.get("proxyWallet") or "").lower().strip()
             fam_boost = float(self._copyflow_leaders_family.get(fam_key, {}).get(w, 0.0) or 0.0)
-            wt = max(float(leaders.get(w, 0.0) or 0.0), fam_boost * 1.35)
+            if use_unweighted_flow:
+                wt = 1.0
+            else:
+                wt = max(float(leaders.get(w, 0.0) or 0.0), fam_boost * 1.35)
             if wt <= 0:
                 continue
             wallet_buy_n[w] = wallet_buy_n.get(w, 0) + 1
@@ -1817,7 +1825,7 @@ class LiveTrader:
                 (sum(1 for n in wallet_buy_n.values() if n >= 2) / max(1, len(wallet_buy_n))), 4
             ),
             "ts": _time.time(),
-            "src": "live",
+            "src": "live-unweighted" if use_unweighted_flow else "live",
         }
         self._copyflow_live_last_update_ts = _time.time()
         self._copyflow_live_zero_streak = 0
@@ -3739,10 +3747,91 @@ class LiveTrader:
             signal_source = "leader-live"
             leader_size_scale = LEADER_FRESH_SIZE_SCALE
         if REQUIRE_LEADER_FLOW and (not leader_ready):
+            core_realtime_ok = (
+                (ws_book_strict is not None)
+                and bool(volume_ready)
+                and (cl_age_s is not None and cl_age_s <= 35.0)
+                and (quote_age_ms <= min(MAX_QUOTE_STALENESS_MS, 1200.0))
+            )
+            if not core_realtime_ok:
                 if self._noisy_log_enabled(f"skip-no-leader:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(f"{Y}[SKIP] {asset} {duration}m leader-flow realtime unavailable{RS}")
                 self._skip_tick("leader_missing")
                 return None
+            # Allow continuation with strict realtime technical stack only.
+            signal_tier = "TIER-B"
+            signal_source = "tech-realtime-no-leader"
+            leader_size_scale = min(leader_size_scale, 0.85)
+            edge -= 0.003
+            if self._noisy_log_enabled(f"leader-miss-tech:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[LEADER-MISS]{RS} {asset} {duration}m no fresh leader-flow "
+                    f"-> using strict realtime technical stack"
+                )
+
+        # Source-quality + signal-conviction analysis (real data only).
+        # This is the primary anti-random layer: trade only when data is both fresh and coherent.
+        cl_fresh = (cl_age_s is not None) and (cl_age_s <= 35.0)
+        quote_fresh = quote_age_ms <= min(MAX_QUOTE_STALENESS_MS, 1200.0)
+        ws_fresh = ws_book_strict is not None
+        vol_fresh = bool(volume_ready)
+        leader_fresh = bool(leader_ready)
+        analysis_quality = (
+            (0.25 if ws_fresh else 0.0)
+            + (0.20 if leader_fresh else 0.0)
+            + (0.20 if cl_fresh else 0.0)
+            + (0.15 if quote_fresh else 0.0)
+            + (0.20 if vol_fresh else 0.0)
+        )
+
+        dir_sign = 1.0 if side == "Up" else -1.0
+        ob_c = max(0.0, min(1.0, ((dir_sign * ob_sig) + 0.10) / 0.30))
+        tk_signed = (taker_ratio - 0.5) * dir_sign
+        tk_c = max(0.0, min(1.0, (tk_signed + 0.05) / 0.18))
+        tf_c = max(0.0, min(1.0, (float(tf_votes) - 1.0) / 3.0))
+        basis_c = max(0.0, min(1.0, ((dir_sign * perp_basis) + 0.0002) / 0.0010))
+        vwap_c = max(0.0, min(1.0, ((dir_sign * vwap_dev) + 0.0008) / 0.0024))
+        cl_c = 1.0 if cl_agree else 0.0
+        leader_c = 0.5
+        if leader_fresh:
+            leader_c = max(0.0, min(1.0, ((copy_net) + 0.12) / 0.34))
+        analysis_conviction = (
+            0.18 * ob_c
+            + 0.18 * tk_c
+            + 0.18 * tf_c
+            + 0.12 * basis_c
+            + 0.12 * vwap_c
+            + 0.12 * cl_c
+            + 0.10 * leader_c
+        )
+
+        if analysis_quality < MIN_ANALYSIS_QUALITY:
+            if self._noisy_log_enabled(f"skip-analysis-quality:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP] {asset} {duration}m low analysis quality "
+                    f"q={analysis_quality:.2f}<{MIN_ANALYSIS_QUALITY:.2f}{RS}"
+                )
+            self._skip_tick("analysis_quality_low")
+            return None
+        if analysis_conviction < MIN_ANALYSIS_CONVICTION:
+            if self._noisy_log_enabled(f"skip-analysis-conv:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP] {asset} {duration}m low analysis conviction "
+                    f"c={analysis_conviction:.2f}<{MIN_ANALYSIS_CONVICTION:.2f}{RS}"
+                )
+            self._skip_tick("analysis_conviction_low")
+            return None
+
+        # Recalibrate posterior using measured analysis quality.
+        # Higher quality allows stronger posterior; weaker quality shrinks toward 50%.
+        quality_scale = ANALYSIS_PROB_SCALE_MIN + (
+            (ANALYSIS_PROB_SCALE_MAX - ANALYSIS_PROB_SCALE_MIN) * max(0.0, min(1.0, analysis_quality))
+        )
+        prob_up = 0.5 + (prob_up - 0.5) * quality_scale
+        prob_up = max(0.05, min(0.95, prob_up))
+        prob_down = 1.0 - prob_up
+        edge_up = prob_up - up_price
+        edge_down = prob_down - (1 - up_price)
 
         # Pre-bid arm: for first seconds after open, bias side/execution to pre-planned signal.
         arm = self._prebid_plan.get(cid, {})
@@ -4145,6 +4234,9 @@ class LiveTrader:
             "min_entry_allowed": min_entry_allowed,
             "copy_adj": copy_adj,
             "copy_net": copy_net,
+            "analysis_quality": analysis_quality,
+            "analysis_conviction": analysis_conviction,
+            "analysis_prob_scale": quality_scale,
             "signal_tier": signal_tier,
             "signal_source": signal_source,
             "leader_size_scale": leader_size_scale,
@@ -4240,6 +4332,8 @@ class LiveTrader:
                   f"score={score} edge={sig['edge']:+.3f} size=${sig['size']:.2f} "
                   f"entry={sig['entry']:.3f} src={sig.get('open_price_source','?')} "
                   f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{tier_tag}{scale_tag}"
+                  f" q={float(sig.get('analysis_quality',0.0) or 0.0):.2f}"
+                  f" c={float(sig.get('analysis_conviction',0.0) or 0.0):.2f}"
                   f"{booster_tag}{hc_tag}{cp_tag}{agree_str}{RS}")
 
         try:
