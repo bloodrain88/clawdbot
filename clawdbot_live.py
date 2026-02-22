@@ -250,6 +250,11 @@ LOG_SETTLE_FIRST_EVERY_SEC = int(os.environ.get("LOG_SETTLE_FIRST_EVERY_SEC", "2
 LOG_BANK_EVERY_SEC = int(os.environ.get("LOG_BANK_EVERY_SEC", "45"))
 LOG_BANK_MIN_DELTA = float(os.environ.get("LOG_BANK_MIN_DELTA", "0.50"))
 LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
+LOG_LIVE_DETAIL = os.environ.get("LOG_LIVE_DETAIL", "false").lower() == "true"
+LOG_LIVE_RK_MAX = int(os.environ.get("LOG_LIVE_RK_MAX", "12"))
+LOG_ROUND_SIGNAL_MIN_SEC = float(os.environ.get("LOG_ROUND_SIGNAL_MIN_SEC", "5"))
+LOG_DEBUG_EVERY_SEC = int(os.environ.get("LOG_DEBUG_EVERY_SEC", "900"))
+LOG_ROUND_SIGNAL_EVERY_SEC = int(os.environ.get("LOG_ROUND_SIGNAL_EVERY_SEC", "900"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
@@ -1383,7 +1388,9 @@ class LiveTrader:
             f"{B}[BOOT]{RS} log(flow/round-empty/settle/bank)="
             f"{LOG_FLOW_EVERY_SEC}/{LOG_ROUND_EMPTY_EVERY_SEC}/"
             f"{LOG_SETTLE_FIRST_EVERY_SEC}/{LOG_BANK_EVERY_SEC}s "
-            f"bank_delta>={LOG_BANK_MIN_DELTA:.2f}"
+            f"bank_delta>={LOG_BANK_MIN_DELTA:.2f} "
+            f"live_detail={LOG_LIVE_DETAIL} debug_every={LOG_DEBUG_EVERY_SEC}s "
+            f"round_signal_every={LOG_ROUND_SIGNAL_EVERY_SEC}s"
         )
         print(
             f"{B}[BOOT]{RS} redeem_poll={REDEEM_POLL_SEC:.1f}s "
@@ -1793,14 +1800,15 @@ class LiveTrader:
             f"  {price_str}\n"
             f"{W}{'─'*66}{RS}"
         )
-        if self._perf_stats.get("score_n", 0) > 0 or self._perf_stats.get("order_n", 0) > 0:
+        show_debug = LOG_VERBOSE or self._should_log("debug-status", LOG_DEBUG_EVERY_SEC)
+        if show_debug and (self._perf_stats.get("score_n", 0) > 0 or self._perf_stats.get("order_n", 0) > 0):
             rpc_ms = self._rpc_stats.get(self._rpc_url, 0.0)
             print(
                 f"  {B}Perf:{RS} score_ema={self._perf_stats.get('score_ms_ema', 0.0):.0f}ms "
                 f"order_ema={self._perf_stats.get('order_ms_ema', 0.0):.0f}ms "
                 f"{B}RPC:{RS} {self._rpc_url} ({rpc_ms:.0f}ms)"
             )
-        if self._bucket_stats.rows:
+        if show_debug and self._bucket_stats.rows:
             top_bucket = sorted(
                 self._bucket_stats.rows.items(),
                 key=lambda kv: kv[1].get("n", 0),
@@ -1884,15 +1892,19 @@ class LiveTrader:
             if stake_src == "value_fallback":
                 stake_label = "value_now"
                 tok_str = "@n/a"
-            print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
-                  f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
-                  f"{stake_label}=${(value_now if stake_label=='value_now' else stake):.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
-                  f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
+            if LOG_LIVE_DETAIL:
+                print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
+                      f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
+                      f"{stake_label}=${(value_now if stake_label=='value_now' else stake):.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
+                      f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
             shown_live_cids.add(cid)
-            agg = live_by_rk.setdefault(rk, {"n": 0, "stake": 0.0, "est": 0.0, "lead": 0})
+            agg = live_by_rk.setdefault(
+                rk, {"n": 0, "stake": 0.0, "value_now": 0.0, "win_payout": 0.0, "lead": 0}
+            )
             agg["n"] += 1
             agg["stake"] += float(stake)
-            agg["est"] += float(payout_est)
+            agg["value_now"] += float(value_now)
+            agg["win_payout"] += float(shares if shares > 0 else payout_est)
             if proj_str == "LEAD":
                 agg["lead"] += 1
         # On-chain open positions not yet hydrated into local pending.
@@ -1939,25 +1951,38 @@ class LiveTrader:
                 m={"asset": asset, "duration": int(meta.get("duration", 15) or 15), "end_ts": end_ts},
                 t={"asset": asset, "side": side, "duration": int(meta.get("duration", 15) or 15), "end_ts": end_ts},
             )
-            print(
-                f"  {Y}[LIVE-PENDING]{RS} {asset} {side} | {title} | "
-                f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
-                f"{('value_now' if stake_src=='value_fallback' else 'bet')}=${(value_now if stake_src=='value_fallback' else stake):.2f} "
-                f"{('@n/a' if stake_src=='value_fallback' else '')} est=${payout_est:.2f} proj={proj_str} | "
-                f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}"
+            if LOG_LIVE_DETAIL:
+                print(
+                    f"  {Y}[LIVE-PENDING]{RS} {asset} {side} | {title} | "
+                    f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
+                    f"{('value_now' if stake_src=='value_fallback' else 'bet')}=${(value_now if stake_src=='value_fallback' else stake):.2f} "
+                    f"{('@n/a' if stake_src=='value_fallback' else '')} est=${payout_est:.2f} proj={proj_str} | "
+                    f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}"
+                )
+            agg = live_by_rk.setdefault(
+                rk, {"n": 0, "stake": 0.0, "value_now": 0.0, "win_payout": 0.0, "lead": 0}
             )
-            agg = live_by_rk.setdefault(rk, {"n": 0, "stake": 0.0, "est": 0.0, "lead": 0})
             agg["n"] += 1
             agg["stake"] += float(stake)
-            agg["est"] += float(payout_est)
+            agg["value_now"] += float(value_now)
+            agg["win_payout"] += float(shares if shares > 0 else payout_est)
             if proj_str == "LEAD":
                 agg["lead"] += 1
         if live_by_rk:
-            for rk, row in sorted(live_by_rk.items(), key=lambda kv: kv[0])[:10]:
+            for rk, row in sorted(live_by_rk.items(), key=lambda kv: kv[0])[:max(1, LOG_LIVE_RK_MAX)]:
+                spent = float(row.get("stake", 0.0) or 0.0)
+                value_now = float(row.get("value_now", 0.0) or 0.0)
+                win_payout = float(row.get("win_payout", 0.0) or 0.0)
+                win_profit = win_payout - spent
+                mult = (win_payout / spent) if spent > 0 else 0.0
+                lead = int(row.get("lead", 0) or 0)
+                n = int(row.get("n", 0) or 0)
+                c_pl = G if win_profit > 0 else (R if win_profit < 0 else Y)
                 print(
-                    f"  {B}[LIVE-RK]{RS} {rk} | trades={row['n']} "
-                    f"stake=${row['stake']:.2f} est_win=${row['est']:.2f} "
-                    f"lead={row['lead']}/{row['n']}"
+                    f"  {B}[LIVE-RK]{RS} {rk} | trades={n} "
+                    f"spent=${spent:.2f} value_now=${value_now:.2f} "
+                    f"win_payout=${win_payout:.2f} win_profit={c_pl}${win_profit:+.2f}{RS} "
+                    f"mult={mult:.2f}x lead={lead}/{n}"
                 )
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
@@ -5037,8 +5062,11 @@ class LiveTrader:
                     best_sig = f"{best.get('cid','')}|{best['asset']}|{best['side']}|{best['score']}"
                     now_log = _time.time()
                     should_emit_best = (
-                        (best_sig != self._last_round_best and (now_log - self._last_round_best_ts) >= max(1.0, SCAN_INTERVAL))
-                        or self._should_log("round-best-heartbeat", 20)
+                        (
+                            best_sig != self._last_round_best
+                            and (now_log - self._last_round_best_ts) >= max(LOG_ROUND_SIGNAL_MIN_SEC, float(LOG_ROUND_SIGNAL_EVERY_SEC))
+                        )
+                        or self._should_log("round-best-heartbeat", LOG_ROUND_SIGNAL_EVERY_SEC)
                     )
                     if should_emit_best:
                         self._last_round_best = best_sig
@@ -5062,8 +5090,11 @@ class LiveTrader:
                         )
                         now_log = _time.time()
                         should_emit_pick = (
-                            (picks != self._last_round_pick and (now_log - self._last_round_pick_ts) >= max(1.0, SCAN_INTERVAL))
-                            or self._should_log("round-pick-heartbeat", 20)
+                            (
+                                picks != self._last_round_pick
+                                and (now_log - self._last_round_pick_ts) >= max(LOG_ROUND_SIGNAL_MIN_SEC, float(LOG_ROUND_SIGNAL_EVERY_SEC))
+                            )
+                            or self._should_log("round-pick-heartbeat", LOG_ROUND_SIGNAL_EVERY_SEC)
                         )
                         if should_emit_pick:
                             self._last_round_pick = picks
