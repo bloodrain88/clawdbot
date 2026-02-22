@@ -340,6 +340,8 @@ WS_BOOK_FALLBACK_MAX_AGE_MS = float(os.environ.get("WS_BOOK_FALLBACK_MAX_AGE_MS"
 LEADER_FLOW_FALLBACK_ENABLED = os.environ.get("LEADER_FLOW_FALLBACK_ENABLED", "true").lower() == "true"
 LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MAX_AGE_SEC", "90"))
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
+# Small tolerance for payout threshold to avoid dead-zone misses (e.g. 1.98x vs 2.00x).
+PAYOUT_NEAR_MISS_TOL = float(os.environ.get("PAYOUT_NEAR_MISS_TOL", "0.03"))
 # Mid-round booster (15m only): small additive bet at high payout/high conviction.
 MID_BOOSTER_ENABLED = os.environ.get("MID_BOOSTER_ENABLED", "true").lower() == "true"
 MID_BOOSTER_ANYTIME_15M = os.environ.get("MID_BOOSTER_ANYTIME_15M", "true").lower() == "true"
@@ -3491,9 +3493,16 @@ class LiveTrader:
 
         payout_mult = 1.0 / max(entry, 1e-9)
         if payout_mult < min_payout_req:
-            if self._noisy_log_enabled(f"skip-score-payout:{asset}:{side}", LOG_SKIP_EVERY_SEC):
-                print(f"{Y}[SKIP] {asset} {side} payout={payout_mult:.2f}x < min={min_payout_req:.2f}x{RS}")
-            return None
+            if payout_mult >= max(1.0, (min_payout_req - PAYOUT_NEAR_MISS_TOL)):
+                if self._noisy_log_enabled(f"payout-near-miss:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[PAYOUT-TOL]{RS} {asset} {side} payout={payout_mult:.2f}x "
+                        f"near min={min_payout_req:.2f}x (tol={PAYOUT_NEAR_MISS_TOL:.2f}x)"
+                    )
+            else:
+                if self._noisy_log_enabled(f"skip-score-payout:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                    print(f"{Y}[SKIP] {asset} {side} payout={payout_mult:.2f}x < min={min_payout_req:.2f}x{RS}")
+                return None
         ev_net = (true_prob / max(entry, 1e-9)) - 1.0 - FEE_RATE_EST
         if ev_net < min_ev_req:
             if self._noisy_log_enabled(f"skip-score-ev:{asset}:{side}", LOG_SKIP_EVERY_SEC):
@@ -4431,8 +4440,15 @@ class LiveTrader:
                     fresh_payout = 1.0 / max(fresh_ask, 1e-9)
                     min_payout_fb, min_ev_fb, _ = self._adaptive_thresholds(duration)
                     if fresh_payout < min_payout_fb:
-                        print(f"{Y}[SKIP] {asset} {side} fallback payout={fresh_payout:.2f}x < min={min_payout_fb:.2f}x{RS}")
-                        return None
+                        if fresh_payout >= max(1.0, (min_payout_fb - PAYOUT_NEAR_MISS_TOL)):
+                            if self._noisy_log_enabled(f"payout-near-miss-fb:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                                print(
+                                    f"{Y}[PAYOUT-TOL]{RS} {asset} {side} fallback payout={fresh_payout:.2f}x "
+                                    f"near min={min_payout_fb:.2f}x (tol={PAYOUT_NEAR_MISS_TOL:.2f}x)"
+                                )
+                        else:
+                            print(f"{Y}[SKIP] {asset} {side} fallback payout={fresh_payout:.2f}x < min={min_payout_fb:.2f}x{RS}")
+                            return None
                     fresh_ep  = true_prob - fresh_ask
                     if fresh_ep < edge_floor:
                         print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_floor:.2f} — price moved against us{RS}")
