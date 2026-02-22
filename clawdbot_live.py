@@ -429,6 +429,23 @@ MAX_BOOK_SPREAD_15M = float(os.environ.get("MAX_BOOK_SPREAD_15M", "0.120"))
 MAKER_ENTRY_TICK_TOL = int(os.environ.get("MAKER_ENTRY_TICK_TOL", "1"))
 ORDER_RETRY_MAX = int(os.environ.get("ORDER_RETRY_MAX", "4"))
 ORDER_RETRY_BASE_SEC = float(os.environ.get("ORDER_RETRY_BASE_SEC", "0.35"))
+
+# Entry timing optimizer (15m):
+# keep initial strong thesis, but allow a short wait for better pricing.
+ENTRY_WAIT_ENABLED = os.environ.get("ENTRY_WAIT_ENABLED", "true").lower() == "true"
+ENTRY_WAIT_WINDOW_15M_SEC = float(os.environ.get("ENTRY_WAIT_WINDOW_15M_SEC", "2.0"))
+ENTRY_WAIT_POLL_SEC = float(os.environ.get("ENTRY_WAIT_POLL_SEC", "0.20"))
+ENTRY_WAIT_MIN_LEFT_SEC = float(os.environ.get("ENTRY_WAIT_MIN_LEFT_SEC", "360"))
+ENTRY_WAIT_MIN_SCORE = int(os.environ.get("ENTRY_WAIT_MIN_SCORE", "12"))
+ENTRY_WAIT_MIN_TRUE_PROB = float(os.environ.get("ENTRY_WAIT_MIN_TRUE_PROB", "0.66"))
+ENTRY_WAIT_MIN_ENTRY = float(os.environ.get("ENTRY_WAIT_MIN_ENTRY", "0.55"))
+ENTRY_WAIT_MAX_ENTRY = float(os.environ.get("ENTRY_WAIT_MAX_ENTRY", "0.78"))
+ENTRY_WAIT_MIN_IMPROVE_TICKS = int(os.environ.get("ENTRY_WAIT_MIN_IMPROVE_TICKS", "1"))
+ENTRY_WAIT_MIN_IMPROVE_ABS = float(os.environ.get("ENTRY_WAIT_MIN_IMPROVE_ABS", "0.005"))
+ENTRY_WAIT_TARGET_DROP_ABS = float(os.environ.get("ENTRY_WAIT_TARGET_DROP_ABS", "0.02"))
+ENTRY_WAIT_MAX_SCORE_DECAY = int(os.environ.get("ENTRY_WAIT_MAX_SCORE_DECAY", "2"))
+ENTRY_WAIT_MAX_PROB_DECAY = float(os.environ.get("ENTRY_WAIT_MAX_PROB_DECAY", "0.03"))
+ENTRY_WAIT_MAX_EDGE_DECAY = float(os.environ.get("ENTRY_WAIT_MAX_EDGE_DECAY", "0.02"))
 MAX_WIN_MODE = os.environ.get("MAX_WIN_MODE", "true").lower() == "true"
 WINMODE_MIN_TRUE_PROB_5M = float(os.environ.get("WINMODE_MIN_TRUE_PROB_5M", "0.58"))
 WINMODE_MIN_TRUE_PROB_15M = float(os.environ.get("WINMODE_MIN_TRUE_PROB_15M", "0.60"))
@@ -4674,6 +4691,9 @@ class LiveTrader:
                     if LOG_VERBOSE:
                         print(f"{Y}[SKIP] extreme latency {sig['asset']} signal={sig.get('signal_latency_ms', 0):.0f}ms{RS}")
                     return
+            sig = await self._maybe_wait_for_better_entry(sig)
+            if sig is None:
+                return
             t_ord = _time.perf_counter()
             exec_result = await self._place_order(
                 sig["token_id"], sig["side"], sig["entry"], sig["size"],
@@ -4790,6 +4810,79 @@ class LiveTrader:
         finally:
             async with self._exec_lock:
                 self._executing_cids.discard(cid)
+
+    async def _maybe_wait_for_better_entry(self, sig: dict) -> dict | None:
+        """Short price-improvement wait while preserving initial conviction snapshot.
+
+        For strong 15m setups only, wait a brief window for a better entry.
+        Enter only if thesis quality is preserved (score/prob/edge decay bounded).
+        """
+        try:
+            if not ENTRY_WAIT_ENABLED:
+                return sig
+            if bool(sig.get("booster_mode", False)) or bool(sig.get("use_limit", False)):
+                return sig
+            duration = int(sig.get("duration", 0) or 0)
+            if duration != 15:
+                return sig
+            mins_left = float(sig.get("mins_left", 0.0) or 0.0)
+            if mins_left * 60.0 <= ENTRY_WAIT_MIN_LEFT_SEC:
+                return sig
+            score0 = int(sig.get("score", 0) or 0)
+            p0 = float(sig.get("true_prob", 0.0) or 0.0)
+            edge0 = float(sig.get("edge", 0.0) or 0.0)
+            e0 = float(sig.get("entry", 0.0) or 0.0)
+            if score0 < ENTRY_WAIT_MIN_SCORE or p0 < ENTRY_WAIT_MIN_TRUE_PROB:
+                return sig
+            if e0 < ENTRY_WAIT_MIN_ENTRY or e0 > ENTRY_WAIT_MAX_ENTRY:
+                return sig
+
+            m = sig.get("m")
+            if not isinstance(m, dict):
+                return sig
+
+            deadline = _time.time() + max(0.0, ENTRY_WAIT_WINDOW_15M_SEC)
+            best = sig
+            improved = False
+            while _time.time() < deadline:
+                await asyncio.sleep(max(0.05, ENTRY_WAIT_POLL_SEC))
+                rsig = await self._score_market(m)
+                if not rsig:
+                    continue
+                if rsig.get("cid") != sig.get("cid") or rsig.get("side") != sig.get("side"):
+                    continue
+                score_t = int(rsig.get("score", 0) or 0)
+                p_t = float(rsig.get("true_prob", 0.0) or 0.0)
+                edge_t = float(rsig.get("edge", 0.0) or 0.0)
+                if (
+                    score_t < (score0 - ENTRY_WAIT_MAX_SCORE_DECAY)
+                    or p_t < (p0 - ENTRY_WAIT_MAX_PROB_DECAY)
+                    or edge_t < (edge0 - ENTRY_WAIT_MAX_EDGE_DECAY)
+                ):
+                    if self._noisy_log_enabled(f"entry-wait-decay:{sig.get('asset','?')}:{sig.get('side','?')}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[ENTRY-WAIT]{RS} {sig.get('asset','?')} {sig.get('side','?')} "
+                            f"thesis decayed: score {score_t}/{score0} prob {p_t:.3f}/{p0:.3f} edge {edge_t:.3f}/{edge0:.3f}"
+                        )
+                    return None
+                e_t = float(rsig.get("entry", 1.0) or 1.0)
+                tick = float(((rsig.get("pm_book_data") or {}).get("tick", 0.01)) or 0.01)
+                min_improve = max(tick * max(1, ENTRY_WAIT_MIN_IMPROVE_TICKS), ENTRY_WAIT_MIN_IMPROVE_ABS)
+                if e_t <= (float(best.get("entry", 1.0) or 1.0) - min_improve):
+                    best = rsig
+                    improved = True
+                    if self._noisy_log_enabled(f"entry-wait-improve:{sig.get('asset','?')}:{sig.get('side','?')}", LOG_EDGE_EVERY_SEC):
+                        print(
+                            f"{B}[ENTRY-WAIT]{RS} {sig.get('asset','?')} {sig.get('side','?')} "
+                            f"entry {float(sig.get('entry',0))*100:.1f}c -> {e_t*100:.1f}c "
+                            f"(score={score_t} prob={p_t:.3f} edge={edge_t:.3f})"
+                        )
+                    if e_t <= (e0 - ENTRY_WAIT_TARGET_DROP_ABS):
+                        break
+            return best if improved else sig
+        except Exception as e:
+            self._errors.tick("entry_wait", print, err=e, every=20)
+            return sig
 
     async def evaluate(self, m: dict):
         """RTDS fast-path: score a single market and execute if score gate passes."""
