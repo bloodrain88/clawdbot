@@ -323,7 +323,8 @@ COPYFLOW_LIVE_ENABLED = os.environ.get("COPYFLOW_LIVE_ENABLED", "true").lower() 
 COPYFLOW_LIVE_REFRESH_SEC = int(os.environ.get("COPYFLOW_LIVE_REFRESH_SEC", "5"))
 COPYFLOW_LIVE_TRADES_LIMIT = int(os.environ.get("COPYFLOW_LIVE_TRADES_LIMIT", "80"))
 COPYFLOW_LIVE_MAX_MARKETS = int(os.environ.get("COPYFLOW_LIVE_MAX_MARKETS", "8"))
-COPYFLOW_LIVE_MAX_AGE_SEC = float(os.environ.get("COPYFLOW_LIVE_MAX_AGE_SEC", "20"))
+COPYFLOW_LIVE_MAX_AGE_SEC = float(os.environ.get("COPYFLOW_LIVE_MAX_AGE_SEC", "180"))
+COPYFLOW_FETCH_RETRIES = int(os.environ.get("COPYFLOW_FETCH_RETRIES", "3"))
 COPYFLOW_CID_ONDEMAND_ENABLED = os.environ.get("COPYFLOW_CID_ONDEMAND_ENABLED", "true").lower() == "true"
 COPYFLOW_CID_ONDEMAND_COOLDOWN_SEC = float(os.environ.get("COPYFLOW_CID_ONDEMAND_COOLDOWN_SEC", "4"))
 COPYFLOW_HEALTH_FORCE_REFRESH_SEC = float(os.environ.get("COPYFLOW_HEALTH_FORCE_REFRESH_SEC", "12"))
@@ -1692,21 +1693,49 @@ class LiveTrader:
         cid_l = str(cid or "").lower().strip()
         if not cid_l:
             return []
-        try:
-            rows = await self._http_get_json(
-                "https://data-api.polymarket.com/trades",
-                params={"conditionId": cid, "limit": str(max(1, int(limit)))},
-                timeout=timeout,
-            )
-        except Exception:
-            rows = []
-        if not isinstance(rows, list):
+        lim = max(1, int(limit))
+        attempts = [
+            {"conditionId": cid, "limit": str(lim)},
+            {"market": cid, "limit": str(lim)},
+            {"condition_id": cid, "limit": str(lim)},
+        ]
+        rows_all = []
+        for _ in range(max(1, COPYFLOW_FETCH_RETRIES)):
+            for prm in attempts:
+                try:
+                    rows = await self._http_get_json(
+                        "https://data-api.polymarket.com/trades",
+                        params=prm,
+                        timeout=timeout,
+                    )
+                except Exception:
+                    rows = []
+                if isinstance(rows, list) and rows:
+                    rows_all.extend(rows)
+            if rows_all:
+                break
+        if not rows_all:
             return []
+
         out = []
-        for tr in rows:
-            c = str((tr or {}).get("conditionId", "")).lower().strip()
-            if c == cid_l:
-                out.append(tr)
+        seen = set()
+        for tr in rows_all:
+            row = tr or {}
+            c = str(row.get("conditionId", "")).lower().strip()
+            if c != cid_l:
+                continue
+            k = (
+                str(row.get("transactionHash", "")).lower().strip(),
+                str(row.get("outcome", "")),
+                str(row.get("proxyWallet", "")).lower().strip(),
+                str(row.get("price", "")),
+                str(row.get("size", "")),
+                str(row.get("timestamp", "")),
+            )
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(row)
         return out
 
     async def _fetch_recent_trades(self, limit: int = 300, timeout: int = 8):
@@ -2613,6 +2642,8 @@ class LiveTrader:
                     f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c | "
                     f"{c_lead}LEAD{RS}={lead}/{n}"
                 )
+        elif self._should_log("live-rk-empty", 15):
+            print(f"  {Y}[LIVE-RK]{RS} none | trades=0 | no active on-chain positions")
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
             if isinstance(val[0], dict):
@@ -3702,12 +3733,8 @@ class LiveTrader:
                         f"entry={leader_entry:.3f} > cap={leader_entry_cap:.3f}"
                     )
             elif MARKET_LEADER_FOLLOW_ENABLED and (not flow_fresh) and flow_n > 0:
-                if self._noisy_log_enabled(f"leader-stale:{asset}:{duration}", LOG_FLOW_EVERY_SEC):
-                    print(
-                        f"{Y}[LEADER-STALE]{RS} {asset} {duration}m "
-                        f"age={flow_age_s:.1f}s > {COPYFLOW_LIVE_MAX_AGE_SEC:.1f}s "
-                        f"(skip force)"
-                    )
+                # Leader-flow stale is informational only: never block/penalize execution.
+                pass
             pref = up_conf if side == "Up" else dn_conf
             opp = dn_conf if side == "Up" else up_conf
             copy_net = pref - opp
@@ -3759,27 +3786,11 @@ class LiveTrader:
             signal_source = "leader-live"
             leader_size_scale = LEADER_FRESH_SIZE_SCALE
         if REQUIRE_LEADER_FLOW and (not leader_ready):
-            core_realtime_ok = (
-                (ws_book_strict is not None)
-                and bool(volume_ready)
-                and (cl_age_s is not None and cl_age_s <= 35.0)
-                and (quote_age_ms <= min(MAX_QUOTE_STALENESS_MS, 1200.0))
-            )
-            if not core_realtime_ok:
-                if self._noisy_log_enabled(f"skip-no-leader:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    print(f"{Y}[SKIP] {asset} {duration}m leader-flow realtime unavailable{RS}")
-                self._skip_tick("leader_missing")
-                return None
-            # Allow continuation with strict realtime technical stack only.
+            # Leader wallets are optional alpha, never a hard gate.
+            # We continue with strict realtime technical stack.
             signal_tier = "TIER-B"
             signal_source = "tech-realtime-no-leader"
-            leader_size_scale = min(leader_size_scale, 0.85)
-            edge -= 0.003
-            if self._noisy_log_enabled(f"leader-miss-tech:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                print(
-                    f"{Y}[LEADER-MISS]{RS} {asset} {duration}m no fresh leader-flow "
-                    f"-> using strict realtime technical stack"
-                )
+            leader_size_scale = min(leader_size_scale, 0.90)
 
         # Source-quality + signal-conviction analysis (real data only).
         # This is the primary anti-random layer: trade only when data is both fresh and coherent.
