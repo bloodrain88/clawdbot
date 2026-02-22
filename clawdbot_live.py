@@ -4066,6 +4066,13 @@ class LiveTrader:
         if not token_id:
             return None
         pm_book_data = _pm_book if token_id == prefetch_token else None
+        if pm_book_data is None:
+            # Ensure entry/payout gates use the actual traded side book, not synthetic 1-up_price.
+            ws_side = self._get_clob_ws_book(token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+            if ws_side is not None:
+                pm_book_data = ws_side
+            else:
+                pm_book_data = await self._fetch_pm_book_safe(token_id)
 
         # ── Live CLOB price (more accurate than Gamma up_price) ──────────────
         live_entry = entry
