@@ -4138,6 +4138,9 @@ class LiveTrader:
         ):
             extra_relax = min(0.06, max(0.0, setup_q - 0.70) * 0.30)
             min_payout_req = max(1.70, min_payout_req - extra_relax)
+        # Core 15m EV floor: avoid low-multiple core entries.
+        if duration >= 15 and (not booster_eval):
+            min_payout_req = max(min_payout_req, 1.70)
         min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
         if ws_fresh and cl_fresh and vol_fresh and mins_left >= (4.0 if duration >= 15 else 2.0):
             max_entry_allowed = min(0.90, max_entry_allowed + 0.02)
@@ -6310,12 +6313,36 @@ class LiveTrader:
             tightness += min(1.0, (self.consec_losses - 1) * 0.25)
         if snap["outcomes"] >= 12 and snap["pf"] > 1.35 and snap["expectancy"] > 0.30 and snap["avg_slip"] < 120:
             tightness -= 0.35
+        # Momentum regime relaxation: when recent realized quality is strong, avoid over-filtering.
+        recent_wr = 0.5
+        recent = list(self.recent_trades)[-10:]
+        if recent:
+            recent_wr = sum(1 for x in recent if x) / max(1, len(recent))
+        if (
+            snap["outcomes"] >= 12
+            and snap["pf"] >= 1.15
+            and snap["recent_pf"] >= 1.10
+            and snap["expectancy"] >= 0.10
+            and snap["avg_slip"] < 180
+            and recent_wr >= 0.60
+            and self.consec_losses == 0
+        ):
+            tightness -= 0.15
         tightness = min(1.8, max(-0.5, tightness))
 
         min_payout_raw = base_payout + (0.20 * tightness)
         min_payout = max(1.55, min(base_payout + payout_upshift_cap, min_payout_raw))
         min_ev = max(0.005, base_ev + (0.015 * tightness))
         max_entry_hard = max(0.33, min(0.80, hard_cap - (0.06 * tightness)))
+        # In favorable regime, allow slightly wider executable entry band.
+        if (
+            snap["outcomes"] >= 12
+            and snap["pf"] >= 1.15
+            and snap["recent_pf"] >= 1.10
+            and snap["expectancy"] >= 0.10
+            and snap["avg_slip"] < 180
+        ):
+            max_entry_hard = min(0.82, max_entry_hard + 0.02)
 
         return min_payout, min_ev, max_entry_hard
 
