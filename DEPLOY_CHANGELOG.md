@@ -12,7 +12,7 @@ Ogni modifica che impatta trading/runtime deve aggiungere una nuova entry con:
 
 ## 2026-02-22
 
-### Commit `pending`
+### Commit `753425f`
 - Scope: `clawdbot_live.py`
 - Summary:
   - Rimosso il floor statico effettivo su `min_entry`: ora e' dinamico per setup quality (`analysis_quality` + `analysis_conviction`), vol_ratio, tf_votes, freshness e mins_left.
