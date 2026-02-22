@@ -605,6 +605,7 @@ class LiveTrader:
         self.open_prices        = {}   # cid → float price
         self.open_prices_source = {}   # cid → "CL-exact" | "CL-fallback"
         self._mkt_log_ts        = {}   # cid → last [MKT] log time
+        self._live_rk_repair_ts = 0.0
         self._log_ts            = {}   # throttle map for repetitive logs
         self._scan_state_last   = None
         self._bank_state_last   = None
@@ -2712,6 +2713,17 @@ class LiveTrader:
                 )
         elif self._should_log("live-rk-empty", 15):
             print(f"  {Y}[LIVE-RK]{RS} none | trades=0 | no active on-chain positions")
+            now_fix = _time.time()
+            if int(self.onchain_open_count or 0) > 0 and (now_fix - float(self._live_rk_repair_ts or 0.0)) >= 20.0:
+                self._live_rk_repair_ts = now_fix
+                print(
+                    f"{Y}[LIVE-RK-MISMATCH]{RS} onchain_open={self.onchain_open_count} "
+                    f"but no live rows — forcing open position resync"
+                )
+                try:
+                    self._sync_open_positions()
+                except Exception as e:
+                    self._errors.tick("live_rk_repair", print, err=e, every=10)
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
             if isinstance(val[0], dict):
