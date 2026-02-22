@@ -251,6 +251,7 @@ RUNTIME_JSON_LOG_FILE = os.path.join(_DATA_DIR, "clawdbot_runtime_logs.jsonl")
 PNL_BASELINE_FILE = os.path.join(_DATA_DIR, "clawdbot_pnl_baseline.json")
 PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false").lower() == "true"
 RUNTIME_JSON_LOG_ENABLED = os.environ.get("RUNTIME_JSON_LOG_ENABLED", "true").lower() == "true"
+RUNTIME_JSON_LOG_ROTATE_DAILY = os.environ.get("RUNTIME_JSON_LOG_ROTATE_DAILY", "true").lower() == "true"
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 STRICT_ONCHAIN_STATE = os.environ.get("STRICT_ONCHAIN_STATE", "true").lower() == "true"
@@ -397,25 +398,46 @@ G="\033[92m"; R="\033[91m"; Y="\033[93m"; B="\033[94m"; W="\033[97m"; RS="\033[0
 class _JsonLogTee:
     """Mirror stdout/stderr to a persistent JSONL journal file."""
 
-    def __init__(self, stream, stream_name: str, path: str, meta: dict):
+    def __init__(self, stream, stream_name: str, path: str, meta: dict, rotate_daily: bool = False):
         self._stream = stream
         self._stream_name = stream_name
-        self._path = path
+        self._base_path = path
         self._meta = dict(meta or {})
         self._buf = ""
         self._lock = threading.Lock()
+        self._rotate_daily = bool(rotate_daily)
+        self._active_day = ""
+        self._active_path = path
 
-    def _append_json_line(self, msg: str):
+    def _daily_path(self, day: str) -> str:
+        d = os.path.dirname(self._base_path) or "."
+        fn = os.path.basename(self._base_path)
+        stem, ext = os.path.splitext(fn)
+        if not ext:
+            ext = ".jsonl"
+        return os.path.join(d, f"{stem}-{day}{ext}")
+
+    def _ensure_target_path(self, ts_now: datetime):
+        if not self._rotate_daily:
+            self._active_path = self._base_path
+            return
+        day = ts_now.strftime("%Y-%m-%d")
+        if day != self._active_day:
+            self._active_day = day
+            self._active_path = self._daily_path(day)
+
+    def _append_json_line(self, msg: str, ts_now: datetime):
         if not msg:
             return
+        self._ensure_target_path(ts_now)
         rec = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": ts_now.isoformat(),
             "stream": self._stream_name,
             "msg": msg,
             **self._meta,
         }
         try:
-            with open(self._path, "a", encoding="utf-8") as f:
+            with open(self._active_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=True) + "\n")
         except Exception:
             # never break runtime printing on journal write issues
@@ -429,14 +451,14 @@ class _JsonLogTee:
             self._buf += s
             while "\n" in self._buf:
                 line, self._buf = self._buf.split("\n", 1)
-                self._append_json_line(line.rstrip("\r"))
+                self._append_json_line(line.rstrip("\r"), datetime.now(timezone.utc))
         return len(s)
 
     def flush(self):
         with self._lock:
             self._stream.flush()
             if self._buf:
-                self._append_json_line(self._buf.rstrip("\r"))
+                self._append_json_line(self._buf.rstrip("\r"), datetime.now(timezone.utc))
                 self._buf = ""
 
     def isatty(self):
@@ -460,9 +482,29 @@ def _install_runtime_json_log():
         "build_id": os.environ.get("NF_BUILD_ID", "") or os.environ.get("NORTHFLANK_BUILD_ID", ""),
         "pid": os.getpid(),
     }
-    sys.stdout = _JsonLogTee(sys.stdout, "stdout", RUNTIME_JSON_LOG_FILE, meta)
-    sys.stderr = _JsonLogTee(sys.stderr, "stderr", RUNTIME_JSON_LOG_FILE, meta)
-    print(f"{B}[LOG-JSON]{RS} {RUNTIME_JSON_LOG_FILE}")
+    sys.stderr = _JsonLogTee(
+        sys.stderr,
+        "stderr",
+        RUNTIME_JSON_LOG_FILE,
+        meta,
+        rotate_daily=RUNTIME_JSON_LOG_ROTATE_DAILY,
+    )
+    sys.stdout = _JsonLogTee(
+        sys.stdout,
+        "stdout",
+        RUNTIME_JSON_LOG_FILE,
+        meta,
+        rotate_daily=RUNTIME_JSON_LOG_ROTATE_DAILY,
+    )
+    log_pattern = RUNTIME_JSON_LOG_FILE
+    if RUNTIME_JSON_LOG_ROTATE_DAILY:
+        d = os.path.dirname(RUNTIME_JSON_LOG_FILE) or "."
+        fn = os.path.basename(RUNTIME_JSON_LOG_FILE)
+        stem, ext = os.path.splitext(fn)
+        if not ext:
+            ext = ".jsonl"
+        log_pattern = os.path.join(d, f"{stem}-YYYY-MM-DD{ext}")
+    print(f"{B}[LOG-JSON]{RS} {log_pattern}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 
