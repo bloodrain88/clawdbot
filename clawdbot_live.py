@@ -1385,6 +1385,9 @@ class LiveTrader:
             f"{B}[BOOT]{RS} "
             f"latency<= {MAX_SIGNAL_LATENCY_MS:.0f}ms quote_stale<= {MAX_QUOTE_STALENESS_MS:.0f}ms "
             f"min_mins_left(5m/15m)={MIN_MINS_LEFT_5M:.1f}/{MIN_MINS_LEFT_15M:.1f} "
+            f"late_dir_lock={LATE_DIR_LOCK_ENABLED} "
+            f"lock_mins(5m/15m)={LATE_DIR_LOCK_MIN_LEFT_5M:.1f}/{LATE_DIR_LOCK_MIN_LEFT_15M:.1f} "
+            f"lock_move>={LATE_DIR_LOCK_MIN_MOVE_PCT*100:.03f}% "
             f"extra_score(BTC5m/XRP15m)=+{EXTRA_SCORE_GATE_BTC_5M}/+{EXTRA_SCORE_GATE_XRP_15M} "
             f"exposure trend(total/side)={EXPOSURE_CAP_TOTAL_TREND:.0%}/{EXPOSURE_CAP_SIDE_TREND:.0%} "
             f"chop(total/side)={EXPOSURE_CAP_TOTAL_CHOP:.0%}/{EXPOSURE_CAP_SIDE_CHOP:.0%}"
@@ -2741,6 +2744,26 @@ class LiveTrader:
             else:
                 side, edge, true_prob = "Down", edge_down, prob_down
 
+        # Late-window direction lock: avoid betting against the beat direction
+        # when the move is already clear near expiry.
+        if (
+            LATE_DIR_LOCK_ENABLED
+            and open_price > 0
+            and current > 0
+            and duration in (5, 15)
+        ):
+            lock_mins = LATE_DIR_LOCK_MIN_LEFT_5M if duration <= 5 else LATE_DIR_LOCK_MIN_LEFT_15M
+            move_abs = abs((current - open_price) / max(open_price, 1e-9))
+            if mins_left <= lock_mins and move_abs >= LATE_DIR_LOCK_MIN_MOVE_PCT:
+                beat_dir = "Up" if current >= open_price else "Down"
+                if side != beat_dir:
+                    if self._noisy_log_enabled(f"late-lock-score:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[SKIP]{RS} {asset} {duration}m {side} late-lock: "
+                            f"beat_dir={beat_dir} mins_left={mins_left:.1f} move={move_abs*100:.2f}%"
+                        )
+                    return None
+
         # Optional copyflow signal from externally ranked leader wallets on same market.
         copy_adj = 0
         copy_net = 0.0
@@ -3083,6 +3106,27 @@ class LiveTrader:
                         f"mins_left={mins_left:.1f} <= gate={min_left_gate:.1f}"
                     )
                 return
+            if (
+                LATE_DIR_LOCK_ENABLED
+                and duration in (5, 15)
+                and sig.get("open_price", 0) > 0
+            ):
+                lock_mins = LATE_DIR_LOCK_MIN_LEFT_5M if duration <= 5 else LATE_DIR_LOCK_MIN_LEFT_15M
+                if mins_left <= lock_mins:
+                    cur_now = self._current_price(sig["asset"]) or sig.get("current", 0)
+                    open_p = float(sig.get("open_price", 0) or 0)
+                    if cur_now > 0 and open_p > 0:
+                        move_abs = abs((cur_now - open_p) / max(open_p, 1e-9))
+                        if move_abs >= LATE_DIR_LOCK_MIN_MOVE_PCT:
+                            beat_dir = "Up" if cur_now >= open_p else "Down"
+                            if sig.get("side") != beat_dir:
+                                if self._noisy_log_enabled(f"late-lock-exec:{sig['asset']}:{sig.get('side','')}", LOG_SKIP_EVERY_SEC):
+                                    print(
+                                        f"{Y}[SKIP]{RS} {sig['asset']} {duration}m {sig.get('side','')} "
+                                        f"late-lock(exec): beat_dir={beat_dir} mins_left={mins_left:.1f} "
+                                        f"move={move_abs*100:.2f}%"
+                                    )
+                                return
             extra_score_gate = 0
             if sig.get("asset") == "BTC" and duration <= 5:
                 extra_score_gate = max(extra_score_gate, EXTRA_SCORE_GATE_BTC_5M)
