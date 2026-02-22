@@ -4867,6 +4867,11 @@ class LiveTrader:
                 taker_edge     = true_prob - best_ask
                 mid_est        = (best_bid + best_ask) / 2
                 maker_edge_est = true_prob - mid_est
+                strong_exec = (
+                    (score >= 12)
+                    and cl_agree
+                    and (taker_edge >= (edge_floor + 0.01 if min_edge_req is not None else 0.05))
+                )
                 # Ensure order notional always satisfies CLOB minimum size in shares.
                 _, min_notional = _normalize_order_size(best_ask, 0.0)
                 if size_usdc < min_notional:
@@ -4922,6 +4927,13 @@ class LiveTrader:
                     score_cap = FAST_TAKER_SCORE_5M if duration <= 5 else FAST_TAKER_SCORE_15M
                     secs_elapsed = max(0.0, duration * 60.0 - max(0.0, mins_left * 60.0))
                     early_cut = FAST_TAKER_EARLY_WINDOW_SEC_5M if duration <= 5 else FAST_TAKER_EARLY_WINDOW_SEC_15M
+                    # Execution-first path: when signal is strong and book is tradable, prefer instant fill.
+                    if (
+                        strong_exec
+                        and best_ask <= eff_max_entry
+                        and spread <= (fast_spread_cap + 0.01)
+                    ):
+                        force_taker = True
                     if (
                         score >= score_cap
                         and spread <= fast_spread_cap
@@ -5075,6 +5087,9 @@ class LiveTrader:
                 if use_limit:
                     # Pullback limit: do not stall the cycle waiting on far-away price.
                     max_wait = min(max_wait, 0.35 if duration <= 5 else 0.60)
+                elif strong_exec and not use_limit:
+                    # For strong setups, do not spend too long in maker limbo.
+                    max_wait = min(max_wait, 0.25 if duration <= 5 else 0.30)
                 polls     = max(1, int(max_wait / poll_interval))
                 print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
                       f"waiting up to {polls*poll_interval}s for fill...{RS}")
@@ -5174,6 +5189,9 @@ class LiveTrader:
                             return None
                     fresh_payout = 1.0 / max(fresh_ask, 1e-9)
                     min_payout_fb, min_ev_fb, _ = self._adaptive_thresholds(duration)
+                    if strong_exec:
+                        # Execution fallback should not over-block strong setups for tiny payout deltas.
+                        min_payout_fb = max(1.65, min_payout_fb - 0.08)
                     if fresh_payout < min_payout_fb:
                         if fresh_payout >= max(1.0, (min_payout_fb - PAYOUT_NEAR_MISS_TOL)):
                             if self._noisy_log_enabled(f"payout-near-miss-fb:{asset}:{side}", LOG_SKIP_EVERY_SEC):
@@ -5184,6 +5202,7 @@ class LiveTrader:
                         else:
                             print(f"{Y}[SKIP] {asset} {side} fallback payout={fresh_payout:.2f}x < min={min_payout_fb:.2f}x{RS}")
                             self._skip_tick("fallback_payout_below")
+                            print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=fallback_payout_below")
                             return None
                     fresh_ep  = true_prob - fresh_ask
                     if fresh_ep < edge_floor:
@@ -5203,6 +5222,7 @@ class LiveTrader:
                             f"slip={slip_now:.1f}bps > cap={slip_cap_bps:.0f}bps"
                         )
                         self._skip_tick("fallback_slip_guard")
+                        print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=fallback_slip_guard")
                         return None
                 except Exception:
                     taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
@@ -5237,6 +5257,7 @@ class LiveTrader:
                     except Exception:
                         self._errors.tick("order_status_check", print, every=50)
                 print(f"{Y}[ORDER] Both maker and FOK taker unfilled — cancelled{RS}")
+                print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=maker_and_fok_unfilled")
                 return None
 
             except Exception as e:
