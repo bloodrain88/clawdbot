@@ -394,6 +394,7 @@ class LiveTrader:
         self.onchain_open_positions = 0.0
         self.onchain_open_count = 0
         self.onchain_redeemable_count = 0
+        self.onchain_open_cids = set()
         self.onchain_total_equity = BANKROLL
         self.onchain_snapshot_ts = 0.0
         self.daily_pnl       = 0.0
@@ -1611,7 +1612,11 @@ class LiveTrader:
             )
         # Show each open position with current win/loss status
         now_ts = _time.time()
+        local_only = 0
         for cid, (m, t) in list(self.pending.items()):
+            if self.onchain_open_cids and cid not in self.onchain_open_cids:
+                local_only += 1
+                continue
             self._force_expired_from_question_if_needed(m, t)
             self._apply_exact_window_from_question(m, t)
             asset      = t.get("asset", "?")
@@ -1660,6 +1665,8 @@ class LiveTrader:
                   f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
                   f"bet=${size:.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
                   f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
+        if local_only > 0:
+            print(f"  {Y}[LOCAL-ONLY]{RS} hidden {local_only} pending entries not confirmed on-chain")
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
             if isinstance(val[0], dict):
@@ -4747,6 +4754,7 @@ class LiveTrader:
                 self.onchain_wallet_usdc = round(usdc, 2)
                 self.onchain_open_positions = round(open_val, 2)
                 self.onchain_open_count = int(open_count)
+                self.onchain_open_cids = set(onchain_open_cids)
                 self.onchain_redeemable_count = int(settling_claim_count)
                 self.onchain_total_equity = total
                 self.onchain_snapshot_ts = _time.time()
