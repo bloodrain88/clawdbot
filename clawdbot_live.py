@@ -321,6 +321,12 @@ MARKET_LEADER_MIN_NET = float(os.environ.get("MARKET_LEADER_MIN_NET", "0.15"))
 MARKET_LEADER_MIN_N = int(os.environ.get("MARKET_LEADER_MIN_N", "30"))
 MARKET_LEADER_SCORE_BONUS = int(os.environ.get("MARKET_LEADER_SCORE_BONUS", "2"))
 MARKET_LEADER_EDGE_BONUS = float(os.environ.get("MARKET_LEADER_EDGE_BONUS", "0.010"))
+# Dynamic sizing guardrail for cheap-entry tails:
+# - keep default risk around LOW_ENTRY_BASE_SOFT_MAX
+# - allow growth toward LOW_ENTRY_HIGH_CONV_SOFT_MAX only on strong conviction
+LOW_ENTRY_SOFT_THRESHOLD = float(os.environ.get("LOW_ENTRY_SOFT_THRESHOLD", "0.35"))
+LOW_ENTRY_BASE_SOFT_MAX = float(os.environ.get("LOW_ENTRY_BASE_SOFT_MAX", "10.0"))
+LOW_ENTRY_HIGH_CONV_SOFT_MAX = float(os.environ.get("LOW_ENTRY_HIGH_CONV_SOFT_MAX", "30.0"))
 PREBID_ARM_ENABLED = os.environ.get("PREBID_ARM_ENABLED", "true").lower() == "true"
 PREBID_MIN_CONF = float(os.environ.get("PREBID_MIN_CONF", "0.58"))
 PREBID_ARM_WINDOW_SEC = float(os.environ.get("PREBID_ARM_WINDOW_SEC", "30"))
@@ -3136,6 +3142,24 @@ class LiveTrader:
             hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.02))
         elif entry <= 0.10:
             hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.03))
+        # Soft cap curve for cheap entries:
+        # default around $10, but scale toward ~$30 only if conviction is truly strong.
+        if entry <= LOW_ENTRY_SOFT_THRESHOLD:
+            score_n = max(0.0, min(1.0, (float(score) - 8.0) / 10.0))
+            prob_n = max(0.0, min(1.0, (float(true_prob) - 0.56) / 0.20))
+            edge_n = max(0.0, min(1.0, (float(edge) - 0.02) / 0.12))
+            # copy_net > 0 means leaders agree with chosen side; <0 penalizes conviction.
+            leader_n = max(0.0, min(1.0, float(copy_net) / 0.40))
+            conviction = (
+                0.35 * score_n
+                + 0.35 * prob_n
+                + 0.20 * edge_n
+                + 0.10 * leader_n
+            )
+            soft_cap = LOW_ENTRY_BASE_SOFT_MAX + (
+                (LOW_ENTRY_HIGH_CONV_SOFT_MAX - LOW_ENTRY_BASE_SOFT_MAX) * conviction
+            )
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, soft_cap))
         model_size = round(
             min(
                 hard_cap,
