@@ -4905,6 +4905,16 @@ class LiveTrader:
             print(f"{Y}[DRY-RUN]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {price:.3f} | id={fake_id}")
             return {"order_id": fake_id, "fill_price": price, "mode": "dry"}
 
+        # Execution backstop: never allow micro-notional orders even if upstream scoring/sync
+        # accidentally emits a tiny size. This is the final safety net before on-chain send.
+        hard_min_notional = max(float(MIN_EXEC_NOTIONAL_USDC), float(MIN_BET_ABS), 1.0)
+        if float(size_usdc or 0.0) < hard_min_notional:
+            print(
+                f"{Y}[SKIP]{RS} {asset} {side} size=${float(size_usdc or 0.0):.2f} "
+                f"< hard_min=${hard_min_notional:.2f} (exec backstop)"
+            )
+            return None
+
         for attempt in range(max(1, ORDER_RETRY_MAX)):
             try:
                 loop = asyncio.get_event_loop()
