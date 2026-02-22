@@ -2840,6 +2840,8 @@ class LiveTrader:
         # Direction from price if moved; from momentum consensus if flat.
         # Max possible: 2+3+4+1+3+3+2+1 = 19 pts
         score = 0
+        # Keep initialized for any early quality penalties before final side selection.
+        edge = 0.0
 
         # Compute momentum — EMA-based (O(1) from cache) + Kalman velocity signal
         mom_5s   = self._momentum_prob(asset, seconds=5)
@@ -2948,7 +2950,6 @@ class LiveTrader:
                 pm_ok = pm_best_ask > 0 and pm_age_ms <= WS_BOOK_FALLBACK_MAX_AGE_MS
             if WS_BOOK_FALLBACK_ENABLED and pm_ok:
                 score -= 1
-                edge -= 0.005
                 ws_book_now = _pm_book
                 if self._noisy_log_enabled(f"ws-fallback:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(
@@ -3252,14 +3253,21 @@ class LiveTrader:
                 score -= 1
                 edge -= 0.005
         if REQUIRE_LEADER_FLOW and (not leader_ready):
-            if LEADER_FLOW_FALLBACK_ENABLED and leader_soft_ready:
-                score -= 1
-                edge -= 0.005
+            if LEADER_FLOW_FALLBACK_ENABLED:
+                # Keep trading with a quality penalty when leader-flow is unavailable/stale.
+                score -= 2
+                edge -= 0.01
                 if self._noisy_log_enabled(f"leader-fallback:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    print(
-                        f"{Y}[LEADER-FALLBACK]{RS} {asset} {duration}m using stale leader-flow "
-                        f"(age={flow_age_s:.1f}s n={flow_n})"
-                    )
+                    if flow_n <= 0:
+                        print(
+                            f"{Y}[LEADER-MISS-FALLBACK]{RS} {asset} {duration}m "
+                            f"no CID leader-flow yet (n=0) — applying penalty"
+                        )
+                    else:
+                        print(
+                            f"{Y}[LEADER-FALLBACK]{RS} {asset} {duration}m using stale leader-flow "
+                            f"(age={flow_age_s:.1f}s n={flow_n})"
+                        )
             else:
                 if self._noisy_log_enabled(f"skip-no-leader:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(
