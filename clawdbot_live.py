@@ -5850,6 +5850,46 @@ class LiveTrader:
                         onchain_settling_usdc_by_cid[cid] = round(
                             float(onchain_settling_usdc_by_cid.get(cid, 0.0) or 0.0) + val, 6
                         )
+                        # Fast on-chain-first settle queue: don't wait for slower scan loops.
+                        if cid not in self.pending_redeem and cid not in self.redeemed_cids:
+                            asset = (
+                                "BTC" if "Bitcoin" in title else
+                                "ETH" if "Ethereum" in title else
+                                "SOL" if "Solana" in title else
+                                "XRP" if "XRP" in title else "?"
+                            )
+                            avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
+                            size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                            spent_guess = 0.0
+                            for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                                vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                                if vv > 0:
+                                    spent_guess = vv
+                                    break
+                            if spent_guess <= 0 and size_tok > 0 and avg_px > 0:
+                                spent_guess = size_tok * avg_px
+                            if spent_guess <= 0:
+                                spent_guess = val
+                            m_s = {"conditionId": cid, "question": title, "asset": asset}
+                            t_s = {
+                                "side": side,
+                                "asset": asset,
+                                "size": spent_guess,
+                                "entry": (avg_px if avg_px > 0 else 0.5),
+                                "duration": 0,
+                                "mkt_price": 0.5,
+                                "mins_left": 0,
+                                "open_price": 0,
+                                "token_id": "",
+                                "order_id": "ONCHAIN-REDEEM-QUEUE",
+                            }
+                            self.pending.pop(cid, None)
+                            self.pending_redeem[cid] = (m_s, t_s)
+                            self._redeem_queued_ts[cid] = _time.time()
+                            print(
+                                f"{G}[ONCHAIN-REDEEM-QUEUE]{RS} {title[:45]} {side} "
+                                f"~${val:.2f} | cid={self._short_cid(cid)}"
+                            )
                         continue
                     open_val += val
                     open_count += 1
