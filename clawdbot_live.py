@@ -2025,6 +2025,7 @@ class LiveTrader:
                 win_payout = float(row.get("win_payout", 0.0) or 0.0)
                 win_profit = win_payout - spent
                 mult = (win_payout / spent) if spent > 0 else 0.0
+                avg_entry = (spent / win_payout) if win_payout > 0 else 0.0
                 lead = int(row.get("lead", 0) or 0)
                 n = int(row.get("n", 0) or 0)
                 up_n = int(row.get("up_n", 0) or 0)
@@ -2050,6 +2051,7 @@ class LiveTrader:
                     f"{G}IF_WIN{RS}=${win_payout:.2f} | "
                     f"{c_pl}PROFIT_IF_WIN{RS}={c_pl}${win_profit:+.2f}{RS} | "
                     f"{B}x{mult:.2f}{RS} | "
+                    f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c | "
                     f"{c_lead}LEAD{RS}={lead}/{n}"
                 )
         # Show settling (pending_redeem) positions
@@ -3788,7 +3790,9 @@ class LiveTrader:
                         if now_ts - _wait_log_ts.get(cid, 0) >= LOG_REDEEM_WAIT_EVERY_SEC:
                             _wait_log_ts[cid] = now_ts
                             elapsed = (now_ts - self._redeem_queued_ts.get(cid, now_ts)) / 60
-                            size = trade.get("size", 0)
+                            size_local = float(trade.get("size", 0) or 0.0)
+                            size_onchain = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
+                            size = size_onchain if size_onchain > 0 else size_local
                             print(
                                 f"{Y}[WAIT]{RS} {asset} {side} ~${size:.2f} — awaiting oracle "
                                 f"({elapsed:.0f}min) | rk={rk} cid={self._short_cid(cid)}"
@@ -5507,7 +5511,20 @@ class LiveTrader:
                            "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
                            "up_price": 0.5, "mins_left": mins_left,
                            "token_up": token_up, "token_down": token_down}
-                    t_r = {"side": side, "size": val, "entry": 0.5,
+                    rec_avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
+                    rec_size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    rec_spent = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            rec_spent = vv
+                            break
+                    if rec_spent <= 0 and rec_size_tok > 0 and rec_avg_px > 0:
+                        rec_spent = rec_size_tok * rec_avg_px
+                    if rec_spent <= 0:
+                        rec_spent = val
+                    rec_entry = rec_avg_px if rec_avg_px > 0 else 0.5
+                    t_r = {"side": side, "size": rec_spent, "entry": rec_entry,
                            "open_price": open_p, "current_price": 0, "true_prob": 0.5,
                            "mkt_price": 0.5, "edge": 0, "mins_left": mins_left,
                            "end_ts": end_ts, "asset": asset, "duration": duration,
@@ -5516,7 +5533,11 @@ class LiveTrader:
                     self.pending[cid] = (m_r, t_r)
                     self.seen.add(cid)
                     self._save_pending()
-                    print(f"{G}[RECOVER] Added to pending: {title[:40]} {side} ${val:.2f} | open={open_p:.2f} | {mins_left:.1f}min left{RS}")
+                    print(
+                        f"{G}[RECOVER]{RS} Added to pending: {title[:40]} {side} "
+                        f"spent=${rec_spent:.2f} mark=${val:.2f} entry={rec_entry:.3f} "
+                        f"| open={open_p:.2f} | {mins_left:.1f}min left"
+                    )
 
                 # 4. Sync trades + win rate from Polymarket activity API (every 5 ticks ~2.5min)
                 if tick % 5 == 1:
@@ -5808,7 +5829,20 @@ class LiveTrader:
                            "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
                            "up_price": 0.5, "mins_left": mins_left,
                            "token_up": token_up, "token_down": token_down}
-                    t_r = {"side": side, "size": val, "entry": 0.5,
+                    rec_avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
+                    rec_size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    rec_spent = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            rec_spent = vv
+                            break
+                    if rec_spent <= 0 and rec_size_tok > 0 and rec_avg_px > 0:
+                        rec_spent = rec_size_tok * rec_avg_px
+                    if rec_spent <= 0:
+                        rec_spent = val
+                    rec_entry = rec_avg_px if rec_avg_px > 0 else 0.5
+                    t_r = {"side": side, "size": rec_spent, "entry": rec_entry,
                            "open_price": 0, "current_price": 0, "true_prob": 0.5,
                            "mkt_price": 0.5, "edge": 0, "mins_left": mins_left,
                            "end_ts": end_ts, "asset": asset, "duration": duration,
@@ -5835,7 +5869,11 @@ class LiveTrader:
                     self.pending[cid] = (m_r, t_r)
                     self.seen.add(cid)
                     added += 1
-                    print(f"{Y}[SYNC] Recovered: {title[:40]} {side} ~${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
+                    print(
+                        f"{Y}[SYNC]{RS} Recovered: {title[:40]} {side} "
+                        f"spent=${rec_spent:.2f} mark=${val:.2f} entry={rec_entry:.3f} "
+                        f"| {duration}m ends in {mins_left:.1f}min"
+                    )
                 if added:
                     self._save_pending()
                     self._save_seen()
