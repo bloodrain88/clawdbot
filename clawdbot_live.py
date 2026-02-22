@@ -300,6 +300,7 @@ FAST_TAKER_SCORE_15M = int(os.environ.get("FAST_TAKER_SCORE_15M", "9"))
 FAST_TAKER_EDGE_DIFF_MAX = float(os.environ.get("FAST_TAKER_EDGE_DIFF_MAX", "0.015"))
 FAST_TAKER_EARLY_WINDOW_SEC_5M = float(os.environ.get("FAST_TAKER_EARLY_WINDOW_SEC_5M", "45"))
 FAST_TAKER_EARLY_WINDOW_SEC_15M = float(os.environ.get("FAST_TAKER_EARLY_WINDOW_SEC_15M", "75"))
+FAST_FOK_MIN_DEPTH_RATIO = float(os.environ.get("FAST_FOK_MIN_DEPTH_RATIO", "1.00"))
 MAX_TAKER_SLIP_BPS_5M = float(os.environ.get("MAX_TAKER_SLIP_BPS_5M", "80"))
 MAX_TAKER_SLIP_BPS_15M = float(os.environ.get("MAX_TAKER_SLIP_BPS_15M", "70"))
 MAX_BOOK_SPREAD_5M = float(os.environ.get("MAX_BOOK_SPREAD_5M", "0.060"))
@@ -1980,7 +1981,7 @@ class LiveTrader:
 
     # ── SCORE + EXECUTE ───────────────────────────────────────────────────────
     async def _fetch_pm_book_safe(self, token_id: str):
-        """Fetch Polymarket CLOB book; return (best_bid, best_ask, tick) or None."""
+        """Fetch Polymarket CLOB book; return compact snapshot or None."""
         if not token_id:
             return None
         loop = asyncio.get_event_loop()
@@ -1993,7 +1994,18 @@ class LiveTrader:
                 return None
             best_ask = float(asks[0].price)
             best_bid = float(bids[0].price) if bids else best_ask - 0.10
-            return (best_bid, best_ask, tick)
+            asks_compact = []
+            for lv in asks[:20]:
+                try:
+                    asks_compact.append((float(lv.price), float(lv.size)))
+                except Exception:
+                    continue
+            return {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "tick": tick,
+                "asks": asks_compact,
+            }
         except Exception:
             return None
 
@@ -2411,7 +2423,11 @@ class LiveTrader:
         # ── Live CLOB price (more accurate than Gamma up_price) ──────────────
         live_entry = entry
         if pm_book_data is not None:
-            _, clob_ask, _ = pm_book_data
+            if isinstance(pm_book_data, dict):
+                clob_ask = float(pm_book_data.get("best_ask", 0.0) or 0.0)
+            else:
+                # Backward compatibility with old tuple format.
+                _, clob_ask, _ = pm_book_data
             live_entry = clob_ask
 
         # ── Entry strategy ────────────────────────────────────────────────────
@@ -2787,6 +2803,23 @@ class LiveTrader:
                     # Market BUY maker amount is USDC and must stay at 2 decimals.
                     return float(round(max(0.0, intended_usdc), 2))
 
+                def _book_depth_usdc(levels, price_cap: float) -> float:
+                    depth = 0.0
+                    for lv in (levels or []):
+                        try:
+                            if isinstance(lv, (tuple, list)) and len(lv) >= 2:
+                                p = float(lv[0])
+                                s = float(lv[1])
+                            else:
+                                p = float(lv.price)
+                                s = float(lv.size)
+                            if p > price_cap + 1e-9:
+                                break
+                            depth += p * s
+                        except Exception:
+                            continue
+                    return float(depth)
+
                 async def _post_limit_fok(exec_price: float) -> tuple[dict, float]:
                     # Strict instant execution with price cap to keep slippage near zero.
                     px = round(max(0.001, min(exec_price, 0.97)), 4)
@@ -2818,10 +2851,22 @@ class LiveTrader:
                 # Use pre-fetched book from scoring phase (free — ran in parallel with Binance signals)
                 # or fetch fresh if not cached (~36ms)
                 if pm_book_data is not None:
-                    best_bid, best_ask, tick = pm_book_data
-                    spread = best_ask - best_bid
-                    pm_book_data = None   # consume once; retries fetch fresh
-                else:
+                    if isinstance(pm_book_data, dict):
+                        best_bid = float(pm_book_data.get("best_bid", 0.0) or 0.0)
+                        best_ask = float(pm_book_data.get("best_ask", 0.0) or 0.0)
+                        tick = float(pm_book_data.get("tick", 0.01) or 0.01)
+                        asks = list(pm_book_data.get("asks") or [])
+                        bids = []
+                    else:
+                        # Backward compatibility with old tuple format.
+                        best_bid, best_ask, tick = pm_book_data
+                        asks = []
+                        bids = []
+                    if best_ask > 0:
+                        spread = best_ask - best_bid
+                    else:
+                        pm_book_data = None
+                if pm_book_data is None:
                     book     = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
                     tick     = float(book.tick_size or "0.01")
                     asks     = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
@@ -2916,7 +2961,22 @@ class LiveTrader:
                 if force_taker:
                     taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
                     slip_now = _slip_bps(taker_price, price)
-                    if slip_now > slip_cap_bps:
+                    needed_notional = _normalize_buy_amount(size_usdc) * FAST_FOK_MIN_DEPTH_RATIO
+                    depth_now = _book_depth_usdc(asks, taker_price)
+                    if depth_now < needed_notional:
+                        try:
+                            ob2 = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                            asks2 = sorted(ob2.asks, key=lambda x: float(x.price)) if ob2.asks else []
+                            depth_now = _book_depth_usdc(asks2, taker_price)
+                        except Exception:
+                            pass
+                    if depth_now < needed_notional:
+                        print(
+                            f"{Y}[FAST-DEPTH]{RS} {asset} {side} insufficient depth "
+                            f"${depth_now:.2f} < need ${needed_notional:.2f} @<= {taker_price:.3f}"
+                        )
+                        force_taker = False
+                    elif slip_now > slip_cap_bps:
                         print(
                             f"{Y}[SLIP-GUARD]{RS} {asset} {side} fast-taker blocked: "
                             f"slip={slip_now:.1f}bps > cap={slip_cap_bps:.0f}bps"
@@ -2947,7 +3007,22 @@ class LiveTrader:
                         force_taker = True
                         taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
                         slip_now = _slip_bps(taker_price, price)
-                        if slip_now > slip_cap_bps:
+                        needed_notional = _normalize_buy_amount(size_usdc) * FAST_FOK_MIN_DEPTH_RATIO
+                        depth_now = _book_depth_usdc(asks, taker_price)
+                        if depth_now < needed_notional:
+                            try:
+                                ob2 = await loop.run_in_executor(None, lambda: self.clob.get_order_book(token_id))
+                                asks2 = sorted(ob2.asks, key=lambda x: float(x.price)) if ob2.asks else []
+                                depth_now = _book_depth_usdc(asks2, taker_price)
+                            except Exception:
+                                pass
+                        if depth_now < needed_notional:
+                            print(
+                                f"{Y}[FAST-DEPTH]{RS} {asset} {side} near-end insufficient depth "
+                                f"${depth_now:.2f} < need ${needed_notional:.2f} @<= {taker_price:.3f}"
+                            )
+                            force_taker = False
+                        elif slip_now > slip_cap_bps:
                             print(
                                 f"{Y}[SLIP-GUARD]{RS} {asset} {side} near-end taker blocked: "
                                 f"slip={slip_now:.1f}bps > cap={slip_cap_bps:.0f}bps"
