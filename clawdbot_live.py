@@ -5416,7 +5416,7 @@ class LiveTrader:
         while True:
             try:
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, lambda: self.clob.post_heartbeat())
+                await loop.run_in_executor(None, lambda: self.clob.post_heartbeat(None))
                 self._heartbeat_last_ok = _time.time()
             except Exception as e:
                 self._errors.tick("clob_heartbeat", print, err=e, every=10)
