@@ -6,6 +6,14 @@ Questo file e' il riferimento unico da usare sempre quando c'e' un problema.
 - Prima diagnostica, poi fix.
 - Mai cambiare strategia senza evidenza dai dati reali.
 - Verificare sempre SHA deploy attivo prima di analizzare i log.
+- Ogni update operativo deve essere documentato in Git in `DEPLOY_CHANGELOG.md`.
+
+### 1.1 Regola documentazione Git (obbligatoria)
+Per ogni commit che tocca runtime/trading/feed/risk:
+1. aggiungere una nuova entry in `DEPLOY_CHANGELOG.md`;
+2. includere sempre stato `WS / CLOB / HEARTBEAT`;
+3. indicare se sono cambiati `entry/payout/ev/size` e come;
+4. includere rollback (`git revert <sha>`).
 
 ## 2) Check deploy (sempre per primo)
 Comando:
