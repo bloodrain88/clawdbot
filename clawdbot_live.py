@@ -1068,6 +1068,25 @@ class LiveTrader:
         q = (m.get("question", "") or "").strip().lower()
         return f"{asset}-{dur}m-q:{q[:64]}"
 
+    def _is_historical_expired_position(self, pos: dict, now_ts: float, grace_sec: float = 1200.0) -> bool:
+        """True for clearly old/expired market windows to avoid replaying stale losses."""
+        try:
+            end_ts = 0.0
+            for ke in ("endDate", "end_date", "eventEndTime"):
+                s = pos.get(ke)
+                if isinstance(s, str) and s:
+                    try:
+                        end_ts = datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+                        break
+                    except Exception:
+                        pass
+            q_st, q_et = self._round_bounds_from_question(str(pos.get("title", "") or ""))
+            if q_et > 0:
+                end_ts = q_et
+            return end_ts > 0 and now_ts > (end_ts + max(60.0, float(grace_sec)))
+        except Exception:
+            return False
+
     async def _http_get_json(self, url: str, params: dict | None = None, timeout: float = 8.0):
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(
@@ -5581,6 +5600,8 @@ class LiveTrader:
                     break
             if not ((size_tok > 0) or (spent_probe >= OPEN_PRESENCE_MIN) or (val >= OPEN_PRESENCE_MIN)):
                 continue
+            if self._is_historical_expired_position(pos, now, grace_sec=1800.0) and val < OPEN_PRESENCE_MIN:
+                continue
 
             # Fetch real market data from Gamma API — always, even if already in pending
             # (to fix wrong end_ts set by _load_pending or _position_sync_loop)
@@ -6840,6 +6861,8 @@ class LiveTrader:
                         continue
                     title = str(p.get("title", "") or "")
                     redeemable = bool(p.get("redeemable", False))
+                    if (not redeemable) and self._is_historical_expired_position(p, now_ts) and val < OPEN_PRESENCE_MIN:
+                        continue
                     if redeemable:
                         settling_claim_val += val
                         settling_claim_count += 1
@@ -7052,6 +7075,8 @@ class LiveTrader:
                         if vv > 0:
                             spent_p = vv
                             break
+                    if self._is_historical_expired_position(p, now_ts) and val_p < OPEN_PRESENCE_MIN:
+                        continue
                     if (size_p > 0) or (spent_p >= OPEN_PRESENCE_MIN) or (val_p >= OPEN_PRESENCE_MIN):
                         api_active_cids.add(cid_p)
                 # On-chain-first cleanup: if a local pending CID is neither on-chain nor API-active
@@ -7107,6 +7132,8 @@ class LiveTrader:
                         or val >= OPEN_PRESENCE_MIN
                     )
                     if rdm or not side or not cid or not rec_present:
+                        continue
+                    if self._is_historical_expired_position(p, now_ts) and val < OPEN_PRESENCE_MIN:
                         continue
                     if cid in self.pending or cid in self.pending_redeem:
                         continue
@@ -7432,6 +7459,8 @@ class LiveTrader:
                             break
                     # Presence is based on open shares/spent, not only mark value.
                     if not ((size_tok > 0) or (spent_probe >= OPEN_PRESENCE_MIN) or (val >= OPEN_PRESENCE_MIN)):
+                        continue
+                    if self._is_historical_expired_position(pos, now, grace_sec=1800.0) and val < OPEN_PRESENCE_MIN:
                         continue
                     if cid in self.redeemed_cids:
                         continue   # already processed — don't re-add
