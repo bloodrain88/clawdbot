@@ -12,7 +12,7 @@ Env vars required (same as bot):
   POLY_ADDRESS      — bot wallet address
 """
 
-import os, sys, time
+import os, sys, time, json
 from web3 import Web3
 from eth_account import Account
 from dotenv import load_dotenv
@@ -25,8 +25,11 @@ BOT_ADDRESS  = Web3.to_checksum_address(os.environ["POLY_ADDRESS"])
 COLD_WALLET  = Web3.to_checksum_address("0xC95CDE072975245E736B192E2972bD6a9A5b37fc")
 
 USDC_E       = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-THRESHOLD    = 400 * 10**6   # $400 in USDC.e (6 decimals)
-KEEP         = 200 * 10**6   # $200 to keep in bot wallet
+DATA_DIR     = os.environ.get("DATA_DIR", "/data")
+PNL_BASELINE_FILE = os.environ.get("PNL_BASELINE_FILE", os.path.join(DATA_DIR, "clawdbot_pnl_baseline.json"))
+CASHOUT_TRIGGER_PNL = float(os.environ.get("CASHOUT_TRIGGER_PNL", "200"))
+CASHOUT_KEEP_USDC   = float(os.environ.get("CASHOUT_KEEP_USDC", "200"))
+KEEP         = int(round(CASHOUT_KEEP_USDC * 1e6))   # USDC.e decimals=6
 
 POLYGON_RPCS = [
     "https://polygon-bor-rpc.publicnode.com",
@@ -84,22 +87,47 @@ def main():
 
     print(f"  MATIC balance : {matic:.4f} MATIC")
     print(f"  USDC.e balance: ${usdc_amt:.2f}")
-    print(f"  Threshold     : $400.00  →  keep $200.00, sweep rest")
+    print(f"  Trigger       : pnl_since_baseline >= ${CASHOUT_TRIGGER_PNL:.2f}")
+    print(f"  Keep balance  : ${CASHOUT_KEEP_USDC:.2f}")
 
     # ── MATIC safety check
     if matic_wei < w3.to_wei(0.01, "ether"):
         print(f"{R}[ABORT] Not enough MATIC for gas ({matic:.4f}){RS}")
         sys.exit(1)
 
-    # ── Balance check
-    if usdc_raw < THRESHOLD:
-        print(f"\n{Y}[SKIP] Balance ${usdc_amt:.2f} < $400 threshold — nothing to sweep{RS}")
+    # ── PnL baseline check (on-chain baseline created by clawdbot_live)
+    baseline_usdc = None
+    baseline_ts = ""
+    try:
+        with open(PNL_BASELINE_FILE, "r", encoding="utf-8") as f:
+            base = json.load(f)
+        baseline_usdc = float(base.get("wallet_usdc", 0.0) or 0.0)
+        baseline_ts = str(base.get("baseline_ts", "") or "")
+    except Exception:
+        pass
+    if baseline_usdc is None or baseline_usdc <= 0:
+        print(f"\n{Y}[SKIP] Missing/invalid baseline file: {PNL_BASELINE_FILE}{RS}")
+        return
+
+    pnl_since = usdc_amt - baseline_usdc
+    print(f"  Baseline USDC : ${baseline_usdc:.2f} ({baseline_ts or 'n/a'})")
+    print(f"  PnL since base: ${pnl_since:+.2f}")
+
+    if pnl_since < CASHOUT_TRIGGER_PNL:
+        print(
+            f"\n{Y}[SKIP] PnL ${pnl_since:.2f} < trigger ${CASHOUT_TRIGGER_PNL:.2f} "
+            f"— cashout disabled until +${CASHOUT_TRIGGER_PNL:.2f}{RS}"
+        )
+        return
+
+    if usdc_raw <= KEEP:
+        print(f"\n{Y}[SKIP] USDC ${usdc_amt:.2f} <= keep ${CASHOUT_KEEP_USDC:.2f} — nothing to sweep{RS}")
         return
 
     # ── Calculate sweep amount
     sweep_raw = usdc_raw - KEEP
     sweep_amt = sweep_raw / 1e6
-    print(f"\n{G}[SWEEP] ${usdc_amt:.2f} >= $400 — sending ${sweep_amt:.2f} to cold wallet{RS}")
+    print(f"\n{G}[SWEEP] PnL trigger reached — sending ${sweep_amt:.2f} to cold wallet{RS}")
     print(f"  From: {BOT_ADDRESS}")
     print(f"  To:   {COLD_WALLET}")
     print(f"  Amount: ${sweep_amt:.2f} USDC.e")

@@ -235,6 +235,8 @@ PENDING_FILE   = os.path.join(_DATA_DIR, "clawdbot_pending.json")
 SEEN_FILE      = os.path.join(_DATA_DIR, "clawdbot_seen.json")
 STATS_FILE     = os.path.join(_DATA_DIR, "clawdbot_stats.json")
 METRICS_FILE   = os.path.join(_DATA_DIR, "clawdbot_onchain_metrics.jsonl")
+PNL_BASELINE_FILE = os.path.join(_DATA_DIR, "clawdbot_pnl_baseline.json")
+PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "true").lower() == "true"
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "false").lower() == "true"
@@ -385,6 +387,8 @@ class LiveTrader:
         self.cl_updated      = {}    # Chainlink last update timestamp per asset
         self.bankroll        = BANKROLL
         self.start_bank      = BANKROLL
+        self._pnl_baseline_locked = False
+        self._pnl_baseline_ts = ""
         self.onchain_wallet_usdc = BANKROLL
         self.onchain_open_positions = 0.0
         self.onchain_open_count = 0
@@ -444,6 +448,7 @@ class LiveTrader:
         self._init_log()
         self._load_pending()
         self._load_stats()
+        self._load_pnl_baseline()
         self._init_w3()
 
     def _build_w3(self, rpc: str, timeout: int = 6):
@@ -1452,7 +1457,8 @@ class LiveTrader:
                 allow = max((float(v) for v in allowances.values()), default=0) / 1e6
                 if usdc > 0:
                     self.bankroll = usdc
-                    self.start_bank = usdc
+                    if (not self._pnl_baseline_locked) and (not PNL_BASELINE_RESET_ON_BOOT):
+                        self.start_bank = usdc
                 print(
                     f"{G}[CLOB] USDC balance: ${usdc:.2f}  allowance: ${allow:.2f}  "
                     f"→ bankroll set to ${self.bankroll:.2f}{RS}"
@@ -4201,6 +4207,38 @@ class LiveTrader:
             self.recent_pnl = deque(maxlen=40)
             self.side_perf = {}
 
+    def _load_pnl_baseline(self):
+        """Load persistent on-chain PnL baseline unless reset is requested on boot."""
+        if PNL_BASELINE_RESET_ON_BOOT:
+            self._pnl_baseline_locked = False
+            self._pnl_baseline_ts = ""
+            return
+        try:
+            with open(PNL_BASELINE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            sb = float(data.get("start_bank", 0.0) or 0.0)
+            ts = str(data.get("baseline_ts", "") or "")
+            if sb > 0:
+                self.start_bank = sb
+                self._pnl_baseline_locked = True
+                self._pnl_baseline_ts = ts
+                print(f"{B}[P&L-BASELINE]{RS} loaded on-chain baseline ${sb:.2f} ts={ts or 'n/a'}")
+        except Exception:
+            self._pnl_baseline_locked = False
+            self._pnl_baseline_ts = ""
+
+    def _save_pnl_baseline(self, total_equity: float, wallet_usdc: float):
+        try:
+            rec = {
+                "start_bank": round(float(total_equity), 2),
+                "wallet_usdc": round(float(wallet_usdc), 2),
+                "baseline_ts": self._pnl_baseline_ts,
+            }
+            with open(PNL_BASELINE_FILE, "w", encoding="utf-8") as f:
+                json.dump(rec, f)
+        except Exception:
+            pass
+
     def _save_stats(self):
         try:
             with open(STATS_FILE, "w") as f:
@@ -4715,10 +4753,15 @@ class LiveTrader:
                     self.bankroll = total
                     if total > self.peak_bankroll:
                         self.peak_bankroll = total
-                    # Keep start_bank current so daily loss % tracks from real balance
-                    # (don't let a stale startup value permanently block trading)
-                    if total > self.start_bank:
+                    if not self._pnl_baseline_locked:
                         self.start_bank = total
+                        self._pnl_baseline_locked = True
+                        self._pnl_baseline_ts = datetime.now(timezone.utc).isoformat()
+                        self._save_pnl_baseline(total, usdc)
+                        print(
+                            f"{B}[P&L-BASELINE]{RS} set on-chain baseline=${total:.2f} "
+                            f"at {self._pnl_baseline_ts}"
+                        )
 
                 # 3. API recovery/stats only (does not drive bankroll valuation)
                 positions = await self._http_get_json(
