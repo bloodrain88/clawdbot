@@ -244,8 +244,8 @@ STRICT_ONCHAIN_STATE = os.environ.get("STRICT_ONCHAIN_STATE", "true").lower() ==
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "false").lower() == "true"
 LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "30"))
 LOG_SCAN_ON_CHANGE_ONLY = os.environ.get("LOG_SCAN_ON_CHANGE_ONLY", "true").lower() == "true"
-LOG_FLOW_EVERY_SEC = int(os.environ.get("LOG_FLOW_EVERY_SEC", "120"))
-LOG_ROUND_EMPTY_EVERY_SEC = int(os.environ.get("LOG_ROUND_EMPTY_EVERY_SEC", "180"))
+LOG_FLOW_EVERY_SEC = int(os.environ.get("LOG_FLOW_EVERY_SEC", "900"))
+LOG_ROUND_EMPTY_EVERY_SEC = int(os.environ.get("LOG_ROUND_EMPTY_EVERY_SEC", "900"))
 LOG_SETTLE_FIRST_EVERY_SEC = int(os.environ.get("LOG_SETTLE_FIRST_EVERY_SEC", "20"))
 LOG_BANK_EVERY_SEC = int(os.environ.get("LOG_BANK_EVERY_SEC", "45"))
 LOG_BANK_MIN_DELTA = float(os.environ.get("LOG_BANK_MIN_DELTA", "0.50"))
@@ -255,6 +255,9 @@ LOG_LIVE_RK_MAX = int(os.environ.get("LOG_LIVE_RK_MAX", "12"))
 LOG_ROUND_SIGNAL_MIN_SEC = float(os.environ.get("LOG_ROUND_SIGNAL_MIN_SEC", "5"))
 LOG_DEBUG_EVERY_SEC = int(os.environ.get("LOG_DEBUG_EVERY_SEC", "900"))
 LOG_ROUND_SIGNAL_EVERY_SEC = int(os.environ.get("LOG_ROUND_SIGNAL_EVERY_SEC", "900"))
+LOG_SKIP_EVERY_SEC = int(os.environ.get("LOG_SKIP_EVERY_SEC", "900"))
+LOG_EDGE_EVERY_SEC = int(os.environ.get("LOG_EDGE_EVERY_SEC", "900"))
+LOG_EXEC_EVERY_SEC = int(os.environ.get("LOG_EXEC_EVERY_SEC", "900"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
@@ -535,6 +538,10 @@ class LiveTrader:
             self._log_ts[key] = now
             return True
         return False
+
+    def _noisy_log_enabled(self, key: str, every_sec: float = LOG_DEBUG_EVERY_SEC) -> bool:
+        # Operator mode: keep logs clean by default; show extra diagnostics sparsely.
+        return LOG_VERBOSE or LOG_LIVE_DETAIL or self._should_log(key, every_sec)
 
     def _short_cid(self, cid: str) -> str:
         if not cid:
@@ -1390,7 +1397,8 @@ class LiveTrader:
             f"{LOG_SETTLE_FIRST_EVERY_SEC}/{LOG_BANK_EVERY_SEC}s "
             f"bank_delta>={LOG_BANK_MIN_DELTA:.2f} "
             f"live_detail={LOG_LIVE_DETAIL} debug_every={LOG_DEBUG_EVERY_SEC}s "
-            f"round_signal_every={LOG_ROUND_SIGNAL_EVERY_SEC}s"
+            f"round_signal_every={LOG_ROUND_SIGNAL_EVERY_SEC}s "
+            f"skip/edge/exec={LOG_SKIP_EVERY_SEC}/{LOG_EDGE_EVERY_SEC}/{LOG_EXEC_EVERY_SEC}s"
         )
         print(
             f"{B}[BOOT]{RS} redeem_poll={REDEEM_POLL_SEC:.1f}s "
@@ -1900,12 +1908,29 @@ class LiveTrader:
                       f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
             shown_live_cids.add(cid)
             agg = live_by_rk.setdefault(
-                rk, {"n": 0, "stake": 0.0, "value_now": 0.0, "win_payout": 0.0, "lead": 0}
+                rk,
+                {
+                    "n": 0,
+                    "stake": 0.0,
+                    "value_now": 0.0,
+                    "win_payout": 0.0,
+                    "lead": 0,
+                    "up_n": 0,
+                    "down_n": 0,
+                    "up_stake": 0.0,
+                    "down_stake": 0.0,
+                },
             )
             agg["n"] += 1
             agg["stake"] += float(stake)
             agg["value_now"] += float(value_now)
             agg["win_payout"] += float(shares if shares > 0 else payout_est)
+            if str(side).lower() == "up":
+                agg["up_n"] += 1
+                agg["up_stake"] += float(stake)
+            else:
+                agg["down_n"] += 1
+                agg["down_stake"] += float(stake)
             if proj_str == "LEAD":
                 agg["lead"] += 1
         # On-chain open positions not yet hydrated into local pending.
@@ -1961,12 +1986,29 @@ class LiveTrader:
                     f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}"
                 )
             agg = live_by_rk.setdefault(
-                rk, {"n": 0, "stake": 0.0, "value_now": 0.0, "win_payout": 0.0, "lead": 0}
+                rk,
+                {
+                    "n": 0,
+                    "stake": 0.0,
+                    "value_now": 0.0,
+                    "win_payout": 0.0,
+                    "lead": 0,
+                    "up_n": 0,
+                    "down_n": 0,
+                    "up_stake": 0.0,
+                    "down_stake": 0.0,
+                },
             )
             agg["n"] += 1
             agg["stake"] += float(stake)
             agg["value_now"] += float(value_now)
             agg["win_payout"] += float(shares if shares > 0 else payout_est)
+            if str(side).lower() == "up":
+                agg["up_n"] += 1
+                agg["up_stake"] += float(stake)
+            else:
+                agg["down_n"] += 1
+                agg["down_stake"] += float(stake)
             if proj_str == "LEAD":
                 agg["lead"] += 1
         if live_by_rk:
@@ -1978,10 +2020,24 @@ class LiveTrader:
                 mult = (win_payout / spent) if spent > 0 else 0.0
                 lead = int(row.get("lead", 0) or 0)
                 n = int(row.get("n", 0) or 0)
+                up_n = int(row.get("up_n", 0) or 0)
+                down_n = int(row.get("down_n", 0) or 0)
+                up_stake = float(row.get("up_stake", 0.0) or 0.0)
+                down_stake = float(row.get("down_stake", 0.0) or 0.0)
                 c_pl = G if win_profit > 0 else (R if win_profit < 0 else Y)
                 c_lead = G if lead > 0 else R
+                if up_n > 0 and down_n == 0:
+                    side_lbl = "UP"
+                    side_stake = up_stake
+                elif down_n > 0 and up_n == 0:
+                    side_lbl = "DOWN"
+                    side_stake = down_stake
+                else:
+                    side_lbl = f"MIX U{up_n}/D{down_n}"
+                    side_stake = spent
                 print(
                     f"  {B}[LIVE-RK]{RS} {rk} | trades={n} | "
+                    f"{Y}SIDE{RS}={side_lbl} (${side_stake:.2f}) | "
                     f"{Y}SPENT{RS}=${spent:.2f} | "
                     f"{B}MARK{RS}=${value_now:.2f} | "
                     f"{G}IF_WIN{RS}=${win_payout:.2f} | "
@@ -2798,21 +2854,21 @@ class LiveTrader:
                 use_limit = True
                 entry = max_entry_allowed
             else:
-                if LOG_VERBOSE:
+                if self._noisy_log_enabled(f"skip-score-entry:{asset}:{side}", LOG_SKIP_EVERY_SEC):
                     print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} outside [{min_entry_allowed:.2f},{max_entry_allowed:.2f}]{RS}")
                 return None
 
         payout_mult = 1.0 / max(entry, 1e-9)
         if payout_mult < min_payout_req:
-            if LOG_VERBOSE:
+            if self._noisy_log_enabled(f"skip-score-payout:{asset}:{side}", LOG_SKIP_EVERY_SEC):
                 print(f"{Y}[SKIP] {asset} {side} payout={payout_mult:.2f}x < min={min_payout_req:.2f}x{RS}")
             return None
         ev_net = (true_prob / max(entry, 1e-9)) - 1.0 - FEE_RATE_EST
         if ev_net < min_ev_req:
-            if LOG_VERBOSE:
+            if self._noisy_log_enabled(f"skip-score-ev:{asset}:{side}", LOG_SKIP_EVERY_SEC):
                 print(f"{Y}[SKIP] {asset} {side} ev_net={ev_net:.3f} < min={min_ev_req:.3f}{RS}")
             return None
-        if self._should_log("flow-thresholds", LOG_FLOW_EVERY_SEC):
+        if self._noisy_log_enabled("flow-thresholds", LOG_FLOW_EVERY_SEC):
             print(
                 f"{B}[FLOW]{RS} "
                 f"payout>={min_payout_req:.2f}x ev>={min_ev_req:.3f} "
