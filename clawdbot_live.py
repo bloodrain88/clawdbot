@@ -5606,11 +5606,11 @@ class LiveTrader:
                            "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
                            "up_price": 0.5, "mins_left": mins_left,
                            "token_up": token_up, "token_down": token_down}
-                    rec_avg_px = self._as_float(pos.get("avgPrice", 0.0), 0.0)
-                    rec_size_tok = self._as_float(pos.get("size", 0.0), 0.0)
+                    rec_avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
+                    rec_size_tok = self._as_float(p.get("size", 0.0), 0.0)
                     rec_spent = 0.0
                     for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
-                        vv = self._as_float(pos.get(k_st, 0.0), 0.0)
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
                         if vv > 0:
                             rec_spent = vv
                             break
