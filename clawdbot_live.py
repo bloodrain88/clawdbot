@@ -2792,15 +2792,23 @@ class LiveTrader:
                 and abs(leader_net) >= MARKET_LEADER_MIN_NET
             ):
                 leader_side = "Up" if leader_net > 0 else "Down"
-                if side != leader_side:
-                    if self._noisy_log_enabled(f"leader-follow:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
-                        print(
-                            f"{B}[LEADER-FOLLOW]{RS} {asset} {duration}m force {side}->{leader_side} "
-                            f"(up={up_conf:.2f} down={dn_conf:.2f} n={flow_n})"
-                        )
-                    side = leader_side
-                score += MARKET_LEADER_SCORE_BONUS
-                edge += MARKET_LEADER_EDGE_BONUS
+                leader_entry = up_price if leader_side == "Up" else (1 - up_price)
+                leader_entry_cap = min(0.97, MAX_ENTRY_PRICE + MAX_ENTRY_TOL + 0.03)
+                if leader_entry <= leader_entry_cap:
+                    if side != leader_side:
+                        if self._noisy_log_enabled(f"leader-follow:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                            print(
+                                f"{B}[LEADER-FOLLOW]{RS} {asset} {duration}m force {side}->{leader_side} "
+                                f"(up={up_conf:.2f} down={dn_conf:.2f} n={flow_n} entry={leader_entry:.3f})"
+                            )
+                        side = leader_side
+                    score += MARKET_LEADER_SCORE_BONUS
+                    edge += MARKET_LEADER_EDGE_BONUS
+                elif self._noisy_log_enabled(f"leader-follow-bypass:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[LEADER-BYPASS]{RS} {asset} {duration}m leader={leader_side} "
+                        f"entry={leader_entry:.3f} > cap={leader_entry_cap:.3f}"
+                    )
             pref = up_conf if side == "Up" else dn_conf
             opp = dn_conf if side == "Up" else up_conf
             copy_net = pref - opp
