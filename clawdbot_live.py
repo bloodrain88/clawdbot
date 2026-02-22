@@ -395,6 +395,8 @@ class LiveTrader:
         self.onchain_open_count = 0
         self.onchain_redeemable_count = 0
         self.onchain_open_cids = set()
+        self.onchain_open_usdc_by_cid = {}
+        self.onchain_settling_usdc_by_cid = {}
         self.onchain_total_equity = BANKROLL
         self.onchain_snapshot_ts = 0.0
         self.daily_pnl       = 0.0
@@ -1614,14 +1616,17 @@ class LiveTrader:
         now_ts = _time.time()
         local_only = 0
         for cid, (m, t) in list(self.pending.items()):
-            if self.onchain_open_cids and cid not in self.onchain_open_cids:
+            if self.onchain_snapshot_ts > 0 and cid not in self.onchain_open_cids:
                 local_only += 1
                 continue
             self._force_expired_from_question_if_needed(m, t)
             self._apply_exact_window_from_question(m, t)
             asset      = t.get("asset", "?")
             side       = t.get("side", "?")
-            size       = t.get("size", 0)
+            size       = float(self.onchain_open_usdc_by_cid.get(cid, 0.0))
+            if size <= 0:
+                local_only += 1
+                continue
             rk         = self._round_key(cid=cid, m=m, t=t)
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
             # NOT the bot's trade entry price — market determines outcome from its own start
@@ -1673,12 +1678,12 @@ class LiveTrader:
                 m_r, t_r = val
                 asset_r = t_r.get("asset", "?")
                 side_r  = t_r.get("side", "?")
-                size_r  = t_r.get("size", 0)
+                size_r  = float(self.onchain_settling_usdc_by_cid.get(cid, 0.0))
                 title_r = m_r.get("question", "")[:38]
                 rk_r = self._round_key(cid=cid, m=m_r, t=t_r)
             else:
                 side_r, asset_r = val
-                size_r = 0; title_r = ""
+                size_r = float(self.onchain_settling_usdc_by_cid.get(cid, 0.0)); title_r = ""
                 rk_r = self._round_key(cid=cid, m={"asset": asset_r}, t={"asset": asset_r, "side": side_r})
             elapsed_r = (_time.time() - self._redeem_queued_ts.get(cid, _time.time())) / 60
             print(f"  {Y}[SETTLING]{RS} {asset_r} {side_r} | {title_r} | bet=${size_r:.2f} | "
@@ -4695,6 +4700,8 @@ class LiveTrader:
                 settling_claim_val = 0.0
                 settling_claim_count = 0
                 onchain_open_cids = set()
+                onchain_open_usdc_by_cid = {}
+                onchain_settling_usdc_by_cid = {}
                 if ctf_bal_contract is not None and addr_cs is not None:
                     # Open (unresolved) positions from local tracked cids, valued by token price cache.
                     for cid, (m_o, t_o) in list(self.pending.items()):
@@ -4718,6 +4725,7 @@ class LiveTrader:
                             open_val += qty * px
                             open_count += 1
                             onchain_open_cids.add(cid)
+                            onchain_open_usdc_by_cid[cid] = round(qty * px, 6)
                         except Exception:
                             continue
 
@@ -4760,6 +4768,7 @@ class LiveTrader:
                                 continue
                             settling_claim_val += qty
                             settling_claim_count += 1
+                            onchain_settling_usdc_by_cid[cid] = round(qty, 6)
                         except Exception:
                             continue
 
@@ -4768,7 +4777,9 @@ class LiveTrader:
                 self.onchain_open_positions = round(open_val, 2)
                 self.onchain_open_count = int(open_count)
                 self.onchain_open_cids = set(onchain_open_cids)
+                self.onchain_open_usdc_by_cid = dict(onchain_open_usdc_by_cid)
                 self.onchain_redeemable_count = int(settling_claim_count)
+                self.onchain_settling_usdc_by_cid = dict(onchain_settling_usdc_by_cid)
                 self.onchain_total_equity = total
                 self.onchain_snapshot_ts = _time.time()
                 bank_state = (
