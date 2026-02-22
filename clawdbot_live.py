@@ -416,6 +416,7 @@ class LiveTrader:
         self.onchain_open_cids = set()
         self.onchain_open_usdc_by_cid = {}
         self.onchain_open_stake_by_cid = {}
+        self.onchain_open_shares_by_cid = {}
         self.onchain_open_meta_by_cid = {}
         self.onchain_settling_usdc_by_cid = {}
         self.onchain_total_equity = BANKROLL
@@ -1837,6 +1838,10 @@ class LiveTrader:
                 stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
             if stake <= 0:
                 continue
+            shares = float(meta.get("shares", 0.0) or 0.0)
+            if shares <= 0:
+                shares = float(self.onchain_open_shares_by_cid.get(cid, 0.0) or 0.0)
+            shares = float(self.onchain_open_shares_by_cid.get(cid, 0.0) or 0.0)
             rk         = self._round_key(cid=cid, m=m, t=t)
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
             # NOT the bot's trade entry price — market determines outcome from its own start
@@ -1865,7 +1870,7 @@ class LiveTrader:
                 move_pct   = (cur_p - open_p) / open_p * 100
                 c          = Y
                 status_str = "LIVE"
-                payout_est = stake / t.get("entry", 0.5) if projected_win else 0
+                payout_est = shares if (projected_win and shares > 0) else (stake / max(float(t.get("entry", 0.5) or 0.5), 1e-9) if projected_win else 0)
                 move_str   = f"({move_pct:+.2f}%)"
                 proj_str   = "LEAD" if projected_win else "TRAIL"
             else:
@@ -1874,8 +1879,8 @@ class LiveTrader:
                 payout_est = 0
                 move_str   = "(no ref)"
                 proj_str   = "NA"
-            tok_price = t.get("entry", 0)
-            tok_str   = f"@{tok_price*100:.0f}¢→{(1/tok_price):.2f}x" if tok_price > 0 else "@?¢"
+            eff_entry = (stake / shares) if shares > 0 else float(t.get("entry", 0.0) or 0.0)
+            tok_str   = f"@{eff_entry*100:.0f}¢→{(shares/max(stake,1e-9)):.2f}x" if shares > 0 and stake > 0 else (f"@{eff_entry*100:.0f}¢→{(1/eff_entry):.2f}x" if eff_entry > 0 else "@?¢")
             print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
                   f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
                   f"bet=${stake:.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
@@ -1914,7 +1919,7 @@ class LiveTrader:
                 pred_winner = "Up" if cur_p >= open_p else "Down"
                 projected_win = (side == pred_winner)
                 move_pct = (cur_p - open_p) / open_p * 100.0
-                payout_est = stake / max(float(meta.get("entry", 0.5) or 0.5), 1e-9) if projected_win else 0.0
+                payout_est = shares if (projected_win and shares > 0) else (stake / max(float(meta.get("entry", 0.5) or 0.5), 1e-9) if projected_win else 0.0)
                 move_str = f"({move_pct:+.2f}%)"
                 proj_str = "LEAD" if projected_win else "TRAIL"
             else:
@@ -3817,7 +3822,7 @@ class LiveTrader:
                             pass
                         if usdc_after <= 0:
                             usdc_after = usdc_before
-                        stake_out = size_f
+                        stake_out = max(size_f, float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0))
                         redeem_in = 0.0
                         if tx_hash_full:
                             redeem_in = self._extract_usdc_in_from_tx(tx_hash_full)
@@ -3872,7 +3877,8 @@ class LiveTrader:
                     else:
                         # Lost on-chain (on-chain is authoritative)
                         if size_f > 0:
-                            pnl = -size_f
+                            stake_loss = max(size_f, float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0))
+                            pnl = -stake_loss
                             self.daily_pnl += pnl
                             self.total += 1
                             self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
@@ -3884,9 +3890,9 @@ class LiveTrader:
                                 "result": "LOSS",
                                 "winner_side": winner,
                                 "winner_source": winner_source,
-                                "size_usdc": size_f,
+                                "size_usdc": stake_loss,
                                 "entry_price": entry,
-                                "stake_out_usdc": round(size_f, 6),
+                                "stake_out_usdc": round(stake_loss, 6),
                                 "redeem_in_usdc": 0.0,
                                 "pnl": round(pnl, 4),
                                 "bankroll_after": round(self.bankroll, 4),
@@ -3901,7 +3907,7 @@ class LiveTrader:
                             wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                             rk_n = self._count_pending_redeem_by_rk(rk)
                             print(f"{R}[LOSS]{RS} {asset} {side} {trade.get('duration',0)}m | "
-                                  f"{R}${pnl:+.2f}{RS} | stake=${size_f:.2f} redeem=$0.00 "
+                                  f"{R}${pnl:+.2f}{RS} | stake=${stake_loss:.2f} redeem=$0.00 "
                                   f"| rk_trades={rk_n} | Bank ${self.bankroll:.2f} | WR {wr} | "
                                   f"rk={rk} cid={self._short_cid(cid)}")
                         done.append(cid)
@@ -3918,6 +3924,10 @@ class LiveTrader:
                 self._mkt_log_ts.pop(cid, None)
                 self.open_prices.pop(cid, None)
                 self.open_prices_source.pop(cid, None)
+                self.onchain_open_usdc_by_cid.pop(cid, None)
+                self.onchain_open_stake_by_cid.pop(cid, None)
+                self.onchain_open_shares_by_cid.pop(cid, None)
+                self.onchain_open_meta_by_cid.pop(cid, None)
             if changed_pending:
                 self._save_pending()
 
@@ -5133,6 +5143,7 @@ class LiveTrader:
                 onchain_open_cids = set()
                 onchain_open_usdc_by_cid = {}
                 onchain_open_stake_by_cid = {}
+                onchain_open_shares_by_cid = {}
                 onchain_open_meta_by_cid = {}
                 onchain_settling_usdc_by_cid = {}
                 for p in positions:
@@ -5159,6 +5170,10 @@ class LiveTrader:
                         float(onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0) + val, 6
                     )
                     size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    if size_tok > 0:
+                        onchain_open_shares_by_cid[cid] = round(
+                            float(onchain_open_shares_by_cid.get(cid, 0.0) or 0.0) + size_tok, 6
+                        )
                     avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
                     stake_guess = 0.0
                     for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
@@ -5222,6 +5237,7 @@ class LiveTrader:
                             "asset": asset,
                             "entry": float(p.get("avgPrice", 0.5) or 0.5),
                             "stake_usdc": round(stable_stake, 6),
+                            "shares": round(size_tok, 6),
                             "duration": dur_guess,
                             "start_ts": float(start_ts if start_ts > 0 else 0.0),
                             "end_ts": float(end_ts if end_ts > 0 else 0.0),
@@ -5235,6 +5251,7 @@ class LiveTrader:
                 self.onchain_open_cids = set(onchain_open_cids)
                 self.onchain_open_usdc_by_cid = dict(onchain_open_usdc_by_cid)
                 self.onchain_open_stake_by_cid = dict(onchain_open_stake_by_cid)
+                self.onchain_open_shares_by_cid = dict(onchain_open_shares_by_cid)
                 self.onchain_open_meta_by_cid = dict(onchain_open_meta_by_cid)
                 self.onchain_redeemable_count = int(settling_claim_count)
                 self.onchain_settling_usdc_by_cid = dict(onchain_settling_usdc_by_cid)
