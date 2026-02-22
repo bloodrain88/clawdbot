@@ -2680,11 +2680,12 @@ class LiveTrader:
             )
             self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
             order_id = (exec_result or {}).get("order_id", "")
+            filled = exec_result is not None
             actual_size_usdc = float((exec_result or {}).get("notional_usdc", sig["size"]) or sig["size"])
             fill_price = float((exec_result or {}).get("fill_price", sig["entry"]) or sig["entry"])
             slip_bps = ((fill_price - sig["entry"]) / max(sig["entry"], 1e-9)) * 10000.0
             stat_bucket = self._bucket_key(sig["duration"], sig["score"], sig["entry"])
-            if order_id:
+            if filled:
                 self._bucket_stats.add_fill(stat_bucket, slip_bps)
             trade = {
                 "side": sig["side"], "size": actual_size_usdc, "entry": sig["entry"],
@@ -2719,7 +2720,7 @@ class LiveTrader:
                 "onchain_score_adj": sig.get("onchain_score_adj", 0),
                 "source_confidence": sig.get("source_confidence", 0.0),
                 "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
-                "placed": bool(order_id),
+                "placed": bool(filled),
                 "order_id": order_id or "",
                 "fill_price": round(fill_price, 6),
                 "slippage_bps": round(slip_bps, 2),
@@ -2728,7 +2729,7 @@ class LiveTrader:
                 "bucket": stat_bucket,
                 "round_key": round_key,
             })
-            if order_id:
+            if filled:
                 self.seen.add(cid)
                 self._save_seen()
                 self.pending[cid] = (m, trade)
