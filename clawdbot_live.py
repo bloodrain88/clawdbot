@@ -1838,9 +1838,6 @@ class LiveTrader:
                 stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
             if stake <= 0:
                 continue
-            shares = float(meta.get("shares", 0.0) or 0.0)
-            if shares <= 0:
-                shares = float(self.onchain_open_shares_by_cid.get(cid, 0.0) or 0.0)
             shares = float(self.onchain_open_shares_by_cid.get(cid, 0.0) or 0.0)
             rk         = self._round_key(cid=cid, m=m, t=t)
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
@@ -1904,6 +1901,9 @@ class LiveTrader:
                 stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
             if stake <= 0:
                 continue
+            shares = float(meta.get("shares", 0.0) or 0.0)
+            if shares <= 0:
+                shares = float(self.onchain_open_shares_by_cid.get(cid, 0.0) or 0.0)
             asset = str(meta.get("asset", "?") or "?")
             side = str(meta.get("side", "?") or "?")
             title = str(meta.get("title", "") or "")[:38]
