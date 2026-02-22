@@ -151,12 +151,12 @@ MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per realized PnL qual
 MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to determine direction
 MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
 DUST_BET       = 5.0      # $5 floor — at 4.55x payout: $5 → $22.75 win
-MIN_BET_ABS    = float(os.environ.get("MIN_BET_ABS", "1.50"))
+MIN_BET_ABS    = float(os.environ.get("MIN_BET_ABS", "2.50"))
 MIN_ORDER_SIZE_SHARES = float(os.environ.get("MIN_ORDER_SIZE_SHARES", "5.0"))
 ORDER_SIZE_PAD_SHARES = float(os.environ.get("ORDER_SIZE_PAD_SHARES", "0.02"))
-MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.01"))
+MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.025"))
 DUST_RECOVER_MIN = float(os.environ.get("DUST_RECOVER_MIN", "0.50"))
-MAX_ABS_BET    = float(os.environ.get("MAX_ABS_BET", "10.0"))     # hard ceiling
+MAX_ABS_BET    = float(os.environ.get("MAX_ABS_BET", "14.0"))     # hard ceiling
 MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
 MAX_OPEN       = int(os.environ.get("MAX_OPEN", "8"))
 MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "8"))
@@ -4144,20 +4144,20 @@ class LiveTrader:
             return 0.20      # >30%: 20% (survival mode, still trading)
 
     def _wr_bet_scale(self) -> float:
-        """Scale size with realized PF/expectancy, not win-rate."""
-        pnl = list(self.recent_pnl)[-16:]
-        if len(pnl) < 8:
+        """EV/PF-only size controller for growth. No win-rate input."""
+        pnl = list(self.recent_pnl)[-30:]
+        if len(pnl) < 10:
             return 1.0
         gross_win = sum(p for p in pnl if p > 0)
         gross_loss = -sum(p for p in pnl if p < 0)
         pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
         exp = sum(pnl) / len(pnl)
-        if pf >= 1.45 and exp > 0.40:
-            return 1.12
-        if pf >= 1.20 and exp > 0.10:
-            return 1.05
-        if pf < 1.00 or exp < 0.0:
-            return 0.85
+        if pf >= 1.35 and exp >= 0.40:
+            return 1.35
+        if pf >= 1.25 and exp >= 0.25:
+            return 1.20
+        if pf < 1.10 or exp < 0.10:
+            return 0.90
         return 1.0
 
     def _adaptive_min_edge(self) -> float:
