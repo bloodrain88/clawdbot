@@ -4212,7 +4212,18 @@ class LiveTrader:
                 # No end_ts at all — estimate from duration
                 end_ts = now + duration * 60
                 print(f"{Y}[SYNC] {title[:40]} — no end_ts, estimating {duration}min{RS}")
-            entry     = (val / size_tok) if size_tok > 0 else 0.5
+            avg_px = self._as_float(pos.get("avgPrice", 0.0), 0.0)
+            rec_spent = 0.0
+            for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                vv = self._as_float(pos.get(k_st, 0.0), 0.0)
+                if vv > 0:
+                    rec_spent = vv
+                    break
+            if rec_spent <= 0 and size_tok > 0 and avg_px > 0:
+                rec_spent = size_tok * avg_px
+            if rec_spent <= 0:
+                rec_spent = val
+            entry = avg_px if avg_px > 0 else ((rec_spent / size_tok) if size_tok > 0 else 0.5)
             mins_left = (end_ts - now) / 60
 
             m = {"conditionId": cid, "question": title, "asset": asset,
@@ -4231,17 +4242,25 @@ class LiveTrader:
                                "asset": asset, "token_up": token_up, "token_down": token_down})
                 old_t.update({"end_ts": end_ts, "asset": asset, "duration": duration,
                                "token_id": token_up if outcome == "Up" else token_down})
-                print(f"{Y}[SYNC] Updated: {title[:40]} {outcome} | {duration}m ends in {mins_left:.1f}min{RS}")
+                if rec_spent > 0:
+                    old_t["size"] = rec_spent
+                if entry > 0:
+                    old_t["entry"] = entry
+                print(f"{Y}[SYNC] Updated: {title[:40]} {outcome} | spent=${old_t.get('size',0):.2f} mark=${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
             else:
-                trade = {"side": outcome, "size": val, "entry": entry,
+                trade = {"side": outcome, "size": rec_spent, "entry": entry,
                          "open_price": 0, "current_price": 0, "true_prob": 0.5,
                          "mkt_price": entry, "edge": 0, "mins_left": mins_left,
                          "end_ts": end_ts, "asset": asset, "duration": duration,
                          "token_id": token_up if outcome == "Up" else token_down,
                          "order_id": "SYNCED"}
-                self.pending[cid] = (m, trade)
-                synced += 1
-                print(f"{Y}[SYNC] Restored: {title[:40]} {outcome} ~${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
+                if mins_left <= 0:
+                    self.pending_redeem[cid] = (m, trade)
+                    print(f"{Y}[SYNC] Restored->settling: {title[:40]} {outcome} | spent=${rec_spent:.2f} mark=${val:.2f} | {duration}m ended {abs(mins_left):.1f}min ago{RS}")
+                else:
+                    self.pending[cid] = (m, trade)
+                    synced += 1
+                    print(f"{Y}[SYNC] Restored: {title[:40]} {outcome} | spent=${rec_spent:.2f} mark=${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
 
         if synced:
             self._save_pending()
@@ -5511,11 +5530,11 @@ class LiveTrader:
                            "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
                            "up_price": 0.5, "mins_left": mins_left,
                            "token_up": token_up, "token_down": token_down}
-                    rec_avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
-                    rec_size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    rec_avg_px = self._as_float(pos.get("avgPrice", 0.0), 0.0)
+                    rec_size_tok = self._as_float(pos.get("size", 0.0), 0.0)
                     rec_spent = 0.0
                     for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
-                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        vv = self._as_float(pos.get(k_st, 0.0), 0.0)
                         if vv > 0:
                             rec_spent = vv
                             break
@@ -5866,14 +5885,22 @@ class LiveTrader:
                     if _onchain_bal == 0 and _token_id_str:
                         print(f"{Y}[SYNC] Skip recovery (bal=0 on-chain): {title[:35]} {side}{RS}")
                         continue
-                    self.pending[cid] = (m_r, t_r)
-                    self.seen.add(cid)
-                    added += 1
-                    print(
-                        f"{Y}[SYNC]{RS} Recovered: {title[:40]} {side} "
-                        f"spent=${rec_spent:.2f} mark=${val:.2f} entry={rec_entry:.3f} "
-                        f"| {duration}m ends in {mins_left:.1f}min"
-                    )
+                    if mins_left <= 0:
+                        self.pending_redeem[cid] = (m_r, t_r)
+                        print(
+                            f"{Y}[SYNC]{RS} Recovered->settling: {title[:40]} {side} "
+                            f"spent=${rec_spent:.2f} mark=${val:.2f} entry={rec_entry:.3f} "
+                            f"| {duration}m ended {abs(mins_left):.1f}min ago"
+                        )
+                    else:
+                        self.pending[cid] = (m_r, t_r)
+                        self.seen.add(cid)
+                        added += 1
+                        print(
+                            f"{Y}[SYNC]{RS} Recovered: {title[:40]} {side} "
+                            f"spent=${rec_spent:.2f} mark=${val:.2f} entry={rec_entry:.3f} "
+                            f"| {duration}m ends in {mins_left:.1f}min"
+                        )
                 if added:
                     self._save_pending()
                     self._save_seen()
