@@ -2795,7 +2795,19 @@ class LiveTrader:
                         order_type=OrderType.FOK,
                     )
                     signed = await loop.run_in_executor(None, lambda: self.clob.create_market_order(order_args))
-                    resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
+                    try:
+                        resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
+                    except Exception as e:
+                        # FOK semantics: if not fully matched immediately, exchange returns a kill error.
+                        # Treat this as unfilled (not a hard order failure).
+                        msg = str(e).lower()
+                        if (
+                            "fully filled or killed" in msg
+                            or "couldn't be fully filled" in msg
+                            or "could not be fully filled" in msg
+                        ):
+                            return {"status": "killed", "orderID": "", "id": ""}, float(px_order)
+                        raise
                     return resp, float(px_order)
 
                 # Use pre-fetched book from scoring phase (free — ran in parallel with Binance signals)
