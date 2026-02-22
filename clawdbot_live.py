@@ -21,6 +21,8 @@ import math
 import csv
 import os
 import re
+import sys
+import threading
 import time as _time
 from collections import deque
 from datetime import datetime, timezone
@@ -245,12 +247,14 @@ PENDING_FILE   = os.path.join(_DATA_DIR, "clawdbot_pending.json")
 SEEN_FILE      = os.path.join(_DATA_DIR, "clawdbot_seen.json")
 STATS_FILE     = os.path.join(_DATA_DIR, "clawdbot_stats.json")
 METRICS_FILE   = os.path.join(_DATA_DIR, "clawdbot_onchain_metrics.jsonl")
+RUNTIME_JSON_LOG_FILE = os.path.join(_DATA_DIR, "clawdbot_runtime_logs.jsonl")
 PNL_BASELINE_FILE = os.path.join(_DATA_DIR, "clawdbot_pnl_baseline.json")
 PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false").lower() == "true"
+RUNTIME_JSON_LOG_ENABLED = os.environ.get("RUNTIME_JSON_LOG_ENABLED", "true").lower() == "true"
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 STRICT_ONCHAIN_STATE = os.environ.get("STRICT_ONCHAIN_STATE", "true").lower() == "true"
-LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "false").lower() == "true"
+LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "true").lower() == "true"
 LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "30"))
 LOG_SCAN_ON_CHANGE_ONLY = os.environ.get("LOG_SCAN_ON_CHANGE_ONLY", "true").lower() == "true"
 LOG_FLOW_EVERY_SEC = int(os.environ.get("LOG_FLOW_EVERY_SEC", "900"))
@@ -259,14 +263,14 @@ LOG_SETTLE_FIRST_EVERY_SEC = int(os.environ.get("LOG_SETTLE_FIRST_EVERY_SEC", "2
 LOG_BANK_EVERY_SEC = int(os.environ.get("LOG_BANK_EVERY_SEC", "45"))
 LOG_BANK_MIN_DELTA = float(os.environ.get("LOG_BANK_MIN_DELTA", "0.50"))
 LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
-LOG_LIVE_DETAIL = os.environ.get("LOG_LIVE_DETAIL", "false").lower() == "true"
+LOG_LIVE_DETAIL = os.environ.get("LOG_LIVE_DETAIL", "true").lower() == "true"
 LOG_LIVE_RK_MAX = int(os.environ.get("LOG_LIVE_RK_MAX", "12"))
 LOG_ROUND_SIGNAL_MIN_SEC = float(os.environ.get("LOG_ROUND_SIGNAL_MIN_SEC", "5"))
-LOG_DEBUG_EVERY_SEC = int(os.environ.get("LOG_DEBUG_EVERY_SEC", "900"))
-LOG_ROUND_SIGNAL_EVERY_SEC = int(os.environ.get("LOG_ROUND_SIGNAL_EVERY_SEC", "900"))
-LOG_SKIP_EVERY_SEC = int(os.environ.get("LOG_SKIP_EVERY_SEC", "900"))
-LOG_EDGE_EVERY_SEC = int(os.environ.get("LOG_EDGE_EVERY_SEC", "900"))
-LOG_EXEC_EVERY_SEC = int(os.environ.get("LOG_EXEC_EVERY_SEC", "900"))
+LOG_DEBUG_EVERY_SEC = int(os.environ.get("LOG_DEBUG_EVERY_SEC", "60"))
+LOG_ROUND_SIGNAL_EVERY_SEC = int(os.environ.get("LOG_ROUND_SIGNAL_EVERY_SEC", "30"))
+LOG_SKIP_EVERY_SEC = int(os.environ.get("LOG_SKIP_EVERY_SEC", "30"))
+LOG_EDGE_EVERY_SEC = int(os.environ.get("LOG_EDGE_EVERY_SEC", "30"))
+LOG_EXEC_EVERY_SEC = int(os.environ.get("LOG_EXEC_EVERY_SEC", "30"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
@@ -388,6 +392,77 @@ BNB_SYM = {info["asset"]: info["asset"].lower() + "usdt" for info in SERIES.valu
 # e.g. {"BTC": "btcusdt", "ETH": "ethusdt", ...}
 
 G="\033[92m"; R="\033[91m"; Y="\033[93m"; B="\033[94m"; W="\033[97m"; RS="\033[0m"
+
+
+class _JsonLogTee:
+    """Mirror stdout/stderr to a persistent JSONL journal file."""
+
+    def __init__(self, stream, stream_name: str, path: str, meta: dict):
+        self._stream = stream
+        self._stream_name = stream_name
+        self._path = path
+        self._meta = dict(meta or {})
+        self._buf = ""
+        self._lock = threading.Lock()
+
+    def _append_json_line(self, msg: str):
+        if not msg:
+            return
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "stream": self._stream_name,
+            "msg": msg,
+            **self._meta,
+        }
+        try:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+        except Exception:
+            # never break runtime printing on journal write issues
+            pass
+
+    def write(self, data):
+        s = "" if data is None else str(data)
+        with self._lock:
+            self._stream.write(s)
+            self._stream.flush()
+            self._buf += s
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                self._append_json_line(line.rstrip("\r"))
+        return len(s)
+
+    def flush(self):
+        with self._lock:
+            self._stream.flush()
+            if self._buf:
+                self._append_json_line(self._buf.rstrip("\r"))
+                self._buf = ""
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+
+def _install_runtime_json_log():
+    if not RUNTIME_JSON_LOG_ENABLED:
+        return
+    try:
+        os.makedirs(os.path.dirname(RUNTIME_JSON_LOG_FILE) or ".", exist_ok=True)
+    except Exception:
+        pass
+    meta = {
+        "service": os.environ.get("NF_SERVICE_ID", "") or os.environ.get("SERVICE_ID", ""),
+        "instance": os.environ.get("HOSTNAME", ""),
+        "deploy_sha": os.environ.get("NF_DEPLOYED_SHA", "") or os.environ.get("GIT_COMMIT", ""),
+        "build_id": os.environ.get("NF_BUILD_ID", "") or os.environ.get("NORTHFLANK_BUILD_ID", ""),
+        "pid": os.getpid(),
+    }
+    sys.stdout = _JsonLogTee(sys.stdout, "stdout", RUNTIME_JSON_LOG_FILE, meta)
+    sys.stderr = _JsonLogTee(sys.stderr, "stderr", RUNTIME_JSON_LOG_FILE, meta)
+    print(f"{B}[LOG-JSON]{RS} {RUNTIME_JSON_LOG_FILE}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -6168,6 +6243,7 @@ class LiveTrader:
 
 if __name__ == "__main__":
     try:
+        _install_runtime_json_log()
         asyncio.run(LiveTrader().run())
     except KeyboardInterrupt:
         print(f"\n{Y}[STOP] Log: {LOG_FILE}{RS}")
