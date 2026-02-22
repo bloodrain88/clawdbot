@@ -1614,19 +1614,23 @@ class LiveTrader:
             )
         # Show each open position with current win/loss status
         now_ts = _time.time()
-        local_only = 0
         for cid, (m, t) in list(self.pending.items()):
-            if self.onchain_snapshot_ts > 0 and cid not in self.onchain_open_cids:
-                local_only += 1
-                continue
+            onchain_confirmed = (self.onchain_snapshot_ts <= 0) or (cid in self.onchain_open_cids)
             self._force_expired_from_question_if_needed(m, t)
             self._apply_exact_window_from_question(m, t)
             asset      = t.get("asset", "?")
             side       = t.get("side", "?")
-            size       = float(self.onchain_open_usdc_by_cid.get(cid, 0.0))
-            if size <= 0:
-                local_only += 1
-                continue
+            if onchain_confirmed:
+                size = float(self.onchain_open_usdc_by_cid.get(cid, 0.0))
+                if size <= 0:
+                    # Keep visibility on recently placed fills while on-chain value cache catches up.
+                    size = float(t.get("size", 0.0) or 0.0)
+                    if size <= 0:
+                        continue
+            else:
+                size = float(t.get("size", 0.0) or 0.0)
+                if size <= 0:
+                    continue
             rk         = self._round_key(cid=cid, m=m, t=t)
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
             # NOT the bot's trade entry price — market determines outcome from its own start
@@ -1654,13 +1658,13 @@ class LiveTrader:
                 projected_win = (side == pred_winner)
                 move_pct   = (cur_p - open_p) / open_p * 100
                 c          = Y
-                status_str = "LIVE"
+                status_str = "LIVE" if onchain_confirmed else "LIVE-PENDING"
                 payout_est = size / t.get("entry", 0.5) if projected_win else 0
                 move_str   = f"({move_pct:+.2f}%)"
                 proj_str   = "LEAD" if projected_win else "TRAIL"
             else:
                 c          = Y
-                status_str = "UNSETTLED"
+                status_str = "UNSETTLED" if onchain_confirmed else "PENDING"
                 payout_est = 0
                 move_str   = "(no ref)"
                 proj_str   = "NA"
@@ -1670,8 +1674,6 @@ class LiveTrader:
                   f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
                   f"bet=${size:.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
                   f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
-        if local_only > 0:
-            print(f"  {Y}[LOCAL-ONLY]{RS} hidden {local_only} pending entries not confirmed on-chain")
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
             if isinstance(val[0], dict):
