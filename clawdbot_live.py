@@ -3900,10 +3900,17 @@ class LiveTrader:
         cl_fresh = (cl_age_s is not None) and (cl_age_s <= 35.0)
         quote_fresh = quote_age_ms <= min(MAX_QUOTE_STALENESS_MS, 1200.0)
         ws_fresh = ws_book_strict is not None
+        rest_fresh = (
+            isinstance(ws_book_now, dict)
+            and str(ws_book_now.get("source", "") or "") in ("clob-rest", "pm")
+            and ((_time.time() - float(ws_book_now.get("ts", 0.0) or 0.0)) * 1000.0)
+            <= max(CLOB_REST_FRESH_MAX_AGE_MS, WS_BOOK_FALLBACK_MAX_AGE_MS)
+        )
+        book_fresh = ws_fresh or rest_fresh
         vol_fresh = bool(volume_ready)
         leader_fresh = bool(leader_ready)
         analysis_quality = (
-            (0.25 if ws_fresh else 0.0)
+            ((0.25 if ws_fresh else (0.22 if rest_fresh else 0.0)))
             + (0.20 if leader_fresh else 0.0)
             + (0.20 if cl_fresh else 0.0)
             + (0.15 if quote_fresh else 0.0)
@@ -3934,36 +3941,39 @@ class LiveTrader:
         quality_floor = float(MIN_ANALYSIS_QUALITY)
         conviction_floor = float(MIN_ANALYSIS_CONVICTION)
         # Dynamic gates by realtime data quality and timing (position-aware, not fixed-only).
-        if ws_fresh and cl_fresh and vol_fresh:
+        if book_fresh and cl_fresh and vol_fresh:
             quality_floor -= 0.03
-        if (not leader_fresh) and ws_fresh and cl_fresh:
+        if (not leader_fresh) and book_fresh and cl_fresh:
             quality_floor -= 0.02
         if mins_left <= (3.5 if duration >= 15 else 1.8):
             quality_floor -= 0.02
             conviction_floor -= 0.01
         if quote_age_ms > 900:
             quality_floor += 0.02
-        if not ws_fresh:
+        if not book_fresh:
             quality_floor += 0.03
             conviction_floor += 0.02
+        elif rest_fresh and (not ws_fresh):
+            # REST fresh is acceptable, but slightly weaker than strict WS.
+            conviction_floor += 0.005
         if not cl_fresh:
             conviction_floor += 0.03
         quality_floor = max(0.45, min(0.75, quality_floor))
         conviction_floor = max(0.45, min(0.72, conviction_floor))
 
-        if analysis_quality < quality_floor:
+        if analysis_quality + 1e-6 < quality_floor:
             if self._noisy_log_enabled(f"skip-analysis-quality:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
                     f"{Y}[SKIP] {asset} {duration}m low analysis quality "
-                    f"q={analysis_quality:.2f}<{quality_floor:.2f}{RS}"
+                    f"q={analysis_quality:.3f}<{quality_floor:.3f}{RS}"
                 )
             self._skip_tick("analysis_quality_low")
             return None
-        if analysis_conviction < conviction_floor:
+        if analysis_conviction + 1e-6 < conviction_floor:
             if self._noisy_log_enabled(f"skip-analysis-conv:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
                     f"{Y}[SKIP] {asset} {duration}m low analysis conviction "
-                    f"c={analysis_conviction:.2f}<{conviction_floor:.2f}{RS}"
+                    f"c={analysis_conviction:.3f}<{conviction_floor:.3f}{RS}"
                 )
             self._skip_tick("analysis_conviction_low")
             return None

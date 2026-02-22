@@ -12,6 +12,19 @@ Ogni modifica che impatta trading/runtime deve aggiungere una nuova entry con:
 
 ## 2026-02-22
 
+### Commit `freshness-first-rest-quality-fix`
+- Scope: `clawdbot_live.py`
+- Summary:
+  - Quando WS strict e' stale ma CLOB REST e' fresco, il book viene considerato valido (`book_fresh`) invece di degradare quality come dato mancante.
+  - `analysis_quality` usa peso ridotto per REST fresh (0.22) vs WS strict (0.25).
+  - `quality_floor/conviction_floor` ora dipendono da `book_fresh` (WS o REST), non solo da WS strict.
+  - Piccola penalita' conviction solo nel caso REST fresh senza WS strict.
+  - Confronti quality/conviction con epsilon + log a 3 decimali per eliminare falsi messaggi tipo `0.50<0.50`.
+- Feed/infra status intent:
+  - Mantiene il modello freshness-first, riduce skip inutili quando il REST book e' realtime.
+- Rollback:
+  - `git revert <sha-commit>`
+
 ### Commit `heartbeat-docs-align`
 - Scope: `clawdbot_live.py`
 - Summary:
