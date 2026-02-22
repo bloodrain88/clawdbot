@@ -415,6 +415,7 @@ class LiveTrader:
         self.onchain_redeemable_count = 0
         self.onchain_open_cids = set()
         self.onchain_open_usdc_by_cid = {}
+        self.onchain_open_meta_by_cid = {}
         self.onchain_settling_usdc_by_cid = {}
         self.onchain_total_equity = BANKROLL
         self.onchain_snapshot_ts = 0.0
@@ -461,6 +462,8 @@ class LiveTrader:
         self.consec_losses      = 0                  # consecutive resolved losses counter
         self._last_round_best   = ""
         self._last_round_pick   = ""
+        self._last_round_best_ts = 0.0
+        self._last_round_pick_ts = 0.0
         # ── Mathematical signal state (EMA + Kalman) ──────────────────────────
         _EMA_HLS = (5, 15, 30, 60, 120)
         self.emas    = {a: {hl: 0.0 for hl in _EMA_HLS} for a in ["BTC","ETH","SOL","XRP"]}
@@ -1764,6 +1767,7 @@ class LiveTrader:
             )
         # Show each open position with current win/loss status
         now_ts = _time.time()
+        shown_live_cids = set()
         for cid, (m, t) in list(self.pending.items()):
             if self.onchain_snapshot_ts > 0 and cid not in self.onchain_open_cids:
                 continue
@@ -1818,6 +1822,46 @@ class LiveTrader:
                   f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
                   f"bet=${size:.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
                   f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
+            shown_live_cids.add(cid)
+        # On-chain open positions not yet hydrated into local pending.
+        # Keep visibility strictly on-chain to avoid "missing live trade" blind spots.
+        for cid, meta in list(self.onchain_open_meta_by_cid.items()):
+            if cid in shown_live_cids:
+                continue
+            size = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
+            if size <= 0:
+                continue
+            asset = str(meta.get("asset", "?") or "?")
+            side = str(meta.get("side", "?") or "?")
+            title = str(meta.get("title", "") or "")[:38]
+            end_ts = float(meta.get("end_ts", 0) or 0)
+            mins_left = max(0.0, (end_ts - now_ts) / 60.0) if end_ts > 0 else 0.0
+            open_p = float(self.open_prices.get(cid, 0.0) or 0.0)
+            src = self.open_prices_source.get(cid, "?")
+            cl_p = float(self.cl_prices.get(asset, 0.0) or 0.0)
+            cur_p = cl_p if cl_p > 0 else float(self.prices.get(asset, 0.0) or 0.0)
+            if open_p > 0 and cur_p > 0:
+                pred_winner = "Up" if cur_p >= open_p else "Down"
+                projected_win = (side == pred_winner)
+                move_pct = (cur_p - open_p) / open_p * 100.0
+                payout_est = size / max(float(meta.get("entry", 0.5) or 0.5), 1e-9) if projected_win else 0.0
+                move_str = f"({move_pct:+.2f}%)"
+                proj_str = "LEAD" if projected_win else "TRAIL"
+            else:
+                payout_est = 0.0
+                move_str = "(no ref)"
+                proj_str = "NA"
+            rk = self._round_key(
+                cid=cid,
+                m={"asset": asset, "duration": int(meta.get("duration", 15) or 15), "end_ts": end_ts},
+                t={"asset": asset, "side": side, "duration": int(meta.get("duration", 15) or 15), "end_ts": end_ts},
+            )
+            print(
+                f"  {Y}[LIVE-PENDING]{RS} {asset} {side} | {title} | "
+                f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
+                f"bet=${size:.2f} est=${payout_est:.2f} proj={proj_str} | "
+                f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}"
+            )
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
             if isinstance(val[0], dict):
@@ -4872,8 +4916,14 @@ class LiveTrader:
                     best = valid[0]
                     other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
                     best_sig = f"{best.get('cid','')}|{best['asset']}|{best['side']}|{best['score']}"
-                    if best_sig != self._last_round_best or self._should_log("round-best-heartbeat", 20):
+                    now_log = _time.time()
+                    should_emit_best = (
+                        (best_sig != self._last_round_best and (now_log - self._last_round_best_ts) >= max(1.0, SCAN_INTERVAL))
+                        or self._should_log("round-best-heartbeat", 20)
+                    )
+                    if should_emit_best:
                         self._last_round_best = best_sig
+                        self._last_round_best_ts = now_log
                         print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
                 elif self._should_log("round-empty", LOG_ROUND_EMPTY_EVERY_SEC):
                     print(f"{Y}[ROUND]{RS} no executable signal")
@@ -4891,8 +4941,14 @@ class LiveTrader:
                             f"{s['asset']} {s['duration']}m {s['side']} g={self._signal_growth_score(s):+.3f}"
                             for s in selected
                         )
-                        if picks != self._last_round_pick or self._should_log("round-pick-heartbeat", 20):
+                        now_log = _time.time()
+                        should_emit_pick = (
+                            (picks != self._last_round_pick and (now_log - self._last_round_pick_ts) >= max(1.0, SCAN_INTERVAL))
+                            or self._should_log("round-pick-heartbeat", 20)
+                        )
+                        if should_emit_pick:
                             self._last_round_pick = picks
+                            self._last_round_pick_ts = now_log
                             print(f"{B}[ROUND-PICK]{RS} {picks}")
                 for sig in selected:
                     if len(to_exec) >= slots:
@@ -4931,29 +4987,12 @@ class LiveTrader:
         ERC20_ABI = [{"inputs":[{"name":"account","type":"address"}],
                       "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
                       "stateMutability":"view","type":"function"}]
-        CTF_BAL_ABI = [
-            {"inputs":[{"name":"owner","type":"address"},{"name":"id","type":"uint256"}],
-             "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
-             "stateMutability":"view","type":"function"},
-            {"inputs":[{"name":"conditionId","type":"bytes32"}],
-             "name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],
-             "stateMutability":"view","type":"function"},
-            {"inputs":[{"name":"conditionId","type":"bytes32"},{"name":"index","type":"uint256"}],
-             "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],
-             "stateMutability":"view","type":"function"},
-        ]
         usdc_contract = None
-        ctf_bal_contract = None
         addr_cs = None
         if self.w3 is not None:
             try:
                 usdc_contract = self.w3.eth.contract(
                     address=Web3.to_checksum_address(USDC_E), abi=ERC20_ABI
-                )
-                cfg = get_contract_config(CHAIN_ID, neg_risk=False)
-                ctf_bal_contract = self.w3.eth.contract(
-                    address=Web3.to_checksum_address(cfg.conditional_tokens),
-                    abi=CTF_BAL_ABI,
                 )
                 addr_cs = Web3.to_checksum_address(ADDRESS)
             except Exception:
@@ -4968,114 +5007,77 @@ class LiveTrader:
             try:
                 loop = asyncio.get_event_loop()
 
-                # 1. On-chain USDC.e balance
-                usdc_raw = await loop.run_in_executor(
-                    None, lambda: usdc_contract.functions.balanceOf(
-                        addr_cs
-                    ).call()
-                ) if usdc_contract else 0
-                usdc = usdc_raw / 1e6
+                # 1) On-chain wallet USDC + Polymarket positions fetched in parallel.
+                usdc_task = (
+                    loop.run_in_executor(
+                        None, lambda: usdc_contract.functions.balanceOf(addr_cs).call()
+                    )
+                    if usdc_contract and addr_cs
+                    else asyncio.sleep(0, result=0)
+                )
+                positions_task = self._http_get_json(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01"},
+                    timeout=10,
+                )
+                usdc_raw, positions = await asyncio.gather(usdc_task, positions_task)
+                usdc = float(usdc_raw or 0) / 1e6
+                if not isinstance(positions, list):
+                    positions = []
 
-                # 2. Strict on-chain CID valuation from wallet token balances.
+                # 2) On-chain-backed open/settling valuation from positions feed.
                 open_val = 0.0
                 open_count = 0
                 settling_claim_val = 0.0
                 settling_claim_count = 0
                 onchain_open_cids = set()
                 onchain_open_usdc_by_cid = {}
+                onchain_open_meta_by_cid = {}
                 onchain_settling_usdc_by_cid = {}
-                if ctf_bal_contract is not None and addr_cs is not None:
-                    # Open (unresolved) positions from local tracked cids, valued by token price cache.
-                    for cid, (m_o, t_o) in list(self.pending.items()):
-                        tok = str(t_o.get("token_id", "") or "").strip()
-                        side_o = str(t_o.get("side", ""))
-                        derived_tok = self._token_id_from_cid_side(cid, side_o)
-                        if not tok.isdigit():
-                            tok = derived_tok
-                        if not tok.isdigit():
-                            continue
-                        try:
-                            bal_raw = await loop.run_in_executor(
-                                None,
-                                lambda ti=int(tok): ctf_bal_contract.functions.balanceOf(addr_cs, ti).call(),
-                            )
-                            qty = bal_raw / 1e6
-                            # Fallback: if saved token_id is stale/wrong, retry with deterministic on-chain token_id.
-                            if qty <= 0 and derived_tok.isdigit() and derived_tok != tok:
-                                bal_raw2 = await loop.run_in_executor(
-                                    None,
-                                    lambda ti=int(derived_tok): ctf_bal_contract.functions.balanceOf(addr_cs, ti).call(),
-                                )
-                                qty2 = bal_raw2 / 1e6
-                                if qty2 > 0:
-                                    tok = derived_tok
-                                    qty = qty2
-                                    t_o["token_id"] = tok
-                            if qty <= 0:
-                                continue
-                            px = float(self.token_prices.get(tok) or 0.0)
-                            if px <= 0:
-                                up_px = float(m_o.get("up_price") or t_o.get("mkt_price") or 0.5)
-                                px = up_px if t_o.get("side") == "Up" else max(0.0, 1.0 - up_px)
-                            open_val += qty * px
-                            open_count += 1
-                            onchain_open_cids.add(cid)
-                            onchain_open_usdc_by_cid[cid] = round(qty * px, 6)
-                        except Exception:
-                            continue
-
-                    # Settling (resolved winners not redeemed yet): claimable notional from on-chain numerators.
-                    for cid, val in list(self.pending_redeem.items()):
-                        if isinstance(val[0], dict):
-                            m_s, t_s = val
-                            side_s = t_s.get("side", "")
-                            tok = str(t_s.get("token_id", "") or "").strip()
-                        else:
-                            side_s, _ = val
-                            m_s = {"conditionId": cid}
-                            tok = ""
-                        derived_tok = self._token_id_from_cid_side(cid, str(side_s))
-                        if not tok.isdigit():
-                            tok = derived_tok
-                        if not tok.isdigit():
-                            continue
-                        try:
-                            cid_bytes = bytes.fromhex(cid.lower().replace("0x", "").zfill(64))
-                            denom = await loop.run_in_executor(
-                                None, lambda b=cid_bytes: ctf_bal_contract.functions.payoutDenominator(b).call()
-                            )
-                            if int(denom) == 0:
-                                continue
-                            n0 = await loop.run_in_executor(
-                                None, lambda b=cid_bytes: ctf_bal_contract.functions.payoutNumerators(b, 0).call()
-                            )
-                            n1 = await loop.run_in_executor(
-                                None, lambda b=cid_bytes: ctf_bal_contract.functions.payoutNumerators(b, 1).call()
-                            )
-                            winner = "Up" if n0 > 0 and n1 == 0 else "Down" if n1 > 0 and n0 == 0 else ""
-                            if winner != side_s:
-                                continue
-                            bal_raw = await loop.run_in_executor(
-                                None,
-                                lambda ti=int(tok): ctf_bal_contract.functions.balanceOf(addr_cs, ti).call(),
-                            )
-                            qty = bal_raw / 1e6
-                            if qty <= 0 and derived_tok.isdigit() and derived_tok != tok:
-                                bal_raw2 = await loop.run_in_executor(
-                                    None,
-                                    lambda ti=int(derived_tok): ctf_bal_contract.functions.balanceOf(addr_cs, ti).call(),
-                                )
-                                qty2 = bal_raw2 / 1e6
-                                if qty2 > 0:
-                                    tok = derived_tok
-                                    qty = qty2
-                            if qty <= 0:
-                                continue
-                            settling_claim_val += qty
-                            settling_claim_count += 1
-                            onchain_settling_usdc_by_cid[cid] = round(qty, 6)
-                        except Exception:
-                            continue
+                for p in positions:
+                    cid = str(p.get("conditionId", "") or "")
+                    if not cid:
+                        continue
+                    side = str(p.get("outcome", "") or "")
+                    val = float(p.get("currentValue", 0) or 0.0)
+                    if not side or val < DUST_RECOVER_MIN:
+                        continue
+                    title = str(p.get("title", "") or "")
+                    redeemable = bool(p.get("redeemable", False))
+                    if redeemable:
+                        settling_claim_val += val
+                        settling_claim_count += 1
+                        onchain_settling_usdc_by_cid[cid] = round(
+                            float(onchain_settling_usdc_by_cid.get(cid, 0.0) or 0.0) + val, 6
+                        )
+                        continue
+                    open_val += val
+                    open_count += 1
+                    onchain_open_cids.add(cid)
+                    onchain_open_usdc_by_cid[cid] = round(
+                        float(onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0) + val, 6
+                    )
+                    prev_meta = onchain_open_meta_by_cid.get(cid) or {}
+                    if (not prev_meta) or (val >= float(prev_meta.get("value", 0.0) or 0.0)):
+                        asset = (
+                            "BTC" if "Bitcoin" in title else
+                            "ETH" if "Ethereum" in title else
+                            "SOL" if "Solana" in title else
+                            "XRP" if "XRP" in title else "?"
+                        )
+                        q_st, q_et = self._round_bounds_from_question(title)
+                        dur_guess = 15
+                        if q_st > 0 and q_et > q_st:
+                            dur_guess = int(round((q_et - q_st) / 60.0))
+                        onchain_open_meta_by_cid[cid] = {
+                            "title": title,
+                            "side": side,
+                            "asset": asset,
+                            "entry": float(p.get("avgPrice", 0.5) or 0.5),
+                            "duration": dur_guess,
+                            "end_ts": float(q_et if q_et > 0 else 0.0),
+                            "value": val,
+                        }
 
                 total = round(usdc + open_val + settling_claim_val, 2)
                 self.onchain_wallet_usdc = round(usdc, 2)
@@ -5083,6 +5085,7 @@ class LiveTrader:
                 self.onchain_open_count = int(open_count)
                 self.onchain_open_cids = set(onchain_open_cids)
                 self.onchain_open_usdc_by_cid = dict(onchain_open_usdc_by_cid)
+                self.onchain_open_meta_by_cid = dict(onchain_open_meta_by_cid)
                 self.onchain_redeemable_count = int(settling_claim_count)
                 self.onchain_settling_usdc_by_cid = dict(onchain_settling_usdc_by_cid)
                 self.onchain_total_equity = total
@@ -5125,13 +5128,6 @@ class LiveTrader:
                         )
 
                 # 3. API recovery/stats only (does not drive bankroll valuation)
-                positions = await self._http_get_json(
-                    "https://data-api.polymarket.com/positions",
-                    params={"user": ADDRESS, "sizeThreshold": "0.01"},
-                    timeout=10,
-                )
-                if not isinstance(positions, list):
-                    positions = []
                 api_active_cids = {
                     p.get("conditionId", "")
                     for p in positions
