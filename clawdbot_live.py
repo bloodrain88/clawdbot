@@ -340,6 +340,23 @@ WS_BOOK_FALLBACK_MAX_AGE_MS = float(os.environ.get("WS_BOOK_FALLBACK_MAX_AGE_MS"
 LEADER_FLOW_FALLBACK_ENABLED = os.environ.get("LEADER_FLOW_FALLBACK_ENABLED", "true").lower() == "true"
 LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MAX_AGE_SEC", "90"))
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
+# Mid-round booster (15m only): small additive bet at high payout/high conviction.
+MID_BOOSTER_ENABLED = os.environ.get("MID_BOOSTER_ENABLED", "true").lower() == "true"
+MID_BOOSTER_ANYTIME_15M = os.environ.get("MID_BOOSTER_ANYTIME_15M", "true").lower() == "true"
+MID_BOOSTER_MIN_LEFT_15M = float(os.environ.get("MID_BOOSTER_MIN_LEFT_15M", "6.0"))
+MID_BOOSTER_MAX_LEFT_15M = float(os.environ.get("MID_BOOSTER_MAX_LEFT_15M", "10.5"))
+MID_BOOSTER_MIN_LEFT_HARD_15M = float(os.environ.get("MID_BOOSTER_MIN_LEFT_HARD_15M", "2.2"))
+MID_BOOSTER_MIN_SCORE = int(os.environ.get("MID_BOOSTER_MIN_SCORE", "11"))
+MID_BOOSTER_MIN_TRUE_PROB = float(os.environ.get("MID_BOOSTER_MIN_TRUE_PROB", "0.60"))
+MID_BOOSTER_MIN_EDGE = float(os.environ.get("MID_BOOSTER_MIN_EDGE", "0.025"))
+MID_BOOSTER_MIN_EV_NET = float(os.environ.get("MID_BOOSTER_MIN_EV_NET", "0.050"))
+MID_BOOSTER_MIN_PAYOUT = float(os.environ.get("MID_BOOSTER_MIN_PAYOUT", "2.80"))
+MID_BOOSTER_MAX_ENTRY = float(os.environ.get("MID_BOOSTER_MAX_ENTRY", "0.35"))
+MID_BOOSTER_SIZE_PCT = float(os.environ.get("MID_BOOSTER_SIZE_PCT", "0.008"))
+MID_BOOSTER_SIZE_PCT_HIGH = float(os.environ.get("MID_BOOSTER_SIZE_PCT_HIGH", "0.020"))
+MID_BOOSTER_MAX_PER_CID = int(os.environ.get("MID_BOOSTER_MAX_PER_CID", "1"))
+MID_BOOSTER_LOSS_STREAK_LOCK = int(os.environ.get("MID_BOOSTER_LOSS_STREAK_LOCK", "4"))
+MID_BOOSTER_LOCK_HOURS = float(os.environ.get("MID_BOOSTER_LOCK_HOURS", "24"))
 # Dynamic sizing guardrail for cheap-entry tails:
 # - keep default risk around LOW_ENTRY_BASE_SOFT_MAX
 # - allow growth toward LOW_ENTRY_HIGH_CONV_SOFT_MAX only on strong conviction
@@ -621,6 +638,9 @@ class LiveTrader:
         self._round_side_attempt_ts = {}          # "round_key|side" → last attempt ts
         self._cid_side_attempt_ts = {}            # "cid|side" → last attempt ts
         self._round_side_block_until = {}         # "round_fingerprint|side" → ttl epoch
+        self._booster_used_by_cid = {}            # cid -> count of executed booster add-ons
+        self._booster_consec_losses = 0
+        self._booster_lock_until = 0.0
         self._redeem_tx_lock    = asyncio.Lock()  # serialize redeem txs to avoid nonce clashes
         self._nonce_mgr         = None
         self._errors            = ErrorTracker()
@@ -707,6 +727,9 @@ class LiveTrader:
     def _noisy_log_enabled(self, key: str, every_sec: float = LOG_DEBUG_EVERY_SEC) -> bool:
         # Operator mode: keep logs clean by default; show extra diagnostics sparsely.
         return LOG_VERBOSE or LOG_LIVE_DETAIL or self._should_log(key, every_sec)
+
+    def _booster_locked(self) -> bool:
+        return _time.time() < float(self._booster_lock_until or 0.0)
 
     def _short_cid(self, cid: str) -> str:
         if not cid:
@@ -2804,8 +2827,19 @@ class LiveTrader:
         Pure analysis — no side effects, no order placement."""
         score_started = _time.perf_counter()
         cid       = m["conditionId"]
+        booster_eval = False
+        booster_side_locked = ""
         if cid in self.seen:
-            return None
+            if MID_BOOSTER_ENABLED and cid in self.pending:
+                _pm, _pt = self.pending.get(cid, ({}, {}))
+                _pside = str((_pt or {}).get("side", "") or "")
+                if _pside in ("Up", "Down"):
+                    booster_eval = True
+                    booster_side_locked = _pside
+                else:
+                    return None
+            else:
+                return None
         asset     = m["asset"]
         duration  = m["duration"]
         mins_left = m["mins_left"]
@@ -3471,6 +3505,8 @@ class LiveTrader:
                 f"payout>={min_payout_req:.2f}x ev>={min_ev_req:.3f} "
                 f"entry=[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]"
             )
+        booster_mode = False
+        booster_note = ""
         fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= 45)
 
         # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
@@ -3567,6 +3603,93 @@ class LiveTrader:
             size = model_size
         size = max(0.50, min(hard_cap, size))
 
+        # Mid-round (or anytime) additive booster on existing same-side position.
+        # This is intentionally a separate, small bet with stricter quality filters.
+        if booster_eval and MID_BOOSTER_ENABLED:
+            if self._booster_locked():
+                if self._noisy_log_enabled(f"booster-lock:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    rem_h = max(0.0, (self._booster_lock_until - _time.time()) / 3600.0)
+                    print(f"{Y}[BOOST-SKIP]{RS} locked {rem_h:.1f}h | cid={self._short_cid(cid)}")
+                return None
+            if duration != 15:
+                return None
+            if side != booster_side_locked:
+                return None
+            if int(self._booster_used_by_cid.get(cid, 0) or 0) >= max(1, MID_BOOSTER_MAX_PER_CID):
+                return None
+            if mins_left < MID_BOOSTER_MIN_LEFT_HARD_15M:
+                return None
+            in_ideal_window = MID_BOOSTER_MIN_LEFT_15M <= mins_left <= MID_BOOSTER_MAX_LEFT_15M
+            if (not MID_BOOSTER_ANYTIME_15M) and (not in_ideal_window):
+                return None
+
+            taker_conf = (is_up and taker_ratio > 0.54) or ((not is_up) and taker_ratio < 0.46)
+            # Mathematical conviction model (15m intraround):
+            # combines microstructure + trend persistence + oracle alignment.
+            ob_c = max(-1.0, min(1.0, ob_sig / 0.35))
+            tf_c = max(0.0, min(1.0, (tf_votes - 1.0) / 3.0))
+            flow_c = max(-1.0, min(1.0, ((taker_ratio - 0.5) * 2.0) if is_up else ((0.5 - taker_ratio) * 2.0)))
+            vol_c = max(0.0, min(1.0, (vol_ratio - 1.0) / 1.5))
+            basis_signed = perp_basis if is_up else -perp_basis
+            basis_c = max(-1.0, min(1.0, basis_signed / 0.0008))
+            vwap_signed = vwap_dev if is_up else -vwap_dev
+            vwap_c = max(-1.0, min(1.0, vwap_signed / 0.0012))
+            oracle_c = 1.0 if cl_agree else -1.0
+            booster_conv = (
+                0.24 * tf_c
+                + 0.20 * max(0.0, ob_c)
+                + 0.16 * max(0.0, flow_c)
+                + 0.12 * vol_c
+                + 0.10 * max(0.0, basis_c)
+                + 0.10 * max(0.0, vwap_c)
+                + 0.08 * max(0.0, oracle_c)
+            )
+            base_quality = (
+                score >= MID_BOOSTER_MIN_SCORE
+                and true_prob >= MID_BOOSTER_MIN_TRUE_PROB
+                and edge >= MID_BOOSTER_MIN_EDGE
+                and ev_net >= MID_BOOSTER_MIN_EV_NET
+                and payout_mult >= MID_BOOSTER_MIN_PAYOUT
+                and entry <= MID_BOOSTER_MAX_ENTRY
+                and cl_agree
+                and imbalance_confirms
+                and taker_conf
+                and vol_ratio >= 1.05
+                and booster_conv >= 0.58
+            )
+            if not base_quality:
+                return None
+            # Outside ideal window keep booster much stricter.
+            if not in_ideal_window:
+                if not (
+                    score >= (MID_BOOSTER_MIN_SCORE + 2)
+                    and true_prob >= (MID_BOOSTER_MIN_TRUE_PROB + 0.02)
+                    and ev_net >= (MID_BOOSTER_MIN_EV_NET + 0.015)
+                    and booster_conv >= 0.66
+                ):
+                    return None
+
+            prev_size = float((self.pending.get(cid, ({}, {}))[1] or {}).get("size", 0.0) or 0.0)
+            b_pct = MID_BOOSTER_SIZE_PCT
+            if score >= (MID_BOOSTER_MIN_SCORE + 3) and true_prob >= (MID_BOOSTER_MIN_TRUE_PROB + 0.03):
+                b_pct = MID_BOOSTER_SIZE_PCT_HIGH
+            b_size = round(max(MIN_BET_ABS, self.bankroll * b_pct), 2)
+            # Keep additive booster small vs existing exposure.
+            if prev_size > 0:
+                b_size = min(b_size, max(MIN_BET_ABS, prev_size * 0.35))
+            size = max(MIN_BET_ABS, min(size, b_size, hard_cap))
+            booster_mode = True
+            booster_note = "mid" if in_ideal_window else "anytime"
+            signal_tier = f"{signal_tier}+BOOST"
+            signal_source = f"{signal_source}+booster"
+            if self._noisy_log_enabled(f"booster-conv:{asset}:{cid}", LOG_EDGE_EVERY_SEC):
+                print(
+                    f"{B}[BOOST-CHECK]{RS} {asset} 15m {side} "
+                    f"conv={booster_conv:.2f} score={score} ev={ev_net:.3f} "
+                    f"payout={payout_mult:.2f}x entry={entry:.3f} "
+                    f"tf={tf_votes} ob={ob_sig:+.2f} tk={taker_ratio:.2f} vol={vol_ratio:.2f}x"
+                )
+
         # Immediate fills: FOK on strong signal, GTC limit otherwise
         # Limit orders (use_limit=True) are always GTC — force_taker stays False
         force_taker = (not use_limit) and (
@@ -3608,6 +3731,8 @@ class LiveTrader:
             "signal_tier": signal_tier,
             "signal_source": signal_source,
             "leader_size_scale": leader_size_scale,
+            "booster_mode": booster_mode,
+            "booster_note": booster_note,
             "book_age_ms": book_age_ms,
             "quote_age_ms": quote_age_ms,
             "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
@@ -3619,18 +3744,31 @@ class LiveTrader:
         cid = sig["cid"]
         m = sig["m"]
         side = sig.get("side", "")
+        is_booster = bool(sig.get("booster_mode", False))
         round_key = self._round_key(cid=cid, m=m, t=sig)
         round_fp = self._round_fingerprint(cid=cid, m=m, t=sig)
-        round_side_key = f"{round_fp}|{side}"
-        cid_side_key = f"{cid}|{side}"
+        round_side_key = f"{round_fp}|{side}|{'B' if is_booster else 'N'}"
+        cid_side_key = f"{cid}|{side}|{'B' if is_booster else 'N'}"
         now_attempt = _time.time()
         async with self._exec_lock:
             # Trim expired round-side blocks.
             for k, exp in list(self._round_side_block_until.items()):
                 if float(exp or 0) <= now_attempt:
                     self._round_side_block_until.pop(k, None)
-            if cid in self.seen or cid in self._executing_cids or len(self.pending) >= MAX_OPEN:
+            if cid in self._executing_cids:
                 return
+            if (not is_booster) and (cid in self.seen or len(self.pending) >= MAX_OPEN):
+                return
+            if is_booster:
+                if self._booster_locked():
+                    return
+                if cid not in self.pending or cid in self.pending_redeem:
+                    return
+                p_side = str((self.pending.get(cid, ({}, {}))[1] or {}).get("side", "") or "")
+                if p_side != side:
+                    return
+                if int(self._booster_used_by_cid.get(cid, 0) or 0) >= max(1, MID_BOOSTER_MAX_PER_CID):
+                    return
             if float(self._round_side_block_until.get(round_side_key, 0) or 0) > now_attempt:
                 return
             # Prevent rapid-fire retries on the same round/side.
@@ -3680,11 +3818,12 @@ class LiveTrader:
             cp_tag = f" copy={sig.get('copy_adj',0):+d}" if sig.get("copy_adj", 0) else ""
             tier_tag = f" {sig.get('signal_tier','TIER-?')}/{sig.get('signal_source','na')}"
             scale_tag = f" szx={float(sig.get('leader_size_scale', 1.0) or 1.0):.2f}"
+            booster_tag = f" BOOST({sig.get('booster_note','')})" if is_booster else ""
             print(f"{tag} {sig['asset']} {sig['duration']}m {sig['side']} | "
                   f"score={score} edge={sig['edge']:+.3f} size=${sig['size']:.2f} "
                   f"entry={sig['entry']:.3f} src={sig.get('open_price_source','?')} "
                   f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{tier_tag}{scale_tag}"
-                  f"{hc_tag}{cp_tag}{agree_str}{RS}")
+                  f"{booster_tag}{hc_tag}{cp_tag}{agree_str}{RS}")
 
         try:
             duration = int(sig.get("duration", 0) or 0)
@@ -3784,6 +3923,10 @@ class LiveTrader:
                 "slip_bps": round(slip_bps, 2),
                 "round_key": round_key,
                 "placed_ts": _time.time(),
+                "booster_mode": bool(is_booster),
+                "booster_note": sig.get("booster_note", ""),
+                "booster_count": 1 if is_booster else 0,
+                "booster_stake_usdc": actual_size_usdc if is_booster else 0.0,
             }
             self._log_onchain_event("ENTRY", cid, {
                 "asset": sig["asset"],
@@ -3807,17 +3950,44 @@ class LiveTrader:
                 "quote_age_ms": round(sig.get("quote_age_ms", 0.0), 2),
                 "bucket": stat_bucket,
                 "round_key": round_key,
+                "booster_mode": bool(is_booster),
+                "booster_note": sig.get("booster_note", ""),
             })
             if filled:
-                self.seen.add(cid)
-                self._save_seen()
-                self.pending[cid] = (m, trade)
-                block_until = float(m.get("end_ts", 0) or 0)
-                if block_until <= now_attempt:
-                    block_until = now_attempt + max(60.0, ROUND_RETRY_COOLDOWN_SEC * 2)
-                self._round_side_block_until[round_side_key] = block_until + 15.0
-                self._save_pending()
-                self._log(m, trade)
+                if is_booster and cid in self.pending:
+                    old_m, old_t = self.pending.get(cid, (m, {}))
+                    old_size = float((old_t or {}).get("size", 0.0) or 0.0)
+                    old_entry = float((old_t or {}).get("entry", sig["entry"]) or sig["entry"])
+                    new_size = float(actual_size_usdc or 0.0)
+                    merged_size = max(0.0, old_size + new_size)
+                    merged_entry = ((old_entry * old_size) + (fill_price * new_size)) / max(merged_size, 1e-9)
+                    old_t["size"] = round(merged_size, 6)
+                    old_t["entry"] = round(merged_entry, 6)
+                    old_t["fill_price"] = round(fill_price, 6)
+                    old_t["slip_bps"] = round(float(trade.get("slip_bps", 0.0) or 0.0), 2)
+                    old_t["placed_ts"] = _time.time()
+                    old_t["booster_mode"] = True
+                    old_t["booster_note"] = sig.get("booster_note", "")
+                    old_t["booster_count"] = int(old_t.get("booster_count", 0) or 0) + 1
+                    old_t["booster_stake_usdc"] = round(float(old_t.get("booster_stake_usdc", 0.0) or 0.0) + new_size, 6)
+                    self.pending[cid] = (old_m, old_t)
+                    self._booster_used_by_cid[cid] = int(self._booster_used_by_cid.get(cid, 0) or 0) + 1
+                    self._save_pending()
+                    print(
+                        f"{G}[BOOST-FILL]{RS} {sig['asset']} {sig['duration']}m {side} "
+                        f"| +${new_size:.2f} @ {fill_price:.3f} | total=${merged_size:.2f} "
+                        f"| cid={self._short_cid(cid)}"
+                    )
+                else:
+                    self.seen.add(cid)
+                    self._save_seen()
+                    self.pending[cid] = (m, trade)
+                    block_until = float(m.get("end_ts", 0) or 0)
+                    if block_until <= now_attempt:
+                        block_until = now_attempt + max(60.0, ROUND_RETRY_COOLDOWN_SEC * 2)
+                    self._round_side_block_until[round_side_key] = block_until + 15.0
+                    self._save_pending()
+                    self._log(m, trade)
         finally:
             async with self._exec_lock:
                 self._executing_cids.discard(cid)
@@ -4618,6 +4788,9 @@ class LiveTrader:
                             usdc_delta = usdc_after - usdc_before
                             redeem_in = usdc_delta if usdc_delta > 0 else float(payout)
                         pnl = redeem_in - stake_out
+                        if int(trade.get("booster_count", 0) or 0) > 0:
+                            self._booster_consec_losses = 0
+                            self._booster_lock_until = 0.0
                         self.daily_pnl += pnl
                         self.total += 1; self.wins += 1
                         self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
@@ -4667,6 +4840,16 @@ class LiveTrader:
                         if size_f > 0:
                             stake_loss = max(size_f, float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0))
                             pnl = -stake_loss
+                            if int(trade.get("booster_count", 0) or 0) > 0:
+                                self._booster_consec_losses = int(self._booster_consec_losses or 0) + 1
+                                lock_n = max(1, MID_BOOSTER_LOSS_STREAK_LOCK)
+                                if self._booster_consec_losses >= lock_n:
+                                    self._booster_lock_until = _time.time() + max(1.0, MID_BOOSTER_LOCK_HOURS) * 3600.0
+                                    rem_h = max(0.0, (self._booster_lock_until - _time.time()) / 3600.0)
+                                    print(
+                                        f"{Y}[BOOST-LOCK]{RS} disabled for {rem_h:.1f}h "
+                                        f"after {self._booster_consec_losses} booster losses"
+                                    )
                             self.daily_pnl += pnl
                             self.total += 1
                             self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
@@ -4716,6 +4899,7 @@ class LiveTrader:
                 self.onchain_open_stake_by_cid.pop(cid, None)
                 self.onchain_open_shares_by_cid.pop(cid, None)
                 self.onchain_open_meta_by_cid.pop(cid, None)
+                self._booster_used_by_cid.pop(cid, None)
             if changed_pending:
                 self._save_pending()
 
