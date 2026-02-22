@@ -1904,6 +1904,8 @@ class LiveTrader:
             title = str(meta.get("title", "") or "")[:38]
             end_ts = float(meta.get("end_ts", 0) or 0)
             mins_left = max(0.0, (end_ts - now_ts) / 60.0) if end_ts > 0 else 0.0
+            if end_ts > 0 and end_ts <= now_ts and cid not in self.pending_redeem:
+                continue
             open_p = float(self.open_prices.get(cid, 0.0) or 0.0)
             src = self.open_prices_source.get(cid, "?")
             cl_p = float(self.cl_prices.get(asset, 0.0) or 0.0)
@@ -5179,18 +5181,50 @@ class LiveTrader:
                             "SOL" if "Solana" in title else
                             "XRP" if "XRP" in title else "?"
                         )
+                        start_ts = 0.0
+                        end_ts = 0.0
+                        for ks in ("eventStartTime", "startDate", "start_date"):
+                            s = p.get(ks)
+                            if isinstance(s, str) and s:
+                                try:
+                                    start_ts = datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+                                    break
+                                except Exception:
+                                    pass
+                        for ke in ("endDate", "end_date", "eventEndTime"):
+                            s = p.get(ke)
+                            if isinstance(s, str) and s:
+                                try:
+                                    end_ts = datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+                                    break
+                                except Exception:
+                                    pass
                         q_st, q_et = self._round_bounds_from_question(title)
-                        dur_guess = 15
                         if q_st > 0 and q_et > q_st:
-                            dur_guess = int(round((q_et - q_st) / 60.0))
+                            start_ts, end_ts = q_st, q_et
+                        elif end_ts <= 0 and q_et > 0:
+                            end_ts = q_et
+                        if start_ts <= 0 and q_st > 0:
+                            start_ts = q_st
+                        dur_guess = 15
+                        if start_ts > 0 and end_ts > start_ts:
+                            dur_guess = max(1, int(round((end_ts - start_ts) / 60.0)))
+                        # Keep stake stable across refreshes (avoid value-driven oscillation).
+                        stable_stake = stake_guess
+                        prev_stake = float(prev_meta.get("stake_usdc", 0.0) or 0.0)
+                        if prev_stake > 0 and stable_stake <= 0:
+                            stable_stake = prev_stake
+                        elif prev_stake > 0 and stable_stake > 0:
+                            stable_stake = max(prev_stake, stable_stake)
                         onchain_open_meta_by_cid[cid] = {
                             "title": title,
                             "side": side,
                             "asset": asset,
                             "entry": float(p.get("avgPrice", 0.5) or 0.5),
-                            "stake_usdc": round(stake_guess, 6),
+                            "stake_usdc": round(stable_stake, 6),
                             "duration": dur_guess,
-                            "end_ts": float(q_et if q_et > 0 else 0.0),
+                            "start_ts": float(start_ts if start_ts > 0 else 0.0),
+                            "end_ts": float(end_ts if end_ts > 0 else 0.0),
                             "value": val,
                         }
 
