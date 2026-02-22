@@ -397,6 +397,7 @@ class LiveTrader:
         self._book_cache     = {}     # token_id -> {"ts_ms": float, "book": OrderBook}
         self._book_sem       = asyncio.Semaphore(max(1, BOOK_FETCH_CONCURRENCY))
         self._heartbeat_last_ok = 0.0
+        self._heartbeat_id   = ""
         self.cl_prices       = {}    # Chainlink oracle prices (resolution source)
         self.cl_updated      = {}    # Chainlink last update timestamp per asset
         self.bankroll        = BANKROLL
@@ -5416,9 +5417,22 @@ class LiveTrader:
         while True:
             try:
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, lambda: self.clob.post_heartbeat(None))
+                hb_resp = await loop.run_in_executor(
+                    None,
+                    lambda: self.clob.post_heartbeat(self._heartbeat_id),
+                )
+                if isinstance(hb_resp, dict):
+                    next_id = (hb_resp.get("heartbeat_id") or "").strip()
+                    if next_id:
+                        self._heartbeat_id = next_id
                 self._heartbeat_last_ok = _time.time()
             except Exception as e:
+                # Polymarket heartbeat protocol: first call uses "", then reuse returned heartbeat_id.
+                # On invalid id error, server may return a fresh heartbeat_id in error payload.
+                msg = str(e)
+                m = re.search(r"heartbeat_id['\"]?\s*[:=]\s*['\"]([0-9a-fA-F-]{8,})['\"]", msg)
+                if m:
+                    self._heartbeat_id = m.group(1)
                 self._errors.tick("clob_heartbeat", print, err=e, every=10)
                 if self._should_log("heartbeat-fail", 30):
                     print(f"{Y}[HEARTBEAT] failed: {e}{RS}")
