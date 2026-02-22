@@ -254,8 +254,8 @@ PNL_BASELINE_FILE = os.path.join(_DATA_DIR, "clawdbot_pnl_baseline.json")
 SETTLED_FILE   = os.path.join(_DATA_DIR, "clawdbot_settled_cids.json")
 PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false").lower() == "true"
 LOSS_STREAK_PAUSE_ENABLED = os.environ.get("LOSS_STREAK_PAUSE_ENABLED", "true").lower() == "true"
-LOSS_STREAK_PAUSE_N = int(os.environ.get("LOSS_STREAK_PAUSE_N", "3"))
-LOSS_STREAK_PAUSE_SEC = float(os.environ.get("LOSS_STREAK_PAUSE_SEC", "3600"))
+LOSS_STREAK_PAUSE_N = int(os.environ.get("LOSS_STREAK_PAUSE_N", "4"))
+LOSS_STREAK_PAUSE_SEC = float(os.environ.get("LOSS_STREAK_PAUSE_SEC", "900"))
 RUNTIME_JSON_LOG_ENABLED = os.environ.get("RUNTIME_JSON_LOG_ENABLED", "true").lower() == "true"
 RUNTIME_JSON_LOG_ROTATE_DAILY = os.environ.get("RUNTIME_JSON_LOG_ROTATE_DAILY", "true").lower() == "true"
 
@@ -1702,6 +1702,32 @@ class LiveTrader:
                 out.append(tr)
         return out
 
+    async def _fetch_recent_trades(self, limit: int = 300, timeout: int = 8):
+        try:
+            rows = await self._http_get_json(
+                "https://data-api.polymarket.com/trades",
+                params={"limit": str(max(1, int(limit)))},
+                timeout=timeout,
+            )
+        except Exception:
+            rows = []
+        return rows if isinstance(rows, list) else []
+
+    def _trade_matches_family(self, tr: dict, asset: str, duration: int) -> bool:
+        """Match a trade row to current market family (asset + 15m/5m) using API metadata."""
+        try:
+            a = str(asset or "").upper()
+            d = int(duration or 0)
+            slug = str((tr or {}).get("slug", "") or "").lower()
+            title = str((tr or {}).get("title", "") or "").lower()
+            if a and a.lower() not in slug and a.lower() not in title:
+                return False
+            if d <= 5:
+                return ("5m" in slug) or ("5 minutes" in title) or ("5 min" in title)
+            return ("15m" in slug) or ("15 minutes" in title) or ("15 min" in title)
+        except Exception:
+            return False
+
     async def _copyflow_refresh_cid_once(self, cid: str, reason: str = "cid") -> int:
         """Targeted leader-flow refresh for one CID used by scorer on missing/stale leader data."""
         cid = str(cid or "").strip()
@@ -1732,6 +1758,16 @@ class LiveTrader:
             return 0
 
         rows = await self._fetch_condition_trades(cid, COPYFLOW_LIVE_TRADES_LIMIT, timeout=8)
+        if not rows:
+            # Source-level fallback (real data): use most recent trades from same family.
+            fam = self.active_mkts.get(cid, {})
+            fam_asset = (fam.get("asset") or "").upper()
+            fam_dur = int(fam.get("duration") or 0)
+            if fam_asset and fam_dur in (5, 15):
+                rows_all = await self._fetch_recent_trades(
+                    max(200, COPYFLOW_LIVE_TRADES_LIMIT * 2), timeout=8
+                )
+                rows = [tr for tr in rows_all if self._trade_matches_family(tr, fam_asset, fam_dur)]
         if not rows:
             self._copyflow_live_zero_streak += 1
             return 0
