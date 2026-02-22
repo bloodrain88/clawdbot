@@ -1732,7 +1732,9 @@ class LiveTrader:
                 print(f"{Y}[RESUME] Loaded {len(self.seen)} seen markets from disk{RS}")
             except Exception:
                 pass
-        # Load seen cids from Polymarket positions — suppress duplicate bets on restart.
+        # Load only *currently open* cids from positions API.
+        # Do not import historical/closed cids into `seen`, otherwise fresh markets
+        # can be incorrectly blocked from candidacy after restart.
         # DO NOT add to self.pending here; _sync_open_positions (called in init_clob)
         # fetches real end_ts from Gamma API and adds them properly.
         try:
@@ -1742,17 +1744,20 @@ class LiveTrader:
                 params={"user": ADDRESS, "sizeThreshold": "0.01"},
                 timeout=8
             ).json()
+            added_open = 0
             for p in positions:
                 cid        = p.get("conditionId", "")
                 redeemable = p.get("redeemable", False)
                 outcome    = p.get("outcome", "")
                 val        = float(p.get("currentValue", 0))
                 title      = p.get("title", "")
-                if cid:
+                # Keep seen aligned to active exposure only.
+                if (not redeemable) and outcome and cid and val >= OPEN_PRESENCE_MIN:
                     self.seen.add(cid)
+                    added_open += 1
                 if not redeemable and outcome and cid:
                     print(f"{Y}[RESUME] Position: {title[:45]} {outcome} ~${val:.2f}{RS}")
-            print(f"{Y}[RESUME] Seen {len(self.seen)} markets from API{RS}")
+            print(f"{Y}[RESUME] Seen+open from API: +{added_open} | total seen={len(self.seen)}{RS}")
         except Exception:
             pass
         # Load pending trades
@@ -5303,6 +5308,8 @@ class LiveTrader:
 
             # Evaluate ALL eligible markets in parallel — no more sequential blocking
             candidates = []
+            eligible_started = 0
+            blocked_seen = 0
             for cid, m in markets.items():
                 if m["start_ts"] > now:
                     sec_to_start = m["start_ts"] - now
@@ -5328,6 +5335,7 @@ class LiveTrader:
                                 )
                     continue
                 if (m["end_ts"] - now) / 60 < 1: continue
+                eligible_started += 1
                 m["mins_left"] = (m["end_ts"] - now) / 60
                 # Set open_price from Chainlink at exact market start time.
                 # Must match Polymarket's resolution reference ("price to beat").
@@ -5384,6 +5392,8 @@ class LiveTrader:
                                   f"now=${cur:,.2f} move={move:+.3f}% | {m['mins_left']:.1f}min left{RS}")
                 if cid not in self.seen:
                     candidates.append(m)
+                else:
+                    blocked_seen += 1
             if candidates:
                 # Score all markets in parallel.
                 t_score = _time.perf_counter()
@@ -5410,6 +5420,11 @@ class LiveTrader:
                         print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
                 elif self._should_log("round-empty", LOG_ROUND_EMPTY_EVERY_SEC):
                     print(f"{Y}[ROUND]{RS} no executable signal")
+                    print(
+                        f"{Y}[ROUND-DIAG]{RS} eligible={eligible_started} candidates={len(candidates)} "
+                        f"blocked_seen={blocked_seen} pending_redeem={len(self.pending_redeem)} "
+                        f"open_onchain={self.onchain_open_count} enable_5m={ENABLE_5M}"
+                    )
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
                 shadow_pending = dict(active_pending)
                 slots = max(0, MAX_OPEN - len(active_pending))
