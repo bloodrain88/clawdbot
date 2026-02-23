@@ -3605,12 +3605,27 @@ class LiveTrader:
         # Pre-fetch likely token book (cheap-side = token_up iff up_price≤0.50)
         prefetch_token = m.get("token_up", "") if up_price <= 0.50 else m.get("token_down", "")
 
-        current = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
-        if current == 0:
-            return None
+        # Decision price selection: use freshest reliable source (prefer CL when fresh),
+        # then apply soft penalties for source divergence instead of hard blocking.
+        rtds_now = float(self.prices.get(asset, 0) or 0.0)
+        cl_now = float(self.cl_prices.get(asset, 0) or 0.0)
         last_tick_ts = self.price_history.get(asset, deque(maxlen=1))[-1][0] if self.price_history.get(asset) else 0
         quote_age_ms = (_time.time() - last_tick_ts) * 1000.0 if last_tick_ts else 9e9
-        if quote_age_ms > MAX_QUOTE_STALENESS_MS:
+        cl_updated = self.cl_updated.get(asset, 0)
+        cl_age_s = (_time.time() - cl_updated) if cl_updated else None
+        if cl_now > 0 and cl_age_s is not None and cl_age_s <= 15.0:
+            current = cl_now
+            px_src = "CL"
+        elif rtds_now > 0 and quote_age_ms <= MAX_QUOTE_STALENESS_MS:
+            current = rtds_now
+            px_src = "RTDS"
+        elif cl_now > 0:
+            current = cl_now
+            px_src = "CL-stale"
+        elif rtds_now > 0:
+            current = rtds_now
+            px_src = "RTDS-stale"
+        else:
             return None
 
         open_price = self.open_prices.get(cid)
@@ -3658,9 +3673,6 @@ class LiveTrader:
         tf_dn_votes = sum([mom_5s < th_dn, mom_30s < th_dn, mom_180s < th_dn, mom_kal < th_dn])
 
         # Chainlink current — the resolution oracle
-        cl_now = self.cl_prices.get(asset, 0)
-        cl_updated = self.cl_updated.get(asset, 0)
-        cl_age_s = (_time.time() - cl_updated) if cl_updated else None
         cl_move_pct = abs(cl_now - open_price) / open_price if cl_now > 0 and open_price > 0 else 0
         cl_direction = ("Up" if cl_now > open_price else "Down") if cl_move_pct >= 0.0002 else None
 
@@ -3668,9 +3680,17 @@ class LiveTrader:
         # Use Binance RTDS only when it's clearly moving; fall back to CL then momentum
         if move_pct >= 0.0003:
             direction = "Up" if current > open_price else "Down"
-            # Binance small move + Chainlink clearly opposite → skip (conflicting oracles)
+            # Small move + opposite CL direction: keep trading, but align to oracle and penalize.
             if cl_direction and cl_direction != direction and move_pct < 0.0010:
-                return None
+                score -= 3
+                edge -= 0.020
+                if cl_age_s is not None and cl_age_s <= 20.0:
+                    direction = cl_direction
+                if self._noisy_log_enabled(f"px-align:{asset}:{duration}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[PX-ALIGN]{RS} {asset} {duration}m conflict rtds={rtds_now:.4f} "
+                        f"cl={cl_now:.4f} open={open_price:.4f} src={px_src} -> dir={direction}"
+                    )
         elif cl_direction:
             direction = cl_direction   # Binance flat → trust Chainlink direction
         elif tf_up_votes > tf_dn_votes:
@@ -3709,6 +3729,19 @@ class LiveTrader:
                 cl_agree = False
         if cl_agree:  score += 1
         else:         score -= 3
+
+        # Soft source-divergence penalty (no hard skip): discourages entries on feed mismatch.
+        if open_price > 0 and cl_now > 0 and rtds_now > 0:
+            div = abs(cl_now - rtds_now) / open_price
+            if div >= 0.0004:
+                div_pen = min(3, max(1, int(div / 0.0004)))
+                score -= div_pen
+                edge -= min(0.03, div * 3.0)
+                if self._noisy_log_enabled(f"data-div:{asset}:{duration}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[DATA-DIV]{RS} {asset} {duration}m cl={cl_now:.4f} rtds={rtds_now:.4f} "
+                        f"open={open_price:.4f} div={div*100:.3f}% (-{div_pen} score)"
+                    )
 
         # On-chain-first confidence: prefer authoritative open-price source + fresh oracle.
         open_src = self.open_prices_source.get(cid, "?")
