@@ -280,6 +280,7 @@ CHAINLINK_ABI = [
      "stateMutability":"view","type":"function"},
 ]
 SCAN_INTERVAL  = float(os.environ.get("SCAN_INTERVAL", "0.5"))
+MARKET_REFRESH_SEC = float(os.environ.get("MARKET_REFRESH_SEC", "30.0"))  # how often to re-fetch Gamma API (was every 0.5s = 600 req/min!)
 PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "5"))
 STATUS_INTERVAL= int(os.environ.get("STATUS_INTERVAL", "15"))
 ONCHAIN_SYNC_SEC = float(os.environ.get("ONCHAIN_SYNC_SEC", "2.0"))
@@ -1064,6 +1065,8 @@ class LiveTrader:
         self._scan_state_last   = None
         self._bank_state_last   = None
         self._open_ref_fetch_ts = {}
+        self._markets_cache_ts  = 0.0  # last time Gamma API was actually fetched
+        self._markets_cache_raw = {}   # cached raw market dicts (without mins_left — recalculated live)
         self.asset_cur_open     = {}   # asset → current market open price (for inter-market continuity)
         self.asset_prev_open    = {}   # asset → previous market open price
         self.active_mkts = {}
@@ -1077,6 +1080,7 @@ class LiveTrader:
         self._pending_absent_counts = {}  # cid -> consecutive sync cycles absent from on-chain/API
         self.seen            = set()
         self._session        = None   # persistent aiohttp session
+        self._http_429_backoff: dict = {}  # host -> backoff_until timestamp
         self._book_cache     = {}     # token_id -> {"ts_ms": float, "book": OrderBook}
         self._book_sem       = asyncio.Semaphore(max(1, BOOK_FETCH_CONCURRENCY))
         self._clob_market_ws = None
@@ -1633,6 +1637,12 @@ class LiveTrader:
             return False
 
     async def _http_get_json(self, url: str, params: dict | None = None, timeout: float = 8.0):
+        # Per-host 429 backoff: skip the request if we're in a backoff window.
+        import urllib.parse as _up
+        _host = _up.urlparse(url).netloc
+        _bt = self._http_429_backoff.get(_host, 0.0)
+        if _bt > _time.time():
+            raise RuntimeError(f"http 429 backoff active for {_host} ({_bt - _time.time():.0f}s left)")
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(
                 limit=max(1, HTTP_CONN_LIMIT),
@@ -1651,9 +1661,17 @@ class LiveTrader:
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as r:
+                if r.status == 429:
+                    retry_after = float(r.headers.get("Retry-After", "30"))
+                    self._http_429_backoff[_host] = _time.time() + max(30.0, retry_after)
+                    if self._should_log(f"429:{_host}", 60):
+                        print(f"{Y}[HTTP] 429 rate-limit from {_host} — backing off {retry_after:.0f}s{RS}")
+                    raise RuntimeError(f"http 429 {url}")
                 if r.status >= 400:
                     raise RuntimeError(f"http {r.status} {url}")
                 return await r.json()
+        except RuntimeError:
+            raise
         except Exception as e:
             self._errors.tick("http_get_json", print, err=e, every=20)
             raise
@@ -1748,7 +1766,7 @@ class LiveTrader:
             cached = self._book_cache.get(token_id)
             if cached and (now_ms - float(cached.get("ts_ms", 0.0))) <= BOOK_CACHE_TTL_MS:
                 return cached.get("book")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         async with self._book_sem:
             if not force_fresh:
                 now_ms = _time.time() * 1000.0
@@ -3478,7 +3496,7 @@ class LiveTrader:
             return
         contracts = {}
         rpc_epoch_local = -1
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while True:
             if self.w3 is None:
                 await asyncio.sleep(3)
@@ -3516,7 +3534,7 @@ class LiveTrader:
         while True:
             await asyncio.sleep(RPC_OPTIMIZE_SEC)
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 best_rpc = self._rpc_url
                 best_ms = self._rpc_stats.get(best_rpc, 1e18)
                 for rpc in POLYGON_RPCS:
@@ -3539,7 +3557,7 @@ class LiveTrader:
                 if best_rpc and best_rpc != self._rpc_url and best_ms + RPC_SWITCH_MARGIN_MS < current_ms:
                     try:
                         nw3 = self._build_w3(best_rpc, timeout=6)
-                        _ = await asyncio.get_event_loop().run_in_executor(None, lambda: nw3.eth.block_number)
+                        _ = await asyncio.get_running_loop().run_in_executor(None, lambda: nw3.eth.block_number)
                         self.w3 = nw3
                         self._rpc_url = best_rpc
                         self._rpc_epoch += 1
@@ -3643,15 +3661,29 @@ class LiveTrader:
 
     async def fetch_markets(self):
         now = datetime.now(timezone.utc).timestamp()
-        # Fetch all 5 series IN PARALLEL — ~27ms instead of 5×27ms+2.5s stagger
-        results = await asyncio.gather(
-            *[self._fetch_series(slug, info, now) for slug, info in SERIES.items()]
-        )
-        found = {}
-        for r in results:
-            found.update(r)
-        self.active_mkts = found
-        return found
+        # Only re-fetch Gamma API every MARKET_REFRESH_SEC (default 30s).
+        # Previously called every SCAN_INTERVAL (0.5s) = 600 HTTP requests/minute for data that barely changes.
+        # mins_left is always recalculated from end_ts so stale cache is safe.
+        if now - self._markets_cache_ts >= MARKET_REFRESH_SEC:
+            results = await asyncio.gather(
+                *[self._fetch_series(slug, info, now) for slug, info in SERIES.items()]
+            )
+            found = {}
+            for r in results:
+                found.update(r)
+            # Strip mins_left from cache — will be recalculated live on each use
+            self._markets_cache_raw = {cid: {k: v for k, v in m.items() if k != "mins_left"}
+                                        for cid, m in found.items()}
+            self._markets_cache_ts = now
+        # Rebuild active_mkts with fresh mins_left from end_ts
+        rebuilt = {}
+        for cid, m in self._markets_cache_raw.items():
+            end_ts = float(m.get("end_ts", 0))
+            if end_ts > 0 and end_ts > now:
+                rebuilt[cid] = dict(m)
+                rebuilt[cid]["mins_left"] = (end_ts - now) / 60.0
+        self.active_mkts = rebuilt
+        return rebuilt
 
     def _active_token_ids(self) -> set[str]:
         toks = set()
@@ -3891,7 +3923,7 @@ class LiveTrader:
             return ws_book
         if not CLOB_REST_FALLBACK_ENABLED:
             return None
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             book     = await self._get_order_book(token_id, force_fresh=True)
             tick     = float(book.tick_size or "0.01")
@@ -4066,7 +4098,7 @@ class LiveTrader:
         # CL is the resolution oracle — disagreement is a major red flag
         cl_agree = True
         if cl_now > 0 and open_price > 0:
-            if (is_up) != (cl_now > open_price):
+            if (is_up) != (cl_now >= open_price):   # >= matches resolution rule (tie → Up wins)
                 cl_agree = False
         if cl_agree:  score += CL_AGREE_SCORE_BONUS
         else:         score -= CL_DISAGREE_SCORE_PEN
@@ -4430,8 +4462,8 @@ class LiveTrader:
         if MAX_WIN_MODE:
             payout_up = 1.0 / max(up_price, 1e-9)
             payout_dn = 1.0 / max(1.0 - up_price, 1e-9)
-            ev_up = (prob_up * payout_up) - 1.0 - FEE_RATE_EST
-            ev_dn = (prob_down * payout_dn) - 1.0 - FEE_RATE_EST
+            ev_up = (prob_up * payout_up) - 1.0 - max(0.001, up_price * (1.0 - up_price) * 0.0624)
+            ev_dn = (prob_down * payout_dn) - 1.0 - max(0.001, (1.0 - up_price) * up_price * 0.0624)
             util_up = ev_up + edge_up * UTIL_EDGE_MULT
             util_dn = ev_dn + edge_down * UTIL_EDGE_MULT
             # Soft contextual prior from current event state (non-blocking).
@@ -4612,8 +4644,8 @@ class LiveTrader:
             and duration >= 15
             and open_price > 0
             and move_pct >= LATE_PAYOUT_RELAX_MIN_MOVE
-            and ((is_up and current >= open_price) or (not is_up and current < open_price))
-            and ((is_up and taker_ratio >= 0.52) or (not is_up and taker_ratio <= 0.48))
+            and ((side_up and current >= open_price) or (not side_up and current < open_price))
+            and ((side_up and taker_ratio >= 0.52) or (not side_up and taker_ratio <= 0.48))
         )
         if late_locked:
             true_prob = max(0.05, min(0.95, true_prob + LATE_PAYOUT_PROB_BOOST))
@@ -5210,7 +5242,10 @@ class LiveTrader:
                     )
                 self._skip_tick("payout_below")
                 return None
-        ev_net = (true_prob / max(entry, 1e-9)) - 1.0 - FEE_RATE_EST
+        # Polymarket fee is price-dependent: p*(1-p)*6.24% (parabolic, peaks at p=0.5).
+        # FEE_RATE_EST (flat 1.56%) overcounts fees on high-payout entries (e.g. p=0.20 → actual=1.0%).
+        _fee_dyn = max(0.001, entry * (1.0 - entry) * 0.0624)
+        ev_net = (true_prob / max(entry, 1e-9)) - 1.0 - _fee_dyn
         exec_slip_cost, exec_nofill_penalty, exec_fill_ratio = self._execution_penalties(duration, score, entry)
         execution_ev = ev_net - exec_slip_cost - exec_nofill_penalty
         if execution_ev < min_ev_req:
@@ -5242,7 +5277,7 @@ class LiveTrader:
                 # Entry-aware minimum probability: allow sub-2x only when posterior is strong enough.
                 # required_prob = breakeven(entry+fees) + safety margin increasing with expensive entries.
                 req_prob = (
-                    (entry * (1.0 + FEE_RATE_EST))
+                    (entry * (1.0 + _fee_dyn))
                     + EV_FRONTIER_MARGIN_BASE
                     + max(0.0, entry - 0.50) * EV_FRONTIER_MARGIN_HIGH_ENTRY
                 )
@@ -6344,7 +6379,7 @@ class LiveTrader:
 
         for attempt in range(max(1, ORDER_RETRY_MAX)):
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 slip_cap_bps = MAX_TAKER_SLIP_BPS_5M if duration <= 5 else MAX_TAKER_SLIP_BPS_15M
 
                 def _slip_bps(exec_price: float, ref_price: float) -> float:
@@ -6850,7 +6885,7 @@ class LiveTrader:
                         print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_floor:.2f} — price moved against us{RS}")
                         self._skip_tick("fallback_edge_below")
                         return None
-                    fresh_ev_net = (true_prob / max(fresh_ask, 1e-9)) - 1.0 - FEE_RATE_EST
+                    fresh_ev_net = (true_prob / max(fresh_ask, 1e-9)) - 1.0 - max(0.001, fresh_ask * (1.0 - fresh_ask) * 0.0624)
                     if fresh_ev_net < min_ev_fb:
                         print(f"{Y}[SKIP] {asset} {side} fallback ev_net={fresh_ev_net:.3f} < min={min_ev_fb:.3f}{RS}")
                         self._skip_tick("fallback_ev_below")
@@ -7006,7 +7041,7 @@ class LiveTrader:
              "stateMutability":"view","type":"function"},
         ]
         ctf  = self.w3.eth.contract(address=ctf_addr, abi=CTF_ABI_FULL)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         # USDC contract for immediate bankroll refresh after wins
         _usdc = self.w3.eth.contract(
             address=Web3.to_checksum_address(USDC_E),
@@ -7788,7 +7823,7 @@ class LiveTrader:
     async def _seed_binance_cache(self):
         """One-time REST seed so cache is ready before WS streams connect."""
         import requests as _req
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         for asset, sym in BNB_SYM.items():
             sym_api = sym.upper()
             try:
@@ -8914,7 +8949,7 @@ class LiveTrader:
         BTC/ETH update every ~27s → 60 rounds covers ~27 minutes lookback."""
         if self.w3 is None or asset not in CHAINLINK_FEEDS:
             return 0.0, "no-w3"
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             contract = self.w3.eth.contract(
                 address=Web3.to_checksum_address(CHAINLINK_FEEDS[asset]),
@@ -9295,16 +9330,8 @@ class LiveTrader:
                         # Unified direction: correlated assets move together — never hold Up + Down simultaneously
                         if pending_dn > 0 and sig["side"] == "Up":   continue
                         if pending_up > 0 and sig["side"] == "Down":  continue
-                    # Correlated Kelly: scale size by 1/sqrt(N) — applies even with TRADE_ALL_MARKETS
-                    # (correlated assets all moving same direction = single factor risk)
-                    if CORR_KELLY_ENABLED:
-                        _all_pending_up = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Up")
-                        _all_pending_dn = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Down")
-                        n_same = (_all_pending_up if sig["side"] == "Up" else _all_pending_dn) + 1
-                        if n_same > 1:
-                            import math as _math
-                            sig = dict(sig)
-                            sig["size"] = round(float(sig.get("size", 0) or 0) / _math.sqrt(n_same), 2)
+                    # NOTE: correlated Kelly sizing is handled by ROUND_CORR_SAME_SIDE_DECAY in execution path.
+                    # Removed scan_loop 1/sqrt(N) division to avoid double-applying the same reduction.
                     to_exec.append(sig)
                     m_sig = sig.get("m", {}) if isinstance(sig.get("m", {}), dict) else {}
                     t_sig = {
@@ -9348,7 +9375,7 @@ class LiveTrader:
                 continue
             tick += 1
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
 
                 # 1) On-chain wallet USDC + Polymarket positions fetched in parallel.
                 usdc_task = (
@@ -9835,7 +9862,7 @@ class LiveTrader:
                     continue  # still active — not resolved yet
                 api_last5.append(1 if by_cid[cid]["redeem"] else 0)
 
-            if total_bets > 0:
+            if total_bets > 0 and total_bets >= self.total:  # never go backwards (API can return partial page)
                 old_t, old_w = self.total, self.wins
                 self.total = total_bets
                 self.wins  = total_wins
@@ -9917,7 +9944,7 @@ class LiveTrader:
              "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],
              "stateMutability":"view","type":"function"},
         ])
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while True:
             try:
                 activity = await self._http_get_json(
@@ -10004,7 +10031,7 @@ class LiveTrader:
             await asyncio.sleep(300)
             try:
                 import requests as _req
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 positions = await loop.run_in_executor(None, lambda: _req.get(
                     "https://data-api.polymarket.com/positions",
                     params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "false"}, timeout=10
@@ -10151,7 +10178,7 @@ class LiveTrader:
             return
         while True:
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 hb_resp = await loop.run_in_executor(
                     None,
                     lambda: self.clob.post_heartbeat(self._heartbeat_id),
@@ -10179,7 +10206,7 @@ class LiveTrader:
             return
         while True:
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 rows = await loop.run_in_executor(None, self.clob.get_notifications)
                 if isinstance(rows, dict):
                     # Different wrappers sometimes return {"data":[...]}
