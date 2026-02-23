@@ -4174,6 +4174,38 @@ class LiveTrader:
                 pm_book_data = ws_side
             else:
                 pm_book_data = await self._fetch_pm_book_safe(token_id)
+        # Side/book sanity check: if chosen token ask is far from expected side price
+        # and opposite token aligns much better, swap to prevent inverted side execution.
+        def _best_ask_from(book):
+            if not book:
+                return 0.0
+            if isinstance(book, dict):
+                return float(book.get("best_ask", 0.0) or 0.0)
+            try:
+                _b, _a, _t = book
+                return float(_a or 0.0)
+            except Exception:
+                return 0.0
+
+        fair_side_entry = up_price if side == "Up" else (1.0 - up_price)
+        cur_ask = _best_ask_from(pm_book_data)
+        if fair_side_entry > 0 and cur_ask > 0 and abs(cur_ask - fair_side_entry) > 0.18:
+            alt_token_id = m["token_down"] if side == "Up" else m["token_up"]
+            alt_book = self._get_clob_ws_book(alt_token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+            if alt_book is None:
+                alt_book = await self._fetch_pm_book_safe(alt_token_id)
+            alt_ask = _best_ask_from(alt_book)
+            if alt_ask > 0:
+                cur_err = abs(cur_ask - fair_side_entry)
+                alt_err = abs(alt_ask - fair_side_entry)
+                if (alt_err + 0.03) < cur_err:
+                    if self._noisy_log_enabled(f"token-swap:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[TOKEN-SWAP]{RS} {asset} {duration}m {side} "
+                            f"ask(cur={cur_ask:.3f},alt={alt_ask:.3f},fair={fair_side_entry:.3f})"
+                        )
+                    token_id = alt_token_id
+                    pm_book_data = alt_book
 
         # ── Live CLOB price (more accurate than Gamma up_price) ──────────────
         live_entry = entry
