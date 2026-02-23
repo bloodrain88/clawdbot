@@ -1056,6 +1056,54 @@ class LiveTrader:
                 return False
         return True
 
+    def _coerce_json_list(self, v):
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            try:
+                x = json.loads(v)
+                return x if isinstance(x, list) else []
+            except Exception:
+                return []
+        return []
+
+    def _map_updown_market_fields(self, market: dict, fallback: dict | None = None) -> tuple[float, str, str]:
+        """Return (up_price, token_up, token_down) robustly from outcomes/tokens.
+        Prevents inverted side mapping when API ordering is not strictly [Up, Down]."""
+        fb = fallback or {}
+        outcomes = self._coerce_json_list((market or {}).get("outcomes")) or self._coerce_json_list(fb.get("outcomes"))
+        prices = self._coerce_json_list((market or {}).get("outcomePrices")) or self._coerce_json_list(fb.get("outcomePrices"))
+        tokens = self._coerce_json_list((market or {}).get("clobTokenIds")) or self._coerce_json_list(fb.get("clobTokenIds"))
+
+        idx_up = None
+        idx_down = None
+        for i, raw in enumerate(outcomes):
+            s = str(raw or "").strip().lower()
+            if idx_up is None and s in ("up", "higher", "above", "yes"):
+                idx_up = i
+            if idx_down is None and s in ("down", "lower", "below", "no"):
+                idx_down = i
+        if idx_up is None and idx_down is not None and len(tokens) >= 2:
+            idx_up = 1 - idx_down
+        if idx_down is None and idx_up is not None and len(tokens) >= 2:
+            idx_down = 1 - idx_up
+        if idx_up is None and len(tokens) > 0:
+            idx_up = 0
+        if idx_down is None and len(tokens) > 1:
+            idx_down = 1 if idx_up == 0 else 0
+
+        token_up = str(tokens[idx_up]) if (idx_up is not None and idx_up < len(tokens)) else (str(tokens[0]) if len(tokens) > 0 else "")
+        token_down = str(tokens[idx_down]) if (idx_down is not None and idx_down < len(tokens)) else (str(tokens[1]) if len(tokens) > 1 else "")
+
+        up_price = 0.5
+        pick = idx_up if idx_up is not None else 0
+        if len(prices) > pick:
+            try:
+                up_price = float(prices[pick])
+            except Exception:
+                up_price = 0.5
+        return up_price, token_up, token_down
+
     def _round_bounds_from_question(self, question: str) -> tuple[float, float]:
         """Best-effort exact ET round parsing from market title."""
         if not question:
@@ -3133,11 +3181,6 @@ class LiveTrader:
                 # This is when Chainlink locks the "price to beat" — must match exactly
                 start_str = (m_data.get("eventStartTime") or ev.get("startTime", ""))
                 cid       = m_data.get("conditionId", "") or ev.get("conditionId", "")
-                prices    = m_data.get("outcomePrices") or ev.get("outcomePrices")
-                tokens    = m_data.get("clobTokenIds") or ev.get("clobTokenIds") or []
-                if isinstance(tokens, str):
-                    try: tokens = json.loads(tokens)
-                    except: tokens = []
                 if not cid or not end_str or not start_str:
                     continue
                 try:
@@ -3147,11 +3190,7 @@ class LiveTrader:
                     continue
                 if end_ts <= now or start_ts > now + 60:
                     continue
-                try:
-                    if isinstance(prices, str): prices = json.loads(prices)
-                    up_price = float(prices[0]) if prices else 0.5
-                except:
-                    up_price = 0.5
+                up_price, token_up, token_down = self._map_updown_market_fields(m_data, fallback=ev)
                 result[cid] = {
                     "conditionId": cid,
                     "question":    q,
@@ -3161,8 +3200,8 @@ class LiveTrader:
                     "start_ts":    start_ts,
                     "up_price":    up_price,
                     "mins_left":   (end_ts - now) / 60,
-                    "token_up":    tokens[0] if len(tokens) > 0 else "",
-                    "token_down":  tokens[1] if len(tokens) > 1 else "",
+                    "token_up":    token_up,
+                    "token_down":  token_down,
                 }
         except Exception as e:
             print(f"{R}[FETCH] {slug}: {e}{RS}")
@@ -6636,12 +6675,7 @@ class LiveTrader:
                 if slug in SERIES:
                     duration = SERIES[slug]["duration"]
                     asset    = SERIES[slug]["asset"]
-                tokens = mkt.get("clobTokenIds") or []
-                if isinstance(tokens, str):
-                    try: tokens = json.loads(tokens)
-                    except: tokens = []
-                token_up   = tokens[0] if len(tokens) > 0 else ""
-                token_down = tokens[1] if len(tokens) > 1 else ""
+                _, token_up, token_down = self._map_updown_market_fields(mkt)
             except Exception as e:
                 print(f"{Y}[SYNC] Gamma lookup failed for {cid[:10]}: {e}{RS}")
             q_st, q_et = self._round_bounds_from_question(title)
@@ -8519,12 +8553,7 @@ class LiveTrader:
                         if slug in SERIES:
                             duration = SERIES[slug]["duration"]
                             asset    = SERIES[slug]["asset"]
-                        toks = mkt.get("clobTokenIds") or []
-                        if isinstance(toks, str):
-                            try: toks = json.loads(toks)
-                            except: toks = []
-                        token_up   = toks[0] if len(toks) > 0 else ""
-                        token_down = toks[1] if len(toks) > 1 else ""
+                        _, token_up, token_down = self._map_updown_market_fields(mkt)
                     except Exception:
                         pass
                     q_st, q_et = self._round_bounds_from_question(title)
@@ -8852,12 +8881,7 @@ class LiveTrader:
                         if slug in SERIES:
                             duration = SERIES[slug]["duration"]
                             asset    = SERIES[slug]["asset"]
-                        toks = mkt.get("clobTokenIds") or []
-                        if isinstance(toks, str):
-                            try: toks = json.loads(toks)
-                            except: toks = []
-                        token_up   = toks[0] if len(toks) > 0 else ""
-                        token_down = toks[1] if len(toks) > 1 else ""
+                        _, token_up, token_down = self._map_updown_market_fields(mkt)
                     except Exception:
                         pass
                     q_st, q_et = self._round_bounds_from_question(title)
