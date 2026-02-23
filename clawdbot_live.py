@@ -236,6 +236,15 @@ EVENT_ALIGN_CONTRA_EDGE_PEN = float(os.environ.get("EVENT_ALIGN_CONTRA_EDGE_PEN"
 EVENT_ALIGN_CONTRA_SIZE_MULT = float(os.environ.get("EVENT_ALIGN_CONTRA_SIZE_MULT", "0.55"))
 EVENT_ALIGN_WITH_SCORE_BONUS = int(os.environ.get("EVENT_ALIGN_WITH_SCORE_BONUS", "1"))
 EVENT_ALIGN_WITH_EDGE_BONUS = float(os.environ.get("EVENT_ALIGN_WITH_EDGE_BONUS", "0.004"))
+CORE_ENTRY_MIN = float(os.environ.get("CORE_ENTRY_MIN", "0.40"))
+CORE_ENTRY_MAX = float(os.environ.get("CORE_ENTRY_MAX", "0.60"))
+CORE_MIN_SCORE = int(os.environ.get("CORE_MIN_SCORE", "12"))
+CORE_MIN_EV = float(os.environ.get("CORE_MIN_EV", "0.020"))
+CORE_SIZE_BONUS = float(os.environ.get("CORE_SIZE_BONUS", "1.12"))
+CONTRARIAN_ENTRY_MAX = float(os.environ.get("CONTRARIAN_ENTRY_MAX", "0.30"))
+CONTRARIAN_SIZE_MULT = float(os.environ.get("CONTRARIAN_SIZE_MULT", "0.55"))
+CONTRARIAN_STRONG_SCORE = int(os.environ.get("CONTRARIAN_STRONG_SCORE", "20"))
+CONTRARIAN_STRONG_EV = float(os.environ.get("CONTRARIAN_STRONG_EV", "0.035"))
 EXTRA_SCORE_GATE_BTC_5M = int(os.environ.get("EXTRA_SCORE_GATE_BTC_5M", "1"))
 EXTRA_SCORE_GATE_XRP_15M = int(os.environ.get("EXTRA_SCORE_GATE_XRP_15M", "0"))
 EXPOSURE_CAP_TOTAL_TREND = float(os.environ.get("EXPOSURE_CAP_TOTAL_TREND", "0.80"))
@@ -499,6 +508,9 @@ SUPER_BET_MIN_SIZE_ENABLED = os.environ.get("SUPER_BET_MIN_SIZE_ENABLED", "true"
 SUPER_BET_ENTRY_MAX = float(os.environ.get("SUPER_BET_ENTRY_MAX", "0.30"))
 SUPER_BET_MIN_PAYOUT = float(os.environ.get("SUPER_BET_MIN_PAYOUT", "3.00"))
 SUPER_BET_MIN_SIZE_USDC = float(os.environ.get("SUPER_BET_MIN_SIZE_USDC", "5.0"))
+SUPER_BET_FLOOR_MIN_SCORE = int(os.environ.get("SUPER_BET_FLOOR_MIN_SCORE", "18"))
+SUPER_BET_FLOOR_MIN_EV = float(os.environ.get("SUPER_BET_FLOOR_MIN_EV", "0.030"))
+SUPER_BET_COOLDOWN_SEC = float(os.environ.get("SUPER_BET_COOLDOWN_SEC", "1200"))
 SUPER_BET_MAX_SIZE_ENABLED = os.environ.get("SUPER_BET_MAX_SIZE_ENABLED", "true").lower() == "true"
 SUPER_BET_MAX_SIZE_USDC = float(os.environ.get("SUPER_BET_MAX_SIZE_USDC", "10.0"))
 SUPER_BET_MAX_BANKROLL_PCT = float(os.environ.get("SUPER_BET_MAX_BANKROLL_PCT", "0.02"))
@@ -788,6 +800,7 @@ class LiveTrader:
         self._booster_used_by_cid = {}            # cid -> count of executed booster add-ons
         self._booster_consec_losses = 0
         self._booster_lock_until = 0.0
+        self._last_superbet_ts = 0.0
         self._redeem_tx_lock    = asyncio.Lock()  # serialize redeem txs to avoid nonce clashes
         self._nonce_mgr         = None
         self._errors            = ErrorTracker()
@@ -5011,14 +5024,21 @@ class LiveTrader:
         # for high-multiple entries (very low price), keep at least a meaningful notional.
         if SUPER_BET_MIN_SIZE_ENABLED:
             payout_mult = (1.0 / max(entry, 1e-9))
+            can_superbet = (
+                score >= SUPER_BET_FLOOR_MIN_SCORE
+                and execution_ev >= SUPER_BET_FLOOR_MIN_EV
+                and (_time.time() - float(self._last_superbet_ts or 0.0)) >= max(0.0, SUPER_BET_COOLDOWN_SEC)
+            )
             if (
                 duration >= 15
                 and entry <= SUPER_BET_ENTRY_MAX
                 and payout_mult >= SUPER_BET_MIN_PAYOUT
                 and size < SUPER_BET_MIN_SIZE_USDC
+                and can_superbet
             ):
                 old_size = size
                 size = min(hard_cap, max(size, SUPER_BET_MIN_SIZE_USDC))
+                self._last_superbet_ts = _time.time()
                 if self._noisy_log_enabled(f"superbet-floor:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                     print(
                         f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet floor "
@@ -5044,6 +5064,52 @@ class LiveTrader:
 
         if size < MIN_EXEC_NOTIONAL_USDC:
             return None
+
+        # Portfolio sizing mix (non-blocking):
+        # - core zone: slightly larger size
+        # - contrarian tails: keep smaller unless exceptionally strong
+        if duration >= 15 and (not booster_mode):
+            if (
+                CORE_ENTRY_MIN <= entry <= CORE_ENTRY_MAX
+                and score >= CORE_MIN_SCORE
+                and execution_ev >= CORE_MIN_EV
+            ):
+                old_size = float(size)
+                size = round(min(hard_cap, size * max(1.0, CORE_SIZE_BONUS)), 2)
+                if self._noisy_log_enabled(f"core-size-bonus:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{B}[SIZE-TUNE]{RS} {asset} {duration}m {side} core bonus "
+                        f"entry={entry:.3f} ${old_size:.2f}->${size:.2f}"
+                    )
+            elif entry <= CONTRARIAN_ENTRY_MAX:
+                strong_contra = (
+                    score >= CONTRARIAN_STRONG_SCORE
+                    and execution_ev >= CONTRARIAN_STRONG_EV
+                )
+                mult = 1.0 if strong_contra else max(0.20, min(1.0, CONTRARIAN_SIZE_MULT))
+                old_size = float(size)
+                size = round(max(float(MIN_EXEC_NOTIONAL_USDC), min(hard_cap, size * mult)), 2)
+                if self._noisy_log_enabled(f"contra-size-mult:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} contrarian "
+                        f"entry={entry:.3f} strong={strong_contra} x={mult:.2f} "
+                        f"${old_size:.2f}->${size:.2f}"
+                    )
+
+        # Event-context size modifier from soft alignment model.
+        if duration >= 15 and (not booster_mode):
+            try:
+                e_mult = max(0.20, min(1.20, float(event_align_size_mult)))
+            except Exception:
+                e_mult = 1.0
+            if abs(e_mult - 1.0) > 1e-9:
+                old_size = float(size)
+                size = round(max(float(MIN_EXEC_NOTIONAL_USDC), min(hard_cap, size * e_mult)), 2)
+                if self._noisy_log_enabled(f"event-align-size:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} event-align x={e_mult:.2f} "
+                        f"${old_size:.2f}->${size:.2f}"
+                    )
 
         # Mid-round (or anytime) additive booster on existing same-side position.
         # This is intentionally a separate, small bet with stricter quality filters.
@@ -5216,14 +5282,21 @@ class LiveTrader:
         # Final superbet/tail normalization after all decays.
         payout_mult = (1.0 / max(entry, 1e-9))
         if SUPER_BET_MIN_SIZE_ENABLED:
+            can_superbet = (
+                score >= SUPER_BET_FLOOR_MIN_SCORE
+                and execution_ev >= SUPER_BET_FLOOR_MIN_EV
+                and (_time.time() - float(self._last_superbet_ts or 0.0)) >= max(0.0, SUPER_BET_COOLDOWN_SEC)
+            )
             if (
                 duration >= 15
                 and entry <= SUPER_BET_ENTRY_MAX
                 and payout_mult >= SUPER_BET_MIN_PAYOUT
                 and size < SUPER_BET_MIN_SIZE_USDC
+                and can_superbet
             ):
                 old_size = float(size)
                 size = max(float(MIN_EXEC_NOTIONAL_USDC), min(hard_cap, float(SUPER_BET_MIN_SIZE_USDC)))
+                self._last_superbet_ts = _time.time()
                 if self._noisy_log_enabled(f"superbet-floor-final:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                     print(
                         f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet floor(final) "
@@ -7785,7 +7858,35 @@ class LiveTrader:
             lag_penalty -= 0.03
         if s_lat > 550:
             lag_penalty -= 0.03
-        return ev_net + edge * 0.35 + payout * 0.06 + score * 0.003 + cl_bonus + lag_penalty
+        wr_lb = float(sig.get("recent_side_wr_lb", 0.5) or 0.5)
+        wr_pen = 0.0
+        if wr_lb < 0.49:
+            wr_pen -= min(0.06, (0.49 - wr_lb) * 0.30)
+        elif wr_lb >= 0.55:
+            wr_pen += min(0.03, (wr_lb - 0.55) * 0.20)
+        # Portfolio-aware utility:
+        # keep contrarian opportunities, but avoid over-prioritizing low-cent tails.
+        low_cent_pen = 0.0
+        if entry <= CONTRARIAN_ENTRY_MAX and score < CONTRARIAN_STRONG_SCORE:
+            low_cent_pen -= min(0.08, (CONTRARIAN_ENTRY_MAX - entry) * 0.20)
+        core_bonus = 0.0
+        if (
+            CORE_ENTRY_MIN <= entry <= CORE_ENTRY_MAX
+            and score >= CORE_MIN_SCORE
+            and ev_net >= CORE_MIN_EV
+        ):
+            core_bonus += 0.03
+        return (
+            ev_net
+            + edge * 0.38
+            + payout * 0.03
+            + score * 0.003
+            + cl_bonus
+            + core_bonus
+            + low_cent_pen
+            + wr_pen
+            + lag_penalty
+        )
 
     def _regime_caps(self) -> tuple[float, float]:
         vals = []
