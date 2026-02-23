@@ -3341,7 +3341,8 @@ class LiveTrader:
         while True:
             try:
                 async with websockets.connect(
-                    RTDS, additional_headers={"Origin": "https://polymarket.com"}
+                    RTDS, additional_headers={"Origin": "https://polymarket.com"},
+                    compression=None,
                 ) as ws:
                     await ws.send(json.dumps({
                         "action": "subscribe",
@@ -3787,6 +3788,7 @@ class LiveTrader:
                     ping_interval=20,
                     ping_timeout=20,
                     max_size=2**22,
+                    compression=None,
                 ) as ws:
                     self._clob_market_ws = ws
                     self._clob_ws_assets_subscribed = set()
@@ -7738,7 +7740,7 @@ class LiveTrader:
         delay = 5
         while True:
             try:
-                async with _ws.connect(url, ping_interval=20, ping_timeout=30) as ws:
+                async with _ws.connect(url, ping_interval=20, ping_timeout=30, compression=None) as ws:
                     print(f"{G}[BNB-SPOT] WS connected{RS}")
                     delay = 5
                     async for raw in ws:
@@ -7779,7 +7781,7 @@ class LiveTrader:
         delay = 5
         while True:
             try:
-                async with _ws.connect(url, ping_interval=20, ping_timeout=30) as ws:
+                async with _ws.connect(url, ping_interval=20, ping_timeout=30, compression=None) as ws:
                     print(f"{G}[BNB-PERP] WS connected{RS}")
                     delay = 5
                     async for raw in ws:
@@ -7807,7 +7809,7 @@ class LiveTrader:
         delay = 5
         while True:
             try:
-                async with _ws.connect(url, ping_interval=20, ping_timeout=30) as ws:
+                async with _ws.connect(url, ping_interval=20, ping_timeout=30, compression=None) as ws:
                     print(f"{G}[BNB-AGG] aggTrade OFI stream connected{RS}")
                     delay = 5
                     async for raw in ws:
