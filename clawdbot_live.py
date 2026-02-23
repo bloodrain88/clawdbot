@@ -195,6 +195,12 @@ MIN_ENTRY_PRICE_15M = float(os.environ.get("MIN_ENTRY_PRICE_15M", "0.20"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.35"))
 MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.52"))
 MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "1.85"))
+# Late-window payout relaxation: aligned entry in last 28% of window → lower payout OK, win rate is higher
+LATE_PAYOUT_RELAX_ENABLED   = os.environ.get("LATE_PAYOUT_RELAX_ENABLED", "true").lower() == "true"
+LATE_PAYOUT_RELAX_PCT_LEFT  = float(os.environ.get("LATE_PAYOUT_RELAX_PCT_LEFT", "0.28"))   # last 28% of window
+LATE_PAYOUT_RELAX_MIN_MOVE  = float(os.environ.get("LATE_PAYOUT_RELAX_MIN_MOVE", "0.0025")) # 0.25% price move confirming direction
+LATE_PAYOUT_RELAX_FLOOR     = float(os.environ.get("LATE_PAYOUT_RELAX_FLOOR", "1.65"))      # accept 1.65x when late+locked
+LATE_PAYOUT_PROB_BOOST      = float(os.environ.get("LATE_PAYOUT_PROB_BOOST", "0.04"))       # true_prob boost for locked-direction entries
 MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.019"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
 HC15_ENABLED = os.environ.get("HC15_ENABLED", "false").lower() == "true"
@@ -844,6 +850,18 @@ CORR_KELLY_ENABLED       = os.environ.get("CORR_KELLY_ENABLED", "1") not in ("0"
 # Real-time OFI: rolling window for aggTrade stream (seconds)
 AGG_OFI_WINDOW_SEC       = float(os.environ.get("AGG_OFI_WINDOW_SEC", "30.0"))
 AGG_OFI_BLEND_W          = float(os.environ.get("AGG_OFI_BLEND_W", "0.60"))  # weight of aggOFI vs kline taker
+# Window-open OFI surge: when round just started and OFI is extreme → bonus score + prob boost
+OFI_SURGE_ENABLED        = os.environ.get("OFI_SURGE_ENABLED", "true").lower() == "true"
+OFI_SURGE_PCT_MIN        = float(os.environ.get("OFI_SURGE_PCT_MIN", "0.78"))    # ≥78% window remaining (first ~3.5 min of 15m)
+OFI_SURGE_WINDOW_SEC     = float(os.environ.get("OFI_SURGE_WINDOW_SEC", "10.0")) # last 10s aggTrade burst window
+OFI_SURGE_THRESH_UP      = float(os.environ.get("OFI_SURGE_THRESH_UP", "0.72"))  # ≥72% buy volume = surge Up
+OFI_SURGE_THRESH_DN      = float(os.environ.get("OFI_SURGE_THRESH_DN", "0.28"))  # ≤28% buy volume = surge Down
+OFI_SURGE_SCORE_BONUS    = int(os.environ.get("OFI_SURGE_SCORE_BONUS", "2"))
+OFI_SURGE_PROB_BOOST     = float(os.environ.get("OFI_SURGE_PROB_BOOST", "0.03"))
+# Cross-asset 3/4 consensus: relax min_score when all other assets confirm direction
+CROSS_CONSENSUS_ENABLED      = os.environ.get("CROSS_CONSENSUS_ENABLED", "true").lower() == "true"
+CROSS_CONSENSUS_MIN_COUNT    = int(os.environ.get("CROSS_CONSENSUS_MIN_COUNT", "3"))    # all 3 other assets agree
+CROSS_CONSENSUS_SCORE_RELAX  = int(os.environ.get("CROSS_CONSENSUS_SCORE_RELAX", "2")) # reduce required min_score by this
 SETUP_SCORE_SLACK_HIGH = int(os.environ.get("SETUP_SCORE_SLACK_HIGH", "12"))
 SETUP_SCORE_SLACK_MID = int(os.environ.get("SETUP_SCORE_SLACK_MID", "9"))
 SETUP_SLACK_HIGH = float(os.environ.get("SETUP_SLACK_HIGH", "0.02"))
@@ -4258,6 +4276,20 @@ class LiveTrader:
         if   cross_count == 3: score += 2   # all other assets confirm → strong macro signal
         elif cross_count >= 2: score += 1   # majority confirm
 
+        # Window-open OFI surge: fresh round + extreme aggTrade burst → strong directional signal
+        # Enter at price ~0.50 (2x payout) with 62-68% win probability when all assets moving together
+        ofi_surge_active = False
+        if (
+            OFI_SURGE_ENABLED
+            and pct_remaining >= OFI_SURGE_PCT_MIN
+            and duration >= 15
+        ):
+            surge_ofi = self._binance_agg_ofi(asset, window_sec=OFI_SURGE_WINDOW_SEC)
+            surge_confirms = (is_up and surge_ofi >= OFI_SURGE_THRESH_UP) or (not is_up and surge_ofi <= OFI_SURGE_THRESH_DN)
+            if surge_confirms:
+                score += OFI_SURGE_SCORE_BONUS
+                ofi_surge_active = True
+
         # BTC lead signal for non-BTC assets — BTC lagged move predicts altcoins (0–2 pts)
         if asset != "BTC":
             if   (is_up and btc_lead_p > BTC_LEAD_T2_UP) or (not is_up and btc_lead_p < BTC_LEAD_T2_DN): score += 2
@@ -4569,6 +4601,26 @@ class LiveTrader:
                         )
                     self._skip_tick("late_lock")
                     return None
+
+        # Late-window locked-direction prob boost:
+        # When in the last LATE_PAYOUT_RELAX_PCT_LEFT of the window AND price has already moved
+        # LATE_PAYOUT_RELAX_MIN_MOVE in our direction AND taker flow confirms → boost true_prob.
+        # This captures high-certainty entries where win rate is 72-78% but payout only 1.65-1.80x.
+        late_locked = (
+            LATE_PAYOUT_RELAX_ENABLED
+            and pct_remaining <= LATE_PAYOUT_RELAX_PCT_LEFT
+            and duration >= 15
+            and open_price > 0
+            and move_pct >= LATE_PAYOUT_RELAX_MIN_MOVE
+            and ((is_up and current >= open_price) or (not is_up and current < open_price))
+            and ((is_up and taker_ratio >= 0.52) or (not is_up and taker_ratio <= 0.48))
+        )
+        if late_locked:
+            true_prob = max(0.05, min(0.95, true_prob + LATE_PAYOUT_PROB_BOOST))
+
+        # OFI surge prob boost (already added score bonus above; now also boost probability)
+        if ofi_surge_active:
+            true_prob = max(0.05, min(0.95, true_prob + OFI_SURGE_PROB_BOOST))
 
         # Optional copyflow signal from externally ranked leader wallets on same market.
         copy_adj = 0
@@ -4948,6 +5000,14 @@ class LiveTrader:
             min_score_local = max(min_score_local, MIN_SCORE_GATE_15M)
         if arm_active:
             min_score_local = max(0, min_score_local - 2)
+        # Cross-asset 3/4 consensus override: all other assets confirm same direction.
+        # Macro move confirmed by all assets → relax min_score (but never below 4).
+        if (
+            CROSS_CONSENSUS_ENABLED
+            and cross_count >= CROSS_CONSENSUS_MIN_COUNT
+            and duration >= 15
+        ):
+            min_score_local = max(4, min_score_local - CROSS_CONSENSUS_SCORE_RELAX)
         if score < min_score_local:
             return None
 
@@ -5078,6 +5138,18 @@ class LiveTrader:
             else:
                 dyn_floor = 1.62
             min_payout_req = max(min_payout_req, dyn_floor)
+        # Late-window locked-direction payout relax:
+        # Win rate is ~72-78% in last LATE_PAYOUT_RELAX_PCT_LEFT of window → 1.65x payout is +EV.
+        # This recovers the 33% skip rate from payout_below on late-window aligned entries.
+        if (
+            LATE_PAYOUT_RELAX_ENABLED
+            and duration >= 15
+            and pct_remaining <= LATE_PAYOUT_RELAX_PCT_LEFT
+            and move_pct >= LATE_PAYOUT_RELAX_MIN_MOVE
+            and open_price > 0 and current > 0
+            and ((side == "Up" and current >= open_price) or (side == "Down" and current < open_price))
+        ):
+            min_payout_req = min(min_payout_req, LATE_PAYOUT_RELAX_FLOOR)
         min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
         if ws_fresh and cl_fresh and vol_fresh and mins_left >= (FRESH_RELAX_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else FRESH_RELAX_MIN_LEFT_5M):
             max_entry_allowed = min(FRESH_RELAX_ENTRY_CAP, max_entry_allowed + FRESH_RELAX_ENTRY_ADD)
@@ -5508,17 +5580,32 @@ class LiveTrader:
                         f"entry={entry:.3f} ${old_size:.2f}->${size:.2f}"
                     )
             elif entry <= CONTRARIAN_ENTRY_MAX:
+                # OFI surge confirming contrarian direction lowers strong_contra threshold.
+                # Reversal at extreme price + burst of buying = high payout near-certain reversal.
+                contra_score_thresh = CONTRARIAN_STRONG_SCORE - (2 if ofi_surge_active else 0)
                 strong_contra = (
-                    score >= CONTRARIAN_STRONG_SCORE
+                    score >= contra_score_thresh
                     and execution_ev >= CONTRARIAN_STRONG_EV
                 )
-                mult = 1.0 if strong_contra else max(CONTRARIAN_SIZE_MIN_MULT, min(1.0, CONTRARIAN_SIZE_MULT))
+                # Super-strong contrarian: surge + consensus + very high score → slight oversize
+                super_contra = (
+                    strong_contra
+                    and ofi_surge_active
+                    and cross_count >= 2
+                    and score >= (CONTRARIAN_STRONG_SCORE + 2)
+                )
+                if super_contra:
+                    mult = 1.15
+                elif strong_contra:
+                    mult = 1.0
+                else:
+                    mult = max(CONTRARIAN_SIZE_MIN_MULT, min(1.0, CONTRARIAN_SIZE_MULT))
                 old_size = float(size)
                 size = round(max(float(MIN_EXEC_NOTIONAL_USDC), min(hard_cap, size * mult)), 2)
                 if self._noisy_log_enabled(f"contra-size-mult:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                     print(
                         f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} contrarian "
-                        f"entry={entry:.3f} strong={strong_contra} x={mult:.2f} "
+                        f"entry={entry:.3f} strong={strong_contra} super={super_contra} x={mult:.2f} "
                         f"${old_size:.2f}->${size:.2f}"
                     )
 
