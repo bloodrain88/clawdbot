@@ -16,7 +16,15 @@ SETUP:
 import asyncio
 import aiohttp
 import websockets
-import json
+try:
+    import orjson as _orjson
+    class json:  # type: ignore
+        loads  = staticmethod(_orjson.loads)
+        dumps  = staticmethod(lambda obj, **kw: _orjson.dumps(obj).decode())
+        load   = staticmethod(__import__("json").load)
+        dump   = staticmethod(__import__("json").dump)
+except ImportError:
+    import json
 import math
 import csv
 import os
@@ -247,10 +255,10 @@ CORE_ENTRY_MAX = float(os.environ.get("CORE_ENTRY_MAX", "0.60"))
 CORE_MIN_SCORE = int(os.environ.get("CORE_MIN_SCORE", "12"))
 CORE_MIN_EV = float(os.environ.get("CORE_MIN_EV", "0.020"))
 CORE_SIZE_BONUS = float(os.environ.get("CORE_SIZE_BONUS", "1.12"))
-CONTRARIAN_ENTRY_MAX = float(os.environ.get("CONTRARIAN_ENTRY_MAX", "0.30"))
-CONTRARIAN_SIZE_MULT = float(os.environ.get("CONTRARIAN_SIZE_MULT", "0.55"))
-CONTRARIAN_STRONG_SCORE = int(os.environ.get("CONTRARIAN_STRONG_SCORE", "20"))
-CONTRARIAN_STRONG_EV = float(os.environ.get("CONTRARIAN_STRONG_EV", "0.035"))
+CONTRARIAN_ENTRY_MAX = float(os.environ.get("CONTRARIAN_ENTRY_MAX", "0.25"))   # was 0.30; empirical: <20¢ contracts underperform implied odds
+CONTRARIAN_SIZE_MULT = float(os.environ.get("CONTRARIAN_SIZE_MULT", "0.35"))   # was 0.55; smaller position for negative-EV-biased entries
+CONTRARIAN_STRONG_SCORE = int(os.environ.get("CONTRARIAN_STRONG_SCORE", "22")) # was 20; require very strong signal to counter structural bias
+CONTRARIAN_STRONG_EV = float(os.environ.get("CONTRARIAN_STRONG_EV", "0.080"))  # was 0.035; need large edge to overcome empirical underperformance bias
 EXTRA_SCORE_GATE_BTC_5M = int(os.environ.get("EXTRA_SCORE_GATE_BTC_5M", "1"))
 EXTRA_SCORE_GATE_XRP_15M = int(os.environ.get("EXTRA_SCORE_GATE_XRP_15M", "0"))
 EXPOSURE_CAP_TOTAL_TREND = float(os.environ.get("EXPOSURE_CAP_TOTAL_TREND", "0.80"))
