@@ -276,6 +276,8 @@ LOG_SCAN_ON_CHANGE_ONLY = os.environ.get("LOG_SCAN_ON_CHANGE_ONLY", "true").lowe
 LOG_FLOW_EVERY_SEC = int(os.environ.get("LOG_FLOW_EVERY_SEC", "300"))
 LOG_ROUND_EMPTY_EVERY_SEC = int(os.environ.get("LOG_ROUND_EMPTY_EVERY_SEC", "30"))
 LOG_SETTLE_FIRST_EVERY_SEC = int(os.environ.get("LOG_SETTLE_FIRST_EVERY_SEC", "20"))
+SETTLE_FIRST_REQUIRE_ONCHAIN_CLAIMABLE = os.environ.get("SETTLE_FIRST_REQUIRE_ONCHAIN_CLAIMABLE", "true").lower() == "true"
+SETTLE_FIRST_FORCE_BLOCK_AFTER_MIN = float(os.environ.get("SETTLE_FIRST_FORCE_BLOCK_AFTER_MIN", "6.0"))
 LOG_BANK_EVERY_SEC = int(os.environ.get("LOG_BANK_EVERY_SEC", "45"))
 LOG_BANK_MIN_DELTA = float(os.environ.get("LOG_BANK_MIN_DELTA", "0.50"))
 LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
@@ -7779,13 +7781,37 @@ class LiveTrader:
             # Settlement always has priority over new entries.
             await self._resolve()
             if self.pending_redeem:
-                if self._should_log("settle-first", LOG_SETTLE_FIRST_EVERY_SEC):
-                    print(
-                        f"{Y}[SETTLE-FIRST]{RS} pending_redeem={len(self.pending_redeem)} "
-                        f"— skipping new entries until win/loss is finalized on-chain"
+                pending_n = len(self.pending_redeem)
+                claimable_n = int(self.onchain_redeemable_count or 0)
+                oldest_q_min = 0.0
+                if self._redeem_queued_ts:
+                    try:
+                        now_q = _time.time()
+                        oldest_q = min(float(v or now_q) for v in self._redeem_queued_ts.values())
+                        oldest_q_min = max(0.0, (now_q - oldest_q) / 60.0)
+                    except Exception:
+                        oldest_q_min = 0.0
+                should_block_settle = True
+                if SETTLE_FIRST_REQUIRE_ONCHAIN_CLAIMABLE:
+                    should_block_settle = (
+                        (claimable_n > 0)
+                        or (oldest_q_min >= max(0.0, SETTLE_FIRST_FORCE_BLOCK_AFTER_MIN))
                     )
-                await asyncio.sleep(SCAN_INTERVAL)
-                continue
+                if should_block_settle:
+                    if self._should_log("settle-first", LOG_SETTLE_FIRST_EVERY_SEC):
+                        print(
+                            f"{Y}[SETTLE-FIRST]{RS} pending_redeem={pending_n} "
+                            f"(claimable={claimable_n}, oldest={oldest_q_min:.1f}m) "
+                            f"— skipping new entries until win/loss is finalized on-chain"
+                        )
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    continue
+                if self._should_log("settle-first-soft", LOG_SETTLE_FIRST_EVERY_SEC):
+                    print(
+                        f"{Y}[SETTLE-FIRST-SOFT]{RS} pending_redeem={pending_n} "
+                        f"(claimable={claimable_n}, oldest={oldest_q_min:.1f}m) "
+                        f"— continue scanning while waiting on redeem claimability"
+                    )
             if self._pause_entries_until > _time.time():
                 if self._should_log("pause-entries", LOG_SETTLE_FIRST_EVERY_SEC):
                     rem_s = max(0.0, self._pause_entries_until - _time.time())
