@@ -5419,6 +5419,25 @@ class LiveTrader:
             sig = await self._maybe_wait_for_better_entry(sig)
             if sig is None:
                 return
+            # Side/token integrity check before execution:
+            # ensures we are sending BUY on the token corresponding to the normalized side.
+            token_up = str((m or {}).get("token_up", "") or "")
+            token_down = str((m or {}).get("token_down", "") or "")
+            expected_token = token_up if sig.get("side") == "Up" else (token_down if sig.get("side") == "Down" else "")
+            actual_token = str(sig.get("token_id", "") or "")
+            if expected_token and actual_token and expected_token != actual_token:
+                print(
+                    f"{R}[SIDE-CHECK]{RS} BLOCK {sig.get('asset','?')} {sig.get('duration',0)}m "
+                    f"side={sig.get('side','?')} expected_token={expected_token[:10]}.. "
+                    f"actual_token={actual_token[:10]}.. cid={self._short_cid(sig.get('cid',''))}"
+                )
+                return
+            if self._noisy_log_enabled(f"side-check:{sig.get('asset','?')}:{sig.get('cid','')}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{B}[SIDE-CHECK]{RS} OK {sig.get('asset','?')} {sig.get('duration',0)}m "
+                    f"side={sig.get('side','?')} token={actual_token[:10]}.. "
+                    f"cid={self._short_cid(sig.get('cid',''))}"
+                )
             t_ord = _time.perf_counter()
             exec_result = await self._place_order(
                 sig["token_id"], sig["side"], sig["entry"], sig["size"],
@@ -6432,6 +6451,12 @@ class LiveTrader:
                         print(f"{Y}[REDEEM] Ambiguous numerators for {asset} cid={cid[:10]}... n0={n0} n1={n1}{RS}")
                         continue
                     won = (winner == side)
+                    if self._noisy_log_enabled(f"settle-check:{cid}", LOG_REDEEM_WAIT_EVERY_SEC):
+                        print(
+                            f"{B}[SETTLE-CHECK]{RS} cid={self._short_cid(cid)} "
+                            f"side={side} winner={winner} won={won} "
+                            f"num0={int(n0)} num1={int(n1)} src={winner_source}"
+                        )
                     size   = trade.get("size", 0)
                     entry  = trade.get("entry", 0.5)
                     size_f = float(size or 0.0)
