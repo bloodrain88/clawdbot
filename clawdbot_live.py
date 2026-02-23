@@ -2763,6 +2763,7 @@ class LiveTrader:
                     side_stake = spent
                 mark_pnl = value_now - spent
                 c_mark = G if mark_pnl > 0 else (R if mark_pnl < 0 else Y)
+                mark_roi = (mark_pnl / spent * 100.0) if spent > 0 else 0.0
                 if lead >= n and n > 0:
                     now_state = "WINNING"
                     c_now = G
@@ -2778,8 +2779,9 @@ class LiveTrader:
                         f"{Y}SIDE{RS}={side_lbl} (${side_stake:.2f}) | "
                         f"{c_now}NOW{RS}={c_now}{now_state}{RS} | "
                         f"{Y}SPENT{RS}=${spent:.2f} | "
-                        f"{B}MARK{RS}=${value_now:.2f} | "
-                        f"{c_mark}P&L_MARK{RS}={c_mark}${mark_pnl:+.2f}{RS} | "
+                        f"{B}REAL_MARK{RS}=${value_now:.2f} | "
+                        f"{c_mark}REAL_PNL_NOW{RS}={c_mark}${mark_pnl:+.2f}{RS} | "
+                        f"{c_mark}REAL_ROI_NOW{RS}={c_mark}{mark_roi:+.1f}%{RS} | "
                         f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c"
                     )
                 else:
@@ -2788,9 +2790,11 @@ class LiveTrader:
                         f"{Y}SIDE{RS}={side_lbl} (${side_stake:.2f}) | "
                         f"{c_now}NOW{RS}={c_now}{now_state}{RS} | "
                         f"{Y}SPENT{RS}=${spent:.2f} | "
-                        f"{B}MARK{RS}=${value_now:.2f} | "
-                        f"{G}IF_WIN{RS}=${win_payout:.2f} | "
-                        f"{c_pl}PROFIT_IF_WIN{RS}={c_pl}${win_profit:+.2f}{RS} | "
+                        f"{B}REAL_MARK{RS}=${value_now:.2f} | "
+                        f"{c_mark}REAL_PNL_NOW{RS}={c_mark}${mark_pnl:+.2f}{RS} | "
+                        f"{c_mark}REAL_ROI_NOW{RS}={c_mark}{mark_roi:+.1f}%{RS} | "
+                        f"{G}SCENARIO_IF_WIN{RS}=${win_payout:.2f} | "
+                        f"{c_pl}SCENARIO_PROFIT_IF_WIN{RS}={c_pl}${win_profit:+.2f}{RS} | "
                         f"{B}x{RS}{mult:.2f} | "
                         f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c | "
                         f"{c_lead}LEAD{RS}={lead}/{n}"
