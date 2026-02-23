@@ -447,6 +447,10 @@ LOW_ENTRY_HIGH_CONV_SOFT_MAX = float(os.environ.get("LOW_ENTRY_HIGH_CONV_SOFT_MA
 PREBID_ARM_ENABLED = os.environ.get("PREBID_ARM_ENABLED", "true").lower() == "true"
 PREBID_MIN_CONF = float(os.environ.get("PREBID_MIN_CONF", "0.58"))
 PREBID_ARM_WINDOW_SEC = float(os.environ.get("PREBID_ARM_WINDOW_SEC", "30"))
+NEXT_MARKET_ANALYSIS_ENABLED = os.environ.get("NEXT_MARKET_ANALYSIS_ENABLED", "true").lower() == "true"
+NEXT_MARKET_ANALYSIS_WINDOW_SEC = float(os.environ.get("NEXT_MARKET_ANALYSIS_WINDOW_SEC", "180"))
+NEXT_MARKET_ANALYSIS_LOG_EVERY_SEC = float(os.environ.get("NEXT_MARKET_ANALYSIS_LOG_EVERY_SEC", "15"))
+NEXT_MARKET_ANALYSIS_MIN_CONF = float(os.environ.get("NEXT_MARKET_ANALYSIS_MIN_CONF", "0.56"))
 ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
 ORDER_FAST_MODE = os.environ.get("ORDER_FAST_MODE", "true").lower() == "true"
 MAKER_POLL_5M_SEC = float(os.environ.get("MAKER_POLL_5M_SEC", "0.15"))
@@ -8610,26 +8614,49 @@ class LiveTrader:
             for cid, m in markets.items():
                 if m["start_ts"] > now:
                     sec_to_start = m["start_ts"] - now
-                    if sec_to_start <= 120:
+                    if NEXT_MARKET_ANALYSIS_ENABLED and sec_to_start <= max(30.0, NEXT_MARKET_ANALYSIS_WINDOW_SEC):
                         flow_pre = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
+                        upc = dnc = 0.0
                         if isinstance(flow_pre, dict):
                             upc = float(flow_pre.get("Up", 0.0) or 0.0)
                             dnc = float(flow_pre.get("Down", 0.0) or 0.0)
-                            if (upc + dnc) > 0 and self._should_log(f"prebid:{cid}", 30):
-                                side_pre = "Up" if upc >= dnc else "Down"
-                                conf_pre = max(upc, dnc)
-                                if PREBID_ARM_ENABLED and conf_pre >= PREBID_MIN_CONF:
-                                    self._prebid_plan[cid] = {
-                                        "side": side_pre,
-                                        "conf": conf_pre,
-                                        "start_ts": float(m.get("start_ts", now)),
-                                        "armed_at": _time.time(),
-                                    }
-                                print(
-                                    f"{B}[PRE-BID]{RS} {m.get('asset','?')} {m.get('duration',0)}m "
-                                    f"starts in {sec_to_start:.0f}s | side={side_pre} conf={conf_pre:.2f} "
-                                    f"rk={self._round_key(cid=cid, m=m)}"
-                                )
+                        flow_dom = (upc - dnc) if (upc + dnc) > 0 else 0.0
+                        flow_conf = max(upc, dnc) if (upc + dnc) > 0 else 0.0
+                        asset_pre = str(m.get("asset", "") or "")
+                        dur_pre = int(m.get("duration", 0) or 0)
+                        mom_up = float(self._momentum_prob(asset_pre, seconds=60))
+                        ob = float(self._binance_imbalance(asset_pre))
+                        tk_ratio, _ = self._binance_taker_flow(asset_pre)
+                        perp_basis, _ = self._binance_perp_signals(asset_pre)
+                        # Pre-open side prior from live feeds (non-blocking, quickly recomputed each scan).
+                        up_score = (
+                            (mom_up - 0.5) * 1.20
+                            + max(-0.25, min(0.25, ob * 0.35))
+                            + max(-0.20, min(0.20, (float(tk_ratio) - 0.5) * 0.90))
+                            + max(-0.12, min(0.12, flow_dom * 0.60))
+                            + max(-0.08, min(0.08, float(perp_basis) * 30.0))
+                        )
+                        side_pre = "Up" if up_score >= 0 else "Down"
+                        conf_pre = max(0.50, min(0.92, 0.50 + abs(up_score)))
+                        # If copyflow is materially strong and disagrees, reduce confidence.
+                        if flow_conf >= 0.60:
+                            side_flow = "Up" if upc >= dnc else "Down"
+                            if side_flow != side_pre:
+                                conf_pre = max(0.50, conf_pre - min(0.18, flow_conf - 0.50))
+                        if PREBID_ARM_ENABLED and conf_pre >= max(PREBID_MIN_CONF, NEXT_MARKET_ANALYSIS_MIN_CONF):
+                            self._prebid_plan[cid] = {
+                                "side": side_pre,
+                                "conf": conf_pre,
+                                "start_ts": float(m.get("start_ts", now)),
+                                "armed_at": _time.time(),
+                            }
+                        if self._should_log(f"next-analysis:{cid}", NEXT_MARKET_ANALYSIS_LOG_EVERY_SEC):
+                            print(
+                                f"{B}[NEXT-ANALYSIS]{RS} {asset_pre} {dur_pre}m starts in {sec_to_start:.0f}s | "
+                                f"side={side_pre} conf={conf_pre:.2f} "
+                                f"(mom={mom_up:.2f} ob={ob:+.2f} tk={float(tk_ratio):.2f} flow={flow_dom:+.2f}) | "
+                                f"rk={self._round_key(cid=cid, m=m)}"
+                            )
                     continue
                 if (m["end_ts"] - now) / 60 < 1: continue
                 eligible_started += 1
