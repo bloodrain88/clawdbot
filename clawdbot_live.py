@@ -4296,7 +4296,7 @@ class LiveTrader:
                 and tf_votes >= 3
                 and cl_agree
             )
-            if core_payout + 1e-9 < CONSISTENCY_MIN_PAYOUT_15M and (not core_strong):
+            if core_payout + 1e-9 < CONSISTENCY_MIN_PAYOUT_15M:
                 if self._noisy_log_enabled(f"skip-consistency-payout:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(
                         f"{Y}[SKIP] {asset} {duration}m consistency payout="
