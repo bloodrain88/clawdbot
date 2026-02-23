@@ -6730,10 +6730,14 @@ class LiveTrader:
             elif cid in self.pending:
                 # Update end_ts and market data on existing pending entry
                 old_m, old_t = self.pending[cid]
+                prev_side = str(old_t.get("side", "") or "")
                 old_m.update({"end_ts": end_ts, "start_ts": start_ts, "duration": duration,
                                "asset": asset, "token_up": token_up, "token_down": token_down})
                 old_t.update({"end_ts": end_ts, "asset": asset, "duration": duration,
+                               "side": outcome,
                                "token_id": token_up if outcome == "Up" else token_down})
+                if prev_side and prev_side != outcome:
+                    print(f"{Y}[SYNC-SIDE]{RS} {title[:40]} side corrected {prev_side}->{outcome}")
                 # Keep local core parameters stable once locked (no local average overwrite).
                 if not bool(old_t.get("core_entry_locked", False)):
                     if rec_spent > 0:
