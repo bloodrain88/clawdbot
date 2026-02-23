@@ -4042,7 +4042,7 @@ class LiveTrader:
             ev_up = (prob_up * payout_up) - 1.0 - FEE_RATE_EST
             ev_dn = (prob_down * payout_dn) - 1.0 - FEE_RATE_EST
             util_up = ev_up + edge_up * 0.35
-            util_dn = ev_dn + edge_dn * 0.35
+            util_dn = ev_dn + edge_down * 0.35
             # Soft contextual prior from current event state (non-blocking).
             if duration >= 15 and open_price > 0 and current > 0 and mins_left <= EVENT_ALIGN_MIN_LEFT_15M:
                 mv = (current - open_price) / max(open_price, 1e-9)
