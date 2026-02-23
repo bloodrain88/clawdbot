@@ -107,3 +107,24 @@ Ogni modifica che impatta trading/runtime deve aggiungere una nuova entry con:
   - Addon/booster non deve assimilarsi alla media core lato bot.
 - Rollback:
   - `git revert 5fcf679`
+
+### Commit `consistency-profit-tuning`
+- Scope: `clawdbot_live.py`
+- Summary:
+  - Profilo `consistency-first` rinforzato per core 15m:
+    - `CONSISTENCY_MIN_PAYOUT_15M` alzato a `2.00x` (default).
+    - Core trade bloccati sotto payout floor salvo setup `strong-core`.
+  - Nuovo filtro matematico `asset-side quality` basato su esiti realizzati on-chain:
+    - metriche: `n`, `profit factor`, `expectancy` da `side_perf`.
+    - penalita' dinamica su rami deboli (`score/edge`).
+    - blocco hard su rami persistentemente negativi.
+  - Obiettivo operativo:
+    - ridurre sequenze LLLWW da branch con expectancy negativa,
+    - mantenere continuita' su branch con edge storico positivo.
+- Feed/infra status intent:
+  - Nessun cambio su WS/CLOB heartbeat o trasporto dati.
+- Risk/position:
+  - Nessun averaging forzato aggiunto.
+  - Nessun aumento aggressivo della size; filtro quality agisce prima del sizing.
+- Rollback:
+  - `git revert <sha-commit>`

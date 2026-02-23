@@ -448,6 +448,25 @@ ENTRY_WAIT_TARGET_DROP_ABS = float(os.environ.get("ENTRY_WAIT_TARGET_DROP_ABS", 
 ENTRY_WAIT_MAX_SCORE_DECAY = int(os.environ.get("ENTRY_WAIT_MAX_SCORE_DECAY", "2"))
 ENTRY_WAIT_MAX_PROB_DECAY = float(os.environ.get("ENTRY_WAIT_MAX_PROB_DECAY", "0.03"))
 ENTRY_WAIT_MAX_EDGE_DECAY = float(os.environ.get("ENTRY_WAIT_MAX_EDGE_DECAY", "0.02"))
+CONSISTENCY_CORE_ENABLED = os.environ.get("CONSISTENCY_CORE_ENABLED", "true").lower() == "true"
+CONSISTENCY_REQUIRE_CL_AGREE_15M = os.environ.get("CONSISTENCY_REQUIRE_CL_AGREE_15M", "true").lower() == "true"
+CONSISTENCY_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_MIN_TRUE_PROB_15M", "0.62"))
+CONSISTENCY_MIN_EXEC_EV_15M = float(os.environ.get("CONSISTENCY_MIN_EXEC_EV_15M", "0.020"))
+CONSISTENCY_MIN_TF_VOTES_15M = int(os.environ.get("CONSISTENCY_MIN_TF_VOTES_15M", "2"))
+CONSISTENCY_MAX_ENTRY_15M = float(os.environ.get("CONSISTENCY_MAX_ENTRY_15M", "0.60"))
+CONSISTENCY_MIN_PAYOUT_15M = float(os.environ.get("CONSISTENCY_MIN_PAYOUT_15M", "2.00"))
+CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M = float(os.environ.get("CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M", "0.78"))
+CONSISTENCY_STRONG_MIN_SCORE_15M = int(os.environ.get("CONSISTENCY_STRONG_MIN_SCORE_15M", "14"))
+CONSISTENCY_STRONG_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_STRONG_MIN_TRUE_PROB_15M", "0.72"))
+CONSISTENCY_STRONG_MIN_EXEC_EV_15M = float(os.environ.get("CONSISTENCY_STRONG_MIN_EXEC_EV_15M", "0.030"))
+ASSET_QUALITY_FILTER_ENABLED = os.environ.get("ASSET_QUALITY_FILTER_ENABLED", "true").lower() == "true"
+ASSET_QUALITY_MIN_TRADES = int(os.environ.get("ASSET_QUALITY_MIN_TRADES", "12"))
+ASSET_QUALITY_MIN_PF = float(os.environ.get("ASSET_QUALITY_MIN_PF", "0.98"))
+ASSET_QUALITY_MIN_EXP = float(os.environ.get("ASSET_QUALITY_MIN_EXP", "0.00"))
+ASSET_QUALITY_SCORE_PENALTY = int(os.environ.get("ASSET_QUALITY_SCORE_PENALTY", "2"))
+ASSET_QUALITY_EDGE_PENALTY = float(os.environ.get("ASSET_QUALITY_EDGE_PENALTY", "0.010"))
+ASSET_QUALITY_BLOCK_PF = float(os.environ.get("ASSET_QUALITY_BLOCK_PF", "0.88"))
+ASSET_QUALITY_BLOCK_EXP = float(os.environ.get("ASSET_QUALITY_BLOCK_EXP", "-0.25"))
 MAX_WIN_MODE = os.environ.get("MAX_WIN_MODE", "true").lower() == "true"
 WINMODE_MIN_TRUE_PROB_5M = float(os.environ.get("WINMODE_MIN_TRUE_PROB_5M", "0.58"))
 WINMODE_MIN_TRUE_PROB_15M = float(os.environ.get("WINMODE_MIN_TRUE_PROB_15M", "0.60"))
@@ -3780,6 +3799,26 @@ class LiveTrader:
         cl_agree = True
         if cl_now > 0 and open_price > 0:
             cl_agree = (cl_now > open_price) == side_up
+        if ASSET_QUALITY_FILTER_ENABLED:
+            q_n, q_pf, q_exp = self._asset_side_quality(asset, side)
+            if q_n >= max(1, ASSET_QUALITY_MIN_TRADES):
+                if q_pf <= ASSET_QUALITY_BLOCK_PF and q_exp <= ASSET_QUALITY_BLOCK_EXP:
+                    if self._noisy_log_enabled(f"skip-asset-quality-block:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[SKIP] {asset} {duration}m quality-block {side} "
+                            f"(n={q_n} pf={q_pf:.2f} exp={q_exp:+.2f}){RS}"
+                        )
+                    self._skip_tick("asset_quality_block")
+                    return None
+                if q_pf < ASSET_QUALITY_MIN_PF or q_exp < ASSET_QUALITY_MIN_EXP:
+                    score -= ASSET_QUALITY_SCORE_PENALTY
+                    edge -= ASSET_QUALITY_EDGE_PENALTY
+                    if self._noisy_log_enabled(f"asset-quality-pen:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[ASSET-QUALITY]{RS} {asset} {duration}m {side} "
+                            f"penalty n={q_n} pf={q_pf:.2f} exp={q_exp:+.2f} "
+                            f"(-{ASSET_QUALITY_SCORE_PENALTY} score)"
+                        )
         imbalance_confirms = ob_sig > 0.10
 
         # Anti-random guard: require multi-signal confluence before any sizing.
@@ -4244,6 +4283,74 @@ class LiveTrader:
                 )
             self._skip_tick("ev_below")
             return None
+        if duration >= 15 and (not booster_eval) and CONSISTENCY_CORE_ENABLED:
+            core_payout = 1.0 / max(entry, 1e-9)
+            core_lead_now = (
+                (side == "Up" and current >= open_price) or
+                (side == "Down" and current <= open_price)
+            )
+            core_strong = (
+                score >= CONSISTENCY_STRONG_MIN_SCORE_15M
+                and true_prob >= CONSISTENCY_STRONG_MIN_TRUE_PROB_15M
+                and execution_ev >= CONSISTENCY_STRONG_MIN_EXEC_EV_15M
+                and tf_votes >= 3
+                and cl_agree
+            )
+            if core_payout + 1e-9 < CONSISTENCY_MIN_PAYOUT_15M and (not core_strong):
+                if self._noisy_log_enabled(f"skip-consistency-payout:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m consistency payout="
+                        f"{core_payout:.3f}x<{CONSISTENCY_MIN_PAYOUT_15M:.3f}x{RS}"
+                    )
+                self._skip_tick("consistency_payout_low")
+                return None
+            if CONSISTENCY_REQUIRE_CL_AGREE_15M and (not cl_agree):
+                if self._noisy_log_enabled(f"skip-consistency-cl:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(f"{Y}[SKIP] {asset} {duration}m consistency: CL disagree on core trade{RS}")
+                self._skip_tick("consistency_cl_disagree")
+                return None
+            if true_prob + 1e-9 < CONSISTENCY_MIN_TRUE_PROB_15M:
+                if self._noisy_log_enabled(f"skip-consistency-prob:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m consistency prob "
+                        f"{true_prob:.3f}<{CONSISTENCY_MIN_TRUE_PROB_15M:.3f}{RS}"
+                    )
+                self._skip_tick("consistency_prob_low")
+                return None
+            if execution_ev + 1e-9 < CONSISTENCY_MIN_EXEC_EV_15M:
+                if self._noisy_log_enabled(f"skip-consistency-ev:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m consistency exec_ev "
+                        f"{execution_ev:.3f}<{CONSISTENCY_MIN_EXEC_EV_15M:.3f}{RS}"
+                    )
+                self._skip_tick("consistency_ev_low")
+                return None
+            if tf_votes < CONSISTENCY_MIN_TF_VOTES_15M:
+                if self._noisy_log_enabled(f"skip-consistency-tf:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m consistency tf_votes "
+                        f"{tf_votes}<{CONSISTENCY_MIN_TF_VOTES_15M}{RS}"
+                    )
+                self._skip_tick("consistency_tf_low")
+                return None
+            if entry > CONSISTENCY_MAX_ENTRY_15M and (not core_strong):
+                if self._noisy_log_enabled(f"skip-consistency-entry:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m consistency entry={entry:.3f} "
+                        f"> cap={CONSISTENCY_MAX_ENTRY_15M:.3f} (not strong-core){RS}"
+                    )
+                self._skip_tick("consistency_entry_high")
+                return None
+            if not core_lead_now:
+                trail_ok = pct_remaining >= CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M and core_strong
+                if not trail_ok:
+                    if self._noisy_log_enabled(f"skip-consistency-trail:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[SKIP] {asset} {duration}m consistency trailing weak "
+                            f"(pct_left={pct_remaining:.2f} strong={core_strong}){RS}"
+                        )
+                    self._skip_tick("consistency_trail_weak")
+                    return None
         if LOW_CENT_ONLY_ON_EXISTING_POSITION and entry <= LOW_CENT_ENTRY_THRESHOLD:
             if not booster_eval:
                 if self._noisy_log_enabled(f"skip-lowcent-new:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
@@ -6652,6 +6759,21 @@ class LiveTrader:
         exp = pnl / max(1, n)
         bias = (pf - 1.0) * 0.02 + (exp / 8.0)
         return max(-0.06, min(0.06, bias))
+
+    def _asset_side_quality(self, asset: str, side: str) -> tuple[int, float, float]:
+        """Return realized quality for asset+side from settled on-chain outcomes.
+        Returns (n, pf, expectancy_usdc)."""
+        k = f"{asset}|{side}"
+        s = self.side_perf.get(k, {})
+        n = int(s.get("n", 0) or 0)
+        if n <= 0:
+            return 0, 1.0, 0.0
+        gw = float(s.get("gross_win", 0.0) or 0.0)
+        gl = float(s.get("gross_loss", 0.0) or 0.0)
+        pnl = float(s.get("pnl", 0.0) or 0.0)
+        pf = (gw / gl) if gl > 0 else (2.0 if gw > 0 else 1.0)
+        exp = pnl / max(1, n)
+        return n, pf, exp
 
     def _kelly_drawdown_scale(self) -> float:
         """Scale Kelly fraction down when in drawdown vs session high.
