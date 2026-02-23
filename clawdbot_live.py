@@ -1145,6 +1145,7 @@ class LiveTrader:
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
         self._exec_lock         = asyncio.Lock()
         self._executing_cids    = set()
+        self._reserved_bankroll = 0.0             # sum of in-flight trade sizes (race guard)
         self._round_side_attempt_ts = {}          # "round_key|side" → last attempt ts
         self._cid_side_attempt_ts = {}            # "cid|side" → last attempt ts
         self._round_side_block_until = {}         # "round_fingerprint|side" → ttl epoch
@@ -3592,8 +3593,9 @@ class LiveTrader:
         b = (1 / entry) - 1
         q = 1 - true_prob
         kelly_f = max(0.0, (true_prob * b - q) / b)
-        size  = self.bankroll * kelly_f * kelly_frac * self._kelly_drawdown_scale()
-        cap   = self.bankroll * MAX_BANKROLL_PCT
+        eff_bank = max(1.0, self.bankroll - self._reserved_bankroll)   # H-4: exclude in-flight
+        size  = eff_bank * kelly_f * kelly_frac * self._kelly_drawdown_scale()
+        cap   = eff_bank * MAX_BANKROLL_PCT
         return round(max(0.0, min(cap, size)), 2)
 
     # ── MARKET FETCHER ────────────────────────────────────────────────────────
@@ -6000,6 +6002,7 @@ class LiveTrader:
             self._round_side_attempt_ts[round_side_key] = now_attempt
             self._cid_side_attempt_ts[cid_side_key] = now_attempt
             self._executing_cids.add(cid)
+            self._reserved_bankroll += float(sig.get("size", 0.0) or 0.0)  # H-4: pre-reserve
         score       = sig["score"]
         score_stars = f"{G}★★★{RS}" if score >= 12 else (f"{G}★★{RS}" if score >= 9 else "★")
         agree_str   = "" if sig["cl_agree"] else f" {Y}[CL!]{RS}"
@@ -6280,6 +6283,7 @@ class LiveTrader:
         finally:
             async with self._exec_lock:
                 self._executing_cids.discard(cid)
+                self._reserved_bankroll = max(0.0, self._reserved_bankroll - float(sig.get("size", 0.0) or 0.0))  # H-4: release
 
     async def _maybe_wait_for_better_entry(self, sig: dict) -> dict | None:
         """Short price-improvement wait while preserving initial conviction snapshot.
@@ -7969,9 +7973,9 @@ class LiveTrader:
             return 0.5
         cutoff = _t.time() - win
         buy_q = sell_q = 0.0
-        for (ts, is_buy, qty) in buf:
+        for (ts, is_buy, qty) in reversed(buf):   # newest-first; break on first old entry
             if ts < cutoff:
-                continue
+                break
             if is_buy:
                 buy_q += qty
             else:
@@ -9649,7 +9653,15 @@ class LiveTrader:
                     )
                 self._bank_state_last = bank_state
                 if total > 0:
-                    self.bankroll = total
+                    # M-7: guard against API-lag deflation (open stakes not yet indexed)
+                    if (
+                        self.bankroll > 0
+                        and open_stake_total == 0
+                        and total < self.bankroll * 0.85
+                    ):
+                        pass  # skip — likely a momentary API miss; keep current bankroll
+                    else:
+                        self.bankroll = total
                     if total > self.peak_bankroll:
                         self.peak_bankroll = total
                     if not self._pnl_baseline_locked:
