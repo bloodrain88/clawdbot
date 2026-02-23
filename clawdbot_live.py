@@ -160,6 +160,7 @@ MIN_ORDER_SIZE_SHARES = float(os.environ.get("MIN_ORDER_SIZE_SHARES", "5.0"))
 ORDER_SIZE_PAD_SHARES = float(os.environ.get("ORDER_SIZE_PAD_SHARES", "0.02"))
 MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.022"))
 DUST_RECOVER_MIN = float(os.environ.get("DUST_RECOVER_MIN", "0.50"))
+MIN_PARTIAL_TRACK_USDC = float(os.environ.get("MIN_PARTIAL_TRACK_USDC", "5.0"))
 # Presence threshold for on-chain position visibility/sync.
 # Keep this low and independent from recovery sizing thresholds.
 OPEN_PRESENCE_MIN = float(os.environ.get("OPEN_PRESENCE_MIN", "0.01"))
@@ -5745,11 +5746,17 @@ class LiveTrader:
                     if filled_sz > 0:
                         self._cache_order_event(order_id, "live", filled_sz)
                         fill_usdc = filled_sz * maker_price
-                        if fill_usdc >= DUST_RECOVER_MIN:
+                        partial_track_floor = max(float(DUST_RECOVER_MIN), float(MIN_PARTIAL_TRACK_USDC))
+                        if fill_usdc >= partial_track_floor:
                             self.bankroll -= min(size_usdc, fill_usdc)
                             print(f"{Y}[PARTIAL]{RS} {side} {asset} {duration}m | "
                                   f"filled≈${fill_usdc:.2f} @ {maker_price:.3f} | tracking open position")
                             return {"order_id": order_id, "fill_price": maker_price, "mode": "maker_partial", "notional_usdc": min(size_usdc, fill_usdc)}
+                        print(
+                            f"{Y}[PARTIAL-DUST]{RS} {side} {asset} {duration}m | "
+                            f"filled≈${fill_usdc:.2f} @ {maker_price:.3f} < track_min=${partial_track_floor:.2f} "
+                            f"| ignore partial tracking"
+                        )
                 except Exception:
                     self._errors.tick("order_partial_check", print, every=50)
 
