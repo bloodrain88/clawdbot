@@ -2605,8 +2605,18 @@ class LiveTrader:
             rk         = self._round_key(cid=cid, m=m, t=t)
             # Use market reference price (Chainlink at market open = Polymarket "price to beat")
             # NOT the bot's trade entry price — market determines outcome from its own start
-            open_p     = self.open_prices.get(cid, 0)
+            open_p     = float(self.open_prices.get(cid, 0.0) or 0.0)
             src        = self.open_prices_source.get(cid, "?")
+            if open_p <= 0:
+                trade_open = float(
+                    (t or {}).get("open_price", 0.0)
+                    or meta_cid.get("open_price", 0.0)
+                    or (m or {}).get("open_price", 0.0)
+                    or 0.0
+                )
+                if trade_open > 0:
+                    open_p = trade_open
+                    src = "TRADE"
             # If no open price yet, try Polymarket API inline (best effort)
             if open_p <= 0:
                 start_ts_m = m.get("start_ts", 0)
@@ -2703,6 +2713,11 @@ class LiveTrader:
                 continue
             open_p = float(self.open_prices.get(cid, 0.0) or 0.0)
             src = self.open_prices_source.get(cid, "?")
+            if open_p <= 0:
+                meta_open = float(meta.get("open_price", 0.0) or 0.0)
+                if meta_open > 0:
+                    open_p = meta_open
+                    src = "TRADE"
             cl_p = float(self.cl_prices.get(asset, 0.0) or 0.0)
             cur_p = cl_p if cl_p > 0 else float(self.prices.get(asset, 0.0) or 0.0)
             if open_p > 0 and cur_p > 0:
