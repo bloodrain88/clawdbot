@@ -465,6 +465,7 @@ ASSET_QUALITY_MIN_PF = float(os.environ.get("ASSET_QUALITY_MIN_PF", "0.98"))
 ASSET_QUALITY_MIN_EXP = float(os.environ.get("ASSET_QUALITY_MIN_EXP", "0.00"))
 ASSET_QUALITY_SCORE_PENALTY = int(os.environ.get("ASSET_QUALITY_SCORE_PENALTY", "2"))
 ASSET_QUALITY_EDGE_PENALTY = float(os.environ.get("ASSET_QUALITY_EDGE_PENALTY", "0.010"))
+ASSET_QUALITY_HARD_BLOCK_ENABLED = os.environ.get("ASSET_QUALITY_HARD_BLOCK_ENABLED", "false").lower() == "true"
 ASSET_QUALITY_BLOCK_PF = float(os.environ.get("ASSET_QUALITY_BLOCK_PF", "0.88"))
 ASSET_QUALITY_BLOCK_EXP = float(os.environ.get("ASSET_QUALITY_BLOCK_EXP", "-0.25"))
 MAX_WIN_MODE = os.environ.get("MAX_WIN_MODE", "true").lower() == "true"
@@ -3803,13 +3804,22 @@ class LiveTrader:
             q_n, q_pf, q_exp = self._asset_side_quality(asset, side)
             if q_n >= max(1, ASSET_QUALITY_MIN_TRADES):
                 if q_pf <= ASSET_QUALITY_BLOCK_PF and q_exp <= ASSET_QUALITY_BLOCK_EXP:
-                    if self._noisy_log_enabled(f"skip-asset-quality-block:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                    if ASSET_QUALITY_HARD_BLOCK_ENABLED:
+                        if self._noisy_log_enabled(f"skip-asset-quality-block:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                            print(
+                                f"{Y}[SKIP] {asset} {duration}m quality-block {side} "
+                                f"(n={q_n} pf={q_pf:.2f} exp={q_exp:+.2f}){RS}"
+                            )
+                        self._skip_tick("asset_quality_block")
+                        return None
+                    # Default: don't freeze execution; apply a stronger penalty only.
+                    score -= max(3, ASSET_QUALITY_SCORE_PENALTY + 1)
+                    edge -= max(0.015, ASSET_QUALITY_EDGE_PENALTY + 0.005)
+                    if self._noisy_log_enabled(f"asset-quality-softblock:{asset}:{side}", LOG_FLOW_EVERY_SEC):
                         print(
-                            f"{Y}[SKIP] {asset} {duration}m quality-block {side} "
-                            f"(n={q_n} pf={q_pf:.2f} exp={q_exp:+.2f}){RS}"
+                            f"{Y}[ASSET-QUALITY]{RS} {asset} {duration}m {side} soft-block "
+                            f"(n={q_n} pf={q_pf:.2f} exp={q_exp:+.2f})"
                         )
-                    self._skip_tick("asset_quality_block")
-                    return None
                 if q_pf < ASSET_QUALITY_MIN_PF or q_exp < ASSET_QUALITY_MIN_EXP:
                     score -= ASSET_QUALITY_SCORE_PENALTY
                     edge -= ASSET_QUALITY_EDGE_PENALTY
