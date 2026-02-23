@@ -466,6 +466,9 @@ HIGH_EV_MIN_SCORE = int(os.environ.get("HIGH_EV_MIN_SCORE", "14"))
 ROLLING_15M_CALIB_ENABLED = os.environ.get("ROLLING_15M_CALIB_ENABLED", "true").lower() == "true"
 ROLLING_15M_CALIB_MIN_N = int(os.environ.get("ROLLING_15M_CALIB_MIN_N", "20"))
 ROLLING_15M_CALIB_WINDOW = int(os.environ.get("ROLLING_15M_CALIB_WINDOW", "400"))
+PM_PATTERN_ENABLED = os.environ.get("PM_PATTERN_ENABLED", "true").lower() == "true"
+PM_PATTERN_MIN_N = int(os.environ.get("PM_PATTERN_MIN_N", "12"))
+PM_PATTERN_MAX_EDGE_ADJ = float(os.environ.get("PM_PATTERN_MAX_EDGE_ADJ", "0.010"))
 CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M = float(os.environ.get("CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M", "0.78"))
 CONSISTENCY_STRONG_MIN_SCORE_15M = int(os.environ.get("CONSISTENCY_STRONG_MIN_SCORE_15M", "14"))
 CONSISTENCY_STRONG_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_STRONG_MIN_TRUE_PROB_15M", "0.72"))
@@ -724,6 +727,7 @@ class LiveTrader:
         self.recent_trades   = deque(maxlen=30)   # rolling window for WR adaptation
         self.recent_pnl      = deque(maxlen=40)   # rolling pnl window for profit-factor/expectancy adaptation
         self._resolved_samples = deque(maxlen=2000)  # rolling settled outcomes for 15m calibration
+        self._pm_pattern_stats = {}
         self.side_perf       = {}                 # "ASSET|SIDE" -> {n, gross_win, gross_loss, pnl}
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
         self._exec_lock         = asyncio.Lock()
@@ -3905,6 +3909,9 @@ class LiveTrader:
         up_conf = 0.0
         dn_conf = 0.0
         flow = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
+        pm_pattern_key = ""
+        pm_pattern_score_adj = 0
+        pm_pattern_edge_adj = 0.0
         if isinstance(flow, dict):
             up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
             dn_conf = float(flow.get("Down", flow.get("down", 0.0)) or 0.0)
@@ -3968,6 +3975,21 @@ class LiveTrader:
                 # Winners buying low-cents but market now expensive: fade confidence.
                 score -= 1
                 edge -= 0.005
+            if PM_PATTERN_ENABLED:
+                pm_pattern_key = self._pm_pattern_key(asset, duration, side, copy_net, flow)
+                patt = self._pm_pattern_profile(pm_pattern_key)
+                pm_pattern_score_adj = int(patt.get("score_adj", 0) or 0)
+                pm_pattern_edge_adj = float(patt.get("edge_adj", 0.0) or 0.0)
+                if pm_pattern_score_adj != 0 or abs(pm_pattern_edge_adj) > 1e-9:
+                    score += pm_pattern_score_adj
+                    edge += pm_pattern_edge_adj
+                    if self._noisy_log_enabled(f"pm-pattern:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{B}[PM-PATTERN]{RS} {asset} {duration}m {side} "
+                            f"adj(score={pm_pattern_score_adj:+d},edge={pm_pattern_edge_adj:+.3f}) "
+                            f"n={int(patt.get('n',0) or 0)} exp={float(patt.get('exp',0.0) or 0.0):+.2f} "
+                            f"wr_lb={float(patt.get('wr_lb',0.5) or 0.5):.2f}"
+                        )
 
         # Real-time CID refresh on missing/stale leader-flow before any gating decision.
         if COPYFLOW_CID_ONDEMAND_ENABLED and (
@@ -4759,6 +4781,9 @@ class LiveTrader:
             "execution_fill_ratio": exec_fill_ratio,
             "copy_adj": copy_adj,
             "copy_net": copy_net,
+            "pm_pattern_key": pm_pattern_key,
+            "pm_pattern_score_adj": pm_pattern_score_adj,
+            "pm_pattern_edge_adj": pm_pattern_edge_adj,
             "analysis_quality": analysis_quality,
             "analysis_conviction": analysis_conviction,
             "analysis_prob_scale": quality_scale,
@@ -4958,6 +4983,9 @@ class LiveTrader:
                 "onchain_score_adj": sig.get("onchain_score_adj", 0),
                 "source_confidence": sig.get("source_confidence", 0.0),
                 "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
+                "pm_pattern_key": sig.get("pm_pattern_key", ""),
+                "pm_pattern_score_adj": sig.get("pm_pattern_score_adj", 0),
+                "pm_pattern_edge_adj": sig.get("pm_pattern_edge_adj", 0.0),
                 "bucket": stat_bucket,
                 "fill_price": fill_price,
                 "slip_bps": round(slip_bps, 2),
@@ -6031,6 +6059,7 @@ class LiveTrader:
                             self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
                             self._record_result(asset, side, True, trade.get("structural", False), pnl=pnl)
                             self._record_resolved_sample(trade, pnl, True)
+                            self._record_pm_pattern_outcome(trade, pnl, True)
                         self._log(m, trade, "WIN", pnl)
                         self._log_onchain_event("RESOLVE", cid, {
                             "asset": asset,
@@ -6108,6 +6137,7 @@ class LiveTrader:
                                 self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
                                 self._record_result(asset, side, False, trade.get("structural", False), pnl=pnl)
                                 self._record_resolved_sample(trade, pnl, False)
+                                self._record_pm_pattern_outcome(trade, pnl, False)
                             self._log(m, trade, "LOSS", pnl)
                             self._log_onchain_event("RESOLVE", cid, {
                                 "asset": asset,
@@ -6697,6 +6727,64 @@ class LiveTrader:
                 "pnl": float(pnl),
                 "won": bool(won),
             })
+        except Exception:
+            pass
+
+    def _pm_pattern_key(self, asset: str, duration: int, side: str, copy_net: float, flow: dict) -> str:
+        low_share = float((flow or {}).get("low_c_share", 0.0) or 0.0)
+        high_share = float((flow or {}).get("high_c_share", 0.0) or 0.0)
+        multibet = float((flow or {}).get("multibet_ratio", 0.0) or 0.0)
+        if abs(copy_net) >= 0.35:
+            dom = "dom-strong"
+        elif abs(copy_net) >= 0.15:
+            dom = "dom-med"
+        else:
+            dom = "dom-weak"
+        if low_share >= 0.55:
+            px_style = "lowcent"
+        elif high_share >= 0.55:
+            px_style = "highcent"
+        else:
+            px_style = "midcent"
+        mb = "multibet-high" if multibet >= 0.30 else "multibet-low"
+        return f"{asset}|{duration}m|{side}|{dom}|{px_style}|{mb}"
+
+    def _pm_pattern_profile(self, pattern_key: str) -> dict:
+        row = self._pm_pattern_stats.get(pattern_key, {})
+        n = int(row.get("n", 0) or 0)
+        if n <= 0:
+            return {"score_adj": 0, "edge_adj": 0.0, "n": 0, "exp": 0.0, "wr_lb": 0.5}
+        wins = int(row.get("wins", 0) or 0)
+        pnl = float(row.get("pnl", 0.0) or 0.0)
+        exp = pnl / max(1, n)
+        wr_lb = self._wilson_lower_bound(wins, n)
+        score_adj = 0
+        edge_adj = 0.0
+        if n >= PM_PATTERN_MIN_N:
+            if exp >= 0.25 and wr_lb >= 0.52:
+                score_adj = 2
+                edge_adj = min(PM_PATTERN_MAX_EDGE_ADJ, 0.004 + min(0.006, exp / 80.0))
+            elif exp >= 0.08 and wr_lb >= 0.50:
+                score_adj = 1
+                edge_adj = min(PM_PATTERN_MAX_EDGE_ADJ, 0.002 + min(0.004, exp / 120.0))
+            elif exp <= -0.20 and wr_lb < 0.45:
+                score_adj = -2
+                edge_adj = -min(PM_PATTERN_MAX_EDGE_ADJ, 0.004 + min(0.006, abs(exp) / 80.0))
+            elif exp < 0.0 and wr_lb < 0.48:
+                score_adj = -1
+                edge_adj = -min(PM_PATTERN_MAX_EDGE_ADJ, 0.002 + min(0.004, abs(exp) / 120.0))
+        return {"score_adj": score_adj, "edge_adj": edge_adj, "n": n, "exp": exp, "wr_lb": wr_lb}
+
+    def _record_pm_pattern_outcome(self, trade: dict, pnl: float, won: bool):
+        try:
+            key = str(trade.get("pm_pattern_key", "") or "")
+            if not key:
+                return
+            row = self._pm_pattern_stats.get(key, {"n": 0, "wins": 0, "pnl": 0.0})
+            row["n"] = int(row.get("n", 0) or 0) + 1
+            row["wins"] = int(row.get("wins", 0) or 0) + (1 if won else 0)
+            row["pnl"] = float(row.get("pnl", 0.0) or 0.0) + float(pnl)
+            self._pm_pattern_stats[key] = row
         except Exception:
             pass
 
