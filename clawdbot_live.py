@@ -225,6 +225,17 @@ LATE_DIR_LOCK_ENABLED = os.environ.get("LATE_DIR_LOCK_ENABLED", "true").lower() 
 LATE_DIR_LOCK_MIN_LEFT_5M = float(os.environ.get("LATE_DIR_LOCK_MIN_LEFT_5M", "2.2"))
 LATE_DIR_LOCK_MIN_LEFT_15M = float(os.environ.get("LATE_DIR_LOCK_MIN_LEFT_15M", "6.0"))
 LATE_DIR_LOCK_MIN_MOVE_PCT = float(os.environ.get("LATE_DIR_LOCK_MIN_MOVE_PCT", "0.0002"))
+EVENT_ALIGN_GUARD_ENABLED = os.environ.get("EVENT_ALIGN_GUARD_ENABLED", "true").lower() == "true"
+EVENT_ALIGN_MIN_LEFT_15M = float(os.environ.get("EVENT_ALIGN_MIN_LEFT_15M", "10.0"))
+EVENT_ALIGN_MIN_MOVE_PCT = float(os.environ.get("EVENT_ALIGN_MIN_MOVE_PCT", "0.0005"))
+EVENT_ALIGN_ALLOW_SCORE = int(os.environ.get("EVENT_ALIGN_ALLOW_SCORE", "22"))
+EVENT_ALIGN_ALLOW_EV = float(os.environ.get("EVENT_ALIGN_ALLOW_EV", "0.040"))
+EVENT_ALIGN_ALLOW_TRUE_PROB = float(os.environ.get("EVENT_ALIGN_ALLOW_TRUE_PROB", "0.84"))
+EVENT_ALIGN_CONTRA_SCORE_PEN = int(os.environ.get("EVENT_ALIGN_CONTRA_SCORE_PEN", "3"))
+EVENT_ALIGN_CONTRA_EDGE_PEN = float(os.environ.get("EVENT_ALIGN_CONTRA_EDGE_PEN", "0.020"))
+EVENT_ALIGN_CONTRA_SIZE_MULT = float(os.environ.get("EVENT_ALIGN_CONTRA_SIZE_MULT", "0.55"))
+EVENT_ALIGN_WITH_SCORE_BONUS = int(os.environ.get("EVENT_ALIGN_WITH_SCORE_BONUS", "1"))
+EVENT_ALIGN_WITH_EDGE_BONUS = float(os.environ.get("EVENT_ALIGN_WITH_EDGE_BONUS", "0.004"))
 EXTRA_SCORE_GATE_BTC_5M = int(os.environ.get("EXTRA_SCORE_GATE_BTC_5M", "1"))
 EXTRA_SCORE_GATE_XRP_15M = int(os.environ.get("EXTRA_SCORE_GATE_XRP_15M", "0"))
 EXPOSURE_CAP_TOTAL_TREND = float(os.environ.get("EXPOSURE_CAP_TOTAL_TREND", "0.80"))
@@ -491,10 +502,6 @@ SUPER_BET_MIN_SIZE_USDC = float(os.environ.get("SUPER_BET_MIN_SIZE_USDC", "5.0")
 SUPER_BET_MAX_SIZE_ENABLED = os.environ.get("SUPER_BET_MAX_SIZE_ENABLED", "true").lower() == "true"
 SUPER_BET_MAX_SIZE_USDC = float(os.environ.get("SUPER_BET_MAX_SIZE_USDC", "10.0"))
 SUPER_BET_MAX_BANKROLL_PCT = float(os.environ.get("SUPER_BET_MAX_BANKROLL_PCT", "0.02"))
-# Hard absolute cap for very cheap-tail entries after all tuning steps.
-TAIL_ENTRY_ABS_CAP_ENABLED = os.environ.get("TAIL_ENTRY_ABS_CAP_ENABLED", "true").lower() == "true"
-TAIL_ENTRY_CAP_PX = float(os.environ.get("TAIL_ENTRY_CAP_PX", "0.30"))
-TAIL_ENTRY_MAX_SIZE_USDC = float(os.environ.get("TAIL_ENTRY_MAX_SIZE_USDC", "10.0"))
 ROLLING_15M_CALIB_ENABLED = os.environ.get("ROLLING_15M_CALIB_ENABLED", "true").lower() == "true"
 ROLLING_15M_CALIB_MIN_N = int(os.environ.get("ROLLING_15M_CALIB_MIN_N", "20"))
 ROLLING_15M_CALIB_WINDOW = int(os.environ.get("ROLLING_15M_CALIB_WINDOW", "400"))
@@ -4014,15 +4021,35 @@ class LiveTrader:
                 return None   # AMM massively overpriced our direction — no edge
             side, edge, true_prob = direction, max(0.01, dir_edge), dir_prob
 
-        # Max-win profile: bias to higher posterior probability side, not continuation side.
+        # Max-win profile (source fix):
+        # choose side by EV utility (not raw probability), with soft event-context prior.
         if MAX_WIN_MODE:
-            if prob_up >= prob_down:
+            payout_up = 1.0 / max(up_price, 1e-9)
+            payout_dn = 1.0 / max(1.0 - up_price, 1e-9)
+            ev_up = (prob_up * payout_up) - 1.0 - FEE_RATE_EST
+            ev_dn = (prob_down * payout_dn) - 1.0 - FEE_RATE_EST
+            util_up = ev_up + edge_up * 0.35
+            util_dn = ev_dn + edge_dn * 0.35
+            # Soft contextual prior from current event state (non-blocking).
+            if duration >= 15 and open_price > 0 and current > 0 and mins_left <= EVENT_ALIGN_MIN_LEFT_15M:
+                mv = (current - open_price) / max(open_price, 1e-9)
+                if abs(mv) >= EVENT_ALIGN_MIN_MOVE_PCT:
+                    # bounded utility shift: follow clear event drift unless EV is decisively opposite
+                    u_shift = min(0.030, max(0.004, abs(mv) * 8.0))
+                    if mv >= 0:
+                        util_up += u_shift
+                        util_dn -= u_shift
+                    else:
+                        util_dn += u_shift
+                        util_up -= u_shift
+            if util_up >= util_dn:
                 side, edge, true_prob = "Up", edge_up, prob_up
             else:
                 side, edge, true_prob = "Down", edge_down, prob_down
 
         # Keep signal components aligned to the effective side.
         side_up = side == "Up"
+        event_align_size_mult = 1.0
         recent_side = up_recent if side_up else dn_recent
         recent_side_n = int(recent_side.get("n", 0) or 0)
         recent_side_exp = float(recent_side.get("exp", 0.0) or 0.0)
@@ -4044,6 +4071,43 @@ class LiveTrader:
         cl_agree = True
         if cl_now > 0 and open_price > 0:
             cl_agree = (cl_now > open_price) == side_up
+
+        # Soft event-alignment penalty (non-blocking):
+        # if signal is contrarian while move is already clear in 15m mid/late window,
+        # reduce score/edge and shrink size rather than hard-skipping.
+        if (
+            EVENT_ALIGN_GUARD_ENABLED
+            and duration >= 15
+            and mins_left <= EVENT_ALIGN_MIN_LEFT_15M
+            and open_price > 0
+            and current > 0
+        ):
+            move_now = (current - open_price) / max(open_price, 1e-9)
+            if abs(move_now) >= EVENT_ALIGN_MIN_MOVE_PCT:
+                event_dir = "Up" if move_now >= 0 else "Down"
+                if side != event_dir:
+                    strong_exception = (
+                        score >= EVENT_ALIGN_ALLOW_SCORE
+                        and true_prob >= EVENT_ALIGN_ALLOW_TRUE_PROB
+                        and execution_ev >= EVENT_ALIGN_ALLOW_EV
+                    )
+                    if not strong_exception:
+                        pen_scale = max(0.6, min(1.4, abs(move_now) / max(EVENT_ALIGN_MIN_MOVE_PCT, 1e-9)))
+                        sc_pen = max(1, int(round(EVENT_ALIGN_CONTRA_SCORE_PEN * pen_scale)))
+                        ed_pen = max(0.004, EVENT_ALIGN_CONTRA_EDGE_PEN * pen_scale)
+                        score -= sc_pen
+                        edge -= ed_pen
+                        true_prob = 0.5 + (true_prob - 0.5) * 0.88
+                        event_align_size_mult = max(0.20, min(1.0, EVENT_ALIGN_CONTRA_SIZE_MULT))
+                        if self._noisy_log_enabled(f"event-align-pen:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                            print(
+                                f"{Y}[EVENT-ALIGN]{RS} {asset} {duration}m contra {side}!={event_dir} "
+                                f"move={move_now*100:+.3f}% sc_pen={sc_pen} ed_pen={ed_pen:+.3f} "
+                                f"size_x={event_align_size_mult:.2f}"
+                            )
+                else:
+                    score += max(0, EVENT_ALIGN_WITH_SCORE_BONUS)
+                    edge += max(0.0, EVENT_ALIGN_WITH_EDGE_BONUS)
         if ASSET_QUALITY_FILTER_ENABLED:
             q_n, q_pf, q_exp = self._asset_side_quality(asset, side)
             if q_n >= max(1, ASSET_QUALITY_MIN_TRADES):
@@ -4852,7 +4916,7 @@ class LiveTrader:
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
         max_single = min(100.0, self.bankroll * bankroll_pct)
         cid_cap    = max(0.50, self.bankroll * MAX_CID_EXPOSURE_PCT)
-        hard_cap   = max(0.50, min(max_single, cid_cap, self.bankroll * MAX_BANKROLL_PCT, float(MAX_ABS_BET)))
+        hard_cap   = max(0.50, min(max_single, cid_cap, self.bankroll * MAX_BANKROLL_PCT))
         # Avoid oversized tail bets: these entries can look high-multiple but are low-quality fills.
         if entry <= 0.05:
             hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.015))
@@ -5176,17 +5240,6 @@ class LiveTrader:
                             f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet cap(final) "
                             f"x={payout_mult:.2f} ${old_size:.2f}->${size:.2f}"
                         )
-        if TAIL_ENTRY_ABS_CAP_ENABLED and duration >= 15 and entry <= TAIL_ENTRY_CAP_PX:
-            tail_cap = max(0.50, min(float(TAIL_ENTRY_MAX_SIZE_USDC), hard_cap))
-            if size > tail_cap:
-                old_size = float(size)
-                size = round(tail_cap, 2)
-                if self._noisy_log_enabled(f"tail-cap-final:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
-                    print(
-                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} tail-cap(final) "
-                        f"entry={entry:.3f} ${old_size:.2f}->${size:.2f}"
-                    )
-
         # Immediate fills: FOK on strong signal, GTC limit otherwise
         # Limit orders (use_limit=True) are always GTC — force_taker stays False
         force_taker = (not use_limit) and (
