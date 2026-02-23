@@ -4343,6 +4343,12 @@ class LiveTrader:
                     )
                 self._skip_tick("consistency_tf_low")
                 return None
+            # Propagate strict payout rule to execution layer so maker/fallback cannot overpay.
+            core_entry_cap = min(0.99, 1.0 / max(1e-9, CONSISTENCY_MIN_PAYOUT_15M))
+            if max_entry_allowed > core_entry_cap:
+                max_entry_allowed = core_entry_cap
+                if min_entry_allowed >= max_entry_allowed:
+                    min_entry_allowed = max(0.01, max_entry_allowed - 0.01)
             if entry > CONSISTENCY_MAX_ENTRY_15M and (not core_strong):
                 if self._noisy_log_enabled(f"skip-consistency-entry:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(
@@ -4824,6 +4830,7 @@ class LiveTrader:
                 max_entry_allowed=sig.get("max_entry_allowed", MAX_ENTRY_PRICE),
                 hc15_mode=sig.get("hc15_mode", False),
                 hc15_fallback_cap=HC15_FALLBACK_MAX_ENTRY,
+                core_position=(not is_booster),
             )
             self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
             order_id = (exec_result or {}).get("order_id", "")
@@ -5011,7 +5018,7 @@ class LiveTrader:
         if sig and sig["score"] >= MIN_SCORE_GATE:
             await self._execute_trade(sig)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None, hc15_mode=False, hc15_fallback_cap=0.36):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None, hc15_mode=False, hc15_fallback_cap=0.36, core_position=True):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -5513,8 +5520,11 @@ class LiveTrader:
                             return None
                     fresh_payout = 1.0 / max(fresh_ask, 1e-9)
                     min_payout_fb, min_ev_fb, _ = self._adaptive_thresholds(duration)
-                    if strong_exec:
-                        # Execution fallback should not over-block strong setups for tiny payout deltas.
+                    if core_position and duration >= 15 and CONSISTENCY_CORE_ENABLED:
+                        # Keep execution fully aligned with core 15m consistency floor.
+                        min_payout_fb = max(min_payout_fb, CONSISTENCY_MIN_PAYOUT_15M)
+                    elif strong_exec:
+                        # Non-core fallback can relax slightly to preserve executable flow.
                         min_payout_fb = max(1.65, min_payout_fb - 0.08)
                     if fresh_payout < min_payout_fb:
                         if fresh_payout >= max(1.0, (min_payout_fb - PAYOUT_NEAR_MISS_TOL)):
@@ -6528,6 +6538,18 @@ class LiveTrader:
         entry_bucket = "<30c" if entry < 0.30 else ("30-50c" if entry <= 0.50 else ">50c")
         return f"{duration}m|{score_bucket}|{entry_bucket}"
 
+    @staticmethod
+    def _wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
+        """Conservative confidence lower-bound for Bernoulli win-rate."""
+        if n <= 0:
+            return 0.0
+        phat = max(0.0, min(1.0, wins / max(1, n)))
+        z2 = z * z
+        denom = 1.0 + z2 / n
+        center = phat + z2 / (2.0 * n)
+        margin = z * math.sqrt((phat * (1.0 - phat) + z2 / (4.0 * n)) / n)
+        return max(0.0, min(1.0, (center - margin) / denom))
+
     def _growth_snapshot(self) -> dict:
         rows = list(self._bucket_stats.rows.values())
         outcomes = sum(int(r.get("outcomes", r.get("wins", 0) + r.get("losses", 0))) for r in rows)
@@ -6545,6 +6567,11 @@ class LiveTrader:
             rp_win = sum(p for p in recent_pnl if p > 0)
             rp_loss = -sum(p for p in recent_pnl if p < 0)
             recent_pf = (rp_win / rp_loss) if rp_loss > 0 else (2.0 if rp_win > 0 else 1.0)
+        recent_trades = list(self.recent_trades)[-20:]
+        recent_n = len(recent_trades)
+        recent_wins = int(sum(1 for x in recent_trades if x))
+        recent_wr = (recent_wins / recent_n) if recent_n > 0 else 0.5
+        recent_wr_lb = self._wilson_lower_bound(recent_wins, recent_n)
         return {
             "outcomes": outcomes,
             "gross_win": gross_win,
@@ -6553,6 +6580,9 @@ class LiveTrader:
             "recent_pf": recent_pf,
             "expectancy": expectancy,
             "avg_slip": avg_slip,
+            "recent_n": recent_n,
+            "recent_wr": recent_wr,
+            "recent_wr_lb": recent_wr_lb,
         }
 
     def _bucket_size_scale(self, duration: int, score: int, entry: float) -> float:
@@ -6599,24 +6629,26 @@ class LiveTrader:
             tightness += min(1.2, (1.0 - snap["pf"]) * 1.5)
         if snap["outcomes"] >= 10 and snap["expectancy"] < 0:
             tightness += min(1.0, abs(snap["expectancy"]) / 0.8)
+        # Conservative confidence guard: if the lower confidence bound of recent WR drops below 50%,
+        # tighten aggressively to protect EV under uncertainty.
+        if snap["recent_n"] >= 10 and snap["recent_wr_lb"] < 0.50:
+            tightness += min(1.0, (0.50 - snap["recent_wr_lb"]) * 4.0)
         if snap["avg_slip"] > 220:
             tightness += min(0.6, (snap["avg_slip"] - 220.0) / 600.0)
         if self.consec_losses >= 2:
             tightness += min(1.0, (self.consec_losses - 1) * 0.25)
         if snap["outcomes"] >= 12 and snap["pf"] > 1.35 and snap["expectancy"] > 0.30 and snap["avg_slip"] < 120:
             tightness -= 0.35
-        # Momentum regime relaxation: when recent realized quality is strong, avoid over-filtering.
-        recent_wr = 0.5
-        recent = list(self.recent_trades)[-10:]
-        if recent:
-            recent_wr = sum(1 for x in recent if x) / max(1, len(recent))
+        # Momentum regime relaxation: require both observed WR and confidence.
         if (
             snap["outcomes"] >= 12
             and snap["pf"] >= 1.15
             and snap["recent_pf"] >= 1.10
             and snap["expectancy"] >= 0.10
             and snap["avg_slip"] < 180
-            and recent_wr >= 0.60
+            and snap["recent_n"] >= 12
+            and snap["recent_wr"] >= 0.58
+            and snap["recent_wr_lb"] >= 0.50
             and self.consec_losses == 0
         ):
             tightness -= 0.15
@@ -6986,6 +7018,7 @@ class LiveTrader:
         wr_str   = f"  BetScale={wr_scale:.1f}x" if wr_scale > 1.0 else ""
         print(
             f"{B}[ADAPT]{RS} Last5PnL={streak or '–'} PF={snap['recent_pf']:.2f} "
+            f"WR={snap['recent_wr']*100:.1f}% LB={snap['recent_wr_lb']*100:.1f}% "
             f"Exp={sum(last5)/max(1,len(last5)):+.2f} MinEdge={me:.2f} "
             f"Streak={self.consec_losses}L DrawdownScale={self._kelly_drawdown_scale():.0%}{wr_str}"
         )
