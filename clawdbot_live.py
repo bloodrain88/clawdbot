@@ -5784,6 +5784,19 @@ class LiveTrader:
                     size   = trade.get("size", 0)
                     entry  = trade.get("entry", 0.5)
                     size_f = float(size or 0.0)
+                    # Idempotency guard: avoid re-reconciling the same settled CID
+                    # across overlapping loops/restarts/API lag windows.
+                    prev_settle = self._settled_outcomes.get(cid, {})
+                    prev_res = str((prev_settle or {}).get("result", "") or "").upper()
+                    if prev_res in ("WIN", "LOSS"):
+                        prev_rk = str((prev_settle or {}).get("rk", "") or "")
+                        if self._noisy_log_enabled(f"settle-dupe:{cid}", LOG_SCAN_HEARTBEAT_SEC):
+                            print(
+                                f"{Y}[SETTLE-DUPE]{RS} skip {asset} {side} "
+                                f"result={prev_res} | rk={prev_rk or rk} cid={self._short_cid(cid)}"
+                            )
+                        done.append(cid)
+                        continue
 
                     # For CLOB positions: CTF tokens are held by the exchange contract,
                     # not the user wallet. Always try redeemPositions — if Polymarket
@@ -5953,6 +5966,14 @@ class LiveTrader:
                                 f"{Y}[REDEEMED-AUTO]{RS} cid={self._short_cid(cid)} "
                                 f"usdc_delta=${usdc_delta:+.2f} ({usdc_before:.2f}->{usdc_after:.2f})"
                             )
+                        self._settled_outcomes[cid] = {
+                            "result": "WIN",
+                            "side": side,
+                            "rk": rk,
+                            "pnl": round(float(pnl), 6),
+                            "ts": _time.time(),
+                        }
+                        self._save_settled_outcomes()
                         done.append(cid)
                     else:
                         # Lost on-chain (on-chain is authoritative)
@@ -6009,6 +6030,14 @@ class LiveTrader:
                                   f"{R}${pnl:+.2f}{RS} | stake=${stake_loss:.2f} redeem=$0.00 "
                                   f"| rk_trades={rk_n} | Bank ${self.bankroll:.2f} | WR {wr} | "
                                   f"rk={rk} cid={self._short_cid(cid)}")
+                            self._settled_outcomes[cid] = {
+                                "result": "LOSS",
+                                "side": side,
+                                "rk": rk,
+                                "pnl": round(float(pnl), 6),
+                                "ts": _time.time(),
+                            }
+                            self._save_settled_outcomes()
                         done.append(cid)
                 except Exception as e:
                     print(f"{Y}[REDEEM] {asset}: {e}{RS}")
