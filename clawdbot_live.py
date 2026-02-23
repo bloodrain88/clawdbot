@@ -4925,8 +4925,9 @@ class LiveTrader:
         # Keep edge/prob aligned with final side after pre-bid/copyflow adjustments.
         base_prob = prob_up if side == "Up" else prob_down
         base_edge = edge_up if side == "Up" else edge_down
-        true_prob = max(true_prob, base_prob) if MAX_WIN_MODE else base_prob
-        edge = max(edge, base_edge) if MAX_WIN_MODE else base_edge
+        # Always take the best estimate: preserves aq/prior adjustments over plain base_prob
+        true_prob = max(true_prob, base_prob)
+        edge      = max(edge, base_edge)
 
         if MAX_WIN_MODE:
             if WINMODE_REQUIRE_CL_AGREE and not cl_agree:
@@ -5181,7 +5182,7 @@ class LiveTrader:
                     return None
             core_lead_now = (
                 (side == "Up" and current >= open_price) or
-                (side == "Down" and current <= open_price)
+                (side == "Down" and current < open_price)   # strict: tie resolves as Up
             )
             core_strong = (
                 score >= CONSISTENCY_STRONG_MIN_SCORE_15M
@@ -6639,7 +6640,7 @@ class LiveTrader:
                 filled = False
                 for i in range(polls):
                     await asyncio.sleep(poll_interval)
-                    ev = self._order_event_cache.get(order_id, {})
+                    ev = dict(self._order_event_cache.get(order_id) or {})
                     ev_status = str(ev.get("status", "") or "").lower()
                     if ev_status == "filled":
                         filled = True
@@ -6674,7 +6675,7 @@ class LiveTrader:
                 # Partial maker fill protection:
                 # status may remain "live" while filled_size > 0. Track it so position is not missed.
                 try:
-                    ev = self._order_event_cache.get(order_id, {})
+                    ev = dict(self._order_event_cache.get(order_id) or {})
                     ev_fill = float(ev.get("filled_size", 0.0) or 0.0)
                     info = None
                     if ev_fill <= 0:
@@ -6793,7 +6794,7 @@ class LiveTrader:
                 # FOK should not partially fill, but keep single state-check for exchange race.
                 if order_id:
                     try:
-                        ev = self._order_event_cache.get(order_id, {})
+                        ev = dict(self._order_event_cache.get(order_id) or {})
                         ev_status = str(ev.get("status", "") or "").lower()
                         if ev_status == "filled":
                             info = {"status": "filled"}
