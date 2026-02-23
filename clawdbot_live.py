@@ -2761,15 +2761,15 @@ class LiveTrader:
                     side_lbl = f"MIX U{up_n}/D{down_n}"
                     side_stake = spent
                 print(
-                    f"  {B}[LIVE-RK]{RS} {rk} | trades={n} | "
+                    f"  {B}[LIVE-RK]{RS} {rk} | state=OPEN(unsettled) | trades={n} | "
                     f"{Y}SIDE{RS}={side_lbl} (${side_stake:.2f}) | "
                     f"{Y}SPENT{RS}=${spent:.2f} | "
                     f"{B}MARK{RS}=${value_now:.2f} | "
-                    f"{G}IF_WIN{RS}=${win_payout:.2f} | "
-                    f"{c_pl}PROFIT_IF_WIN{RS}={c_pl}${win_profit:+.2f}{RS} | "
-                    f"{B}x{mult:.2f}{RS} | "
+                    f"{G}HYP_IF_WIN{RS}=${win_payout:.2f} | "
+                    f"{c_pl}HYP_PROFIT_IF_WIN{RS}={c_pl}${win_profit:+.2f}{RS} | "
+                    f"{B}HYP_x{RS}{mult:.2f} | "
                     f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c | "
-                    f"{c_lead}LEAD{RS}={lead}/{n}"
+                    f"{c_lead}PROJ_LEAD{RS}={lead}/{n}"
                 )
         elif self._should_log("live-rk-empty", 15):
             print(f"  {Y}[LIVE-RK]{RS} none | trades=0 | no active on-chain positions")
