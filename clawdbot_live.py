@@ -463,6 +463,9 @@ HIGH_EV_SIZE_BOOST = float(os.environ.get("HIGH_EV_SIZE_BOOST", "1.25"))
 HIGH_EV_SIZE_BOOST_MAX = float(os.environ.get("HIGH_EV_SIZE_BOOST_MAX", "1.40"))
 HIGH_EV_MIN_EXEC_EV = float(os.environ.get("HIGH_EV_MIN_EXEC_EV", "0.035"))
 HIGH_EV_MIN_SCORE = int(os.environ.get("HIGH_EV_MIN_SCORE", "14"))
+ROLLING_15M_CALIB_ENABLED = os.environ.get("ROLLING_15M_CALIB_ENABLED", "true").lower() == "true"
+ROLLING_15M_CALIB_MIN_N = int(os.environ.get("ROLLING_15M_CALIB_MIN_N", "20"))
+ROLLING_15M_CALIB_WINDOW = int(os.environ.get("ROLLING_15M_CALIB_WINDOW", "400"))
 CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M = float(os.environ.get("CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M", "0.78"))
 CONSISTENCY_STRONG_MIN_SCORE_15M = int(os.environ.get("CONSISTENCY_STRONG_MIN_SCORE_15M", "14"))
 CONSISTENCY_STRONG_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_STRONG_MIN_TRUE_PROB_15M", "0.72"))
@@ -720,6 +723,7 @@ class LiveTrader:
         self.stats           = {}    # {asset: {side: {wins, total}}} — persisted
         self.recent_trades   = deque(maxlen=30)   # rolling window for WR adaptation
         self.recent_pnl      = deque(maxlen=40)   # rolling pnl window for profit-factor/expectancy adaptation
+        self._resolved_samples = deque(maxlen=2000)  # rolling settled outcomes for 15m calibration
         self.side_perf       = {}                 # "ASSET|SIDE" -> {n, gross_win, gross_loss, pnl}
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
         self._exec_lock         = asyncio.Lock()
@@ -4220,6 +4224,9 @@ class LiveTrader:
             max_entry_allowed = max(max_entry_allowed, min(0.85, model_cap))
         # Adaptive protection against poor payout fills from realized outcomes.
         min_payout_req, min_ev_req, adaptive_hard_cap = self._adaptive_thresholds(duration)
+        rolling_profile = self._rolling_15m_profile(duration, live_entry, open_src, cl_age_s)
+        if duration >= 15 and (not booster_eval):
+            min_ev_req = max(0.005, min_ev_req + float(rolling_profile.get("ev_add", 0.0) or 0.0))
         # Dynamic flow constraints by current setup quality (avoid static hardcoded behavior).
         setup_q = max(0.0, min(1.0, (analysis_quality * 0.55) + (analysis_conviction * 0.45)))
         q_relax = max(0.0, setup_q - 0.55)
@@ -4312,6 +4319,20 @@ class LiveTrader:
             return None
         if duration >= 15 and (not booster_eval) and CONSISTENCY_CORE_ENABLED:
             core_payout = 1.0 / max(entry, 1e-9)
+            dyn_prob_floor = max(
+                0.50,
+                min(
+                    0.90,
+                    CONSISTENCY_MIN_TRUE_PROB_15M + float(rolling_profile.get("prob_add", 0.0) or 0.0),
+                ),
+            )
+            dyn_ev_floor = max(
+                0.005,
+                min(
+                    0.060,
+                    CONSISTENCY_MIN_EXEC_EV_15M + float(rolling_profile.get("ev_add", 0.0) or 0.0),
+                ),
+            )
             if EV_FRONTIER_ENABLED:
                 # Entry-aware minimum probability: allow sub-2x only when posterior is strong enough.
                 # required_prob = breakeven(entry+fees) + safety margin increasing with expensive entries.
@@ -4352,19 +4373,19 @@ class LiveTrader:
                     print(f"{Y}[SKIP] {asset} {duration}m consistency: CL disagree on core trade{RS}")
                 self._skip_tick("consistency_cl_disagree")
                 return None
-            if true_prob + 1e-9 < CONSISTENCY_MIN_TRUE_PROB_15M:
+            if true_prob + 1e-9 < dyn_prob_floor:
                 if self._noisy_log_enabled(f"skip-consistency-prob:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(
                         f"{Y}[SKIP] {asset} {duration}m consistency prob "
-                        f"{true_prob:.3f}<{CONSISTENCY_MIN_TRUE_PROB_15M:.3f}{RS}"
+                        f"{true_prob:.3f}<{dyn_prob_floor:.3f}{RS}"
                     )
                 self._skip_tick("consistency_prob_low")
                 return None
-            if execution_ev + 1e-9 < CONSISTENCY_MIN_EXEC_EV_15M:
+            if execution_ev + 1e-9 < dyn_ev_floor:
                 if self._noisy_log_enabled(f"skip-consistency-ev:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(
                         f"{Y}[SKIP] {asset} {duration}m consistency exec_ev "
-                        f"{execution_ev:.3f}<{CONSISTENCY_MIN_EXEC_EV_15M:.3f}{RS}"
+                        f"{execution_ev:.3f}<{dyn_ev_floor:.3f}{RS}"
                     )
                 self._skip_tick("consistency_ev_low")
                 return None
@@ -4527,6 +4548,14 @@ class LiveTrader:
             ),
             2,
         )
+        if duration >= 15 and (not booster_eval):
+            model_size = round(
+                min(
+                    hard_cap,
+                    model_size * float(rolling_profile.get("size_mult", 1.0) or 1.0),
+                ),
+                2,
+            )
         if (
             HIGH_EV_SIZE_BOOST_ENABLED
             and duration >= 15
@@ -5969,6 +5998,7 @@ class LiveTrader:
                             self.total += 1; self.wins += 1
                             self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
                             self._record_result(asset, side, True, trade.get("structural", False), pnl=pnl)
+                            self._record_resolved_sample(trade, pnl, True)
                         self._log(m, trade, "WIN", pnl)
                         self._log_onchain_event("RESOLVE", cid, {
                             "asset": asset,
@@ -6045,6 +6075,7 @@ class LiveTrader:
                                 self.total += 1
                                 self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
                                 self._record_result(asset, side, False, trade.get("structural", False), pnl=pnl)
+                                self._record_resolved_sample(trade, pnl, False)
                             self._log(m, trade, "LOSS", pnl)
                             self._log_onchain_event("RESOLVE", cid, {
                                 "asset": asset,
@@ -6609,6 +6640,84 @@ class LiveTrader:
         score_bucket = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
         entry_bucket = "<30c" if entry < 0.30 else ("30-50c" if entry <= 0.50 else ">50c")
         return f"{duration}m|{score_bucket}|{entry_bucket}"
+
+    @staticmethod
+    def _entry_band(entry: float) -> str:
+        e = float(entry or 0.0)
+        if e <= 0:
+            return "missing"
+        if e < 0.45:
+            return "<45c"
+        if e < 0.55:
+            return "45-55c"
+        if e < 0.65:
+            return "55-65c"
+        return "65c+"
+
+    def _record_resolved_sample(self, trade: dict, pnl: float, won: bool):
+        try:
+            self._resolved_samples.append({
+                "ts": _time.time(),
+                "duration": int(trade.get("duration", 0) or 0),
+                "entry": float(trade.get("entry", 0.0) or 0.0),
+                "source": str(trade.get("open_price_source", "?") or "?"),
+                "cl_age_s": trade.get("chainlink_age_s", None),
+                "pnl": float(pnl),
+                "won": bool(won),
+            })
+        except Exception:
+            pass
+
+    def _rolling_15m_profile(self, duration: int, entry: float, open_src: str, cl_age_s) -> dict:
+        if (not ROLLING_15M_CALIB_ENABLED) or duration < 15:
+            return {"prob_add": 0.0, "ev_add": 0.0, "size_mult": 1.0, "n": 0, "exp": 0.0, "wr_lb": 0.5}
+        band = self._entry_band(entry)
+        src_ok = (open_src == "PM") and (cl_age_s is not None) and (float(cl_age_s) <= 45.0)
+        vals = []
+        for s in list(self._resolved_samples)[-max(50, ROLLING_15M_CALIB_WINDOW):]:
+            if int(s.get("duration", 0) or 0) < 15:
+                continue
+            if self._entry_band(float(s.get("entry", 0.0) or 0.0)) != band:
+                continue
+            s_src = str(s.get("source", "?") or "?")
+            s_age = s.get("cl_age_s", None)
+            s_ok = (s_src == "PM") and (s_age is not None) and (float(s_age) <= 45.0)
+            if s_ok != src_ok:
+                continue
+            vals.append(s)
+        n = len(vals)
+        if n < ROLLING_15M_CALIB_MIN_N:
+            return {"prob_add": 0.0, "ev_add": 0.0, "size_mult": 1.0, "n": n, "exp": 0.0, "wr_lb": 0.5}
+        wins = sum(1 for x in vals if bool(x.get("won", False)))
+        pnl = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals)
+        exp = pnl / max(1, n)
+        gw = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) > 0)
+        gl = -sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) < 0)
+        pf = (gw / gl) if gl > 0 else (2.0 if gw > 0 else 1.0)
+        wr_lb = self._wilson_lower_bound(wins, n)
+        prob_add = 0.0
+        ev_add = 0.0
+        size_mult = 1.0
+        if exp <= -0.30 or wr_lb < 0.45 or pf < 0.90:
+            prob_add += 0.025
+            ev_add += 0.006
+            size_mult *= 0.75
+        elif exp >= 0.20 and wr_lb >= 0.52 and pf >= 1.10:
+            prob_add -= 0.008
+            ev_add -= 0.001
+            size_mult *= 1.12
+        if (not src_ok) and (exp < 0):
+            prob_add += 0.020
+            ev_add += 0.004
+            size_mult *= 0.85
+        return {
+            "prob_add": max(-0.02, min(0.05, prob_add)),
+            "ev_add": max(-0.004, min(0.012, ev_add)),
+            "size_mult": max(0.65, min(1.25, size_mult)),
+            "n": n,
+            "exp": exp,
+            "wr_lb": wr_lb,
+        }
 
     @staticmethod
     def _wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
