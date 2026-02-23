@@ -2773,19 +2773,29 @@ class LiveTrader:
                 c_mark = G if mark_pnl > 0 else (R if mark_pnl < 0 else Y)
                 mark_roi = (mark_pnl / spent * 100.0) if spent > 0 else 0.0
                 if lead >= n and n > 0:
-                    now_state = "WINNING"
-                    c_now = G
+                    event_state = "LEAD"
+                    c_event = G
                 elif lead <= 0:
-                    now_state = "LOSING"
-                    c_now = R
+                    event_state = "TRAIL"
+                    c_event = R
                 else:
-                    now_state = "MIXED"
-                    c_now = Y
+                    event_state = "MIXED"
+                    c_event = Y
+                if mark_pnl > 0:
+                    mark_state = "GREEN"
+                    c_mark_state = G
+                elif mark_pnl < 0:
+                    mark_state = "RED"
+                    c_mark_state = R
+                else:
+                    mark_state = "FLAT"
+                    c_mark_state = Y
                 if LIVE_RK_REAL_ONLY:
                     print(
                         f"  {B}[LIVE-RK]{RS} {rk} | state=OPEN(unsettled) | trades={n} | "
                         f"{Y}SIDE{RS}={side_lbl} (${side_stake:.2f}) | "
-                        f"{c_now}NOW{RS}={c_now}{now_state}{RS} | "
+                        f"{c_event}EVENT_NOW{RS}={c_event}{event_state}{RS}({lead}/{n}) | "
+                        f"{c_mark_state}MARK_NOW{RS}={c_mark_state}{mark_state}{RS} | "
                         f"{Y}SPENT{RS}=${spent:.2f} | "
                         f"{B}REAL_MARK{RS}=${value_now:.2f} | "
                         f"{c_mark}REAL_PNL_NOW{RS}={c_mark}${mark_pnl:+.2f}{RS} | "
@@ -2796,7 +2806,8 @@ class LiveTrader:
                     print(
                         f"  {B}[LIVE-RK]{RS} {rk} | state=OPEN(unsettled) | trades={n} | "
                         f"{Y}SIDE{RS}={side_lbl} (${side_stake:.2f}) | "
-                        f"{c_now}NOW{RS}={c_now}{now_state}{RS} | "
+                        f"{c_event}EVENT_NOW{RS}={c_event}{event_state}{RS}({lead}/{n}) | "
+                        f"{c_mark_state}MARK_NOW{RS}={c_mark_state}{mark_state}{RS} | "
                         f"{Y}SPENT{RS}=${spent:.2f} | "
                         f"{B}REAL_MARK{RS}=${value_now:.2f} | "
                         f"{c_mark}REAL_PNL_NOW{RS}={c_mark}${mark_pnl:+.2f}{RS} | "
@@ -2804,8 +2815,7 @@ class LiveTrader:
                         f"{G}SCENARIO_IF_WIN{RS}=${win_payout:.2f} | "
                         f"{c_pl}SCENARIO_PROFIT_IF_WIN{RS}={c_pl}${win_profit:+.2f}{RS} | "
                         f"{B}x{RS}{mult:.2f} | "
-                        f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c | "
-                        f"{c_lead}LEAD{RS}={lead}/{n}"
+                        f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c"
                     )
         elif self._should_log("live-rk-empty", 15):
             print(f"  {Y}[LIVE-RK]{RS} none | trades=0 | no active on-chain positions")
