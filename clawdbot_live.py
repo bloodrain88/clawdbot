@@ -531,6 +531,14 @@ RECENT_SIDE_PRIOR_LOOKBACK_H = float(os.environ.get("RECENT_SIDE_PRIOR_LOOKBACK_
 RECENT_SIDE_PRIOR_MAX_PROB_ADJ = float(os.environ.get("RECENT_SIDE_PRIOR_MAX_PROB_ADJ", "0.025"))
 RECENT_SIDE_PRIOR_MAX_EDGE_ADJ = float(os.environ.get("RECENT_SIDE_PRIOR_MAX_EDGE_ADJ", "0.010"))
 RECENT_SIDE_PRIOR_MAX_SCORE_ADJ = int(os.environ.get("RECENT_SIDE_PRIOR_MAX_SCORE_ADJ", "2"))
+ASSET_ENTRY_PRIOR_ENABLED = os.environ.get("ASSET_ENTRY_PRIOR_ENABLED", "true").lower() == "true"
+ASSET_ENTRY_PRIOR_MIN_N = int(os.environ.get("ASSET_ENTRY_PRIOR_MIN_N", "12"))
+ASSET_ENTRY_PRIOR_LOOKBACK_H = float(os.environ.get("ASSET_ENTRY_PRIOR_LOOKBACK_H", "48"))
+ASSET_ENTRY_PRIOR_MAX_PROB_ADJ = float(os.environ.get("ASSET_ENTRY_PRIOR_MAX_PROB_ADJ", "0.018"))
+ASSET_ENTRY_PRIOR_MAX_EDGE_ADJ = float(os.environ.get("ASSET_ENTRY_PRIOR_MAX_EDGE_ADJ", "0.012"))
+ASSET_ENTRY_PRIOR_MAX_SCORE_ADJ = int(os.environ.get("ASSET_ENTRY_PRIOR_MAX_SCORE_ADJ", "3"))
+ASSET_ENTRY_PRIOR_MIN_SIZE_MULT = float(os.environ.get("ASSET_ENTRY_PRIOR_MIN_SIZE_MULT", "0.55"))
+ASSET_ENTRY_PRIOR_MAX_SIZE_MULT = float(os.environ.get("ASSET_ENTRY_PRIOR_MAX_SIZE_MULT", "1.20"))
 CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M = float(os.environ.get("CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M", "0.78"))
 CONSISTENCY_STRONG_MIN_SCORE_15M = int(os.environ.get("CONSISTENCY_STRONG_MIN_SCORE_15M", "14"))
 CONSISTENCY_STRONG_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_STRONG_MIN_TRUE_PROB_15M", "0.72"))
@@ -2754,7 +2762,7 @@ class LiveTrader:
                 tok_str = "@n/a"
             if LOG_LIVE_DETAIL:
                 print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
-                      f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
+                      f"beat={open_p:.6f}[{src}] now={cur_p:.6f} {move_str} | "
                       f"{stake_label}=${(value_now if stake_label=='value_now' else stake):.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
                       f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
             shown_live_cids.add(cid)
@@ -2836,7 +2844,7 @@ class LiveTrader:
             if LOG_LIVE_DETAIL:
                 print(
                     f"  {Y}[LIVE-PENDING]{RS} {asset} {side} | {title} | "
-                    f"beat={open_p:.4f}[{src}] now={cur_p:.4f} {move_str} | "
+                    f"beat={open_p:.6f}[{src}] now={cur_p:.6f} {move_str} | "
                     f"{('value_now' if stake_src=='value_fallback' else 'bet')}=${(value_now if stake_src=='value_fallback' else stake):.2f} "
                     f"{('@n/a' if stake_src=='value_fallback' else '')} est=${payout_est:.2f} proj={proj_str} | "
                     f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}"
@@ -4094,6 +4102,7 @@ class LiveTrader:
                 side, edge, true_prob = "Down", edge_down, prob_down
 
         # Keep signal components aligned to the effective side.
+        asset_entry_size_mult = 1.0
         side_up = side == "Up"
         event_align_size_mult = 1.0
         recent_side = up_recent if side_up else dn_recent
@@ -4111,6 +4120,25 @@ class LiveTrader:
                     f"{B}[RECENT-SIDE]{RS} {asset} {duration}m {side} "
                     f"adj(score={recent_side_score_adj:+d},edge={recent_side_edge_adj:+.3f},prob={recent_side_prob_adj:+.3f}) "
                     f"n={recent_side_n} exp={recent_side_exp:+.2f} wr_lb={recent_side_wr_lb:.2f}"
+                )
+        # Asset+entry-band profile from settled on-chain outcomes.
+        aq_entry = up_price if side_up else (1.0 - up_price)
+        aq = self._asset_entry_profile(asset, duration, side, aq_entry, open_src, cl_age_s)
+        aq_score = int(aq.get("score_adj", 0) or 0)
+        aq_edge = float(aq.get("edge_adj", 0.0) or 0.0)
+        aq_prob = float(aq.get("prob_adj", 0.0) or 0.0)
+        asset_entry_size_mult = float(aq.get("size_mult", 1.0) or 1.0)
+        if aq_score != 0 or abs(aq_edge) > 1e-9 or abs(aq_prob) > 1e-9:
+            score += aq_score
+            edge += aq_edge
+            true_prob = max(0.05, min(0.95, true_prob + aq_prob))
+            if self._noisy_log_enabled(f"onchain-q:{asset}:{duration}:{side}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{B}[ONCHAIN-Q]{RS} {asset} {duration}m {side} "
+                    f"band={aq.get('band','?')} n={int(aq.get('n',0) or 0)} "
+                    f"wr_lb={float(aq.get('wr_lb',0.5) or 0.5):.2f} pf={float(aq.get('pf',1.0) or 1.0):.2f} "
+                    f"exp={float(aq.get('exp',0.0) or 0.0):+.2f} "
+                    f"adj(score={aq_score:+d},edge={aq_edge:+.3f},prob={aq_prob:+.3f},size_x={asset_entry_size_mult:.2f})"
                 )
         tf_votes = tf_up_votes if side_up else tf_dn_votes
         ob_sig = dw_ob if side_up else -dw_ob
@@ -4135,7 +4163,6 @@ class LiveTrader:
                     strong_exception = (
                         score >= EVENT_ALIGN_ALLOW_SCORE
                         and true_prob >= EVENT_ALIGN_ALLOW_TRUE_PROB
-                        and execution_ev >= EVENT_ALIGN_ALLOW_EV
                     )
                     if not strong_exception:
                         pen_scale = max(0.6, min(1.4, abs(move_now) / max(EVENT_ALIGN_MIN_MOVE_PCT, 1e-9)))
@@ -5002,7 +5029,7 @@ class LiveTrader:
         model_size = round(
             min(
                 hard_cap,
-                raw_size * vol_mult * wr_scale * oracle_scale * bucket_scale * cents_scale * time_scale * leader_size_scale,
+                raw_size * vol_mult * wr_scale * oracle_scale * bucket_scale * cents_scale * time_scale * leader_size_scale * asset_entry_size_mult,
             ),
             2,
         )
@@ -7704,6 +7731,110 @@ class LiveTrader:
             "wr_lb": wr_lb,
         }
 
+    def _asset_entry_profile(self, asset: str, duration: int, side: str, entry: float, open_src: str, cl_age_s) -> dict:
+        """Data-driven quality prior from settled on-chain outcomes for (asset,duration,side,entry-band).
+        Non-blocking: adjusts score/edge/prob/size continuously."""
+        if not ASSET_ENTRY_PRIOR_ENABLED:
+            return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "size_mult": 1.0, "n": 0, "exp": 0.0, "wr_lb": 0.5, "pf": 1.0, "band": "na"}
+        try:
+            band = self._entry_band(float(entry or 0.0))
+            now_ts = _time.time()
+            lookback_s = max(0.0, float(ASSET_ENTRY_PRIOR_LOOKBACK_H) * 3600.0)
+            src_ok = (open_src == "PM") and (cl_age_s is not None) and (float(cl_age_s) <= 45.0)
+            vals = []
+            for s in list(self._resolved_samples)[-1200:]:
+                if str(s.get("asset", "") or "") != str(asset):
+                    continue
+                if int(s.get("duration", 0) or 0) != int(duration):
+                    continue
+                if str(s.get("side", "") or "") != str(side):
+                    continue
+                if self._entry_band(float(s.get("entry", 0.0) or 0.0)) != band:
+                    continue
+                ts = float(s.get("ts", 0.0) or 0.0)
+                if ts <= 0:
+                    continue
+                if lookback_s > 0 and (now_ts - ts) > lookback_s:
+                    continue
+                s_src = str(s.get("source", "?") or "?")
+                s_age = s.get("cl_age_s", None)
+                s_ok = (s_src == "PM") and (s_age is not None) and (float(s_age) <= 45.0)
+                # Prefer same source-quality bucket; if sparse, fall back to full bucket.
+                if s_ok == src_ok:
+                    vals.append(s)
+            if len(vals) < max(1, ASSET_ENTRY_PRIOR_MIN_N // 2):
+                vals = []
+                for s in list(self._resolved_samples)[-1200:]:
+                    if str(s.get("asset", "") or "") != str(asset):
+                        continue
+                    if int(s.get("duration", 0) or 0) != int(duration):
+                        continue
+                    if str(s.get("side", "") or "") != str(side):
+                        continue
+                    if self._entry_band(float(s.get("entry", 0.0) or 0.0)) != band:
+                        continue
+                    ts = float(s.get("ts", 0.0) or 0.0)
+                    if ts <= 0:
+                        continue
+                    if lookback_s > 0 and (now_ts - ts) > lookback_s:
+                        continue
+                    vals.append(s)
+            n = len(vals)
+            if n < max(1, ASSET_ENTRY_PRIOR_MIN_N):
+                return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "size_mult": 1.0, "n": n, "exp": 0.0, "wr_lb": 0.5, "pf": 1.0, "band": band}
+            wins = sum(1 for x in vals if bool(x.get("won", False)))
+            pnl = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals)
+            exp = pnl / max(1, n)
+            wr_lb = self._wilson_lower_bound(wins, n)
+            gross_win = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) > 0)
+            gross_loss = -sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) < 0)
+            pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
+
+            score_adj = 0
+            edge_adj = 0.0
+            prob_adj = 0.0
+            size_mult = 1.0
+            # Poor cluster => reduce confidence and size, but never block.
+            if (wr_lb < 0.44 and pf < 0.90) or exp <= -0.70:
+                score_adj = -3 if (n >= 24 and wr_lb < 0.42 and exp <= -1.00) else -2
+                edge_adj = -(0.005 + min(0.007, abs(exp) / 120.0))
+                prob_adj = -(0.008 + min(0.010, abs(exp) / 90.0))
+                size_mult = 0.55 if score_adj <= -3 else 0.70
+            elif (wr_lb < 0.49 and pf < 0.98) or exp < 0.0:
+                score_adj = -1
+                edge_adj = -0.003
+                prob_adj = -0.005
+                size_mult = 0.85
+            # Strong cluster => boost confidence and allow modest size increase.
+            elif (wr_lb >= 0.58 and pf >= 1.25 and exp >= 0.90 and n >= 24):
+                score_adj = 2
+                edge_adj = 0.005
+                prob_adj = 0.008
+                size_mult = 1.15
+            elif (wr_lb >= 0.54 and pf >= 1.10 and exp >= 0.30):
+                score_adj = 1
+                edge_adj = 0.003
+                prob_adj = 0.005
+                size_mult = 1.06
+
+            score_adj = int(max(-ASSET_ENTRY_PRIOR_MAX_SCORE_ADJ, min(ASSET_ENTRY_PRIOR_MAX_SCORE_ADJ, score_adj)))
+            edge_adj = float(max(-ASSET_ENTRY_PRIOR_MAX_EDGE_ADJ, min(ASSET_ENTRY_PRIOR_MAX_EDGE_ADJ, edge_adj)))
+            prob_adj = float(max(-ASSET_ENTRY_PRIOR_MAX_PROB_ADJ, min(ASSET_ENTRY_PRIOR_MAX_PROB_ADJ, prob_adj)))
+            size_mult = float(max(ASSET_ENTRY_PRIOR_MIN_SIZE_MULT, min(ASSET_ENTRY_PRIOR_MAX_SIZE_MULT, size_mult)))
+            return {
+                "score_adj": score_adj,
+                "edge_adj": edge_adj,
+                "prob_adj": prob_adj,
+                "size_mult": size_mult,
+                "n": int(n),
+                "exp": float(exp),
+                "wr_lb": float(wr_lb),
+                "pf": float(pf),
+                "band": band,
+            }
+        except Exception:
+            return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "size_mult": 1.0, "n": 0, "exp": 0.0, "wr_lb": 0.5, "pf": 1.0, "band": "na"}
+
     @staticmethod
     def _wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
         """Conservative confidence lower-bound for Bernoulli win-rate."""
@@ -8554,8 +8685,10 @@ class LiveTrader:
                         self._mkt_log_ts[cid] = now_ts
                         move = (cur - ref) / ref * 100
                         if LOG_VERBOSE or abs(move) >= LOG_MKT_MOVE_THRESHOLD_PCT:
-                            print(f"{B}[MKT] {asset} {dur}m | beat=${ref:,.2f} [{src}] | "
-                                  f"now=${cur:,.2f} move={move:+.3f}% | {m['mins_left']:.1f}min left{RS}")
+                            ref_fmt = f"{ref:,.6f}" if ref < 100 else f"{ref:,.2f}"
+                            cur_fmt = f"{cur:,.6f}" if cur < 100 else f"{cur:,.2f}"
+                            print(f"{B}[MKT] {asset} {dur}m | beat=${ref_fmt} [{src}] | "
+                                  f"now=${cur_fmt} move={move:+.3f}% | {m['mins_left']:.1f}min left{RS}")
                 if cid not in self.seen:
                     candidates.append(m)
                 else:
