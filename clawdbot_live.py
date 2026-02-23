@@ -158,13 +158,13 @@ MIN_BET_ABS    = float(os.environ.get("MIN_BET_ABS", "2.50"))
 MIN_EXEC_NOTIONAL_USDC = float(os.environ.get("MIN_EXEC_NOTIONAL_USDC", "5.0"))
 MIN_ORDER_SIZE_SHARES = float(os.environ.get("MIN_ORDER_SIZE_SHARES", "5.0"))
 ORDER_SIZE_PAD_SHARES = float(os.environ.get("ORDER_SIZE_PAD_SHARES", "0.02"))
-MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.025"))
+MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.018"))
 DUST_RECOVER_MIN = float(os.environ.get("DUST_RECOVER_MIN", "0.50"))
 # Presence threshold for on-chain position visibility/sync.
 # Keep this low and independent from recovery sizing thresholds.
 OPEN_PRESENCE_MIN = float(os.environ.get("OPEN_PRESENCE_MIN", "0.01"))
 MAX_ABS_BET    = float(os.environ.get("MAX_ABS_BET", "14.0"))     # hard ceiling
-MAX_BANKROLL_PCT = 0.35   # never risk more than 35% of bankroll on a single bet
+MAX_BANKROLL_PCT = 0.25   # never risk more than 25% of bankroll on a single bet
 MAX_OPEN       = int(os.environ.get("MAX_OPEN", "8"))
 MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "8"))
 MAX_CID_EXPOSURE_PCT = float(os.environ.get("MAX_CID_EXPOSURE_PCT", "0.10"))
@@ -181,7 +181,7 @@ MIN_ENTRY_PRICE_15M = float(os.environ.get("MIN_ENTRY_PRICE_15M", "0.20"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.35"))
 MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.52"))
 MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "1.85"))
-MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.018"))
+MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.021"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
 HC15_ENABLED = os.environ.get("HC15_ENABLED", "false").lower() == "true"
 HC15_MIN_SCORE = int(os.environ.get("HC15_MIN_SCORE", "10"))
@@ -191,7 +191,7 @@ HC15_TARGET_ENTRY = float(os.environ.get("HC15_TARGET_ENTRY", "0.30"))
 HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
 HC15_FALLBACK_MAX_ENTRY = float(os.environ.get("HC15_FALLBACK_MAX_ENTRY", "0.36"))
 MIN_PAYOUT_MULT_5M = float(os.environ.get("MIN_PAYOUT_MULT_5M", "1.75"))
-MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.018"))
+MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.021"))
 ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.54"))
 ENTRY_HARD_CAP_15M = float(os.environ.get("ENTRY_HARD_CAP_15M", "0.65"))
 ENTRY_NEAR_MISS_TOL = float(os.environ.get("ENTRY_NEAR_MISS_TOL", "0.030"))
@@ -450,8 +450,8 @@ ENTRY_WAIT_MAX_PROB_DECAY = float(os.environ.get("ENTRY_WAIT_MAX_PROB_DECAY", "0
 ENTRY_WAIT_MAX_EDGE_DECAY = float(os.environ.get("ENTRY_WAIT_MAX_EDGE_DECAY", "0.02"))
 CONSISTENCY_CORE_ENABLED = os.environ.get("CONSISTENCY_CORE_ENABLED", "true").lower() == "true"
 CONSISTENCY_REQUIRE_CL_AGREE_15M = os.environ.get("CONSISTENCY_REQUIRE_CL_AGREE_15M", "true").lower() == "true"
-CONSISTENCY_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_MIN_TRUE_PROB_15M", "0.62"))
-CONSISTENCY_MIN_EXEC_EV_15M = float(os.environ.get("CONSISTENCY_MIN_EXEC_EV_15M", "0.020"))
+CONSISTENCY_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_MIN_TRUE_PROB_15M", "0.64"))
+CONSISTENCY_MIN_EXEC_EV_15M = float(os.environ.get("CONSISTENCY_MIN_EXEC_EV_15M", "0.024"))
 CONSISTENCY_MIN_TF_VOTES_15M = int(os.environ.get("CONSISTENCY_MIN_TF_VOTES_15M", "2"))
 CONSISTENCY_MAX_ENTRY_15M = float(os.environ.get("CONSISTENCY_MAX_ENTRY_15M", "0.60"))
 CONSISTENCY_MIN_PAYOUT_15M = float(os.environ.get("CONSISTENCY_MIN_PAYOUT_15M", "2.00"))
@@ -470,7 +470,7 @@ ASSET_QUALITY_BLOCK_PF = float(os.environ.get("ASSET_QUALITY_BLOCK_PF", "0.88"))
 ASSET_QUALITY_BLOCK_EXP = float(os.environ.get("ASSET_QUALITY_BLOCK_EXP", "-0.25"))
 MAX_WIN_MODE = os.environ.get("MAX_WIN_MODE", "true").lower() == "true"
 WINMODE_MIN_TRUE_PROB_5M = float(os.environ.get("WINMODE_MIN_TRUE_PROB_5M", "0.58"))
-WINMODE_MIN_TRUE_PROB_15M = float(os.environ.get("WINMODE_MIN_TRUE_PROB_15M", "0.60"))
+WINMODE_MIN_TRUE_PROB_15M = float(os.environ.get("WINMODE_MIN_TRUE_PROB_15M", "0.62"))
 WINMODE_MIN_EDGE = float(os.environ.get("WINMODE_MIN_EDGE", "0.015"))
 WINMODE_MAX_ENTRY_5M = float(os.environ.get("WINMODE_MAX_ENTRY_5M", "0.60"))
 WINMODE_MAX_ENTRY_15M = float(os.environ.get("WINMODE_MAX_ENTRY_15M", "0.56"))
@@ -3500,6 +3500,15 @@ class LiveTrader:
             return None
         elif cl_age_s > 45:
             onchain_adj -= 2
+        # Empirical guard from live outcomes: core 15m trades with missing/stale CL age
+        # have materially worse expectancy. Hard-block them.
+        if duration >= 15 and (not booster_eval):
+            if cl_age_s is None or cl_age_s > 45:
+                if self._noisy_log_enabled(f"skip-core-source-age:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    a = -1.0 if cl_age_s is None else float(cl_age_s)
+                    print(f"{Y}[SKIP] {asset} {duration}m core source-age invalid (cl_age={a:.1f}s){RS}")
+                self._skip_tick("core_source_age_invalid")
+                return None
         score += onchain_adj
 
         # ── Binance signals from WS cache (instant) + PM book fetch (async ~36ms) ─
@@ -6684,7 +6693,11 @@ class LiveTrader:
         tightness = min(1.8, max(-0.5, tightness))
 
         min_payout_raw = base_payout + (0.20 * tightness)
-        min_payout = max(1.55, min(base_payout + payout_upshift_cap, min_payout_raw))
+        if duration >= 15:
+            # Keep 15m payout floor strict: adapt upward only, never below base.
+            min_payout = max(base_payout, min(base_payout + payout_upshift_cap, min_payout_raw))
+        else:
+            min_payout = max(1.55, min(base_payout + payout_upshift_cap, min_payout_raw))
         min_ev = max(0.005, base_ev + (0.015 * tightness))
         max_entry_hard = max(0.33, min(0.80, hard_cap - (0.06 * tightness)))
         # In favorable regime, allow slightly wider executable entry band.
