@@ -5790,7 +5790,7 @@ class LiveTrader:
                     prev_res = str((prev_settle or {}).get("result", "") or "").upper()
                     if prev_res in ("WIN", "LOSS"):
                         prev_rk = str((prev_settle or {}).get("rk", "") or "")
-                        if self._noisy_log_enabled(f"settle-dupe:{cid}", LOG_SCAN_HEARTBEAT_SEC):
+                        if self._noisy_log_enabled(f"settle-dupe:{cid}", LOG_REDEEM_WAIT_EVERY_SEC):
                             print(
                                 f"{Y}[SETTLE-DUPE]{RS} skip {asset} {side} "
                                 f"result={prev_res} | rk={prev_rk or rk} cid={self._short_cid(cid)}"
