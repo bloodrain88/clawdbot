@@ -467,7 +467,7 @@ ROLLING_15M_CALIB_ENABLED = os.environ.get("ROLLING_15M_CALIB_ENABLED", "true").
 ROLLING_15M_CALIB_MIN_N = int(os.environ.get("ROLLING_15M_CALIB_MIN_N", "20"))
 ROLLING_15M_CALIB_WINDOW = int(os.environ.get("ROLLING_15M_CALIB_WINDOW", "400"))
 PM_PATTERN_ENABLED = os.environ.get("PM_PATTERN_ENABLED", "true").lower() == "true"
-PM_PATTERN_MIN_N = int(os.environ.get("PM_PATTERN_MIN_N", "12"))
+PM_PATTERN_MIN_N = int(os.environ.get("PM_PATTERN_MIN_N", "6"))
 PM_PATTERN_MAX_EDGE_ADJ = float(os.environ.get("PM_PATTERN_MAX_EDGE_ADJ", "0.010"))
 CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M = float(os.environ.get("CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M", "0.78"))
 CONSISTENCY_STRONG_MIN_SCORE_15M = int(os.environ.get("CONSISTENCY_STRONG_MIN_SCORE_15M", "14"))
@@ -3990,6 +3990,17 @@ class LiveTrader:
                             f"n={int(patt.get('n',0) or 0)} exp={float(patt.get('exp',0.0) or 0.0):+.2f} "
                             f"wr_lb={float(patt.get('wr_lb',0.5) or 0.5):.2f}"
                         )
+                elif (
+                    int(patt.get("n", 0) or 0) > 0
+                    and int(patt.get("n", 0) or 0) < int(patt.get("min_n", PM_PATTERN_MIN_N) or PM_PATTERN_MIN_N)
+                    and self._noisy_log_enabled(f"pm-pattern-warmup:{asset}:{cid}", LOG_FLOW_EVERY_SEC)
+                ):
+                    print(
+                        f"{Y}[PM-PATTERN-WARMUP]{RS} {asset} {duration}m {side} "
+                        f"n={int(patt.get('n',0) or 0)}/{int(patt.get('min_n', PM_PATTERN_MIN_N) or PM_PATTERN_MIN_N)} "
+                        f"exp={float(patt.get('exp',0.0) or 0.0):+.2f} "
+                        f"wr_lb={float(patt.get('wr_lb',0.5) or 0.5):.2f}"
+                    )
 
         # Real-time CID refresh on missing/stale leader-flow before any gating decision.
         if COPYFLOW_CID_ONDEMAND_ENABLED and (
@@ -6753,7 +6764,7 @@ class LiveTrader:
         row = self._pm_pattern_stats.get(pattern_key, {})
         n = int(row.get("n", 0) or 0)
         if n <= 0:
-            return {"score_adj": 0, "edge_adj": 0.0, "n": 0, "exp": 0.0, "wr_lb": 0.5}
+            return {"score_adj": 0, "edge_adj": 0.0, "n": 0, "exp": 0.0, "wr_lb": 0.5, "min_n": PM_PATTERN_MIN_N}
         wins = int(row.get("wins", 0) or 0)
         pnl = float(row.get("pnl", 0.0) or 0.0)
         exp = pnl / max(1, n)
@@ -6773,7 +6784,14 @@ class LiveTrader:
             elif exp < 0.0 and wr_lb < 0.48:
                 score_adj = -1
                 edge_adj = -min(PM_PATTERN_MAX_EDGE_ADJ, 0.002 + min(0.004, abs(exp) / 120.0))
-        return {"score_adj": score_adj, "edge_adj": edge_adj, "n": n, "exp": exp, "wr_lb": wr_lb}
+        return {
+            "score_adj": score_adj,
+            "edge_adj": edge_adj,
+            "n": n,
+            "exp": exp,
+            "wr_lb": wr_lb,
+            "min_n": PM_PATTERN_MIN_N,
+        }
 
     def _record_pm_pattern_outcome(self, trade: dict, pnl: float, won: bool):
         try:
@@ -7185,6 +7203,7 @@ class LiveTrader:
             self.recent_trades = deque(data.get("recent", []), maxlen=30)
             self.recent_pnl = deque(data.get("recent_pnl", []), maxlen=40)
             self.side_perf = data.get("side_perf", {})
+            self._pm_pattern_stats = data.get("pm_pattern_stats", {}) or {}
             total = sum(s.get("total",0) for a in self.stats.values() for s in a.values())
             wins  = sum(s.get("wins",0)  for a in self.stats.values() for s in a.values())
             if total and LOG_STATS_LOCAL:
@@ -7194,6 +7213,7 @@ class LiveTrader:
             self.recent_trades = deque(maxlen=30)
             self.recent_pnl = deque(maxlen=40)
             self.side_perf = {}
+            self._pm_pattern_stats = {}
 
     def _load_pnl_baseline(self):
         """Load persistent on-chain PnL baseline unless reset is requested on boot."""
@@ -7236,6 +7256,7 @@ class LiveTrader:
                         "recent": list(self.recent_trades),
                         "recent_pnl": list(self.recent_pnl),
                         "side_perf": self.side_perf,
+                        "pm_pattern_stats": self._pm_pattern_stats,
                     },
                     f,
                 )
