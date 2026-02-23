@@ -273,6 +273,7 @@ LOG_BANK_MIN_DELTA = float(os.environ.get("LOG_BANK_MIN_DELTA", "0.50"))
 LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
 LOG_LIVE_DETAIL = os.environ.get("LOG_LIVE_DETAIL", "true").lower() == "true"
 LOG_LIVE_RK_MAX = int(os.environ.get("LOG_LIVE_RK_MAX", "12"))
+LIVE_RK_REAL_ONLY = os.environ.get("LIVE_RK_REAL_ONLY", "false").lower() == "true"
 # Keep freshly-filled local positions visible while on-chain position APIs catch up.
 LIVE_LOCAL_GRACE_SEC = float(os.environ.get("LIVE_LOCAL_GRACE_SEC", "120"))
 LOG_ROUND_SIGNAL_MIN_SEC = float(os.environ.get("LOG_ROUND_SIGNAL_MIN_SEC", "5"))
@@ -2760,17 +2761,40 @@ class LiveTrader:
                 else:
                     side_lbl = f"MIX U{up_n}/D{down_n}"
                     side_stake = spent
-                print(
-                    f"  {B}[LIVE-RK]{RS} {rk} | state=OPEN(unsettled) | trades={n} | "
-                    f"{Y}SIDE{RS}={side_lbl} (${side_stake:.2f}) | "
-                    f"{Y}SPENT{RS}=${spent:.2f} | "
-                    f"{B}MARK{RS}=${value_now:.2f} | "
-                    f"{G}HYP_IF_WIN{RS}=${win_payout:.2f} | "
-                    f"{c_pl}HYP_PROFIT_IF_WIN{RS}={c_pl}${win_profit:+.2f}{RS} | "
-                    f"{B}HYP_x{RS}{mult:.2f} | "
-                    f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c | "
-                    f"{c_lead}PROJ_LEAD{RS}={lead}/{n}"
-                )
+                mark_pnl = value_now - spent
+                c_mark = G if mark_pnl > 0 else (R if mark_pnl < 0 else Y)
+                if lead >= n and n > 0:
+                    now_state = "WINNING"
+                    c_now = G
+                elif lead <= 0:
+                    now_state = "LOSING"
+                    c_now = R
+                else:
+                    now_state = "MIXED"
+                    c_now = Y
+                if LIVE_RK_REAL_ONLY:
+                    print(
+                        f"  {B}[LIVE-RK]{RS} {rk} | state=OPEN(unsettled) | trades={n} | "
+                        f"{Y}SIDE{RS}={side_lbl} (${side_stake:.2f}) | "
+                        f"{c_now}NOW{RS}={c_now}{now_state}{RS} | "
+                        f"{Y}SPENT{RS}=${spent:.2f} | "
+                        f"{B}MARK{RS}=${value_now:.2f} | "
+                        f"{c_mark}P&L_MARK{RS}={c_mark}${mark_pnl:+.2f}{RS} | "
+                        f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c"
+                    )
+                else:
+                    print(
+                        f"  {B}[LIVE-RK]{RS} {rk} | state=OPEN(unsettled) | trades={n} | "
+                        f"{Y}SIDE{RS}={side_lbl} (${side_stake:.2f}) | "
+                        f"{c_now}NOW{RS}={c_now}{now_state}{RS} | "
+                        f"{Y}SPENT{RS}=${spent:.2f} | "
+                        f"{B}MARK{RS}=${value_now:.2f} | "
+                        f"{G}IF_WIN{RS}=${win_payout:.2f} | "
+                        f"{c_pl}PROFIT_IF_WIN{RS}={c_pl}${win_profit:+.2f}{RS} | "
+                        f"{B}x{RS}{mult:.2f} | "
+                        f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c | "
+                        f"{c_lead}LEAD{RS}={lead}/{n}"
+                    )
         elif self._should_log("live-rk-empty", 15):
             print(f"  {Y}[LIVE-RK]{RS} none | trades=0 | no active on-chain positions")
             now_fix = _time.time()
