@@ -479,6 +479,9 @@ SUPER_BET_MIN_SIZE_ENABLED = os.environ.get("SUPER_BET_MIN_SIZE_ENABLED", "true"
 SUPER_BET_ENTRY_MAX = float(os.environ.get("SUPER_BET_ENTRY_MAX", "0.30"))
 SUPER_BET_MIN_PAYOUT = float(os.environ.get("SUPER_BET_MIN_PAYOUT", "3.00"))
 SUPER_BET_MIN_SIZE_USDC = float(os.environ.get("SUPER_BET_MIN_SIZE_USDC", "5.0"))
+SUPER_BET_MAX_SIZE_ENABLED = os.environ.get("SUPER_BET_MAX_SIZE_ENABLED", "true").lower() == "true"
+SUPER_BET_MAX_SIZE_USDC = float(os.environ.get("SUPER_BET_MAX_SIZE_USDC", "10.0"))
+SUPER_BET_MAX_BANKROLL_PCT = float(os.environ.get("SUPER_BET_MAX_BANKROLL_PCT", "0.02"))
 ROLLING_15M_CALIB_ENABLED = os.environ.get("ROLLING_15M_CALIB_ENABLED", "true").lower() == "true"
 ROLLING_15M_CALIB_MIN_N = int(os.environ.get("ROLLING_15M_CALIB_MIN_N", "20"))
 ROLLING_15M_CALIB_WINDOW = int(os.environ.get("ROLLING_15M_CALIB_WINDOW", "400"))
@@ -4677,9 +4680,9 @@ class LiveTrader:
         hard_cap   = max(0.50, min(max_single, cid_cap, self.bankroll * MAX_BANKROLL_PCT))
         # Avoid oversized tail bets: these entries can look high-multiple but are low-quality fills.
         if entry <= 0.05:
-            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.02))
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.015))
         elif entry <= 0.10:
-            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.03))
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.020))
         # Soft cap curve for cheap entries:
         # default around $10, but scale toward ~$30 only if conviction is truly strong.
         if entry <= LOW_ENTRY_SOFT_THRESHOLD:
@@ -4783,6 +4786,22 @@ class LiveTrader:
                         f"x={payout_mult:.2f} entry={entry:.3f} "
                         f"${old_size:.2f}->${size:.2f}"
                     )
+
+        # Super-bet cap:
+        # keep very-high-multiple tails from over-allocating notional when liquidity/noise is high.
+        if SUPER_BET_MAX_SIZE_ENABLED:
+            payout_mult = (1.0 / max(entry, 1e-9))
+            if duration >= 15 and entry <= SUPER_BET_ENTRY_MAX and payout_mult >= SUPER_BET_MIN_PAYOUT:
+                max_super = max(0.50, min(SUPER_BET_MAX_SIZE_USDC, self.bankroll * SUPER_BET_MAX_BANKROLL_PCT))
+                if size > max_super:
+                    old_size = size
+                    size = round(max(0.50, max_super), 2)
+                    if self._noisy_log_enabled(f"superbet-cap:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet cap "
+                            f"x={payout_mult:.2f} entry={entry:.3f} "
+                            f"${old_size:.2f}->${size:.2f}"
+                        )
 
         if size < MIN_EXEC_NOTIONAL_USDC:
             return None
