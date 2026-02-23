@@ -171,6 +171,13 @@ MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "8"))
 MAX_CID_EXPOSURE_PCT = float(os.environ.get("MAX_CID_EXPOSURE_PCT", "0.10"))
 BLOCK_OPPOSITE_SIDE_SAME_CID = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_CID", "true").lower() == "true"
 BLOCK_OPPOSITE_SIDE_SAME_ROUND = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_ROUND", "true").lower() == "true"
+ROUND_STACK_SIZE_DECAY = float(os.environ.get("ROUND_STACK_SIZE_DECAY", "0.72"))
+ROUND_STACK_SIZE_MIN = float(os.environ.get("ROUND_STACK_SIZE_MIN", "0.45"))
+LOW_ENTRY_SIZE_HAIRCUT_ENABLED = os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_ENABLED", "true").lower() == "true"
+LOW_ENTRY_SIZE_HAIRCUT_PX = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_PX", "0.30"))
+LOW_ENTRY_SIZE_HAIRCUT_MULT = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_MULT", "0.65"))
+LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE = int(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE", "18"))
+LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB", "0.80"))
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
@@ -4828,6 +4835,52 @@ class LiveTrader:
                     f"payout={payout_mult:.2f}x entry={entry:.3f} "
                     f"tf={tf_votes} ob={ob_sig:+.2f} tk={taker_ratio:.2f} vol={vol_ratio:.2f}x"
                 )
+
+        # Live EV tuning (non-blocking):
+        # 1) Reduce tail-risk sizing on very low-cent entries unless conviction is exceptional.
+        if (
+            LOW_ENTRY_SIZE_HAIRCUT_ENABLED
+            and duration >= 15
+            and (not booster_mode)
+            and entry <= LOW_ENTRY_SIZE_HAIRCUT_PX
+            and not (score >= LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE and true_prob >= LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB)
+        ):
+            old_size = float(size)
+            size = max(float(MIN_EXEC_NOTIONAL_USDC), round(old_size * LOW_ENTRY_SIZE_HAIRCUT_MULT, 2))
+            if self._noisy_log_enabled(f"low-entry-haircut:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} low-entry haircut "
+                    f"entry={entry:.3f} size=${old_size:.2f}->${size:.2f}"
+                )
+
+        # 2) Same-round concentration decay: keep trading, but scale down 2nd/3rd/... leg.
+        if duration >= 15 and (not booster_mode):
+            sig_fp = self._round_fingerprint(
+                cid=cid,
+                m=m,
+                t={"asset": asset, "side": side, "duration": duration},
+            )
+            same_round_same_side = 0
+            for c_p, (m_p, t_p) in self.pending.items():
+                try:
+                    if self._round_fingerprint(cid=c_p, m=m_p, t=t_p) != sig_fp:
+                        continue
+                    if str(t_p.get("side", "")) != side:
+                        continue
+                    same_round_same_side += 1
+                except Exception:
+                    continue
+            if same_round_same_side > 0:
+                decay = max(0.05, min(1.0, ROUND_STACK_SIZE_DECAY))
+                floor = max(0.05, min(1.0, ROUND_STACK_SIZE_MIN))
+                mult = max(floor, decay ** same_round_same_side)
+                old_size = float(size)
+                size = max(float(MIN_EXEC_NOTIONAL_USDC), round(old_size * mult, 2))
+                if self._noisy_log_enabled(f"round-stack-size:{asset}:{side}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} round-stack x{mult:.2f} "
+                        f"(legs={same_round_same_side+1}) ${old_size:.2f}->${size:.2f}"
+                    )
 
         # Immediate fills: FOK on strong signal, GTC limit otherwise
         # Limit orders (use_limit=True) are always GTC — force_taker stays False
