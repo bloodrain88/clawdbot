@@ -837,6 +837,13 @@ EXEC_EDGE_FLOOR_DEFAULT  = float(os.environ.get("EXEC_EDGE_FLOOR_DEFAULT",  "0.0
 EXEC_EDGE_FLOOR_NO_CL    = float(os.environ.get("EXEC_EDGE_FLOOR_NO_CL",    "0.02"))
 EXEC_EDGE_STRONG_DELTA   = float(os.environ.get("EXEC_EDGE_STRONG_DELTA",   "0.01"))
 EXEC_EDGE_EARLY_DELTA    = float(os.environ.get("EXEC_EDGE_EARLY_DELTA",    "0.015"))
+# Resolution uses >= so an exact CL tie resolves as Up — add small structural bias to p_up_ll
+TIE_BIAS_UP              = float(os.environ.get("TIE_BIAS_UP",              "0.005"))
+# Correlated Kelly: scale size by 1/sqrt(N) when N same-direction positions are open
+CORR_KELLY_ENABLED       = os.environ.get("CORR_KELLY_ENABLED", "1") not in ("0", "false", "False")
+# Real-time OFI: rolling window for aggTrade stream (seconds)
+AGG_OFI_WINDOW_SEC       = float(os.environ.get("AGG_OFI_WINDOW_SEC", "30.0"))
+AGG_OFI_BLEND_W          = float(os.environ.get("AGG_OFI_BLEND_W", "0.60"))  # weight of aggOFI vs kline taker
 SETUP_SCORE_SLACK_HIGH = int(os.environ.get("SETUP_SCORE_SLACK_HIGH", "12"))
 SETUP_SCORE_SLACK_MID = int(os.environ.get("SETUP_SCORE_SLACK_MID", "9"))
 SETUP_SLACK_HIGH = float(os.environ.get("SETUP_SLACK_HIGH", "0.02"))
@@ -1027,7 +1034,8 @@ class LiveTrader:
         # Binance WS cache — populated by _stream_binance_* loops, read by _binance_* helpers
         self.binance_cache = {
             a: {"depth_bids": [], "depth_asks": [], "klines": [],
-                "mark": 0.0, "index": 0.0, "funding": 0.0}
+                "mark": 0.0, "index": 0.0, "funding": 0.0,
+                "agg_ofi_buf": deque(maxlen=2000)}  # (ts_float, buy_qty) for rolling OFI
             for a in BNB_SYM
         }
         self.open_prices        = {}   # cid → float price
@@ -4310,6 +4318,8 @@ class LiveTrader:
         llr *= regime_mult
         # Sigmoid → prob_up
         p_up_ll   = 1.0 / (1.0 + math.exp(-max(-LLR_CLAMP, min(LLR_CLAMP, llr))))
+        # Structural tie bias: resolution uses >= so exact CL tie resolves as Up
+        p_up_ll   = min(1.0, p_up_ll + TIE_BIAS_UP)
         bias_up   = self._direction_bias(asset, "Up", duration)
         bias_down = self._direction_bias(asset, "Down", duration)
         # Net bias: bias_up raises P(Up), bias_down lowers P(Up) — normalize so sum=1
@@ -4972,7 +4982,8 @@ class LiveTrader:
             alt_ask = _best_ask_from(alt_book)
             if alt_ask > 0:
                 cur_err = abs(cur_ask - fair_side_entry)
-                alt_err = abs(alt_ask - fair_side_entry)
+                alt_fair = 1.0 - fair_side_entry  # alt token's fair price is complement
+                alt_err = abs(alt_ask - alt_fair)
                 if (alt_err + FAIR_SIDE_SWAP_ERR_MARGIN) < cur_err:
                     if self._noisy_log_enabled(f"token-swap:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                         print(
@@ -7640,8 +7651,14 @@ class LiveTrader:
         rec_vol   = sum(float(k[5]) for k in recent)
         rec_taker = sum(float(k[9]) for k in recent)
         hist_avg  = (sum(float(k[5]) for k in hist) / len(hist)) if hist else rec_vol
-        taker_ratio = rec_taker / rec_vol if rec_vol > 0 else 0.5
+        kline_ratio = rec_taker / rec_vol if rec_vol > 0 else 0.5
         vol_ratio   = (rec_vol / 3) / hist_avg if hist_avg > 0 else 1.0
+        # Blend with real-time aggTrade OFI when available (higher weight = more responsive)
+        agg_ratio = self._binance_agg_ofi(asset)
+        if agg_ratio != 0.5:
+            taker_ratio = AGG_OFI_BLEND_W * agg_ratio + (1.0 - AGG_OFI_BLEND_W) * kline_ratio
+        else:
+            taker_ratio = kline_ratio
         return round(taker_ratio, 3), round(vol_ratio, 2)
 
     def _binance_perp_signals(self, asset: str) -> tuple:
@@ -7779,6 +7796,55 @@ class LiveTrader:
                 print(f"{Y}[BNB-PERP] {e} — reconnect in {delay}s{RS}")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
+
+    async def _stream_binance_aggtrade(self):
+        """Persistent WS: aggTrade stream for all assets → real-time OFI in binance_cache."""
+        import websockets as _ws, json as _j, time as _t
+        sym_map = {v: k for k, v in BNB_SYM.items()}
+        streams = [f"{s}@aggTrade" for s in BNB_SYM.values()]
+        url = "wss://stream.binance.com/stream?streams=" + "/".join(streams)
+        delay = 5
+        while True:
+            try:
+                async with _ws.connect(url, ping_interval=20, ping_timeout=30) as ws:
+                    print(f"{G}[BNB-AGG] aggTrade OFI stream connected{RS}")
+                    delay = 5
+                    async for raw in ws:
+                        msg    = _j.loads(raw)
+                        stream = msg.get("stream", "")
+                        data   = msg.get("data", {})
+                        sym    = stream.split("@")[0]
+                        asset  = sym_map.get(sym)
+                        if not asset:
+                            continue
+                        # m=True means maker was buyer → taker is SELLER; m=False → taker is BUYER
+                        is_buy = not bool(data.get("m", False))
+                        qty    = float(data.get("q", 0) or 0)
+                        ts     = _t.time()
+                        self.binance_cache[asset]["agg_ofi_buf"].append((ts, is_buy, qty))
+            except Exception as e:
+                print(f"{Y}[BNB-AGG] {e} — reconnect in {delay}s{RS}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
+    def _binance_agg_ofi(self, asset: str, window_sec: float | None = None) -> float:
+        """Rolling OFI ratio from aggTrade buffer. Returns 0.5 if no data."""
+        import time as _t
+        win = window_sec if window_sec is not None else AGG_OFI_WINDOW_SEC
+        buf = self.binance_cache.get(asset, {}).get("agg_ofi_buf")
+        if not buf:
+            return 0.5
+        cutoff = _t.time() - win
+        buy_q = sell_q = 0.0
+        for (ts, is_buy, qty) in buf:
+            if ts < cutoff:
+                continue
+            if is_buy:
+                buy_q += qty
+            else:
+                sell_q += qty
+        total = buy_q + sell_q
+        return round(buy_q / total, 4) if total > 0 else 0.5
 
     def _cross_asset_direction(self, asset: str, direction: str) -> int:
         """Count how many OTHER assets are trending in the same direction right now.
@@ -9139,6 +9205,13 @@ class LiveTrader:
                         # Unified direction: correlated assets move together — never hold Up + Down simultaneously
                         if pending_dn > 0 and sig["side"] == "Up":   continue
                         if pending_up > 0 and sig["side"] == "Down":  continue
+                    # Correlated Kelly: scale size by 1/sqrt(N) when N same-dir positions already pending
+                    if CORR_KELLY_ENABLED and not TRADE_ALL_MARKETS:
+                        n_same = (pending_up if sig["side"] == "Up" else pending_dn) + 1
+                        if n_same > 1:
+                            import math as _math
+                            sig = dict(sig)
+                            sig["size"] = round(float(sig.get("size", 0) or 0) / _math.sqrt(n_same), 2)
                     to_exec.append(sig)
                     m_sig = sig.get("m", {}) if isinstance(sig.get("m", {}), dict) else {}
                     t_sig = {
@@ -10136,8 +10209,9 @@ class LiveTrader:
 
         await asyncio.gather(
             _guard("stream_rtds",           self.stream_rtds),
-            _guard("_stream_binance_spot",  self._stream_binance_spot),
-            _guard("_stream_binance_futures", self._stream_binance_futures),
+            _guard("_stream_binance_spot",      self._stream_binance_spot),
+            _guard("_stream_binance_futures",   self._stream_binance_futures),
+            _guard("_stream_binance_aggtrade",  self._stream_binance_aggtrade),
             _guard("_stream_clob_market_book", self._stream_clob_market_book),
             _guard("vol_loop",              self.vol_loop),
             _guard("scan_loop",             self.scan_loop),
