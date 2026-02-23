@@ -833,6 +833,10 @@ TF_SCORE_MID = int(os.environ.get("TF_SCORE_MID", "2"))
 CORE_DURATION_MIN = int(os.environ.get("CORE_DURATION_MIN", "15"))
 FAIR_SIDE_MISMATCH_SWAP = float(os.environ.get("FAIR_SIDE_MISMATCH_SWAP", "0.18"))
 FAIR_SIDE_SWAP_ERR_MARGIN = float(os.environ.get("FAIR_SIDE_SWAP_ERR_MARGIN", "0.03"))
+EXEC_EDGE_FLOOR_DEFAULT  = float(os.environ.get("EXEC_EDGE_FLOOR_DEFAULT",  "0.04"))
+EXEC_EDGE_FLOOR_NO_CL    = float(os.environ.get("EXEC_EDGE_FLOOR_NO_CL",    "0.02"))
+EXEC_EDGE_STRONG_DELTA   = float(os.environ.get("EXEC_EDGE_STRONG_DELTA",   "0.01"))
+EXEC_EDGE_EARLY_DELTA    = float(os.environ.get("EXEC_EDGE_EARLY_DELTA",    "0.015"))
 SETUP_SCORE_SLACK_HIGH = int(os.environ.get("SETUP_SCORE_SLACK_HIGH", "12"))
 SETUP_SCORE_SLACK_MID = int(os.environ.get("SETUP_SCORE_SLACK_MID", "9"))
 SETUP_SLACK_HIGH = float(os.environ.get("SETUP_SLACK_HIGH", "0.02"))
@@ -4308,8 +4312,9 @@ class LiveTrader:
         p_up_ll   = 1.0 / (1.0 + math.exp(-max(-LLR_CLAMP, min(LLR_CLAMP, llr))))
         bias_up   = self._direction_bias(asset, "Up", duration)
         bias_down = self._direction_bias(asset, "Down", duration)
-        prob_up   = max(0.05, min(0.95, p_up_ll + bias_up))
-        prob_down = max(0.05, min(0.95, 1.0 - p_up_ll + bias_down))
+        # Net bias: bias_up raises P(Up), bias_down lowers P(Up) — normalize so sum=1
+        prob_up   = max(0.05, min(0.95, p_up_ll + bias_up - bias_down))
+        prob_down = 1.0 - prob_up
 
         # Early continuation prior boost (bounded, realtime-confirmed).
         if prev_win_dir == direction and pct_remaining > CONT_BONUS_EARLY_PCT:
@@ -6367,13 +6372,13 @@ class LiveTrader:
                             f"${min_notional:.2f} (min {MIN_ORDER_SIZE_SHARES:.0f} shares)"
                         )
                     size_usdc = min_notional
-                edge_floor = min_edge_req if min_edge_req is not None else 0.04
+                edge_floor = min_edge_req if min_edge_req is not None else EXEC_EDGE_FLOOR_DEFAULT
                 if not cl_agree:
-                    edge_floor += 0.02
+                    edge_floor += EXEC_EDGE_FLOOR_NO_CL
                 strong_exec = (
                     (score >= 12)
                     and cl_agree
-                    and (taker_edge >= (edge_floor + 0.01))
+                    and (taker_edge >= (edge_floor + EXEC_EDGE_STRONG_DELTA))
                 )
                 base_spread_cap = MAX_BOOK_SPREAD_5M if duration <= 5 else MAX_BOOK_SPREAD_15M
                 if (spread - base_spread_cap) > 1e-6 and not use_limit:
@@ -6423,7 +6428,7 @@ class LiveTrader:
                         score >= score_cap
                         and spread <= fast_spread_cap
                         and best_ask <= eff_max_entry
-                        and taker_edge >= (edge_floor + 0.01)
+                        and taker_edge >= (edge_floor + EXEC_EDGE_STRONG_DELTA)
                     ):
                         force_taker = True
                     elif (
@@ -6431,7 +6436,7 @@ class LiveTrader:
                         and score >= (score_cap + 1)
                         and spread <= (fast_spread_cap + 0.005)
                         and best_ask <= eff_max_entry
-                        and taker_edge >= (edge_floor + 0.015)
+                        and taker_edge >= (edge_floor + EXEC_EDGE_EARLY_DELTA)
                     ):
                         force_taker = True
                     elif (
