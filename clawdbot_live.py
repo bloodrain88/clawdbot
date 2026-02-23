@@ -302,6 +302,7 @@ SEEN_MAX_KEEP = int(os.environ.get("SEEN_MAX_KEEP", "600"))
 LOG_OPEN_WAIT_EVERY_SEC = int(os.environ.get("LOG_OPEN_WAIT_EVERY_SEC", "120"))
 LOG_REDEEM_WAIT_EVERY_SEC = int(os.environ.get("LOG_REDEEM_WAIT_EVERY_SEC", "180"))
 REDEEM_POLL_SEC = float(os.environ.get("REDEEM_POLL_SEC", "2.0"))
+REDEEM_POLL_SEC_ACTIVE = float(os.environ.get("REDEEM_POLL_SEC_ACTIVE", "0.25"))
 REDEEM_REQUIRE_ONCHAIN_CONFIRM = os.environ.get("REDEEM_REQUIRE_ONCHAIN_CONFIRM", "true").lower() == "true"
 LOG_MKT_MOVE_THRESHOLD_PCT = float(os.environ.get("LOG_MKT_MOVE_THRESHOLD_PCT", "0.15"))
 FORCE_REDEEM_SCAN_SEC = int(os.environ.get("FORCE_REDEEM_SCAN_SEC", "5"))
@@ -2099,6 +2100,7 @@ class LiveTrader:
         )
         print(
             f"{B}[BOOT]{RS} redeem_poll={REDEEM_POLL_SEC:.1f}s "
+            f"redeem_poll_active={REDEEM_POLL_SEC_ACTIVE:.2f}s "
             f"force_redeem_scan={FORCE_REDEEM_SCAN_SEC}s "
             f"onchain_sync={ONCHAIN_SYNC_SEC:.1f}s "
             f"heartbeat={CLOB_HEARTBEAT_SEC:.1f}s "
@@ -6076,7 +6078,8 @@ class LiveTrader:
 
         _wait_log_ts = {}   # cid → last time we printed [WAIT] for it
         while True:
-            await asyncio.sleep(REDEEM_POLL_SEC)
+            poll_sleep = REDEEM_POLL_SEC_ACTIVE if self.pending_redeem else REDEEM_POLL_SEC
+            await asyncio.sleep(max(0.05, poll_sleep))
             if not self.pending_redeem:
                 continue
             positions_by_cid = {}
