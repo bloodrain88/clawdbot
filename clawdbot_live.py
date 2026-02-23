@@ -344,7 +344,7 @@ HTTP_CONN_LIMIT = int(os.environ.get("HTTP_CONN_LIMIT", "80"))
 HTTP_CONN_PER_HOST = int(os.environ.get("HTTP_CONN_PER_HOST", "30"))
 HTTP_DNS_TTL_SEC = int(os.environ.get("HTTP_DNS_TTL_SEC", "300"))
 HTTP_KEEPALIVE_SEC = float(os.environ.get("HTTP_KEEPALIVE_SEC", "30"))
-BOOK_CACHE_TTL_MS = float(os.environ.get("BOOK_CACHE_TTL_MS", "180"))
+BOOK_CACHE_TTL_MS = float(os.environ.get("BOOK_CACHE_TTL_MS", "450"))  # ~scan_interval to avoid double-fetch
 BOOK_CACHE_MAX = int(os.environ.get("BOOK_CACHE_MAX", "256"))
 BOOK_FETCH_CONCURRENCY = int(os.environ.get("BOOK_FETCH_CONCURRENCY", "16"))
 CLOB_HEARTBEAT_SEC = float(os.environ.get("CLOB_HEARTBEAT_SEC", "6"))
@@ -9206,9 +9206,12 @@ class LiveTrader:
                         # Unified direction: correlated assets move together — never hold Up + Down simultaneously
                         if pending_dn > 0 and sig["side"] == "Up":   continue
                         if pending_up > 0 and sig["side"] == "Down":  continue
-                    # Correlated Kelly: scale size by 1/sqrt(N) when N same-dir positions already pending
-                    if CORR_KELLY_ENABLED and not TRADE_ALL_MARKETS:
-                        n_same = (pending_up if sig["side"] == "Up" else pending_dn) + 1
+                    # Correlated Kelly: scale size by 1/sqrt(N) — applies even with TRADE_ALL_MARKETS
+                    # (correlated assets all moving same direction = single factor risk)
+                    if CORR_KELLY_ENABLED:
+                        _all_pending_up = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Up")
+                        _all_pending_dn = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Down")
+                        n_same = (_all_pending_up if sig["side"] == "Up" else _all_pending_dn) + 1
                         if n_same > 1:
                             import math as _math
                             sig = dict(sig)
@@ -10235,6 +10238,12 @@ class LiveTrader:
 if __name__ == "__main__":
     try:
         _install_runtime_json_log()
+        try:
+            import uvloop
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+            print("[PERF] uvloop enabled — faster async event loop")
+        except ImportError:
+            pass
         asyncio.run(LiveTrader().run())
     except KeyboardInterrupt:
         print(f"\n{Y}[STOP] Log: {LOG_FILE}{RS}")
