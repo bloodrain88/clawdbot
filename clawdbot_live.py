@@ -468,10 +468,10 @@ HIGH_EV_MIN_SCORE = int(os.environ.get("HIGH_EV_MIN_SCORE", "14"))
 ROLLING_15M_CALIB_ENABLED = os.environ.get("ROLLING_15M_CALIB_ENABLED", "true").lower() == "true"
 ROLLING_15M_CALIB_MIN_N = int(os.environ.get("ROLLING_15M_CALIB_MIN_N", "20"))
 ROLLING_15M_CALIB_WINDOW = int(os.environ.get("ROLLING_15M_CALIB_WINDOW", "400"))
-PM_PATTERN_ENABLED = os.environ.get("PM_PATTERN_ENABLED", "true").lower() == "true"
+PM_PATTERN_ENABLED = os.environ.get("PM_PATTERN_ENABLED", "false").lower() == "true"
 PM_PATTERN_MIN_N = int(os.environ.get("PM_PATTERN_MIN_N", "6"))
 PM_PATTERN_MAX_EDGE_ADJ = float(os.environ.get("PM_PATTERN_MAX_EDGE_ADJ", "0.010"))
-PM_PUBLIC_PATTERN_ENABLED = os.environ.get("PM_PUBLIC_PATTERN_ENABLED", "true").lower() == "true"
+PM_PUBLIC_PATTERN_ENABLED = os.environ.get("PM_PUBLIC_PATTERN_ENABLED", "false").lower() == "true"
 PM_PUBLIC_PATTERN_MIN_N = int(os.environ.get("PM_PUBLIC_PATTERN_MIN_N", "24"))
 PM_PUBLIC_PATTERN_MAX_EDGE_ADJ = float(os.environ.get("PM_PUBLIC_PATTERN_MAX_EDGE_ADJ", "0.006"))
 PM_PUBLIC_PATTERN_DOM_MED = float(os.environ.get("PM_PUBLIC_PATTERN_DOM_MED", "0.12"))
