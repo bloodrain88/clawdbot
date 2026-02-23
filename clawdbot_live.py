@@ -158,7 +158,7 @@ MIN_BET_ABS    = float(os.environ.get("MIN_BET_ABS", "2.50"))
 MIN_EXEC_NOTIONAL_USDC = float(os.environ.get("MIN_EXEC_NOTIONAL_USDC", "5.0"))
 MIN_ORDER_SIZE_SHARES = float(os.environ.get("MIN_ORDER_SIZE_SHARES", "5.0"))
 ORDER_SIZE_PAD_SHARES = float(os.environ.get("ORDER_SIZE_PAD_SHARES", "0.02"))
-MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.018"))
+MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.022"))
 DUST_RECOVER_MIN = float(os.environ.get("DUST_RECOVER_MIN", "0.50"))
 # Presence threshold for on-chain position visibility/sync.
 # Keep this low and independent from recovery sizing thresholds.
@@ -181,7 +181,7 @@ MIN_ENTRY_PRICE_15M = float(os.environ.get("MIN_ENTRY_PRICE_15M", "0.20"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.35"))
 MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.52"))
 MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "1.85"))
-MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.021"))
+MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.019"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
 HC15_ENABLED = os.environ.get("HC15_ENABLED", "false").lower() == "true"
 HC15_MIN_SCORE = int(os.environ.get("HC15_MIN_SCORE", "10"))
@@ -191,7 +191,7 @@ HC15_TARGET_ENTRY = float(os.environ.get("HC15_TARGET_ENTRY", "0.30"))
 HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
 HC15_FALLBACK_MAX_ENTRY = float(os.environ.get("HC15_FALLBACK_MAX_ENTRY", "0.36"))
 MIN_PAYOUT_MULT_5M = float(os.environ.get("MIN_PAYOUT_MULT_5M", "1.75"))
-MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.021"))
+MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.019"))
 ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.54"))
 ENTRY_HARD_CAP_15M = float(os.environ.get("ENTRY_HARD_CAP_15M", "0.65"))
 ENTRY_NEAR_MISS_TOL = float(os.environ.get("ENTRY_NEAR_MISS_TOL", "0.030"))
@@ -454,7 +454,15 @@ CONSISTENCY_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_MIN_TRUE_PROB_
 CONSISTENCY_MIN_EXEC_EV_15M = float(os.environ.get("CONSISTENCY_MIN_EXEC_EV_15M", "0.024"))
 CONSISTENCY_MIN_TF_VOTES_15M = int(os.environ.get("CONSISTENCY_MIN_TF_VOTES_15M", "2"))
 CONSISTENCY_MAX_ENTRY_15M = float(os.environ.get("CONSISTENCY_MAX_ENTRY_15M", "0.60"))
-CONSISTENCY_MIN_PAYOUT_15M = float(os.environ.get("CONSISTENCY_MIN_PAYOUT_15M", "2.00"))
+CONSISTENCY_MIN_PAYOUT_15M = float(os.environ.get("CONSISTENCY_MIN_PAYOUT_15M", "1.90"))
+EV_FRONTIER_ENABLED = os.environ.get("EV_FRONTIER_ENABLED", "true").lower() == "true"
+EV_FRONTIER_MARGIN_BASE = float(os.environ.get("EV_FRONTIER_MARGIN_BASE", "0.010"))
+EV_FRONTIER_MARGIN_HIGH_ENTRY = float(os.environ.get("EV_FRONTIER_MARGIN_HIGH_ENTRY", "0.050"))
+HIGH_EV_SIZE_BOOST_ENABLED = os.environ.get("HIGH_EV_SIZE_BOOST_ENABLED", "true").lower() == "true"
+HIGH_EV_SIZE_BOOST = float(os.environ.get("HIGH_EV_SIZE_BOOST", "1.25"))
+HIGH_EV_SIZE_BOOST_MAX = float(os.environ.get("HIGH_EV_SIZE_BOOST_MAX", "1.40"))
+HIGH_EV_MIN_EXEC_EV = float(os.environ.get("HIGH_EV_MIN_EXEC_EV", "0.035"))
+HIGH_EV_MIN_SCORE = int(os.environ.get("HIGH_EV_MIN_SCORE", "14"))
 CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M = float(os.environ.get("CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M", "0.78"))
 CONSISTENCY_STRONG_MIN_SCORE_15M = int(os.environ.get("CONSISTENCY_STRONG_MIN_SCORE_15M", "14"))
 CONSISTENCY_STRONG_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_STRONG_MIN_TRUE_PROB_15M", "0.72"))
@@ -3500,10 +3508,10 @@ class LiveTrader:
             return None
         elif cl_age_s > 45:
             onchain_adj -= 2
-        # Empirical guard from live outcomes: core 15m trades with missing/stale CL age
-        # have materially worse expectancy. Hard-block them.
+        # Empirical guard from live outcomes: core 15m trades with missing CL age
+        # are materially worse. Keep block for missing age, allow mildly stale.
         if duration >= 15 and (not booster_eval):
-            if cl_age_s is None or cl_age_s > 45:
+            if cl_age_s is None:
                 if self._noisy_log_enabled(f"skip-core-source-age:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     a = -1.0 if cl_age_s is None else float(cl_age_s)
                     print(f"{Y}[SKIP] {asset} {duration}m core source-age invalid (cl_age={a:.1f}s){RS}")
@@ -4304,6 +4312,22 @@ class LiveTrader:
             return None
         if duration >= 15 and (not booster_eval) and CONSISTENCY_CORE_ENABLED:
             core_payout = 1.0 / max(entry, 1e-9)
+            if EV_FRONTIER_ENABLED:
+                # Entry-aware minimum probability: allow sub-2x only when posterior is strong enough.
+                # required_prob = breakeven(entry+fees) + safety margin increasing with expensive entries.
+                req_prob = (
+                    (entry * (1.0 + FEE_RATE_EST))
+                    + EV_FRONTIER_MARGIN_BASE
+                    + max(0.0, entry - 0.50) * EV_FRONTIER_MARGIN_HIGH_ENTRY
+                )
+                if true_prob + 1e-9 < req_prob:
+                    if self._noisy_log_enabled(f"skip-ev-frontier:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[SKIP] {asset} {duration}m ev-frontier prob "
+                            f"{true_prob:.3f}<{req_prob:.3f} (entry={entry:.3f}){RS}"
+                        )
+                    self._skip_tick("ev_frontier_prob_low")
+                    return None
             core_lead_now = (
                 (side == "Up" and current >= open_price) or
                 (side == "Down" and current <= open_price)
@@ -4503,6 +4527,16 @@ class LiveTrader:
             ),
             2,
         )
+        if (
+            HIGH_EV_SIZE_BOOST_ENABLED
+            and duration >= 15
+            and (not booster_eval)
+            and score >= HIGH_EV_MIN_SCORE
+            and execution_ev >= HIGH_EV_MIN_EXEC_EV
+            and entry <= 0.50
+        ):
+            boost = min(HIGH_EV_SIZE_BOOST_MAX, max(1.0, HIGH_EV_SIZE_BOOST))
+            model_size = round(min(hard_cap, model_size * boost), 2)
         dyn_floor  = min(hard_cap, max(MIN_BET_ABS, self.bankroll * MIN_BET_PCT))
         # Mid-entry high-conviction floor:
         # avoid dust-size core bets on solid 15m setups around 30c-55c.
