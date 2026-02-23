@@ -469,6 +469,11 @@ ROLLING_15M_CALIB_WINDOW = int(os.environ.get("ROLLING_15M_CALIB_WINDOW", "400")
 PM_PATTERN_ENABLED = os.environ.get("PM_PATTERN_ENABLED", "true").lower() == "true"
 PM_PATTERN_MIN_N = int(os.environ.get("PM_PATTERN_MIN_N", "6"))
 PM_PATTERN_MAX_EDGE_ADJ = float(os.environ.get("PM_PATTERN_MAX_EDGE_ADJ", "0.010"))
+PM_PUBLIC_PATTERN_ENABLED = os.environ.get("PM_PUBLIC_PATTERN_ENABLED", "true").lower() == "true"
+PM_PUBLIC_PATTERN_MIN_N = int(os.environ.get("PM_PUBLIC_PATTERN_MIN_N", "24"))
+PM_PUBLIC_PATTERN_MAX_EDGE_ADJ = float(os.environ.get("PM_PUBLIC_PATTERN_MAX_EDGE_ADJ", "0.006"))
+PM_PUBLIC_PATTERN_DOM_MED = float(os.environ.get("PM_PUBLIC_PATTERN_DOM_MED", "0.12"))
+PM_PUBLIC_PATTERN_DOM_STRONG = float(os.environ.get("PM_PUBLIC_PATTERN_DOM_STRONG", "0.22"))
 CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M = float(os.environ.get("CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M", "0.78"))
 CONSISTENCY_STRONG_MIN_SCORE_15M = int(os.environ.get("CONSISTENCY_STRONG_MIN_SCORE_15M", "14"))
 CONSISTENCY_STRONG_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_STRONG_MIN_TRUE_PROB_15M", "0.72"))
@@ -3912,6 +3917,14 @@ class LiveTrader:
         pm_pattern_key = ""
         pm_pattern_score_adj = 0
         pm_pattern_edge_adj = 0.0
+        pm_pattern_n = 0
+        pm_pattern_exp = 0.0
+        pm_pattern_wr_lb = 0.5
+        pm_public_pattern_score_adj = 0
+        pm_public_pattern_edge_adj = 0.0
+        pm_public_pattern_n = 0
+        pm_public_pattern_dom = 0.0
+        pm_public_pattern_avg_c = 0.0
         if isinstance(flow, dict):
             up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
             dn_conf = float(flow.get("Down", flow.get("down", 0.0)) or 0.0)
@@ -3980,6 +3993,9 @@ class LiveTrader:
                 patt = self._pm_pattern_profile(pm_pattern_key)
                 pm_pattern_score_adj = int(patt.get("score_adj", 0) or 0)
                 pm_pattern_edge_adj = float(patt.get("edge_adj", 0.0) or 0.0)
+                pm_pattern_n = int(patt.get("n", 0) or 0)
+                pm_pattern_exp = float(patt.get("exp", 0.0) or 0.0)
+                pm_pattern_wr_lb = float(patt.get("wr_lb", 0.5) or 0.5)
                 if pm_pattern_score_adj != 0 or abs(pm_pattern_edge_adj) > 1e-9:
                     score += pm_pattern_score_adj
                     edge += pm_pattern_edge_adj
@@ -4000,6 +4016,35 @@ class LiveTrader:
                         f"n={int(patt.get('n',0) or 0)}/{int(patt.get('min_n', PM_PATTERN_MIN_N) or PM_PATTERN_MIN_N)} "
                         f"exp={float(patt.get('exp',0.0) or 0.0):+.2f} "
                         f"wr_lb={float(patt.get('wr_lb',0.5) or 0.5):.2f}"
+                    )
+            if PM_PUBLIC_PATTERN_ENABLED:
+                pub = self._pm_public_pattern_profile(side, flow, (up_price if side == "Up" else (1.0 - up_price)))
+                pub_score_adj = int(pub.get("score_adj", 0) or 0)
+                pub_edge_adj = float(pub.get("edge_adj", 0.0) or 0.0)
+                pm_public_pattern_score_adj = pub_score_adj
+                pm_public_pattern_edge_adj = pub_edge_adj
+                pm_public_pattern_n = int(pub.get("n", 0) or 0)
+                pm_public_pattern_dom = float(pub.get("dom", 0.0) or 0.0)
+                pm_public_pattern_avg_c = float(pub.get("avg_c", 0.0) or 0.0)
+                if pub_score_adj != 0 or abs(pub_edge_adj) > 1e-9:
+                    score += pub_score_adj
+                    edge += pub_edge_adj
+                    if self._noisy_log_enabled(f"pm-public-pattern:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{B}[PM-PUBLIC-PATTERN]{RS} {asset} {duration}m {side} "
+                            f"adj(score={pub_score_adj:+d},edge={pub_edge_adj:+.3f}) "
+                            f"n={int(pub.get('n',0) or 0)} dom={float(pub.get('dom',0.0) or 0.0):+.2f} "
+                            f"avg={float(pub.get('avg_c',0.0) or 0.0):.1f}c src={str(flow.get('src','?') or '?')}"
+                        )
+                elif (
+                    int(pub.get("n", 0) or 0) > 0
+                    and int(pub.get("n", 0) or 0) < int(pub.get("min_n", PM_PUBLIC_PATTERN_MIN_N) or PM_PUBLIC_PATTERN_MIN_N)
+                    and self._noisy_log_enabled(f"pm-public-pattern-warmup:{asset}:{cid}", LOG_FLOW_EVERY_SEC)
+                ):
+                    print(
+                        f"{Y}[PM-PUBLIC-WARMUP]{RS} {asset} {duration}m {side} "
+                        f"n={int(pub.get('n',0) or 0)}/{int(pub.get('min_n', PM_PUBLIC_PATTERN_MIN_N) or PM_PUBLIC_PATTERN_MIN_N)} "
+                        f"dom={float(pub.get('dom',0.0) or 0.0):+.2f} avg={float(pub.get('avg_c',0.0) or 0.0):.1f}c"
                     )
 
         # Real-time CID refresh on missing/stale leader-flow before any gating decision.
@@ -4795,6 +4840,22 @@ class LiveTrader:
             "pm_pattern_key": pm_pattern_key,
             "pm_pattern_score_adj": pm_pattern_score_adj,
             "pm_pattern_edge_adj": pm_pattern_edge_adj,
+            "pm_pattern_n": pm_pattern_n,
+            "pm_pattern_exp": pm_pattern_exp,
+            "pm_pattern_wr_lb": pm_pattern_wr_lb,
+            "pm_public_pattern_score_adj": pm_public_pattern_score_adj,
+            "pm_public_pattern_edge_adj": pm_public_pattern_edge_adj,
+            "pm_public_pattern_n": pm_public_pattern_n,
+            "pm_public_pattern_dom": pm_public_pattern_dom,
+            "pm_public_pattern_avg_c": pm_public_pattern_avg_c,
+            "rolling_n": int(rolling_profile.get("n", 0) or 0),
+            "rolling_exp": float(rolling_profile.get("exp", 0.0) or 0.0),
+            "rolling_wr_lb": float(rolling_profile.get("wr_lb", 0.5) or 0.5),
+            "rolling_prob_add": float(rolling_profile.get("prob_add", 0.0) or 0.0),
+            "rolling_ev_add": float(rolling_profile.get("ev_add", 0.0) or 0.0),
+            "rolling_size_mult": float(rolling_profile.get("size_mult", 1.0) or 1.0),
+            "min_payout_req": min_payout_req,
+            "min_ev_req": min_ev_req,
             "analysis_quality": analysis_quality,
             "analysis_conviction": analysis_conviction,
             "analysis_prob_scale": quality_scale,
@@ -4994,9 +5055,27 @@ class LiveTrader:
                 "onchain_score_adj": sig.get("onchain_score_adj", 0),
                 "source_confidence": sig.get("source_confidence", 0.0),
                 "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
+                "execution_ev": sig.get("execution_ev", 0.0),
+                "ev_net": sig.get("ev_net", 0.0),
                 "pm_pattern_key": sig.get("pm_pattern_key", ""),
                 "pm_pattern_score_adj": sig.get("pm_pattern_score_adj", 0),
                 "pm_pattern_edge_adj": sig.get("pm_pattern_edge_adj", 0.0),
+                "pm_pattern_n": sig.get("pm_pattern_n", 0),
+                "pm_pattern_exp": sig.get("pm_pattern_exp", 0.0),
+                "pm_pattern_wr_lb": sig.get("pm_pattern_wr_lb", 0.5),
+                "pm_public_pattern_score_adj": sig.get("pm_public_pattern_score_adj", 0),
+                "pm_public_pattern_edge_adj": sig.get("pm_public_pattern_edge_adj", 0.0),
+                "pm_public_pattern_n": sig.get("pm_public_pattern_n", 0),
+                "pm_public_pattern_dom": sig.get("pm_public_pattern_dom", 0.0),
+                "pm_public_pattern_avg_c": sig.get("pm_public_pattern_avg_c", 0.0),
+                "rolling_n": sig.get("rolling_n", 0),
+                "rolling_exp": sig.get("rolling_exp", 0.0),
+                "rolling_wr_lb": sig.get("rolling_wr_lb", 0.5),
+                "rolling_prob_add": sig.get("rolling_prob_add", 0.0),
+                "rolling_ev_add": sig.get("rolling_ev_add", 0.0),
+                "rolling_size_mult": sig.get("rolling_size_mult", 1.0),
+                "min_payout_req": sig.get("min_payout_req", 0.0),
+                "min_ev_req": sig.get("min_ev_req", 0.0),
                 "bucket": stat_bucket,
                 "fill_price": fill_price,
                 "slip_bps": round(slip_bps, 2),
@@ -5038,6 +5117,20 @@ class LiveTrader:
                 "booster_mode": bool(is_booster),
                 "booster_note": sig.get("booster_note", ""),
             })
+            if filled and self._noisy_log_enabled(f"entry-stats:{sig['asset']}:{cid}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{B}[ENTRY-STATS]{RS} {sig['asset']} {sig['duration']}m {sig['side']} "
+                    f"ev={float(sig.get('execution_ev',0.0) or 0.0):+.3f} "
+                    f"payout={1.0/max(float(sig.get('entry',0.5) or 0.5),1e-9):.2f}x "
+                    f"min(payout/ev)={float(sig.get('min_payout_req',0.0) or 0.0):.2f}x/"
+                    f"{float(sig.get('min_ev_req',0.0) or 0.0):.3f} "
+                    f"pm={int(sig.get('pm_pattern_score_adj',0) or 0):+d}/{float(sig.get('pm_pattern_edge_adj',0.0) or 0.0):+.3f}"
+                    f"(n={int(sig.get('pm_pattern_n',0) or 0)} exp={float(sig.get('pm_pattern_exp',0.0) or 0.0):+.2f}) "
+                    f"pub={int(sig.get('pm_public_pattern_score_adj',0) or 0):+d}/{float(sig.get('pm_public_pattern_edge_adj',0.0) or 0.0):+.3f}"
+                    f"(n={int(sig.get('pm_public_pattern_n',0) or 0)} dom={float(sig.get('pm_public_pattern_dom',0.0) or 0.0):+.2f}) "
+                    f"roll(n={int(sig.get('rolling_n',0) or 0)} exp={float(sig.get('rolling_exp',0.0) or 0.0):+.2f} "
+                    f"wr_lb={float(sig.get('rolling_wr_lb',0.5) or 0.5):.2f})"
+                )
             if filled:
                 if is_booster and cid in self.pending:
                     old_m, old_t = self.pending.get(cid, (m, {}))
@@ -6100,6 +6193,15 @@ class LiveTrader:
                               f"{G}${pnl:+.2f}{RS} | stake=${stake_out:.2f} redeem=${redeem_in:.2f} "
                               f"| rk_trades={rk_n} | Bank ${self.bankroll:.2f} | WR {wr} | "
                               f"{suffix} | rk={rk} cid={self._short_cid(cid)}")
+                        if not reconcile_only:
+                            print(
+                                f"{B}[OUTCOME-STATS]{RS} {asset} {side} {trade.get('duration',0)}m "
+                                f"ev={float(trade.get('execution_ev',0.0) or 0.0):+.3f} "
+                                f"payout={1.0/max(float(trade.get('entry',0.5) or 0.5),1e-9):.2f}x "
+                                f"pm={int(trade.get('pm_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_pattern_edge_adj',0.0) or 0.0):+.3f} "
+                                f"pub={int(trade.get('pm_public_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_public_pattern_edge_adj',0.0) or 0.0):+.3f} "
+                                f"roll_n={int(trade.get('rolling_n',0) or 0)} roll_exp={float(trade.get('rolling_exp',0.0) or 0.0):+.2f}"
+                            )
                         if tx_hash_full:
                             print(
                                 f"{G}[REDEEMED-ONCHAIN]{RS} cid={self._short_cid(cid)} "
@@ -6177,6 +6279,15 @@ class LiveTrader:
                                   f"{R}${pnl:+.2f}{RS} | stake=${stake_loss:.2f} redeem=$0.00 "
                                   f"| rk_trades={rk_n} | Bank ${self.bankroll:.2f} | WR {wr} | "
                                   f"rk={rk} cid={self._short_cid(cid)}")
+                            if not reconcile_only:
+                                print(
+                                    f"{B}[OUTCOME-STATS]{RS} {asset} {side} {trade.get('duration',0)}m "
+                                    f"ev={float(trade.get('execution_ev',0.0) or 0.0):+.3f} "
+                                    f"payout={1.0/max(float(trade.get('entry',0.5) or 0.5),1e-9):.2f}x "
+                                    f"pm={int(trade.get('pm_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_pattern_edge_adj',0.0) or 0.0):+.3f} "
+                                    f"pub={int(trade.get('pm_public_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_public_pattern_edge_adj',0.0) or 0.0):+.3f} "
+                                    f"roll_n={int(trade.get('rolling_n',0) or 0)} roll_exp={float(trade.get('rolling_exp',0.0) or 0.0):+.2f}"
+                                )
                             self._settled_outcomes[cid] = {
                                 "result": "LOSS",
                                 "side": side,
@@ -6805,6 +6916,67 @@ class LiveTrader:
             self._pm_pattern_stats[key] = row
         except Exception:
             pass
+
+    def _pm_public_pattern_profile(self, side: str, flow: dict, entry_px: float) -> dict:
+        """Pattern prior from public PM activity (leader/live flow), independent from own outcomes."""
+        try:
+            f = flow or {}
+            n = int(f.get("n", 0) or 0)
+            up = float(f.get("Up", f.get("up", 0.0)) or 0.0)
+            dn = float(f.get("Down", f.get("down", 0.0)) or 0.0)
+            avg_c = float(f.get("avg_entry_c", 0.0) or 0.0)
+            low_share = float(f.get("low_c_share", 0.0) or 0.0)
+            high_share = float(f.get("high_c_share", 0.0) or 0.0)
+            multibet = float(f.get("multibet_ratio", 0.0) or 0.0)
+            pref = up if side == "Up" else dn
+            opp = dn if side == "Up" else up
+            dom = pref - opp
+            if n <= 0:
+                return {"score_adj": 0, "edge_adj": 0.0, "n": 0, "dom": 0.0, "avg_c": 0.0, "min_n": PM_PUBLIC_PATTERN_MIN_N}
+            if n < PM_PUBLIC_PATTERN_MIN_N:
+                return {
+                    "score_adj": 0,
+                    "edge_adj": 0.0,
+                    "n": n,
+                    "dom": dom,
+                    "avg_c": avg_c,
+                    "min_n": PM_PUBLIC_PATTERN_MIN_N,
+                }
+            score_adj = 0
+            edge_adj = 0.0
+            # Dominance prior from public side-bias (weighted by ranked wallets/live flow).
+            if dom >= PM_PUBLIC_PATTERN_DOM_STRONG:
+                score_adj += 1
+                edge_adj += min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.003 + (dom - PM_PUBLIC_PATTERN_DOM_STRONG) * 0.015)
+            elif dom <= -PM_PUBLIC_PATTERN_DOM_STRONG:
+                score_adj -= 1
+                edge_adj -= min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.003 + (abs(dom) - PM_PUBLIC_PATTERN_DOM_STRONG) * 0.015)
+            elif dom >= PM_PUBLIC_PATTERN_DOM_MED:
+                edge_adj += min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.0015 + (dom - PM_PUBLIC_PATTERN_DOM_MED) * 0.010)
+            elif dom <= -PM_PUBLIC_PATTERN_DOM_MED:
+                edge_adj -= min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.0015 + (abs(dom) - PM_PUBLIC_PATTERN_DOM_MED) * 0.010)
+            # Entry-style prior: prefer side aligned with public low-cent behavior at better pricing.
+            if avg_c > 0 and low_share >= 0.55 and 0.30 <= entry_px <= 0.55:
+                score_adj += 1
+                edge_adj += 0.0015
+            elif avg_c > 0 and high_share >= 0.60 and entry_px >= 0.62:
+                score_adj -= 1
+                edge_adj -= 0.0015
+            # Repeated same-wallet stacking is useful, but keep impact small.
+            if multibet >= 0.35:
+                edge_adj += 0.001
+            score_adj = max(-2, min(2, score_adj))
+            edge_adj = max(-PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, edge_adj))
+            return {
+                "score_adj": score_adj,
+                "edge_adj": edge_adj,
+                "n": n,
+                "dom": dom,
+                "avg_c": avg_c,
+                "min_n": PM_PUBLIC_PATTERN_MIN_N,
+            }
+        except Exception:
+            return {"score_adj": 0, "edge_adj": 0.0, "n": 0, "dom": 0.0, "avg_c": 0.0, "min_n": PM_PUBLIC_PATTERN_MIN_N}
 
     def _rolling_15m_profile(self, duration: int, entry: float, open_src: str, cl_age_s) -> dict:
         if (not ROLLING_15M_CALIB_ENABLED) or duration < 15:
