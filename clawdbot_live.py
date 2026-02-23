@@ -423,20 +423,20 @@ MID_BOOSTER_ENABLED = os.environ.get("MID_BOOSTER_ENABLED", "true").lower() == "
 MID_BOOSTER_ANYTIME_15M = os.environ.get("MID_BOOSTER_ANYTIME_15M", "true").lower() == "true"
 MID_BOOSTER_MIN_LEFT_15M = float(os.environ.get("MID_BOOSTER_MIN_LEFT_15M", "6.0"))
 MID_BOOSTER_MAX_LEFT_15M = float(os.environ.get("MID_BOOSTER_MAX_LEFT_15M", "10.5"))
-MID_BOOSTER_MIN_LEFT_HARD_15M = float(os.environ.get("MID_BOOSTER_MIN_LEFT_HARD_15M", "2.2"))
-MID_BOOSTER_MIN_SCORE = int(os.environ.get("MID_BOOSTER_MIN_SCORE", "11"))
-MID_BOOSTER_MIN_TRUE_PROB = float(os.environ.get("MID_BOOSTER_MIN_TRUE_PROB", "0.60"))
-MID_BOOSTER_MIN_EDGE = float(os.environ.get("MID_BOOSTER_MIN_EDGE", "0.025"))
-MID_BOOSTER_MIN_EV_NET = float(os.environ.get("MID_BOOSTER_MIN_EV_NET", "0.050"))
-MID_BOOSTER_MIN_PAYOUT = float(os.environ.get("MID_BOOSTER_MIN_PAYOUT", "2.80"))
-MID_BOOSTER_MAX_ENTRY = float(os.environ.get("MID_BOOSTER_MAX_ENTRY", "0.35"))
-MID_BOOSTER_SIZE_PCT = float(os.environ.get("MID_BOOSTER_SIZE_PCT", "0.008"))
-MID_BOOSTER_SIZE_PCT_HIGH = float(os.environ.get("MID_BOOSTER_SIZE_PCT_HIGH", "0.020"))
-MID_BOOSTER_MAX_PER_CID = int(os.environ.get("MID_BOOSTER_MAX_PER_CID", "1"))
+MID_BOOSTER_MIN_LEFT_HARD_15M = float(os.environ.get("MID_BOOSTER_MIN_LEFT_HARD_15M", "1.6"))
+MID_BOOSTER_MIN_SCORE = int(os.environ.get("MID_BOOSTER_MIN_SCORE", "10"))
+MID_BOOSTER_MIN_TRUE_PROB = float(os.environ.get("MID_BOOSTER_MIN_TRUE_PROB", "0.57"))
+MID_BOOSTER_MIN_EDGE = float(os.environ.get("MID_BOOSTER_MIN_EDGE", "0.018"))
+MID_BOOSTER_MIN_EV_NET = float(os.environ.get("MID_BOOSTER_MIN_EV_NET", "0.028"))
+MID_BOOSTER_MIN_PAYOUT = float(os.environ.get("MID_BOOSTER_MIN_PAYOUT", "2.20"))
+MID_BOOSTER_MAX_ENTRY = float(os.environ.get("MID_BOOSTER_MAX_ENTRY", "0.50"))
+MID_BOOSTER_SIZE_PCT = float(os.environ.get("MID_BOOSTER_SIZE_PCT", "0.012"))
+MID_BOOSTER_SIZE_PCT_HIGH = float(os.environ.get("MID_BOOSTER_SIZE_PCT_HIGH", "0.030"))
+MID_BOOSTER_MAX_PER_CID = int(os.environ.get("MID_BOOSTER_MAX_PER_CID", "2"))
 MID_BOOSTER_LOSS_STREAK_LOCK = int(os.environ.get("MID_BOOSTER_LOSS_STREAK_LOCK", "4"))
 MID_BOOSTER_LOCK_HOURS = float(os.environ.get("MID_BOOSTER_LOCK_HOURS", "24"))
 CONTINUATION_PRIOR_MAX_BOOST = float(os.environ.get("CONTINUATION_PRIOR_MAX_BOOST", "0.06"))
-LOW_CENT_ONLY_ON_EXISTING_POSITION = os.environ.get("LOW_CENT_ONLY_ON_EXISTING_POSITION", "true").lower() == "true"
+LOW_CENT_ONLY_ON_EXISTING_POSITION = os.environ.get("LOW_CENT_ONLY_ON_EXISTING_POSITION", "false").lower() == "true"
 LOW_CENT_ENTRY_THRESHOLD = float(os.environ.get("LOW_CENT_ENTRY_THRESHOLD", "0.10"))
 # Dynamic sizing guardrail for cheap-entry tails:
 # - keep default risk around LOW_ENTRY_BASE_SOFT_MAX
@@ -514,7 +514,7 @@ SUPER_BET_MIN_PAYOUT = float(os.environ.get("SUPER_BET_MIN_PAYOUT", "3.00"))
 SUPER_BET_MIN_SIZE_USDC = float(os.environ.get("SUPER_BET_MIN_SIZE_USDC", "5.0"))
 SUPER_BET_FLOOR_MIN_SCORE = int(os.environ.get("SUPER_BET_FLOOR_MIN_SCORE", "18"))
 SUPER_BET_FLOOR_MIN_EV = float(os.environ.get("SUPER_BET_FLOOR_MIN_EV", "0.030"))
-SUPER_BET_COOLDOWN_SEC = float(os.environ.get("SUPER_BET_COOLDOWN_SEC", "1200"))
+SUPER_BET_COOLDOWN_SEC = float(os.environ.get("SUPER_BET_COOLDOWN_SEC", "420"))
 SUPER_BET_MAX_SIZE_ENABLED = os.environ.get("SUPER_BET_MAX_SIZE_ENABLED", "true").lower() == "true"
 SUPER_BET_MAX_SIZE_USDC = float(os.environ.get("SUPER_BET_MAX_SIZE_USDC", "10.0"))
 SUPER_BET_MAX_BANKROLL_PCT = float(os.environ.get("SUPER_BET_MAX_BANKROLL_PCT", "0.02"))
@@ -4932,6 +4932,24 @@ class LiveTrader:
                     )
                 self._skip_tick("lowcent_not_leading")
                 return None
+        elif (not booster_eval) and entry <= LOW_CENT_ENTRY_THRESHOLD:
+            # Allow low-cent first entries too, but only for very strong setups.
+            lowcent_new_ok = (
+                duration >= 15
+                and score >= max(SUPER_BET_FLOOR_MIN_SCORE, 18)
+                and true_prob >= 0.74
+                and execution_ev >= max(SUPER_BET_FLOOR_MIN_EV, 0.035)
+                and payout_mult >= 3.0
+                and cl_agree
+            )
+            if not lowcent_new_ok:
+                if self._noisy_log_enabled(f"skip-lowcent-weak-new:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP]{RS} {asset} {duration}m low-cent new entry weak "
+                        f"(score={score} p={true_prob:.3f} ev={execution_ev:.3f})"
+                    )
+                self._skip_tick("lowcent_new_weak")
+                return None
         if self._noisy_log_enabled("flow-thresholds", LOG_FLOW_EVERY_SEC):
             print(
                 f"{B}[FLOW]{RS} "
@@ -5223,11 +5241,10 @@ class LiveTrader:
                 and execution_ev >= MID_BOOSTER_MIN_EV_NET
                 and payout_mult >= MID_BOOSTER_MIN_PAYOUT
                 and entry <= MID_BOOSTER_MAX_ENTRY
-                and cl_agree
-                and imbalance_confirms
-                and taker_conf
-                and vol_ratio >= 1.05
-                and booster_conv >= 0.58
+                and ((cl_agree and imbalance_confirms) or score >= (MID_BOOSTER_MIN_SCORE + 3))
+                and (taker_conf or edge >= (MID_BOOSTER_MIN_EDGE + 0.02))
+                and vol_ratio >= 0.90
+                and booster_conv >= 0.50
             )
             if not base_quality:
                 return None
