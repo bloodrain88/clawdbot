@@ -4058,6 +4058,12 @@ class LiveTrader:
                     score += pub_score_adj
                     edge += pub_edge_adj
                     if self._noisy_log_enabled(f"pm-public-pattern:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        if float(pub.get("avg_c", 0.0) or 0.0) >= 85.0 and abs(float(pub.get("dom", 0.0) or 0.0)) >= PM_PUBLIC_PATTERN_DOM_MED:
+                            print(
+                                f"{Y}[PM-PUBLIC-OCROWD]{RS} {asset} {duration}m {side} "
+                                f"high-cent crowd mode avg={float(pub.get('avg_c',0.0) or 0.0):.1f}c "
+                                f"dom={float(pub.get('dom',0.0) or 0.0):+.2f}"
+                            )
                         print(
                             f"{B}[PM-PUBLIC-PATTERN]{RS} {asset} {duration}m {side} "
                             f"adj(score={pub_score_adj:+d},edge={pub_edge_adj:+.3f}) "
@@ -6972,26 +6978,38 @@ class LiveTrader:
                 }
             score_adj = 0
             edge_adj = 0.0
-            # Dominance prior from public side-bias (weighted by ranked wallets/live flow).
-            if dom >= PM_PUBLIC_PATTERN_DOM_STRONG:
-                score_adj += 1
-                edge_adj += min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.003 + (dom - PM_PUBLIC_PATTERN_DOM_STRONG) * 0.015)
-            elif dom <= -PM_PUBLIC_PATTERN_DOM_STRONG:
-                score_adj -= 1
-                edge_adj -= min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.003 + (abs(dom) - PM_PUBLIC_PATTERN_DOM_STRONG) * 0.015)
-            elif dom >= PM_PUBLIC_PATTERN_DOM_MED:
-                edge_adj += min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.0015 + (dom - PM_PUBLIC_PATTERN_DOM_MED) * 0.010)
-            elif dom <= -PM_PUBLIC_PATTERN_DOM_MED:
-                edge_adj -= min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.0015 + (abs(dom) - PM_PUBLIC_PATTERN_DOM_MED) * 0.010)
+            # Crowd-extreme filter: when public flow is concentrated at very high cents,
+            # treat matching-side dominance as overpay risk (anti-EV), not a buy signal.
+            overcrowded_highcent = (avg_c >= 85.0 and high_share >= 0.55 and abs(dom) >= PM_PUBLIC_PATTERN_DOM_MED)
+            if overcrowded_highcent:
+                if dom >= PM_PUBLIC_PATTERN_DOM_MED:
+                    score_adj -= 1
+                    edge_adj -= min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.003 + (dom - PM_PUBLIC_PATTERN_DOM_MED) * 0.010)
+                elif dom <= -PM_PUBLIC_PATTERN_DOM_MED:
+                    score_adj += 1
+                    edge_adj += min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.002 + (abs(dom) - PM_PUBLIC_PATTERN_DOM_MED) * 0.008)
+            else:
+                # Dominance prior from public side-bias (weighted by ranked wallets/live flow),
+                # only outside overheated high-cent regimes.
+                if dom >= PM_PUBLIC_PATTERN_DOM_STRONG:
+                    score_adj += 1
+                    edge_adj += min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.003 + (dom - PM_PUBLIC_PATTERN_DOM_STRONG) * 0.015)
+                elif dom <= -PM_PUBLIC_PATTERN_DOM_STRONG:
+                    score_adj -= 1
+                    edge_adj -= min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.003 + (abs(dom) - PM_PUBLIC_PATTERN_DOM_STRONG) * 0.015)
+                elif dom >= PM_PUBLIC_PATTERN_DOM_MED:
+                    edge_adj += min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.0015 + (dom - PM_PUBLIC_PATTERN_DOM_MED) * 0.010)
+                elif dom <= -PM_PUBLIC_PATTERN_DOM_MED:
+                    edge_adj -= min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.0015 + (abs(dom) - PM_PUBLIC_PATTERN_DOM_MED) * 0.010)
             # Entry-style prior: prefer side aligned with public low-cent behavior at better pricing.
-            if avg_c > 0 and low_share >= 0.55 and 0.30 <= entry_px <= 0.55:
+            if avg_c > 0 and avg_c <= 65.0 and low_share >= 0.55 and 0.30 <= entry_px <= 0.55:
                 score_adj += 1
                 edge_adj += 0.0015
-            elif avg_c > 0 and high_share >= 0.60 and entry_px >= 0.62:
+            elif avg_c > 0 and avg_c >= 75.0 and high_share >= 0.60 and entry_px >= 0.62:
                 score_adj -= 1
-                edge_adj -= 0.0015
+                edge_adj -= 0.0025
             # Repeated same-wallet stacking is useful, but keep impact small.
-            if multibet >= 0.35:
+            if multibet >= 0.35 and 25.0 <= avg_c <= 70.0:
                 edge_adj += 0.001
             score_adj = max(-2, min(2, score_adj))
             edge_adj = max(-PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, edge_adj))
