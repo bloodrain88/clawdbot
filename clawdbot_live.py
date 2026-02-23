@@ -588,7 +588,7 @@ IMBALANCE_CONFIRM_MIN = float(os.environ.get("IMBALANCE_CONFIRM_MIN", "0.10"))
 ANALYSIS_CL_FRESH_MAX_AGE_SEC = float(os.environ.get("ANALYSIS_CL_FRESH_MAX_AGE_SEC", "35.0"))
 ANALYSIS_QUOTE_FRESH_MAX_MS = float(os.environ.get("ANALYSIS_QUOTE_FRESH_MAX_MS", "1200.0"))
 ANALYSIS_QUALITY_WS_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_WS_WEIGHT", "0.25"))
-ANALYSIS_QUALITY_REST_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_REST_WEIGHT", "0.22"))
+ANALYSIS_QUALITY_REST_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_REST_WEIGHT", "0.25"))  # was 0.22; REST at 0ms age = same quality as WS
 ANALYSIS_QUALITY_LEADER_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_LEADER_WEIGHT", "0.20"))
 ANALYSIS_QUALITY_CL_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_CL_WEIGHT", "0.20"))
 ANALYSIS_QUALITY_QUOTE_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_QUOTE_WEIGHT", "0.15"))
@@ -756,14 +756,14 @@ MOVE_SCORE_T2 = float(os.environ.get("MOVE_SCORE_T2", "0.0012"))
 MOVE_SCORE_T1 = float(os.environ.get("MOVE_SCORE_T1", "0.0005"))
 CL_AGREE_SCORE_BONUS = int(os.environ.get("CL_AGREE_SCORE_BONUS", "1"))
 CL_DISAGREE_SCORE_PEN = int(os.environ.get("CL_DISAGREE_SCORE_PEN", "3"))
-DIV_PEN_START = float(os.environ.get("DIV_PEN_START", "0.0004"))
-DIV_PEN_MAX_SCORE = int(os.environ.get("DIV_PEN_MAX_SCORE", "3"))
+DIV_PEN_START = float(os.environ.get("DIV_PEN_START", "0.0008"))      # was 0.0004; CL heartbeat 30-60s causes 0.04-0.10% div — don't penalise normal lag
+DIV_PEN_MAX_SCORE = int(os.environ.get("DIV_PEN_MAX_SCORE", "2"))     # was 3; cap at -2 to avoid over-penalising
 DIV_PEN_EDGE_CAP = float(os.environ.get("DIV_PEN_EDGE_CAP", "0.03"))
 DIV_PEN_EDGE_MULT = float(os.environ.get("DIV_PEN_EDGE_MULT", "3.0"))
 CL_AGE_MAX_SKIP = float(os.environ.get("CL_AGE_MAX_SKIP", "90.0"))
 CL_AGE_WARN = float(os.environ.get("CL_AGE_WARN", "45.0"))
 CL_AGE_WARN_SCORE_PEN = int(os.environ.get("CL_AGE_WARN_SCORE_PEN", "2"))
-WS_FALLBACK_SCORE_PEN = int(os.environ.get("WS_FALLBACK_SCORE_PEN", "1"))
+WS_FALLBACK_SCORE_PEN = int(os.environ.get("WS_FALLBACK_SCORE_PEN", "0"))  # was 1; CLOB REST at age=0ms is real-time — no penalty
 WS_SOFT_SCORE_PEN = int(os.environ.get("WS_SOFT_SCORE_PEN", "2"))
 CACHE_MIN_KLINES = int(os.environ.get("CACHE_MIN_KLINES", "10"))
 JUMP_CONFIRM_SCORE = int(os.environ.get("JUMP_CONFIRM_SCORE", "2"))
@@ -5183,7 +5183,7 @@ class LiveTrader:
         ):
             min_payout_req = min(min_payout_req, LATE_PAYOUT_RELAX_FLOOR)
         min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
-        if ws_fresh and cl_fresh and vol_fresh and mins_left >= (FRESH_RELAX_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else FRESH_RELAX_MIN_LEFT_5M):
+        if (ws_fresh or rest_fresh) and cl_fresh and vol_fresh and mins_left >= (FRESH_RELAX_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else FRESH_RELAX_MIN_LEFT_5M):
             max_entry_allowed = min(FRESH_RELAX_ENTRY_CAP, max_entry_allowed + FRESH_RELAX_ENTRY_ADD)
         max_entry_allowed = min(max_entry_allowed, adaptive_hard_cap)
         # Dynamic min-entry (not fixed hard floor): adapt to setup quality + microstructure.
@@ -5198,7 +5198,7 @@ class LiveTrader:
         if mins_left <= (ANALYSIS_LATE_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else ANALYSIS_LATE_MIN_LEFT_5M):
             # Near expiry, avoid ultra-low entries that are mostly noise/fill artifacts.
             min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + ENTRY_TIGHTEN_ADD)
-        if not ws_fresh:
+        if not (ws_fresh or rest_fresh):   # only tighten when both WS and REST are stale
             min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + ENTRY_TIGHTEN_ADD)
         min_entry_allowed = max(0.01, min(min_entry_dyn, max_entry_allowed - 0.01))
         # High-conviction 15m mode: target lower cents early for better payout.
