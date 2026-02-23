@@ -150,10 +150,10 @@ POLY_API_SECRET = _pick_env("POLY_API_SECRET")
 POLY_API_PASSPHRASE = _pick_env("POLY_API_PASSPHRASE")
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
-MIN_EDGE       = 0.08     # 8% base min edge (auto-adapted per realized PnL quality)
-MIN_MOVE       = 0.0003   # 0.03% below this = truly flat — use momentum to determine direction
-MOMENTUM_WEIGHT = 0.40   # initial BS vs momentum blend (0=pure BS, 1=pure momentum)
-DUST_BET       = 5.0      # $5 floor — at 4.55x payout: $5 → $22.75 win
+MIN_EDGE       = float(os.environ.get("MIN_EDGE", "0.08"))     # base edge floor
+MIN_MOVE       = float(os.environ.get("MIN_MOVE", "0.0003"))   # flat filter threshold
+MOMENTUM_WEIGHT = float(os.environ.get("MOMENTUM_WEIGHT", "0.40"))
+DUST_BET       = float(os.environ.get("DUST_BET", "5.0"))
 MIN_BET_ABS    = float(os.environ.get("MIN_BET_ABS", "2.50"))
 MIN_EXEC_NOTIONAL_USDC = float(os.environ.get("MIN_EXEC_NOTIONAL_USDC", "5.0"))
 MIN_ORDER_SIZE_SHARES = float(os.environ.get("MIN_ORDER_SIZE_SHARES", "5.0"))
@@ -165,7 +165,7 @@ MIN_PARTIAL_TRACK_USDC = float(os.environ.get("MIN_PARTIAL_TRACK_USDC", "5.0"))
 # Keep this low and independent from recovery sizing thresholds.
 OPEN_PRESENCE_MIN = float(os.environ.get("OPEN_PRESENCE_MIN", "0.01"))
 MAX_ABS_BET    = float(os.environ.get("MAX_ABS_BET", "14.0"))     # hard ceiling
-MAX_BANKROLL_PCT = 0.25   # never risk more than 25% of bankroll on a single bet
+MAX_BANKROLL_PCT = float(os.environ.get("MAX_BANKROLL_PCT", "0.25"))
 MAX_OPEN       = int(os.environ.get("MAX_OPEN", "8"))
 MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "8"))
 MAX_CID_EXPOSURE_PCT = float(os.environ.get("MAX_CID_EXPOSURE_PCT", "0.10"))
@@ -563,6 +563,303 @@ WINMODE_MIN_EDGE = float(os.environ.get("WINMODE_MIN_EDGE", "0.015"))
 WINMODE_MAX_ENTRY_5M = float(os.environ.get("WINMODE_MAX_ENTRY_5M", "0.60"))
 WINMODE_MAX_ENTRY_15M = float(os.environ.get("WINMODE_MAX_ENTRY_15M", "0.56"))
 WINMODE_REQUIRE_CL_AGREE = os.environ.get("WINMODE_REQUIRE_CL_AGREE", "true").lower() == "true"
+# Side/alignment and analysis model knobs (all env-tunable to avoid fixed literals in decision path).
+LEADER_ENTRY_CAP_HARD_MAX = float(os.environ.get("LEADER_ENTRY_CAP_HARD_MAX", "0.97"))
+LEADER_ENTRY_CAP_EXTRA = float(os.environ.get("LEADER_ENTRY_CAP_EXTRA", "0.03"))
+COPY_NET_EDGE_MULT = float(os.environ.get("COPY_NET_EDGE_MULT", "0.01"))
+LEADER_STYLE_HIGH_SHARE_MIN = float(os.environ.get("LEADER_STYLE_HIGH_SHARE_MIN", "0.60"))
+LEADER_STYLE_LOW_SHARE_MIN = float(os.environ.get("LEADER_STYLE_LOW_SHARE_MIN", "0.60"))
+LEADER_STYLE_MULTIBET_MIN = float(os.environ.get("LEADER_STYLE_MULTIBET_MIN", "0.30"))
+LEADER_STYLE_EXPENSIVE_ENTRY_MIN = float(os.environ.get("LEADER_STYLE_EXPENSIVE_ENTRY_MIN", "0.55"))
+LEADER_STYLE_SCORE_BONUS = int(os.environ.get("LEADER_STYLE_SCORE_BONUS", "1"))
+LEADER_STYLE_SCORE_PENALTY = int(os.environ.get("LEADER_STYLE_SCORE_PENALTY", "1"))
+LEADER_STYLE_EDGE_BONUS = float(os.environ.get("LEADER_STYLE_EDGE_BONUS", "0.005"))
+LEADER_STYLE_EDGE_PENALTY = float(os.environ.get("LEADER_STYLE_EDGE_PENALTY", "0.005"))
+PM_PUBLIC_OCROWD_AVG_C_MIN = float(os.environ.get("PM_PUBLIC_OCROWD_AVG_C_MIN", "85.0"))
+LEADER_NOFLOW_SIZE_SCALE = float(os.environ.get("LEADER_NOFLOW_SIZE_SCALE", "0.90"))
+IMBALANCE_CONFIRM_MIN = float(os.environ.get("IMBALANCE_CONFIRM_MIN", "0.10"))
+ANALYSIS_CL_FRESH_MAX_AGE_SEC = float(os.environ.get("ANALYSIS_CL_FRESH_MAX_AGE_SEC", "35.0"))
+ANALYSIS_QUOTE_FRESH_MAX_MS = float(os.environ.get("ANALYSIS_QUOTE_FRESH_MAX_MS", "1200.0"))
+ANALYSIS_QUALITY_WS_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_WS_WEIGHT", "0.25"))
+ANALYSIS_QUALITY_REST_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_REST_WEIGHT", "0.22"))
+ANALYSIS_QUALITY_LEADER_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_LEADER_WEIGHT", "0.20"))
+ANALYSIS_QUALITY_CL_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_CL_WEIGHT", "0.20"))
+ANALYSIS_QUALITY_QUOTE_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_QUOTE_WEIGHT", "0.15"))
+ANALYSIS_QUALITY_VOL_WEIGHT = float(os.environ.get("ANALYSIS_QUALITY_VOL_WEIGHT", "0.20"))
+ANALYSIS_OB_OFFSET = float(os.environ.get("ANALYSIS_OB_OFFSET", "0.10"))
+ANALYSIS_OB_SCALE = float(os.environ.get("ANALYSIS_OB_SCALE", "0.30"))
+ANALYSIS_TAKER_OFFSET = float(os.environ.get("ANALYSIS_TAKER_OFFSET", "0.05"))
+ANALYSIS_TAKER_SCALE = float(os.environ.get("ANALYSIS_TAKER_SCALE", "0.18"))
+ANALYSIS_TF_BASE = float(os.environ.get("ANALYSIS_TF_BASE", "1.0"))
+ANALYSIS_TF_SCALE = float(os.environ.get("ANALYSIS_TF_SCALE", "3.0"))
+ANALYSIS_BASIS_OFFSET = float(os.environ.get("ANALYSIS_BASIS_OFFSET", "0.0002"))
+ANALYSIS_BASIS_SCALE = float(os.environ.get("ANALYSIS_BASIS_SCALE", "0.0010"))
+ANALYSIS_VWAP_OFFSET = float(os.environ.get("ANALYSIS_VWAP_OFFSET", "0.0008"))
+ANALYSIS_VWAP_SCALE = float(os.environ.get("ANALYSIS_VWAP_SCALE", "0.0024"))
+ANALYSIS_LEADER_BASE = float(os.environ.get("ANALYSIS_LEADER_BASE", "0.5"))
+ANALYSIS_LEADER_OFFSET = float(os.environ.get("ANALYSIS_LEADER_OFFSET", "0.12"))
+ANALYSIS_LEADER_SCALE = float(os.environ.get("ANALYSIS_LEADER_SCALE", "0.34"))
+ANALYSIS_CONV_W_OB = float(os.environ.get("ANALYSIS_CONV_W_OB", "0.18"))
+ANALYSIS_CONV_W_TK = float(os.environ.get("ANALYSIS_CONV_W_TK", "0.18"))
+ANALYSIS_CONV_W_TF = float(os.environ.get("ANALYSIS_CONV_W_TF", "0.18"))
+ANALYSIS_CONV_W_BASIS = float(os.environ.get("ANALYSIS_CONV_W_BASIS", "0.12"))
+ANALYSIS_CONV_W_VWAP = float(os.environ.get("ANALYSIS_CONV_W_VWAP", "0.12"))
+ANALYSIS_CONV_W_CL = float(os.environ.get("ANALYSIS_CONV_W_CL", "0.12"))
+ANALYSIS_CONV_W_LEADER = float(os.environ.get("ANALYSIS_CONV_W_LEADER", "0.10"))
+ANALYSIS_FLOOR_GOODDATA_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_GOODDATA_QUAL_DELTA", "0.03"))
+ANALYSIS_FLOOR_NOLEADER_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_NOLEADER_QUAL_DELTA", "0.02"))
+ANALYSIS_FLOOR_LATE_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_LATE_QUAL_DELTA", "0.02"))
+ANALYSIS_FLOOR_LATE_CONV_DELTA = float(os.environ.get("ANALYSIS_FLOOR_LATE_CONV_DELTA", "0.01"))
+ANALYSIS_FLOOR_OLDQUOTE_MS = float(os.environ.get("ANALYSIS_FLOOR_OLDQUOTE_MS", "900.0"))
+ANALYSIS_FLOOR_OLDQUOTE_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_OLDQUOTE_QUAL_DELTA", "0.02"))
+ANALYSIS_FLOOR_NOBOOK_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_NOBOOK_QUAL_DELTA", "0.03"))
+ANALYSIS_FLOOR_NOBOOK_CONV_DELTA = float(os.environ.get("ANALYSIS_FLOOR_NOBOOK_CONV_DELTA", "0.02"))
+ANALYSIS_FLOOR_RESTONLY_CONV_DELTA = float(os.environ.get("ANALYSIS_FLOOR_RESTONLY_CONV_DELTA", "0.005"))
+ANALYSIS_FLOOR_NOCL_CONV_DELTA = float(os.environ.get("ANALYSIS_FLOOR_NOCL_CONV_DELTA", "0.03"))
+ANALYSIS_SIDE_MIN_N = int(os.environ.get("ANALYSIS_SIDE_MIN_N", "6"))
+ANALYSIS_SIDE_GOOD_WR_LB = float(os.environ.get("ANALYSIS_SIDE_GOOD_WR_LB", "0.54"))
+ANALYSIS_SIDE_BAD_WR_LB = float(os.environ.get("ANALYSIS_SIDE_BAD_WR_LB", "0.45"))
+ANALYSIS_SIDE_GOOD_QUAL_DELTA = float(os.environ.get("ANALYSIS_SIDE_GOOD_QUAL_DELTA", "0.02"))
+ANALYSIS_SIDE_GOOD_CONV_DELTA = float(os.environ.get("ANALYSIS_SIDE_GOOD_CONV_DELTA", "0.04"))
+ANALYSIS_SIDE_BAD_QUAL_DELTA = float(os.environ.get("ANALYSIS_SIDE_BAD_QUAL_DELTA", "0.02"))
+ANALYSIS_SIDE_BAD_CONV_DELTA = float(os.environ.get("ANALYSIS_SIDE_BAD_CONV_DELTA", "0.04"))
+ANALYSIS_QUAL_FLOOR_MIN = float(os.environ.get("ANALYSIS_QUAL_FLOOR_MIN", "0.42"))
+ANALYSIS_QUAL_FLOOR_MAX = float(os.environ.get("ANALYSIS_QUAL_FLOOR_MAX", "0.75"))
+ANALYSIS_CONV_FLOOR_MIN = float(os.environ.get("ANALYSIS_CONV_FLOOR_MIN", "0.35"))
+ANALYSIS_CONV_FLOOR_MAX = float(os.environ.get("ANALYSIS_CONV_FLOOR_MAX", "0.72"))
+ANALYSIS_LATE_MIN_LEFT_15M = float(os.environ.get("ANALYSIS_LATE_MIN_LEFT_15M", "3.5"))
+ANALYSIS_LATE_MIN_LEFT_5M = float(os.environ.get("ANALYSIS_LATE_MIN_LEFT_5M", "1.8"))
+PROB_CLAMP_MIN = float(os.environ.get("PROB_CLAMP_MIN", "0.05"))
+PROB_CLAMP_MAX = float(os.environ.get("PROB_CLAMP_MAX", "0.95"))
+PROB_REBALANCE_MIN = float(os.environ.get("PROB_REBALANCE_MIN", "0.01"))
+PROB_REBALANCE_MAX = float(os.environ.get("PROB_REBALANCE_MAX", "0.99"))
+PREBID_SCORE_BONUS = int(os.environ.get("PREBID_SCORE_BONUS", "2"))
+PREBID_EDGE_MULT = float(os.environ.get("PREBID_EDGE_MULT", "0.05"))
+LOWCENT_NEW_MIN_SCORE = int(os.environ.get("LOWCENT_NEW_MIN_SCORE", "18"))
+LOWCENT_NEW_MIN_TRUE_PROB = float(os.environ.get("LOWCENT_NEW_MIN_TRUE_PROB", "0.74"))
+LOWCENT_NEW_MIN_EXEC_EV = float(os.environ.get("LOWCENT_NEW_MIN_EXEC_EV", "0.035"))
+LOWCENT_NEW_MIN_PAYOUT = float(os.environ.get("LOWCENT_NEW_MIN_PAYOUT", "3.0"))
+ENTRY_TIER_SCORE_HIGH = int(os.environ.get("ENTRY_TIER_SCORE_HIGH", "12"))
+ENTRY_TIER_SCORE_MID = int(os.environ.get("ENTRY_TIER_SCORE_MID", "8"))
+ORACLE_SCALE_DISAGREE_FRESH = float(os.environ.get("ORACLE_SCALE_DISAGREE_FRESH", "0.60"))
+ORACLE_SCALE_DISAGREE_STALE = float(os.environ.get("ORACLE_SCALE_DISAGREE_STALE", "0.80"))
+ENTRY_CENTS_SCALE_3C = float(os.environ.get("ENTRY_CENTS_SCALE_3C", "0.12"))
+ENTRY_CENTS_SCALE_5C = float(os.environ.get("ENTRY_CENTS_SCALE_5C", "0.18"))
+ENTRY_CENTS_SCALE_10C = float(os.environ.get("ENTRY_CENTS_SCALE_10C", "0.28"))
+ENTRY_CENTS_SCALE_20C = float(os.environ.get("ENTRY_CENTS_SCALE_20C", "0.45"))
+TIME_SCALE_LATE_2_5 = float(os.environ.get("TIME_SCALE_LATE_2_5", "0.20"))
+TIME_SCALE_LATE_3_5 = float(os.environ.get("TIME_SCALE_LATE_3_5", "0.35"))
+TIME_SCALE_LATE_5_0 = float(os.environ.get("TIME_SCALE_LATE_5_0", "0.55"))
+MAX_SINGLE_ABS_CAP = float(os.environ.get("MAX_SINGLE_ABS_CAP", "100.0"))
+MIN_HARD_CAP_USDC = float(os.environ.get("MIN_HARD_CAP_USDC", "0.50"))
+TAIL_CAP_ENTRY_1 = float(os.environ.get("TAIL_CAP_ENTRY_1", "0.05"))
+TAIL_CAP_ENTRY_2 = float(os.environ.get("TAIL_CAP_ENTRY_2", "0.10"))
+TAIL_CAP_BANKROLL_PCT_1 = float(os.environ.get("TAIL_CAP_BANKROLL_PCT_1", "0.015"))
+TAIL_CAP_BANKROLL_PCT_2 = float(os.environ.get("TAIL_CAP_BANKROLL_PCT_2", "0.020"))
+SOFTCAP_SCORE_BASE = float(os.environ.get("SOFTCAP_SCORE_BASE", "8.0"))
+SOFTCAP_SCORE_SCALE = float(os.environ.get("SOFTCAP_SCORE_SCALE", "10.0"))
+SOFTCAP_PROB_BASE = float(os.environ.get("SOFTCAP_PROB_BASE", "0.56"))
+SOFTCAP_PROB_SCALE = float(os.environ.get("SOFTCAP_PROB_SCALE", "0.20"))
+SOFTCAP_EDGE_BASE = float(os.environ.get("SOFTCAP_EDGE_BASE", "0.02"))
+SOFTCAP_EDGE_SCALE = float(os.environ.get("SOFTCAP_EDGE_SCALE", "0.12"))
+SOFTCAP_LEADER_SCALE = float(os.environ.get("SOFTCAP_LEADER_SCALE", "0.40"))
+SOFTCAP_W_SCORE = float(os.environ.get("SOFTCAP_W_SCORE", "0.35"))
+SOFTCAP_W_PROB = float(os.environ.get("SOFTCAP_W_PROB", "0.35"))
+SOFTCAP_W_EDGE = float(os.environ.get("SOFTCAP_W_EDGE", "0.20"))
+SOFTCAP_W_LEADER = float(os.environ.get("SOFTCAP_W_LEADER", "0.10"))
+NOLEADER_ENTRY_MAX = float(os.environ.get("NOLEADER_ENTRY_MAX", "0.40"))
+NOLEADER_SCORE_BASE = float(os.environ.get("NOLEADER_SCORE_BASE", "9.0"))
+NOLEADER_SCORE_SCALE = float(os.environ.get("NOLEADER_SCORE_SCALE", "9.0"))
+NOLEADER_PROB_BASE = float(os.environ.get("NOLEADER_PROB_BASE", "0.58"))
+NOLEADER_PROB_SCALE = float(os.environ.get("NOLEADER_PROB_SCALE", "0.20"))
+NOLEADER_EDGE_BASE = float(os.environ.get("NOLEADER_EDGE_BASE", "0.02"))
+NOLEADER_EDGE_SCALE = float(os.environ.get("NOLEADER_EDGE_SCALE", "0.10"))
+NOLEADER_W_SCORE = float(os.environ.get("NOLEADER_W_SCORE", "0.45"))
+NOLEADER_W_PROB = float(os.environ.get("NOLEADER_W_PROB", "0.35"))
+NOLEADER_W_EDGE = float(os.environ.get("NOLEADER_W_EDGE", "0.20"))
+NOLEADER_CAP_BASE = float(os.environ.get("NOLEADER_CAP_BASE", "6.0"))
+NOLEADER_CAP_RANGE = float(os.environ.get("NOLEADER_CAP_RANGE", "6.0"))
+NOLEADER_NEAR_END_MIN_LEFT = float(os.environ.get("NOLEADER_NEAR_END_MIN_LEFT", "3.5"))
+NOLEADER_NEAR_END_CAP = float(os.environ.get("NOLEADER_NEAR_END_CAP", "8.0"))
+HIGH_EV_ENTRY_MAX = float(os.environ.get("HIGH_EV_ENTRY_MAX", "0.50"))
+MID_FLOOR_ENTRY_MIN = float(os.environ.get("MID_FLOOR_ENTRY_MIN", "0.30"))
+MID_FLOOR_ENTRY_MAX = float(os.environ.get("MID_FLOOR_ENTRY_MAX", "0.55"))
+MID_FLOOR_MIN_SCORE = int(os.environ.get("MID_FLOOR_MIN_SCORE", "12"))
+MID_FLOOR_MIN_TRUE_PROB = float(os.environ.get("MID_FLOOR_MIN_TRUE_PROB", "0.70"))
+MID_FLOOR_EV_MARGIN = float(os.environ.get("MID_FLOOR_EV_MARGIN", "0.008"))
+MID_FLOOR_EV_ABS = float(os.environ.get("MID_FLOOR_EV_ABS", "0.020"))
+MID_FLOOR_MIN_USDC = float(os.environ.get("MID_FLOOR_MIN_USDC", "4.0"))
+MID_FLOOR_BANKROLL_PCT = float(os.environ.get("MID_FLOOR_BANKROLL_PCT", "0.012"))
+FORCE_MIN_ENTRY_TAIL = float(os.environ.get("FORCE_MIN_ENTRY_TAIL", "0.10"))
+FORCE_MIN_LEFT_TAIL = float(os.environ.get("FORCE_MIN_LEFT_TAIL", "3.5"))
+MODEL_HICONF_MIN_SCORE = int(os.environ.get("MODEL_HICONF_MIN_SCORE", "12"))
+MODEL_HICONF_MIN_TRUE_PROB = float(os.environ.get("MODEL_HICONF_MIN_TRUE_PROB", "0.62"))
+MODEL_HICONF_MIN_EDGE = float(os.environ.get("MODEL_HICONF_MIN_EDGE", "0.03"))
+ABS_MIN_SIZE_USDC = float(os.environ.get("ABS_MIN_SIZE_USDC", "0.50"))
+EVENT_ALIGN_SIZE_MIN = float(os.environ.get("EVENT_ALIGN_SIZE_MIN", "0.20"))
+EVENT_ALIGN_SIZE_MAX = float(os.environ.get("EVENT_ALIGN_SIZE_MAX", "1.20"))
+CONTRARIAN_SIZE_MIN_MULT = float(os.environ.get("CONTRARIAN_SIZE_MIN_MULT", "0.20"))
+BOOSTER_TAKER_CONF_UP_MIN = float(os.environ.get("BOOSTER_TAKER_CONF_UP_MIN", "0.54"))
+BOOSTER_TAKER_CONF_DN_MAX = float(os.environ.get("BOOSTER_TAKER_CONF_DN_MAX", "0.46"))
+BOOSTER_OB_SCALE = float(os.environ.get("BOOSTER_OB_SCALE", "0.35"))
+BOOSTER_TF_BASE = float(os.environ.get("BOOSTER_TF_BASE", "1.0"))
+BOOSTER_TF_SCALE = float(os.environ.get("BOOSTER_TF_SCALE", "3.0"))
+BOOSTER_FLOW_SCALE = float(os.environ.get("BOOSTER_FLOW_SCALE", "2.0"))
+BOOSTER_VOL_BASE = float(os.environ.get("BOOSTER_VOL_BASE", "1.0"))
+BOOSTER_VOL_SCALE = float(os.environ.get("BOOSTER_VOL_SCALE", "1.5"))
+BOOSTER_BASIS_SCALE = float(os.environ.get("BOOSTER_BASIS_SCALE", "0.0008"))
+BOOSTER_VWAP_SCALE = float(os.environ.get("BOOSTER_VWAP_SCALE", "0.0012"))
+BOOSTER_W_TF = float(os.environ.get("BOOSTER_W_TF", "0.24"))
+BOOSTER_W_OB = float(os.environ.get("BOOSTER_W_OB", "0.20"))
+BOOSTER_W_FLOW = float(os.environ.get("BOOSTER_W_FLOW", "0.16"))
+BOOSTER_W_VOL = float(os.environ.get("BOOSTER_W_VOL", "0.12"))
+BOOSTER_W_BASIS = float(os.environ.get("BOOSTER_W_BASIS", "0.10"))
+BOOSTER_W_VWAP = float(os.environ.get("BOOSTER_W_VWAP", "0.10"))
+BOOSTER_W_ORACLE = float(os.environ.get("BOOSTER_W_ORACLE", "0.08"))
+BOOSTER_STRONG_SCORE_DELTA = int(os.environ.get("BOOSTER_STRONG_SCORE_DELTA", "3"))
+BOOSTER_STRONG_EDGE_DELTA = float(os.environ.get("BOOSTER_STRONG_EDGE_DELTA", "0.02"))
+BOOSTER_MIN_VOL_RATIO = float(os.environ.get("BOOSTER_MIN_VOL_RATIO", "0.90"))
+BOOSTER_MIN_CONV = float(os.environ.get("BOOSTER_MIN_CONV", "0.50"))
+BOOSTER_OUTSIDE_SCORE_DELTA = int(os.environ.get("BOOSTER_OUTSIDE_SCORE_DELTA", "2"))
+BOOSTER_OUTSIDE_PROB_DELTA = float(os.environ.get("BOOSTER_OUTSIDE_PROB_DELTA", "0.02"))
+BOOSTER_OUTSIDE_EV_DELTA = float(os.environ.get("BOOSTER_OUTSIDE_EV_DELTA", "0.015"))
+BOOSTER_OUTSIDE_MIN_CONV = float(os.environ.get("BOOSTER_OUTSIDE_MIN_CONV", "0.66"))
+BOOSTER_STRONG_SIZE_SCORE_DELTA = int(os.environ.get("BOOSTER_STRONG_SIZE_SCORE_DELTA", "3"))
+BOOSTER_STRONG_SIZE_PROB_DELTA = float(os.environ.get("BOOSTER_STRONG_SIZE_PROB_DELTA", "0.03"))
+BOOSTER_PREV_SIZE_CAP_MULT = float(os.environ.get("BOOSTER_PREV_SIZE_CAP_MULT", "0.35"))
+FORCE_TAKER_SCORE = int(os.environ.get("FORCE_TAKER_SCORE", "12"))
+FORCE_TAKER_MOVE_MIN = float(os.environ.get("FORCE_TAKER_MOVE_MIN", "0.0015"))
+DEFAULT_EPS = float(os.environ.get("DEFAULT_EPS", "1e-9"))
+DEFAULT_CMP_EPS = float(os.environ.get("DEFAULT_CMP_EPS", "1e-6"))
+# Core score model thresholds (env-tunable; no fixed literals in scoring path).
+PCT_REMAINING_MIN = float(os.environ.get("PCT_REMAINING_MIN", "0.15"))
+PREV_WIN_DIR_MOVE_MIN = float(os.environ.get("PREV_WIN_DIR_MOVE_MIN", "0.0002"))
+MOM_THRESH_UP = float(os.environ.get("MOM_THRESH_UP", "0.53"))
+MOM_THRESH_DN = float(os.environ.get("MOM_THRESH_DN", "0.47"))
+CL_DIRECTION_MOVE_MIN = float(os.environ.get("CL_DIRECTION_MOVE_MIN", "0.0002"))
+DIR_MOVE_MIN = float(os.environ.get("DIR_MOVE_MIN", "0.0003"))
+DIR_CONFLICT_MOVE_MAX = float(os.environ.get("DIR_CONFLICT_MOVE_MAX", "0.0010"))
+DIR_CONFLICT_CL_AGE_MAX = float(os.environ.get("DIR_CONFLICT_CL_AGE_MAX", "20.0"))
+DIR_CONFLICT_SCORE_PEN = int(os.environ.get("DIR_CONFLICT_SCORE_PEN", "3"))
+DIR_CONFLICT_EDGE_PEN = float(os.environ.get("DIR_CONFLICT_EDGE_PEN", "0.020"))
+TIMING_SCORE_PCT_2 = float(os.environ.get("TIMING_SCORE_PCT_2", "0.85"))
+TIMING_SCORE_PCT_1 = float(os.environ.get("TIMING_SCORE_PCT_1", "0.70"))
+MOVE_SCORE_T3 = float(os.environ.get("MOVE_SCORE_T3", "0.0020"))
+MOVE_SCORE_T2 = float(os.environ.get("MOVE_SCORE_T2", "0.0012"))
+MOVE_SCORE_T1 = float(os.environ.get("MOVE_SCORE_T1", "0.0005"))
+CL_AGREE_SCORE_BONUS = int(os.environ.get("CL_AGREE_SCORE_BONUS", "1"))
+CL_DISAGREE_SCORE_PEN = int(os.environ.get("CL_DISAGREE_SCORE_PEN", "3"))
+DIV_PEN_START = float(os.environ.get("DIV_PEN_START", "0.0004"))
+DIV_PEN_MAX_SCORE = int(os.environ.get("DIV_PEN_MAX_SCORE", "3"))
+DIV_PEN_EDGE_CAP = float(os.environ.get("DIV_PEN_EDGE_CAP", "0.03"))
+DIV_PEN_EDGE_MULT = float(os.environ.get("DIV_PEN_EDGE_MULT", "3.0"))
+CL_AGE_MAX_SKIP = float(os.environ.get("CL_AGE_MAX_SKIP", "90.0"))
+CL_AGE_WARN = float(os.environ.get("CL_AGE_WARN", "45.0"))
+CL_AGE_WARN_SCORE_PEN = int(os.environ.get("CL_AGE_WARN_SCORE_PEN", "2"))
+WS_FALLBACK_SCORE_PEN = int(os.environ.get("WS_FALLBACK_SCORE_PEN", "1"))
+WS_SOFT_SCORE_PEN = int(os.environ.get("WS_SOFT_SCORE_PEN", "2"))
+CACHE_MIN_KLINES = int(os.environ.get("CACHE_MIN_KLINES", "10"))
+JUMP_CONFIRM_SCORE = int(os.environ.get("JUMP_CONFIRM_SCORE", "2"))
+OB_HARD_BLOCK = float(os.environ.get("OB_HARD_BLOCK", "-0.40"))
+OB_SCORE_T3 = float(os.environ.get("OB_SCORE_T3", "0.25"))
+OB_SCORE_T2 = float(os.environ.get("OB_SCORE_T2", "0.10"))
+OB_SCORE_T1 = float(os.environ.get("OB_SCORE_T1", "-0.10"))
+TAKER_T3_UP = float(os.environ.get("TAKER_T3_UP", "0.62"))
+TAKER_T3_DN = float(os.environ.get("TAKER_T3_DN", "0.38"))
+TAKER_T2_UP = float(os.environ.get("TAKER_T2_UP", "0.55"))
+TAKER_T2_DN = float(os.environ.get("TAKER_T2_DN", "0.45"))
+TAKER_NEUTRAL = float(os.environ.get("TAKER_NEUTRAL", "0.05"))
+VOL_SCORE_T2 = float(os.environ.get("VOL_SCORE_T2", "2.0"))
+VOL_SCORE_T1 = float(os.environ.get("VOL_SCORE_T1", "1.3"))
+PERP_CONFIRM = float(os.environ.get("PERP_CONFIRM", "0.0002"))
+PERP_STRONG = float(os.environ.get("PERP_STRONG", "0.0005"))
+FUNDING_POS_STRONG = float(os.environ.get("FUNDING_POS_STRONG", "0.0005"))
+FUNDING_NEG_CONFIRM = float(os.environ.get("FUNDING_NEG_CONFIRM", "-0.0002"))
+FUNDING_POS_EXTREME = float(os.environ.get("FUNDING_POS_EXTREME", "0.0010"))
+FUNDING_NEG_STRONG = float(os.environ.get("FUNDING_NEG_STRONG", "-0.0005"))
+VWAP_SCORE_T2 = float(os.environ.get("VWAP_SCORE_T2", "0.0015"))
+VWAP_SCORE_T1 = float(os.environ.get("VWAP_SCORE_T1", "0.0008"))
+DISP_SIGMA_STRONG = float(os.environ.get("DISP_SIGMA_STRONG", "1.0"))
+DISP_SIGMA_MID = float(os.environ.get("DISP_SIGMA_MID", "0.5"))
+BTC_LEAD_T2_UP = float(os.environ.get("BTC_LEAD_T2_UP", "0.60"))
+BTC_LEAD_T2_DN = float(os.environ.get("BTC_LEAD_T2_DN", "0.40"))
+BTC_LEAD_T1_UP = float(os.environ.get("BTC_LEAD_T1_UP", "0.55"))
+BTC_LEAD_T1_DN = float(os.environ.get("BTC_LEAD_T1_DN", "0.45"))
+BTC_LEAD_NEG_UP = float(os.environ.get("BTC_LEAD_NEG_UP", "0.40"))
+BTC_LEAD_NEG_DN = float(os.environ.get("BTC_LEAD_NEG_DN", "0.60"))
+CONT_HIT_TAKER_UP = float(os.environ.get("CONT_HIT_TAKER_UP", "0.53"))
+CONT_HIT_TAKER_DN = float(os.environ.get("CONT_HIT_TAKER_DN", "0.47"))
+CONT_HIT_OB = float(os.environ.get("CONT_HIT_OB", "0.08"))
+CONT_BONUS_EARLY_PCT = float(os.environ.get("CONT_BONUS_EARLY_PCT", "0.80"))
+REGIME_VR_TREND = float(os.environ.get("REGIME_VR_TREND", "1.05"))
+REGIME_AC_TREND = float(os.environ.get("REGIME_AC_TREND", "0.05"))
+REGIME_VR_MR = float(os.environ.get("REGIME_VR_MR", "0.95"))
+REGIME_AC_MR = float(os.environ.get("REGIME_AC_MR", "-0.05"))
+REGIME_MULT_TREND = float(os.environ.get("REGIME_MULT_TREND", "1.15"))
+REGIME_MULT_MR = float(os.environ.get("REGIME_MULT_MR", "0.85"))
+LLR_PRICE_MULT = float(os.environ.get("LLR_PRICE_MULT", "1.5"))
+LLR_EMA_MULT = float(os.environ.get("LLR_EMA_MULT", "300.0"))
+LLR_KALMAN_MULT = float(os.environ.get("LLR_KALMAN_MULT", "0.4"))
+LLR_OB_MULT = float(os.environ.get("LLR_OB_MULT", "2.5"))
+LLR_TAKER_MULT = float(os.environ.get("LLR_TAKER_MULT", "5.0"))
+LLR_PERP_MULT = float(os.environ.get("LLR_PERP_MULT", "1000.0"))
+LLR_PERP_CAP = float(os.environ.get("LLR_PERP_CAP", "1.5"))
+LLR_CL_AGREE = float(os.environ.get("LLR_CL_AGREE", "0.4"))
+LLR_CL_DISAGREE = float(os.environ.get("LLR_CL_DISAGREE", "1.0"))
+LLR_BTC_LEAD_MULT = float(os.environ.get("LLR_BTC_LEAD_MULT", "3.0"))
+LLR_CLAMP = float(os.environ.get("LLR_CLAMP", "6.0"))
+PRIOR_BOOST_TF = float(os.environ.get("PRIOR_BOOST_TF", "0.015"))
+PRIOR_BOOST_TAKER = float(os.environ.get("PRIOR_BOOST_TAKER", "0.015"))
+PRIOR_BOOST_OB = float(os.environ.get("PRIOR_BOOST_OB", "0.010"))
+PRIOR_BOOST_CL = float(os.environ.get("PRIOR_BOOST_CL", "0.010"))
+PRIOR_BOOST_TAKER_UP = float(os.environ.get("PRIOR_BOOST_TAKER_UP", "0.54"))
+PRIOR_BOOST_TAKER_DN = float(os.environ.get("PRIOR_BOOST_TAKER_DN", "0.46"))
+PRIOR_BOOST_OB_MIN = float(os.environ.get("PRIOR_BOOST_OB_MIN", "0.10"))
+PREFILTER_MIN = float(os.environ.get("PREFILTER_MIN", "0.02"))
+PREFILTER_EDGE_MULT = float(os.environ.get("PREFILTER_EDGE_MULT", "0.25"))
+FORCE_DIR_MOVE_MIN = float(os.environ.get("FORCE_DIR_MOVE_MIN", "0.0005"))
+FORCE_DIR_EDGE_HARD_BLOCK = float(os.environ.get("FORCE_DIR_EDGE_HARD_BLOCK", "-0.15"))
+FORCE_DIR_EDGE_FLOOR = float(os.environ.get("FORCE_DIR_EDGE_FLOOR", "0.01"))
+UTIL_EDGE_MULT = float(os.environ.get("UTIL_EDGE_MULT", "0.35"))
+PREFETCH_UP_PRICE_MAX = float(os.environ.get("PREFETCH_UP_PRICE_MAX", "0.50"))
+CL_FRESH_PRICE_AGE_SEC = float(os.environ.get("CL_FRESH_PRICE_AGE_SEC", "15.0"))
+EARLY_CONT_PCT_MIN = float(os.environ.get("EARLY_CONT_PCT_MIN", "0.85"))
+TF_VOTES_STRONG = int(os.environ.get("TF_VOTES_STRONG", "3"))
+TF_VOTES_MAX = int(os.environ.get("TF_VOTES_MAX", "4"))
+TF_VOTES_MID = int(os.environ.get("TF_VOTES_MID", "2"))
+TF_SCORE_MAX = int(os.environ.get("TF_SCORE_MAX", "5"))
+TF_SCORE_STRONG = int(os.environ.get("TF_SCORE_STRONG", "4"))
+TF_SCORE_MID = int(os.environ.get("TF_SCORE_MID", "2"))
+CORE_DURATION_MIN = int(os.environ.get("CORE_DURATION_MIN", "15"))
+FAIR_SIDE_MISMATCH_SWAP = float(os.environ.get("FAIR_SIDE_MISMATCH_SWAP", "0.18"))
+FAIR_SIDE_SWAP_ERR_MARGIN = float(os.environ.get("FAIR_SIDE_SWAP_ERR_MARGIN", "0.03"))
+SETUP_SCORE_SLACK_HIGH = int(os.environ.get("SETUP_SCORE_SLACK_HIGH", "12"))
+SETUP_SCORE_SLACK_MID = int(os.environ.get("SETUP_SCORE_SLACK_MID", "9"))
+SETUP_SLACK_HIGH = float(os.environ.get("SETUP_SLACK_HIGH", "0.02"))
+SETUP_SLACK_MID = float(os.environ.get("SETUP_SLACK_MID", "0.01"))
+SETUP_Q_HARD_RELAX_SCORE = int(os.environ.get("SETUP_Q_HARD_RELAX_SCORE", "12"))
+SETUP_Q_HARD_RELAX_PROB = float(os.environ.get("SETUP_Q_HARD_RELAX_PROB", "0.82"))
+SETUP_Q_HARD_RELAX_MIN = float(os.environ.get("SETUP_Q_HARD_RELAX_MIN", "0.70"))
+SETUP_Q_HARD_RELAX_MAX = float(os.environ.get("SETUP_Q_HARD_RELAX_MAX", "0.06"))
+SETUP_Q_HARD_RELAX_MULT = float(os.environ.get("SETUP_Q_HARD_RELAX_MULT", "0.30"))
+ROLL_EXP_GOOD = float(os.environ.get("ROLL_EXP_GOOD", "0.10"))
+ROLL_WR_GOOD = float(os.environ.get("ROLL_WR_GOOD", "0.50"))
+ROLL_EXP_BAD = float(os.environ.get("ROLL_EXP_BAD", "-0.10"))
+ROLL_WR_BAD = float(os.environ.get("ROLL_WR_BAD", "0.46"))
+FRESH_RELAX_MIN_LEFT_15M = float(os.environ.get("FRESH_RELAX_MIN_LEFT_15M", "4.0"))
+FRESH_RELAX_MIN_LEFT_5M = float(os.environ.get("FRESH_RELAX_MIN_LEFT_5M", "2.0"))
+FRESH_RELAX_ENTRY_CAP = float(os.environ.get("FRESH_RELAX_ENTRY_CAP", "0.90"))
+FRESH_RELAX_ENTRY_ADD = float(os.environ.get("FRESH_RELAX_ENTRY_ADD", "0.02"))
+SETUP_Q_RELAX_MIN = float(os.environ.get("SETUP_Q_RELAX_MIN", "0.72"))
+SETUP_Q_RELAX_MAX = float(os.environ.get("SETUP_Q_RELAX_MAX", "0.08"))
+SETUP_Q_RELAX_MULT = float(os.environ.get("SETUP_Q_RELAX_MULT", "0.20"))
+SETUP_Q_TIGHTEN_MIN = float(os.environ.get("SETUP_Q_TIGHTEN_MIN", "0.58"))
+SETUP_Q_TIGHTEN_MAX = float(os.environ.get("SETUP_Q_TIGHTEN_MAX", "0.06"))
+SETUP_Q_TIGHTEN_MULT = float(os.environ.get("SETUP_Q_TIGHTEN_MULT", "0.25"))
+SETUP_VOL_RELAX_MIN = float(os.environ.get("SETUP_VOL_RELAX_MIN", "1.10"))
+ENTRY_TIGHTEN_ADD = float(os.environ.get("ENTRY_TIGHTEN_ADD", "0.01"))
+PULLBACK_MIN_ENTRY_FLOOR = float(os.environ.get("PULLBACK_MIN_ENTRY_FLOOR", "0.20"))
+FORCE_TAKER_CL_AGE_FRESH = float(os.environ.get("FORCE_TAKER_CL_AGE_FRESH", "45"))
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
 }
@@ -3615,7 +3912,7 @@ class LiveTrader:
         up_price  = m["up_price"]
         label     = f"{asset} {duration}m | {m.get('question','')[:45]}"
         # Pre-fetch likely token book (cheap-side = token_up iff up_price≤0.50)
-        prefetch_token = m.get("token_up", "") if up_price <= 0.50 else m.get("token_down", "")
+        prefetch_token = m.get("token_up", "") if up_price <= PREFETCH_UP_PRICE_MAX else m.get("token_down", "")
 
         # Decision price selection: use freshest reliable source (prefer CL when fresh),
         # then apply soft penalties for source divergence instead of hard blocking.
@@ -3625,7 +3922,7 @@ class LiveTrader:
         quote_age_ms = (_time.time() - last_tick_ts) * 1000.0 if last_tick_ts else 9e9
         cl_updated = self.cl_updated.get(asset, 0)
         cl_age_s = (_time.time() - cl_updated) if cl_updated else None
-        if cl_now > 0 and cl_age_s is not None and cl_age_s <= 15.0:
+        if cl_now > 0 and cl_age_s is not None and cl_age_s <= CL_FRESH_PRICE_AGE_SEC:
             current = cl_now
             px_src = "CL"
         elif rtds_now > 0 and quote_age_ms <= MAX_QUOTE_STALENESS_MS:
@@ -3652,7 +3949,7 @@ class LiveTrader:
         # Timing gate: only block final 2 min (price already moved fully, no edge).
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
-        if pct_remaining < 0.15:
+        if pct_remaining < PCT_REMAINING_MIN:
             return None   # last ~2 min — too late to fill at good price
 
         # Previous window direction from CL prices (used as one signal among others).
@@ -3661,8 +3958,8 @@ class LiveTrader:
         prev_win_dir  = None
         if prev_open > 0 and open_price > 0:
             diff = (open_price - prev_open) / prev_open
-            if   diff >  0.0002: prev_win_dir = "Up"
-            elif diff < -0.0002: prev_win_dir = "Down"
+            if   diff >  PREV_WIN_DIR_MOVE_MIN: prev_win_dir = "Up"
+            elif diff < -PREV_WIN_DIR_MOVE_MIN: prev_win_dir = "Down"
 
         move_pct = abs(current - open_price) / open_price if open_price > 0 else 0
         move_str = f"{(current-open_price)/open_price:+.3%}"
@@ -3680,23 +3977,23 @@ class LiveTrader:
         mom_30s  = self._momentum_prob(asset, seconds=30)
         mom_180s = self._momentum_prob(asset, seconds=180)
         mom_kal  = self._kalman_vel_prob(asset)
-        th_up, th_dn = 0.53, 0.47
+        th_up, th_dn = MOM_THRESH_UP, MOM_THRESH_DN
         tf_up_votes = sum([mom_5s > th_up, mom_30s > th_up, mom_180s > th_up, mom_kal > th_up])
         tf_dn_votes = sum([mom_5s < th_dn, mom_30s < th_dn, mom_180s < th_dn, mom_kal < th_dn])
 
         # Chainlink current — the resolution oracle
         cl_move_pct = abs(cl_now - open_price) / open_price if cl_now > 0 and open_price > 0 else 0
-        cl_direction = ("Up" if cl_now > open_price else "Down") if cl_move_pct >= 0.0002 else None
+        cl_direction = ("Up" if cl_now > open_price else "Down") if cl_move_pct >= CL_DIRECTION_MOVE_MIN else None
 
         # Direction: Chainlink is authoritative (it resolves the market)
         # Use Binance RTDS only when it's clearly moving; fall back to CL then momentum
-        if move_pct >= 0.0003:
+        if move_pct >= DIR_MOVE_MIN:
             direction = "Up" if current > open_price else "Down"
             # Small move + opposite CL direction: keep trading, but align to oracle and penalize.
-            if cl_direction and cl_direction != direction and move_pct < 0.0010:
-                score -= 3
-                edge -= 0.020
-                if cl_age_s is not None and cl_age_s <= 20.0:
+            if cl_direction and cl_direction != direction and move_pct < DIR_CONFLICT_MOVE_MAX:
+                score -= DIR_CONFLICT_SCORE_PEN
+                edge -= DIR_CONFLICT_EDGE_PEN
+                if cl_age_s is not None and cl_age_s <= DIR_CONFLICT_CL_AGE_MAX:
                     direction = cl_direction
                 if self._noisy_log_enabled(f"px-align:{asset}:{duration}", LOG_FLOW_EVERY_SEC):
                     print(
@@ -3714,24 +4011,24 @@ class LiveTrader:
 
         is_up    = (direction == "Up")
         tf_votes = tf_up_votes if is_up else tf_dn_votes
-        very_strong_mom = (tf_votes >= 3)
+        very_strong_mom = (tf_votes >= TF_VOTES_STRONG)
 
-        is_early_continuation = (prev_win_dir == direction and pct_remaining > 0.85)
+        is_early_continuation = (prev_win_dir == direction and pct_remaining > EARLY_CONT_PCT_MIN)
 
         # Entry timing (0-2 pts) — earlier = AMM hasn't repriced yet = better odds
-        if   pct_remaining >= 0.85: score += 2   # first 2.25 min of 15-min market
-        elif pct_remaining >= 0.70: score += 1   # first 4.5 min
+        if   pct_remaining >= TIMING_SCORE_PCT_2: score += 2
+        elif pct_remaining >= TIMING_SCORE_PCT_1: score += 1
 
         # Move size (0-3 pts) — price confirmation bonus; not a gate
-        if   move_pct >= 0.0020: score += 3
-        elif move_pct >= 0.0012: score += 2
-        elif move_pct >= 0.0005: score += 1
+        if   move_pct >= MOVE_SCORE_T3: score += 3
+        elif move_pct >= MOVE_SCORE_T2: score += 2
+        elif move_pct >= MOVE_SCORE_T1: score += 1
         # flat/tiny move → +0 pts (still tradeable if momentum/taker confirm)
 
         # Multi-TF momentum + Kalman (0-5 pts; signals: 5s/30s/180s EMA + Kalman velocity)
-        if   tf_votes == 4: score += 5
-        elif tf_votes == 3: score += 4
-        elif tf_votes == 2: score += 2
+        if   tf_votes == TF_VOTES_MAX: score += TF_SCORE_MAX
+        elif tf_votes == TF_VOTES_STRONG: score += TF_SCORE_STRONG
+        elif tf_votes == TF_VOTES_MID: score += TF_SCORE_MID
 
         # Chainlink direction agreement (+1 agree / −3 disagree)
         # CL is the resolution oracle — disagreement is a major red flag
@@ -3739,16 +4036,16 @@ class LiveTrader:
         if cl_now > 0 and open_price > 0:
             if (is_up) != (cl_now > open_price):
                 cl_agree = False
-        if cl_agree:  score += 1
-        else:         score -= 3
+        if cl_agree:  score += CL_AGREE_SCORE_BONUS
+        else:         score -= CL_DISAGREE_SCORE_PEN
 
         # Soft source-divergence penalty (no hard skip): discourages entries on feed mismatch.
         if open_price > 0 and cl_now > 0 and rtds_now > 0:
             div = abs(cl_now - rtds_now) / open_price
-            if div >= 0.0004:
-                div_pen = min(3, max(1, int(div / 0.0004)))
+            if div >= DIV_PEN_START:
+                div_pen = min(DIV_PEN_MAX_SCORE, max(1, int(div / DIV_PEN_START)))
                 score -= div_pen
-                edge -= min(0.03, div * 3.0)
+                edge -= min(DIV_PEN_EDGE_CAP, div * DIV_PEN_EDGE_MULT)
                 if self._noisy_log_enabled(f"data-div:{asset}:{duration}", LOG_FLOW_EVERY_SEC):
                     print(
                         f"{Y}[DATA-DIV]{RS} {asset} {duration}m cl={cl_now:.4f} rtds={rtds_now:.4f} "
@@ -3767,10 +4064,10 @@ class LiveTrader:
             onchain_adj -= 1
         if cl_age_s is None:
             onchain_adj -= 1
-        elif cl_age_s > 90:
+        elif cl_age_s > CL_AGE_MAX_SKIP:
             return None
-        elif cl_age_s > 45:
-            onchain_adj -= 2
+        elif cl_age_s > CL_AGE_WARN:
+            onchain_adj -= CL_AGE_WARN_SCORE_PEN
         # Empirical guard from live outcomes: core 15m trades with missing CL age
         # are materially worse. Keep block for missing age, allow mildly stale.
         if duration >= 15 and (not booster_eval):
@@ -3822,7 +4119,7 @@ class LiveTrader:
                     and pm_age_ms <= CLOB_REST_FRESH_MAX_AGE_MS
                 )
             if clob_rest_ok or (WS_BOOK_FALLBACK_ENABLED and PM_BOOK_FALLBACK_ENABLED and pm_ok):
-                score -= 1
+                score -= WS_FALLBACK_SCORE_PEN
                 ws_book_now = _pm_book
                 if self._noisy_log_enabled(f"ws-fallback:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
                     if clob_rest_ok:
@@ -3839,7 +4136,7 @@ class LiveTrader:
                 # Last-resort soft WS fallback (short stale window) to avoid hard stalls.
                 if isinstance(ws_book_soft, dict):
                     ws_book_now = ws_book_soft
-                    score -= 2
+                    score -= WS_SOFT_SCORE_PEN
                     if self._noisy_log_enabled(f"ws-soft:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
                         ws_age_pref = self._clob_ws_book_age_ms(prefetch_token)
                         print(
@@ -3876,7 +4173,7 @@ class LiveTrader:
         is_jump, jump_dir, jump_z = self._jump_detect(asset)
         btc_lead_p = self._btc_lead_signal(asset)
         cache_a = self.binance_cache.get(asset, {})
-        volume_ready = bool(cache_a.get("depth_bids")) and bool(cache_a.get("depth_asks")) and (len(cache_a.get("klines", [])) >= 10)
+        volume_ready = bool(cache_a.get("depth_bids")) and bool(cache_a.get("depth_asks")) and (len(cache_a.get("klines", [])) >= CACHE_MIN_KLINES)
         if REQUIRE_VOLUME_SIGNAL and not volume_ready:
             if self._noisy_log_enabled(f"skip-no-vol:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(f"{Y}[SKIP] {asset} {duration}m missing live Binance depth/volume cache{RS}")
@@ -3887,30 +4184,30 @@ class LiveTrader:
         if is_jump and jump_dir is not None and jump_dir != direction:
             return None
         if is_jump and jump_dir == direction:
-            score += 2   # jump confirms direction — strong momentum signal
+            score += JUMP_CONFIRM_SCORE
 
         # Order book imbalance — depth-weighted 1/rank (more reliable than flat sum)
         ob_sig = dw_ob if is_up else -dw_ob    # positive = OB confirms direction
-        if ob_sig < -0.40:
+        if ob_sig < OB_HARD_BLOCK:
             return None    # extreme contra OB — hard block
-        if   ob_sig > 0.25: score += 3
-        elif ob_sig > 0.10: score += 2
-        elif ob_sig > -0.10: score += 1
+        if   ob_sig > OB_SCORE_T3: score += 3
+        elif ob_sig > OB_SCORE_T2: score += 2
+        elif ob_sig > OB_SCORE_T1: score += 1
         else:               score -= 1
-        imbalance_confirms = ob_sig > 0.10
+        imbalance_confirms = ob_sig > IMBALANCE_CONFIRM_MIN
 
         # Taker buy/sell flow + volume vs 30-min avg (−1 to +5 pts)
-        if   (is_up and taker_ratio > 0.62) or (not is_up and taker_ratio < 0.38): score += 3
-        elif (is_up and taker_ratio > 0.55) or (not is_up and taker_ratio < 0.45): score += 2
-        elif abs(taker_ratio - 0.50) < 0.05: score += 1
+        if   (is_up and taker_ratio > TAKER_T3_UP) or (not is_up and taker_ratio < TAKER_T3_DN): score += 3
+        elif (is_up and taker_ratio > TAKER_T2_UP) or (not is_up and taker_ratio < TAKER_T2_DN): score += 2
+        elif abs(taker_ratio - 0.50) < TAKER_NEUTRAL: score += 1
         else:                                score -= 1
-        if   vol_ratio > 2.0: score += 2
-        elif vol_ratio > 1.3: score += 1
+        if   vol_ratio > VOL_SCORE_T2: score += 2
+        elif vol_ratio > VOL_SCORE_T1: score += 1
 
         # Perp futures basis: premium = leveraged longs crowding in = bullish (−1 to +2 pts)
-        perp_confirms = (is_up and perp_basis > 0.0002) or (not is_up and perp_basis < -0.0002)
-        perp_strong   = (is_up and perp_basis > 0.0005) or (not is_up and perp_basis < -0.0005)
-        perp_contra   = (is_up and perp_basis < -0.0002) or (not is_up and perp_basis > 0.0002)
+        perp_confirms = (is_up and perp_basis > PERP_CONFIRM) or (not is_up and perp_basis < -PERP_CONFIRM)
+        perp_strong   = (is_up and perp_basis > PERP_STRONG) or (not is_up and perp_basis < -PERP_STRONG)
+        perp_contra   = (is_up and perp_basis < -PERP_CONFIRM) or (not is_up and perp_basis > PERP_CONFIRM)
         if   perp_strong:   score += 2
         elif perp_confirms: score += 1
         elif perp_contra:   score -= 1
@@ -3918,29 +4215,29 @@ class LiveTrader:
         # Funding rate: extreme = crowded = contrarian (−1 to +1 pts)
         # High positive funding + Down bet = contrarian confirms shorts
         # Very high positive funding + Up bet = overcrowded longs = risky
-        if   (not is_up and funding_rate >  0.0005): score += 1  # crowded longs → contrarian short
-        elif (is_up     and funding_rate < -0.0002): score += 1  # crowded shorts → contrarian long
-        elif (is_up     and funding_rate >  0.0010): score -= 1  # extremely crowded long + bet Up
-        elif (not is_up and funding_rate < -0.0005): score -= 1  # crowded shorts + bet Down risky
+        if   (not is_up and funding_rate >  FUNDING_POS_STRONG): score += 1
+        elif (is_up     and funding_rate <  FUNDING_NEG_CONFIRM): score += 1
+        elif (is_up     and funding_rate >  FUNDING_POS_EXTREME): score -= 1
+        elif (not is_up and funding_rate <  FUNDING_NEG_STRONG): score -= 1
 
         # VWAP: momentum signal (−2 to +2 pts)
         # Price ABOVE window VWAP in our direction = momentum confirms = good
         # Price BELOW window VWAP in our direction = momentum weak = bad
         vwap_net = vwap_dev if is_up else -vwap_dev   # positive = price above VWAP in bet direction
-        if   vwap_net >  0.0015: score += 2   # strongly above VWAP → momentum confirms bet
-        elif vwap_net >  0.0008: score += 1
-        elif vwap_net < -0.0015: score -= 2   # strongly below VWAP → momentum against bet
-        elif vwap_net < -0.0008: score -= 1
+        if   vwap_net >  VWAP_SCORE_T2: score += 2
+        elif vwap_net >  VWAP_SCORE_T1: score += 1
+        elif vwap_net < -VWAP_SCORE_T2: score -= 2
+        elif vwap_net < -VWAP_SCORE_T1: score -= 1
 
         # Vol-normalized displacement signal (−2 to +2 pts)
         sigma_15m = self.vols.get(asset, 0.70) * (15 / (252 * 390)) ** 0.5
         open_price_disp = open_price
         if open_price_disp and sigma_15m > 0:
             net_disp = (current - open_price_disp) / open_price_disp * (1 if is_up else -1)
-            if   net_disp > sigma_15m * 1.0: score += 2   # extended in direction = strong momentum
-            elif net_disp > sigma_15m * 0.5: score += 1
-            elif net_disp < -sigma_15m * 1.0: score -= 2  # price moved opposite to our bet
-            elif net_disp < -sigma_15m * 0.5: score -= 1
+            if   net_disp > sigma_15m * DISP_SIGMA_STRONG: score += 2
+            elif net_disp > sigma_15m * DISP_SIGMA_MID: score += 1
+            elif net_disp < -sigma_15m * DISP_SIGMA_STRONG: score -= 2
+            elif net_disp < -sigma_15m * DISP_SIGMA_MID: score -= 1
 
         # Cross-asset confirmation: how many other assets trending same direction? (0-2 pts)
         cross_count = self._cross_asset_direction(asset, direction)
@@ -3949,9 +4246,9 @@ class LiveTrader:
 
         # BTC lead signal for non-BTC assets — BTC lagged move predicts altcoins (0–2 pts)
         if asset != "BTC":
-            if   (is_up and btc_lead_p > 0.60) or (not is_up and btc_lead_p < 0.40): score += 2
-            elif (is_up and btc_lead_p > 0.55) or (not is_up and btc_lead_p < 0.45): score += 1
-            elif (is_up and btc_lead_p < 0.40) or (not is_up and btc_lead_p > 0.60): score -= 1
+            if   (is_up and btc_lead_p > BTC_LEAD_T2_UP) or (not is_up and btc_lead_p < BTC_LEAD_T2_DN): score += 2
+            elif (is_up and btc_lead_p > BTC_LEAD_T1_UP) or (not is_up and btc_lead_p < BTC_LEAD_T1_DN): score += 1
+            elif (is_up and btc_lead_p < BTC_LEAD_NEG_UP) or (not is_up and btc_lead_p > BTC_LEAD_NEG_DN): score -= 1
 
         # Previous-window continuation (data-driven, low weight).
         # Never use a fixed global continuation prior; require realtime corroboration.
@@ -3959,20 +4256,20 @@ class LiveTrader:
             if prev_win_dir == direction:
                 conf_hits = 0
                 conf_hits += 1 if tf_votes >= 3 else 0
-                conf_hits += 1 if ((is_up and taker_ratio > 0.53) or ((not is_up) and taker_ratio < 0.47)) else 0
-                conf_hits += 1 if ((is_up and ob_sig > 0.08) or ((not is_up) and ob_sig < -0.08)) else 0
+                conf_hits += 1 if ((is_up and taker_ratio > CONT_HIT_TAKER_UP) or ((not is_up) and taker_ratio < CONT_HIT_TAKER_DN)) else 0
+                conf_hits += 1 if ((is_up and ob_sig > CONT_HIT_OB) or ((not is_up) and ob_sig < -CONT_HIT_OB)) else 0
                 if conf_hits >= 2:
-                    score += 2 if pct_remaining > 0.80 else 1
+                    score += 2 if pct_remaining > CONT_BONUS_EARLY_PCT else 1
             else:
                 score -= 1
 
         # Autocorr + Variance Ratio regime: trending boosts momentum confidence
-        if vr_ratio > 1.05 and autocorr > 0.05:
+        if vr_ratio > REGIME_VR_TREND and autocorr > REGIME_AC_TREND:
             score += 1       # trending regime — momentum more reliable
-            regime_mult = 1.15
-        elif vr_ratio < 0.95 and autocorr < -0.05:
+            regime_mult = REGIME_MULT_TREND
+        elif vr_ratio < REGIME_VR_MR and autocorr < REGIME_AC_MR:
             score -= 1       # mean-reverting — momentum less reliable
-            regime_mult = 0.85
+            regime_mult = REGIME_MULT_MR
         else:
             regime_mult = 1.0
 
@@ -3981,50 +4278,50 @@ class LiveTrader:
         llr = 0.0
         # 1. Price displacement z-score
         if open_price > 0 and sigma_15m > 0:
-            llr += (current - open_price) / open_price / sigma_15m * 1.5
+            llr += (current - open_price) / open_price / sigma_15m * LLR_PRICE_MULT
         # 2. Short vs long EMA cross
         ema5  = self.emas.get(asset, {}).get(5, current)
         ema60 = self.emas.get(asset, {}).get(60, current)
         if ema60 > 0:
-            llr += (ema5 / ema60 - 1.0) * 300.0
+            llr += (ema5 / ema60 - 1.0) * LLR_EMA_MULT
         # 3. Kalman velocity
         k = self.kalman.get(asset, {})
         if k.get("rdy"):
             per_sec_vol = max(self.vols.get(asset, 0.7) / math.sqrt(252 * 24 * 3600), 1e-8)
-            llr += k["vel"] / per_sec_vol * 0.4
+            llr += k["vel"] / per_sec_vol * LLR_KALMAN_MULT
         # 4. Depth-weighted OB imbalance
-        llr += dw_ob * 2.5
+        llr += dw_ob * LLR_OB_MULT
         # 5. Taker buy/sell flow
-        llr += (taker_ratio - 0.5) * 5.0
+        llr += (taker_ratio - 0.5) * LLR_TAKER_MULT
         # 6. Perp basis
         if abs(perp_basis) > 1e-7:
-            llr += math.copysign(min(abs(perp_basis) * 1000.0, 1.5), perp_basis)
+            llr += math.copysign(min(abs(perp_basis) * LLR_PERP_MULT, LLR_PERP_CAP), perp_basis)
         # 7. Chainlink oracle agreement
-        if cl_agree:  llr += 0.4
-        else:         llr -= 1.0
+        if cl_agree:  llr += LLR_CL_AGREE
+        else:         llr -= LLR_CL_DISAGREE
         # 8. BTC lead for altcoins
         if asset != "BTC":
-            llr += (btc_lead_p - 0.5) * 3.0
+            llr += (btc_lead_p - 0.5) * LLR_BTC_LEAD_MULT
         # 9. Regime scale
         llr *= regime_mult
         # Sigmoid → prob_up
-        p_up_ll   = 1.0 / (1.0 + math.exp(-max(-6.0, min(6.0, llr))))
+        p_up_ll   = 1.0 / (1.0 + math.exp(-max(-LLR_CLAMP, min(LLR_CLAMP, llr))))
         bias_up   = self._direction_bias(asset, "Up", duration)
         bias_down = self._direction_bias(asset, "Down", duration)
         prob_up   = max(0.05, min(0.95, p_up_ll + bias_up))
         prob_down = max(0.05, min(0.95, 1.0 - p_up_ll + bias_down))
 
         # Early continuation prior boost (bounded, realtime-confirmed).
-        if prev_win_dir == direction and pct_remaining > 0.80:
+        if prev_win_dir == direction and pct_remaining > CONT_BONUS_EARLY_PCT:
             prior_boost = 0.0
             if tf_votes >= 3:
-                prior_boost += 0.015
-            if ((is_up and taker_ratio > 0.54) or ((not is_up) and taker_ratio < 0.46)):
-                prior_boost += 0.015
-            if ((is_up and ob_sig > 0.10) or ((not is_up) and ob_sig < -0.10)):
-                prior_boost += 0.010
+                prior_boost += PRIOR_BOOST_TF
+            if ((is_up and taker_ratio > PRIOR_BOOST_TAKER_UP) or ((not is_up) and taker_ratio < PRIOR_BOOST_TAKER_DN)):
+                prior_boost += PRIOR_BOOST_TAKER
+            if ((is_up and ob_sig > PRIOR_BOOST_OB_MIN) or ((not is_up) and ob_sig < -PRIOR_BOOST_OB_MIN)):
+                prior_boost += PRIOR_BOOST_OB
             if cl_agree:
-                prior_boost += 0.010
+                prior_boost += PRIOR_BOOST_CL
             prior_boost = max(0.0, min(CONTINUATION_PRIOR_MAX_BOOST, prior_boost))
             if direction == "Up":
                 prob_up = max(prob_up, min(0.95, prob_up + prior_boost))
@@ -4044,40 +4341,40 @@ class LiveTrader:
         dn_recent = self._recent_side_profile(asset, duration, "Down")
         up_adj = float(up_recent.get("prob_adj", 0.0) or 0.0)
         dn_adj = float(dn_recent.get("prob_adj", 0.0) or 0.0)
-        if abs(up_adj) > 1e-9 or abs(dn_adj) > 1e-9:
-            pu = max(0.01, min(0.99, prob_up + up_adj))
-            pd = max(0.01, min(0.99, prob_down + dn_adj))
+        if abs(up_adj) > DEFAULT_EPS or abs(dn_adj) > DEFAULT_EPS:
+            pu = max(PROB_REBALANCE_MIN, min(PROB_REBALANCE_MAX, prob_up + up_adj))
+            pd = max(PROB_REBALANCE_MIN, min(PROB_REBALANCE_MAX, prob_down + dn_adj))
             z = pu + pd
             if z > 0:
-                prob_up = max(0.05, min(0.95, pu / z))
+                prob_up = max(PROB_CLAMP_MIN, min(PROB_CLAMP_MAX, pu / z))
                 prob_down = 1.0 - prob_up
 
         edge_up   = prob_up   - up_price
         edge_down = prob_down - (1 - up_price)
         min_edge   = self._adaptive_min_edge()
-        pre_filter = max(0.02, min_edge * 0.25)   # loose pre-filter vs AMM
+        pre_filter = max(PREFILTER_MIN, min_edge * PREFILTER_EDGE_MULT)
 
         # Lock side to price direction when move is clear.
         # AMM edge comparison only used when price is flat (no clear directional signal)
-        if move_pct >= 0.0005:
+        if move_pct >= FORCE_DIR_MOVE_MIN:
             forced_side = "Up" if current > open_price else "Down"
             forced_edge = edge_up if forced_side == "Up" else edge_down
             forced_prob = prob_up if forced_side == "Up" else prob_down
             if forced_edge >= 0:
                 side, edge, true_prob = forced_side, forced_edge, forced_prob
-            elif forced_edge < -0.15:
+            elif forced_edge < FORCE_DIR_EDGE_HARD_BLOCK:
                 return None   # AMM has massively overpriced this direction — no edge at all
             else:
-                side, edge, true_prob = forced_side, max(0.01, forced_edge), forced_prob
+                side, edge, true_prob = forced_side, max(FORCE_DIR_EDGE_FLOOR, forced_edge), forced_prob
         else:
             # Flat price: side MUST match direction (CL/momentum consensus).
             # AMM edge only used to reject extreme mispricing (< -15%).
             # Momentum/CL direction wins over weak market-pricing noise.
             dir_edge = edge_up if direction == "Up" else edge_down
             dir_prob = prob_up if direction == "Up" else prob_down
-            if dir_edge < -0.15:
+            if dir_edge < FORCE_DIR_EDGE_HARD_BLOCK:
                 return None   # AMM massively overpriced our direction — no edge
-            side, edge, true_prob = direction, max(0.01, dir_edge), dir_prob
+            side, edge, true_prob = direction, max(FORCE_DIR_EDGE_FLOOR, dir_edge), dir_prob
 
         # Max-win profile (source fix):
         # choose side by EV utility (not raw probability), with soft event-context prior.
@@ -4086,14 +4383,14 @@ class LiveTrader:
             payout_dn = 1.0 / max(1.0 - up_price, 1e-9)
             ev_up = (prob_up * payout_up) - 1.0 - FEE_RATE_EST
             ev_dn = (prob_down * payout_dn) - 1.0 - FEE_RATE_EST
-            util_up = ev_up + edge_up * 0.35
-            util_dn = ev_dn + edge_down * 0.35
+            util_up = ev_up + edge_up * UTIL_EDGE_MULT
+            util_dn = ev_dn + edge_down * UTIL_EDGE_MULT
             # Soft contextual prior from current event state (non-blocking).
-            if duration >= 15 and open_price > 0 and current > 0 and mins_left <= EVENT_ALIGN_MIN_LEFT_15M:
+            if duration >= CORE_DURATION_MIN and open_price > 0 and current > 0 and mins_left <= EVENT_ALIGN_MIN_LEFT_15M:
                 mv = (current - open_price) / max(open_price, 1e-9)
                 if abs(mv) >= EVENT_ALIGN_MIN_MOVE_PCT:
                     # bounded utility shift: follow clear event drift unless EV is decisively opposite
-                    u_shift = min(0.030, max(0.004, abs(mv) * 8.0))
+                    u_shift = min(SETUP_Q_HARD_RELAX_MAX, max(EVENT_ALIGN_WITH_EDGE_BONUS, abs(mv) * LLR_PERP_MULT / 125.0))
                     if mv >= 0:
                         util_up += u_shift
                         util_dn -= u_shift
@@ -4116,7 +4413,7 @@ class LiveTrader:
         recent_side_score_adj = int(recent_side.get("score_adj", 0) or 0)
         recent_side_edge_adj = float(recent_side.get("edge_adj", 0.0) or 0.0)
         recent_side_prob_adj = float(recent_side.get("prob_adj", 0.0) or 0.0)
-        if recent_side_score_adj != 0 or abs(recent_side_edge_adj) > 1e-9:
+        if recent_side_score_adj != 0 or abs(recent_side_edge_adj) > DEFAULT_EPS:
             score += recent_side_score_adj
             edge += recent_side_edge_adj
             if self._noisy_log_enabled(f"recent-side:{asset}:{side}", LOG_FLOW_EVERY_SEC):
@@ -4132,7 +4429,7 @@ class LiveTrader:
         aq_edge = float(aq.get("edge_adj", 0.0) or 0.0)
         aq_prob = float(aq.get("prob_adj", 0.0) or 0.0)
         asset_entry_size_mult = float(aq.get("size_mult", 1.0) or 1.0)
-        if aq_score != 0 or abs(aq_edge) > 1e-9 or abs(aq_prob) > 1e-9:
+        if aq_score != 0 or abs(aq_edge) > DEFAULT_EPS or abs(aq_prob) > DEFAULT_EPS:
             score += aq_score
             edge += aq_edge
             true_prob = max(0.05, min(0.95, true_prob + aq_prob))
@@ -4309,7 +4606,10 @@ class LiveTrader:
             ):
                 leader_side = "Up" if leader_net > 0 else "Down"
                 leader_entry = up_price if leader_side == "Up" else (1 - up_price)
-                leader_entry_cap = min(0.97, MAX_ENTRY_PRICE + MAX_ENTRY_TOL + 0.03)
+                leader_entry_cap = min(
+                    LEADER_ENTRY_CAP_HARD_MAX,
+                    MAX_ENTRY_PRICE + MAX_ENTRY_TOL + LEADER_ENTRY_CAP_EXTRA,
+                )
                 if leader_entry <= leader_entry_cap:
                     if side != leader_side:
                         if self._noisy_log_enabled(f"leader-follow:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
@@ -4336,19 +4636,19 @@ class LiveTrader:
             copy_net = pref - opp
             copy_adj = int(round(max(-COPYFLOW_BONUS_MAX, min(COPYFLOW_BONUS_MAX, copy_net * COPYFLOW_BONUS_MAX))))
             score += copy_adj
-            edge += copy_net * 0.01
+            edge += copy_net * COPY_NET_EDGE_MULT
             # Leader behavior style signal: are winners buying cheap or paying high cents?
             avg_c = float(flow.get("avg_entry_c", 0.0) or 0.0)
             low_share = float(flow.get("low_c_share", 0.0) or 0.0)
             high_share = float(flow.get("high_c_share", 0.0) or 0.0)
             multibet_ratio = float(flow.get("multibet_ratio", 0.0) or 0.0)
-            if avg_c > 0 and high_share >= 0.60 and multibet_ratio >= 0.30:
-                score += 1
-                edge += 0.005
-            elif avg_c > 0 and low_share >= 0.60 and (up_price if side == "Up" else (1 - up_price)) > 0.55:
+            if avg_c > 0 and high_share >= LEADER_STYLE_HIGH_SHARE_MIN and multibet_ratio >= LEADER_STYLE_MULTIBET_MIN:
+                score += LEADER_STYLE_SCORE_BONUS
+                edge += LEADER_STYLE_EDGE_BONUS
+            elif avg_c > 0 and low_share >= LEADER_STYLE_LOW_SHARE_MIN and (up_price if side == "Up" else (1 - up_price)) > LEADER_STYLE_EXPENSIVE_ENTRY_MIN:
                 # Winners buying low-cents but market now expensive: fade confidence.
-                score -= 1
-                edge -= 0.005
+                score -= LEADER_STYLE_SCORE_PENALTY
+                edge -= LEADER_STYLE_EDGE_PENALTY
             if PM_PATTERN_ENABLED:
                 pm_pattern_key = self._pm_pattern_key(asset, duration, side, copy_net, flow)
                 patt = self._pm_pattern_profile(pm_pattern_key)
@@ -4391,7 +4691,7 @@ class LiveTrader:
                     score += pub_score_adj
                     edge += pub_edge_adj
                     if self._noisy_log_enabled(f"pm-public-pattern:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
-                        if float(pub.get("avg_c", 0.0) or 0.0) >= 85.0 and abs(float(pub.get("dom", 0.0) or 0.0)) >= PM_PUBLIC_PATTERN_DOM_MED:
+                        if float(pub.get("avg_c", 0.0) or 0.0) >= PM_PUBLIC_OCROWD_AVG_C_MIN and abs(float(pub.get("dom", 0.0) or 0.0)) >= PM_PUBLIC_PATTERN_DOM_MED:
                             print(
                                 f"{Y}[PM-PUBLIC-OCROWD]{RS} {asset} {duration}m {side} "
                                 f"high-cent crowd mode avg={float(pub.get('avg_c',0.0) or 0.0):.1f}c "
@@ -4450,7 +4750,7 @@ class LiveTrader:
             # We continue with strict realtime technical stack.
             signal_tier = "TIER-B"
             signal_source = "tech-realtime-no-leader"
-            leader_size_scale = min(leader_size_scale, 0.90)
+            leader_size_scale = min(leader_size_scale, LEADER_NOFLOW_SIZE_SCALE)
 
         # Leader/prebid can change side: refresh side-aligned metrics.
         side_up = side == "Up"
@@ -4459,12 +4759,12 @@ class LiveTrader:
         cl_agree = True
         if cl_now > 0 and open_price > 0:
             cl_agree = (cl_now > open_price) == side_up
-        imbalance_confirms = ob_sig > 0.10
+        imbalance_confirms = ob_sig > IMBALANCE_CONFIRM_MIN
 
         # Source-quality + signal-conviction analysis (real data only).
         # This is the primary anti-random layer: trade only when data is both fresh and coherent.
-        cl_fresh = (cl_age_s is not None) and (cl_age_s <= 35.0)
-        quote_fresh = quote_age_ms <= min(MAX_QUOTE_STALENESS_MS, 1200.0)
+        cl_fresh = (cl_age_s is not None) and (cl_age_s <= ANALYSIS_CL_FRESH_MAX_AGE_SEC)
+        quote_fresh = quote_age_ms <= min(MAX_QUOTE_STALENESS_MS, ANALYSIS_QUOTE_FRESH_MAX_MS)
         ws_fresh = ws_book_strict is not None
         rest_fresh = (
             isinstance(ws_book_now, dict)
@@ -4476,71 +4776,71 @@ class LiveTrader:
         vol_fresh = bool(volume_ready)
         leader_fresh = bool(leader_ready)
         analysis_quality = (
-            ((0.25 if ws_fresh else (0.22 if rest_fresh else 0.0)))
-            + (0.20 if leader_fresh else 0.0)
-            + (0.20 if cl_fresh else 0.0)
-            + (0.15 if quote_fresh else 0.0)
-            + (0.20 if vol_fresh else 0.0)
+            ((ANALYSIS_QUALITY_WS_WEIGHT if ws_fresh else (ANALYSIS_QUALITY_REST_WEIGHT if rest_fresh else 0.0)))
+            + (ANALYSIS_QUALITY_LEADER_WEIGHT if leader_fresh else 0.0)
+            + (ANALYSIS_QUALITY_CL_WEIGHT if cl_fresh else 0.0)
+            + (ANALYSIS_QUALITY_QUOTE_WEIGHT if quote_fresh else 0.0)
+            + (ANALYSIS_QUALITY_VOL_WEIGHT if vol_fresh else 0.0)
         )
 
         dir_sign = 1.0 if side == "Up" else -1.0
-        ob_c = max(0.0, min(1.0, (ob_sig + 0.10) / 0.30))
+        ob_c = max(0.0, min(1.0, (ob_sig + ANALYSIS_OB_OFFSET) / ANALYSIS_OB_SCALE))
         tk_signed = (taker_ratio - 0.5) * dir_sign
-        tk_c = max(0.0, min(1.0, (tk_signed + 0.05) / 0.18))
-        tf_c = max(0.0, min(1.0, (float(tf_votes) - 1.0) / 3.0))
-        basis_c = max(0.0, min(1.0, ((dir_sign * perp_basis) + 0.0002) / 0.0010))
-        vwap_c = max(0.0, min(1.0, ((dir_sign * vwap_dev) + 0.0008) / 0.0024))
+        tk_c = max(0.0, min(1.0, (tk_signed + ANALYSIS_TAKER_OFFSET) / ANALYSIS_TAKER_SCALE))
+        tf_c = max(0.0, min(1.0, (float(tf_votes) - ANALYSIS_TF_BASE) / ANALYSIS_TF_SCALE))
+        basis_c = max(0.0, min(1.0, ((dir_sign * perp_basis) + ANALYSIS_BASIS_OFFSET) / ANALYSIS_BASIS_SCALE))
+        vwap_c = max(0.0, min(1.0, ((dir_sign * vwap_dev) + ANALYSIS_VWAP_OFFSET) / ANALYSIS_VWAP_SCALE))
         cl_c = 1.0 if cl_agree else 0.0
-        leader_c = 0.5
+        leader_c = ANALYSIS_LEADER_BASE
         if leader_fresh:
-            leader_c = max(0.0, min(1.0, ((copy_net) + 0.12) / 0.34))
+            leader_c = max(0.0, min(1.0, ((copy_net) + ANALYSIS_LEADER_OFFSET) / ANALYSIS_LEADER_SCALE))
         analysis_conviction = (
-            0.18 * ob_c
-            + 0.18 * tk_c
-            + 0.18 * tf_c
-            + 0.12 * basis_c
-            + 0.12 * vwap_c
-            + 0.12 * cl_c
-            + 0.10 * leader_c
+            ANALYSIS_CONV_W_OB * ob_c
+            + ANALYSIS_CONV_W_TK * tk_c
+            + ANALYSIS_CONV_W_TF * tf_c
+            + ANALYSIS_CONV_W_BASIS * basis_c
+            + ANALYSIS_CONV_W_VWAP * vwap_c
+            + ANALYSIS_CONV_W_CL * cl_c
+            + ANALYSIS_CONV_W_LEADER * leader_c
         )
 
         quality_floor = float(MIN_ANALYSIS_QUALITY)
         conviction_floor = float(MIN_ANALYSIS_CONVICTION)
         # Dynamic gates by realtime data quality and timing (position-aware, not fixed-only).
         if book_fresh and cl_fresh and vol_fresh:
-            quality_floor -= 0.03
+            quality_floor -= ANALYSIS_FLOOR_GOODDATA_QUAL_DELTA
         if (not leader_fresh) and book_fresh and cl_fresh:
-            quality_floor -= 0.02
-        if mins_left <= (3.5 if duration >= 15 else 1.8):
-            quality_floor -= 0.02
-            conviction_floor -= 0.01
-        if quote_age_ms > 900:
-            quality_floor += 0.02
+            quality_floor -= ANALYSIS_FLOOR_NOLEADER_QUAL_DELTA
+        if mins_left <= (ANALYSIS_LATE_MIN_LEFT_15M if duration >= 15 else ANALYSIS_LATE_MIN_LEFT_5M):
+            quality_floor -= ANALYSIS_FLOOR_LATE_QUAL_DELTA
+            conviction_floor -= ANALYSIS_FLOOR_LATE_CONV_DELTA
+        if quote_age_ms > ANALYSIS_FLOOR_OLDQUOTE_MS:
+            quality_floor += ANALYSIS_FLOOR_OLDQUOTE_QUAL_DELTA
         if not book_fresh:
-            quality_floor += 0.03
-            conviction_floor += 0.02
+            quality_floor += ANALYSIS_FLOOR_NOBOOK_QUAL_DELTA
+            conviction_floor += ANALYSIS_FLOOR_NOBOOK_CONV_DELTA
         elif rest_fresh and (not ws_fresh):
             # REST fresh is acceptable, but slightly weaker than strict WS.
-            conviction_floor += 0.005
+            conviction_floor += ANALYSIS_FLOOR_RESTONLY_CONV_DELTA
         if not cl_fresh:
-            conviction_floor += 0.03
+            conviction_floor += ANALYSIS_FLOOR_NOCL_CONV_DELTA
         # Data-driven floor adaptation from recent settled on-chain outcomes
         # for this exact (asset, duration, side) cluster.
         side_prof_live = self._recent_side_profile(asset, duration, side)
         side_n_live = int(side_prof_live.get("n", 0) or 0)
         side_exp_live = float(side_prof_live.get("exp", 0.0) or 0.0)
         side_wr_lb_live = float(side_prof_live.get("wr_lb", 0.5) or 0.5)
-        if side_n_live >= max(6, int(RECENT_SIDE_PRIOR_MIN_N)):
-            if side_wr_lb_live >= 0.54 and side_exp_live > 0:
-                quality_floor -= 0.02
-                conviction_floor -= 0.04
-            elif side_wr_lb_live <= 0.45 and side_exp_live < 0:
-                quality_floor += 0.02
-                conviction_floor += 0.04
-        quality_floor = max(0.42, min(0.75, quality_floor))
-        conviction_floor = max(0.35, min(0.72, conviction_floor))
+        if side_n_live >= max(ANALYSIS_SIDE_MIN_N, int(RECENT_SIDE_PRIOR_MIN_N)):
+            if side_wr_lb_live >= ANALYSIS_SIDE_GOOD_WR_LB and side_exp_live > 0:
+                quality_floor -= ANALYSIS_SIDE_GOOD_QUAL_DELTA
+                conviction_floor -= ANALYSIS_SIDE_GOOD_CONV_DELTA
+            elif side_wr_lb_live <= ANALYSIS_SIDE_BAD_WR_LB and side_exp_live < 0:
+                quality_floor += ANALYSIS_SIDE_BAD_QUAL_DELTA
+                conviction_floor += ANALYSIS_SIDE_BAD_CONV_DELTA
+        quality_floor = max(ANALYSIS_QUAL_FLOOR_MIN, min(ANALYSIS_QUAL_FLOOR_MAX, quality_floor))
+        conviction_floor = max(ANALYSIS_CONV_FLOOR_MIN, min(ANALYSIS_CONV_FLOOR_MAX, conviction_floor))
 
-        if analysis_quality + 1e-6 < quality_floor:
+        if analysis_quality + DEFAULT_CMP_EPS < quality_floor:
             if self._noisy_log_enabled(f"skip-analysis-quality:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
                     f"{Y}[SKIP] {asset} {duration}m low analysis quality "
@@ -4548,7 +4848,7 @@ class LiveTrader:
                 )
             self._skip_tick("analysis_quality_low")
             return None
-        if analysis_conviction + 1e-6 < conviction_floor:
+        if analysis_conviction + DEFAULT_CMP_EPS < conviction_floor:
             if self._noisy_log_enabled(f"skip-analysis-conv:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
                     f"{Y}[SKIP] {asset} {duration}m low analysis conviction "
@@ -4563,19 +4863,19 @@ class LiveTrader:
             (ANALYSIS_PROB_SCALE_MAX - ANALYSIS_PROB_SCALE_MIN) * max(0.0, min(1.0, analysis_quality))
         )
         prob_up = 0.5 + (prob_up - 0.5) * quality_scale
-        prob_up = max(0.05, min(0.95, prob_up))
+        prob_up = max(PROB_CLAMP_MIN, min(PROB_CLAMP_MAX, prob_up))
         prob_down = 1.0 - prob_up
         # Apply recent side prior again after quality rescale (keeps final posterior aligned to live outcomes).
         up_recent = self._recent_side_profile(asset, duration, "Up")
         dn_recent = self._recent_side_profile(asset, duration, "Down")
         up_adj = float(up_recent.get("prob_adj", 0.0) or 0.0)
         dn_adj = float(dn_recent.get("prob_adj", 0.0) or 0.0)
-        if abs(up_adj) > 1e-9 or abs(dn_adj) > 1e-9:
-            pu = max(0.01, min(0.99, prob_up + up_adj))
-            pd = max(0.01, min(0.99, prob_down + dn_adj))
+        if abs(up_adj) > DEFAULT_EPS or abs(dn_adj) > DEFAULT_EPS:
+            pu = max(PROB_REBALANCE_MIN, min(PROB_REBALANCE_MAX, prob_up + up_adj))
+            pd = max(PROB_REBALANCE_MIN, min(PROB_REBALANCE_MAX, prob_down + dn_adj))
             z = pu + pd
             if z > 0:
-                prob_up = max(0.05, min(0.95, pu / z))
+                prob_up = max(PROB_CLAMP_MIN, min(PROB_CLAMP_MAX, pu / z))
                 prob_down = 1.0 - prob_up
         edge_up = prob_up - up_price
         edge_down = prob_down - (1 - up_price)
@@ -4593,8 +4893,8 @@ class LiveTrader:
                 if arm_side in ("Up", "Down") and arm_side != side:
                     side = arm_side
                     entry = up_price if side == "Up" else (1 - up_price)
-                score += 2
-                edge += max(0.0, conf - 0.5) * 0.05
+                score += PREBID_SCORE_BONUS
+                edge += max(0.0, conf - 0.5) * PREBID_EDGE_MULT
 
         # Pre-bid may override side: refresh aligned metrics for downstream gates/sizing.
         side_up = side == "Up"
@@ -4603,7 +4903,7 @@ class LiveTrader:
         cl_agree = True
         if cl_now > 0 and open_price > 0:
             cl_agree = (cl_now > open_price) == side_up
-        imbalance_confirms = ob_sig > 0.10
+        imbalance_confirms = ob_sig > IMBALANCE_CONFIRM_MIN
 
         # Bet the signal direction — EV_net and execution quality drive growth.
         entry = up_price if side == "Up" else (1 - up_price)
@@ -4659,7 +4959,7 @@ class LiveTrader:
 
         fair_side_entry = up_price if side == "Up" else (1.0 - up_price)
         cur_ask = _best_ask_from(pm_book_data)
-        if fair_side_entry > 0 and cur_ask > 0 and abs(cur_ask - fair_side_entry) > 0.18:
+        if fair_side_entry > 0 and cur_ask > 0 and abs(cur_ask - fair_side_entry) > FAIR_SIDE_MISMATCH_SWAP:
             alt_token_id = m["token_down"] if side == "Up" else m["token_up"]
             alt_book = self._get_clob_ws_book(alt_token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
             if alt_book is None:
@@ -4668,7 +4968,7 @@ class LiveTrader:
             if alt_ask > 0:
                 cur_err = abs(cur_ask - fair_side_entry)
                 alt_err = abs(alt_ask - fair_side_entry)
-                if (alt_err + 0.03) < cur_err:
+                if (alt_err + FAIR_SIDE_SWAP_ERR_MARGIN) < cur_err:
                     if self._noisy_log_enabled(f"token-swap:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                         print(
                             f"{Y}[TOKEN-SWAP]{RS} {asset} {duration}m {side} "
@@ -4698,7 +4998,7 @@ class LiveTrader:
         # Trade every eligible market while still preferring higher-payout entries.
         use_limit = False
         # Dynamic max entry: base + tolerance + small conviction slack.
-        score_slack = 0.02 if score >= 12 else (0.01 if score >= 9 else 0.0)
+        score_slack = SETUP_SLACK_HIGH if score >= SETUP_SCORE_SLACK_HIGH else (SETUP_SLACK_MID if score >= SETUP_SCORE_SLACK_MID else 0.0)
         max_entry_allowed = min(0.97, MAX_ENTRY_PRICE + MAX_ENTRY_TOL + score_slack)
         min_entry_allowed = 0.01
         base_min_entry_allowed = 0.01
@@ -4736,23 +5036,23 @@ class LiveTrader:
         # Additional payout relaxation only for strong, side-aligned 15m setups.
         # This reduces "no-trade" dead-zones without opening weak entries.
         if (
-            duration >= 15
-            and score >= 12
-            and true_prob >= 0.82
-            and setup_q >= 0.70
+            duration >= CORE_DURATION_MIN
+            and score >= SETUP_Q_HARD_RELAX_SCORE
+            and true_prob >= SETUP_Q_HARD_RELAX_PROB
+            and setup_q >= SETUP_Q_HARD_RELAX_MIN
             and cl_agree
         ):
-            extra_relax = min(0.06, max(0.0, setup_q - 0.70) * 0.30)
+            extra_relax = min(SETUP_Q_HARD_RELAX_MAX, max(0.0, setup_q - SETUP_Q_HARD_RELAX_MIN) * SETUP_Q_HARD_RELAX_MULT)
             min_payout_req = max(1.70, min_payout_req - extra_relax)
         # Core 15m payout floor is data-driven from rolling on-chain profile.
-        if duration >= 15 and (not booster_eval):
+        if duration >= CORE_DURATION_MIN and (not booster_eval):
             roll_n = int(rolling_profile.get("n", 0) or 0)
             roll_exp = float(rolling_profile.get("exp", 0.0) or 0.0)
             roll_wr_lb = float(rolling_profile.get("wr_lb", 0.5) or 0.5)
             if roll_n >= max(8, int(ROLLING_15M_CALIB_MIN_N)):
-                if roll_exp >= 0.10 and roll_wr_lb >= 0.50:
+                if roll_exp >= ROLL_EXP_GOOD and roll_wr_lb >= ROLL_WR_GOOD:
                     dyn_floor = 1.50
-                elif roll_exp <= -0.10 or roll_wr_lb < 0.46:
+                elif roll_exp <= ROLL_EXP_BAD or roll_wr_lb < ROLL_WR_BAD:
                     dyn_floor = 1.78
                 else:
                     dyn_floor = 1.62
@@ -4760,23 +5060,23 @@ class LiveTrader:
                 dyn_floor = 1.62
             min_payout_req = max(min_payout_req, dyn_floor)
         min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
-        if ws_fresh and cl_fresh and vol_fresh and mins_left >= (4.0 if duration >= 15 else 2.0):
-            max_entry_allowed = min(0.90, max_entry_allowed + 0.02)
+        if ws_fresh and cl_fresh and vol_fresh and mins_left >= (FRESH_RELAX_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else FRESH_RELAX_MIN_LEFT_5M):
+            max_entry_allowed = min(FRESH_RELAX_ENTRY_CAP, max_entry_allowed + FRESH_RELAX_ENTRY_ADD)
         max_entry_allowed = min(max_entry_allowed, adaptive_hard_cap)
         # Dynamic min-entry (not fixed hard floor): adapt to setup quality + microstructure.
         # High-quality setup can dip lower for super-payout entries; weaker setup is stricter.
         min_entry_dyn = float(base_min_entry_allowed)
-        if setup_q >= 0.72 and vol_ratio >= 1.10 and tf_votes >= 2:
-            relax = min(0.08, (setup_q - 0.72) * 0.20)  # up to -8c
+        if setup_q >= SETUP_Q_RELAX_MIN and vol_ratio >= SETUP_VOL_RELAX_MIN and tf_votes >= TF_VOTES_MID:
+            relax = min(SETUP_Q_RELAX_MAX, (setup_q - SETUP_Q_RELAX_MIN) * SETUP_Q_RELAX_MULT)
             min_entry_dyn = max(0.01, min_entry_dyn - relax)
-        elif setup_q <= 0.58:
-            tighten = min(0.06, (0.58 - setup_q) * 0.25)  # up to +6c
+        elif setup_q <= SETUP_Q_TIGHTEN_MIN:
+            tighten = min(SETUP_Q_TIGHTEN_MAX, (SETUP_Q_TIGHTEN_MIN - setup_q) * SETUP_Q_TIGHTEN_MULT)
             min_entry_dyn = min(0.45, min_entry_dyn + tighten)
-        if mins_left <= (3.5 if duration >= 15 else 1.8):
+        if mins_left <= (ANALYSIS_LATE_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else ANALYSIS_LATE_MIN_LEFT_5M):
             # Near expiry, avoid ultra-low entries that are mostly noise/fill artifacts.
-            min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + 0.01)
+            min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + ENTRY_TIGHTEN_ADD)
         if not ws_fresh:
-            min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + 0.01)
+            min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + ENTRY_TIGHTEN_ADD)
         min_entry_allowed = max(0.01, min(min_entry_dyn, max_entry_allowed - 0.01))
         # High-conviction 15m mode: target lower cents early for better payout.
         hc15 = (
@@ -4792,7 +5092,7 @@ class LiveTrader:
             if min_entry_allowed <= live_entry <= max_entry_allowed:
                 entry = live_entry
             elif PULLBACK_LIMIT_ENABLED and pct_remaining >= (
-                PULLBACK_LIMIT_MIN_PCT_LEFT if duration <= 5 else max(PULLBACK_LIMIT_MIN_PCT_LEFT, 0.20)
+                PULLBACK_LIMIT_MIN_PCT_LEFT if duration <= 5 else max(PULLBACK_LIMIT_MIN_PCT_LEFT, PULLBACK_MIN_ENTRY_FLOOR)
             ):
                 # Don't miss good-payout setups: park a pullback limit at max acceptable entry.
                 use_limit = True
@@ -4961,10 +5261,10 @@ class LiveTrader:
             # Allow low-cent first entries too, but only for very strong setups.
             lowcent_new_ok = (
                 duration >= 15
-                and score >= max(SUPER_BET_FLOOR_MIN_SCORE, 18)
-                and true_prob >= 0.74
-                and execution_ev >= max(SUPER_BET_FLOOR_MIN_EV, 0.035)
-                and payout_mult >= 3.0
+                and score >= max(SUPER_BET_FLOOR_MIN_SCORE, LOWCENT_NEW_MIN_SCORE)
+                and true_prob >= LOWCENT_NEW_MIN_TRUE_PROB
+                and execution_ev >= max(SUPER_BET_FLOOR_MIN_EV, LOWCENT_NEW_MIN_EXEC_EV)
+                and payout_mult >= LOWCENT_NEW_MIN_PAYOUT
                 and cl_agree
             )
             if not lowcent_new_ok:
@@ -4985,76 +5285,76 @@ class LiveTrader:
             )
         booster_mode = False
         booster_note = ""
-        fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= 45)
+        fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= FORCE_TAKER_CL_AGE_FRESH)
 
         # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
         # Higher payout (cheaper tokens) gets larger Kelly fraction.
         # Expensive tokens still traded but with smaller exposure.
         if entry <= 0.20:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.20, 0.10
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.16, 0.08
-            else:             kelly_frac, bankroll_pct = 0.12, 0.06
+            if   score >= ENTRY_TIER_SCORE_HIGH: kelly_frac, bankroll_pct = 0.20, 0.10
+            elif score >= ENTRY_TIER_SCORE_MID:  kelly_frac, bankroll_pct = 0.16, 0.08
+            else:                                kelly_frac, bankroll_pct = 0.12, 0.06
         elif entry <= 0.30:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.16, 0.08
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.12, 0.06
-            else:             kelly_frac, bankroll_pct = 0.10, 0.05
+            if   score >= ENTRY_TIER_SCORE_HIGH: kelly_frac, bankroll_pct = 0.16, 0.08
+            elif score >= ENTRY_TIER_SCORE_MID:  kelly_frac, bankroll_pct = 0.12, 0.06
+            else:                                kelly_frac, bankroll_pct = 0.10, 0.05
         elif entry <= 0.40:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.12, 0.06
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.10, 0.05
-            else:             kelly_frac, bankroll_pct = 0.08, 0.04
+            if   score >= ENTRY_TIER_SCORE_HIGH: kelly_frac, bankroll_pct = 0.12, 0.06
+            elif score >= ENTRY_TIER_SCORE_MID:  kelly_frac, bankroll_pct = 0.10, 0.05
+            else:                                kelly_frac, bankroll_pct = 0.08, 0.04
         elif entry <= 0.55:
-            if   score >= 12: kelly_frac, bankroll_pct = 0.08, 0.04
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.06, 0.03
-            else:             kelly_frac, bankroll_pct = 0.05, 0.025
-        else:  # 0.55–0.85
-            if   score >= 12: kelly_frac, bankroll_pct = 0.04, 0.02
-            elif score >= 8:  kelly_frac, bankroll_pct = 0.03, 0.015
-            else:             kelly_frac, bankroll_pct = 0.02, 0.010
+            if   score >= ENTRY_TIER_SCORE_HIGH: kelly_frac, bankroll_pct = 0.08, 0.04
+            elif score >= ENTRY_TIER_SCORE_MID:  kelly_frac, bankroll_pct = 0.06, 0.03
+            else:                                kelly_frac, bankroll_pct = 0.05, 0.025
+        else:
+            if   score >= ENTRY_TIER_SCORE_HIGH: kelly_frac, bankroll_pct = 0.04, 0.02
+            elif score >= ENTRY_TIER_SCORE_MID:  kelly_frac, bankroll_pct = 0.03, 0.015
+            else:                                kelly_frac, bankroll_pct = 0.02, 0.010
 
         wr_scale   = self._wr_bet_scale()
-        oracle_scale = 0.60 if fresh_cl_disagree else (0.80 if not cl_agree else 1.0)
+        oracle_scale = ORACLE_SCALE_DISAGREE_FRESH if fresh_cl_disagree else (ORACLE_SCALE_DISAGREE_STALE if not cl_agree else 1.0)
         bucket_scale = self._bucket_size_scale(duration, score, entry)
         # Risk-aware size decay for tail-priced entries and near-expiry windows.
         # This preserves signal direction while preventing oversized bets on 2c/7c tails.
         cents_scale = 1.0
         if entry <= 0.03:
-            cents_scale = 0.12
+            cents_scale = ENTRY_CENTS_SCALE_3C
         elif entry <= 0.05:
-            cents_scale = 0.18
+            cents_scale = ENTRY_CENTS_SCALE_5C
         elif entry <= 0.10:
-            cents_scale = 0.28
+            cents_scale = ENTRY_CENTS_SCALE_10C
         elif entry <= 0.20:
-            cents_scale = 0.45
+            cents_scale = ENTRY_CENTS_SCALE_20C
         time_scale = 1.0
         if duration >= 15:
             if mins_left <= 2.5:
-                time_scale = 0.20
+                time_scale = TIME_SCALE_LATE_2_5
             elif mins_left <= 3.5:
-                time_scale = 0.35
+                time_scale = TIME_SCALE_LATE_3_5
             elif mins_left <= 5.0:
-                time_scale = 0.55
+                time_scale = TIME_SCALE_LATE_5_0
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
-        max_single = min(100.0, self.bankroll * bankroll_pct)
-        cid_cap    = max(0.50, self.bankroll * MAX_CID_EXPOSURE_PCT)
-        hard_cap   = max(0.50, min(max_single, cid_cap, self.bankroll * MAX_BANKROLL_PCT))
+        max_single = min(MAX_SINGLE_ABS_CAP, self.bankroll * bankroll_pct)
+        cid_cap    = max(MIN_HARD_CAP_USDC, self.bankroll * MAX_CID_EXPOSURE_PCT)
+        hard_cap   = max(MIN_HARD_CAP_USDC, min(max_single, cid_cap, self.bankroll * MAX_BANKROLL_PCT))
         # Avoid oversized tail bets: these entries can look high-multiple but are low-quality fills.
-        if entry <= 0.05:
-            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.015))
-        elif entry <= 0.10:
-            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.020))
+        if entry <= TAIL_CAP_ENTRY_1:
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * TAIL_CAP_BANKROLL_PCT_1))
+        elif entry <= TAIL_CAP_ENTRY_2:
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * TAIL_CAP_BANKROLL_PCT_2))
         # Soft cap curve for cheap entries:
         # default around $10, but scale toward ~$30 only if conviction is truly strong.
         if entry <= LOW_ENTRY_SOFT_THRESHOLD:
-            score_n = max(0.0, min(1.0, (float(score) - 8.0) / 10.0))
-            prob_n = max(0.0, min(1.0, (float(true_prob) - 0.56) / 0.20))
-            edge_n = max(0.0, min(1.0, (float(edge) - 0.02) / 0.12))
+            score_n = max(0.0, min(1.0, (float(score) - SOFTCAP_SCORE_BASE) / SOFTCAP_SCORE_SCALE))
+            prob_n = max(0.0, min(1.0, (float(true_prob) - SOFTCAP_PROB_BASE) / SOFTCAP_PROB_SCALE))
+            edge_n = max(0.0, min(1.0, (float(edge) - SOFTCAP_EDGE_BASE) / SOFTCAP_EDGE_SCALE))
             # copy_net > 0 means leaders agree with chosen side; <0 penalizes conviction.
-            leader_n = max(0.0, min(1.0, float(copy_net) / 0.40))
+            leader_n = max(0.0, min(1.0, float(copy_net) / SOFTCAP_LEADER_SCALE))
             conviction = (
-                0.35 * score_n
-                + 0.35 * prob_n
-                + 0.20 * edge_n
-                + 0.10 * leader_n
+                SOFTCAP_W_SCORE * score_n
+                + SOFTCAP_W_PROB * prob_n
+                + SOFTCAP_W_EDGE * edge_n
+                + SOFTCAP_W_LEADER * leader_n
             )
             soft_cap = LOW_ENTRY_BASE_SOFT_MAX + (
                 (LOW_ENTRY_HIGH_CONV_SOFT_MAX - LOW_ENTRY_BASE_SOFT_MAX) * conviction
@@ -5062,16 +5362,16 @@ class LiveTrader:
             hard_cap = min(hard_cap, max(MIN_BET_ABS, soft_cap))
         # Risk cap when leader flow is not fresh: avoid oversized bets on cheap entries.
         # Deterministic cap from signal quality (score/prob/edge), no random guard.
-        if duration >= 15 and entry <= 0.40 and (not leader_ready):
-            score_q = max(0.0, min(1.0, (float(score) - 9.0) / 9.0))
-            prob_q = max(0.0, min(1.0, (float(true_prob) - 0.58) / 0.20))
-            edge_q = max(0.0, min(1.0, (float(edge) - 0.02) / 0.10))
-            qual = 0.45 * score_q + 0.35 * prob_q + 0.20 * edge_q
+        if duration >= 15 and entry <= NOLEADER_ENTRY_MAX and (not leader_ready):
+            score_q = max(0.0, min(1.0, (float(score) - NOLEADER_SCORE_BASE) / NOLEADER_SCORE_SCALE))
+            prob_q = max(0.0, min(1.0, (float(true_prob) - NOLEADER_PROB_BASE) / NOLEADER_PROB_SCALE))
+            edge_q = max(0.0, min(1.0, (float(edge) - NOLEADER_EDGE_BASE) / NOLEADER_EDGE_SCALE))
+            qual = NOLEADER_W_SCORE * score_q + NOLEADER_W_PROB * prob_q + NOLEADER_W_EDGE * edge_q
             # Cap range: ~$6 (weak) .. ~$12 (strong but no fresh leaders).
-            no_leader_cap = 6.0 + (6.0 * qual)
+            no_leader_cap = NOLEADER_CAP_BASE + (NOLEADER_CAP_RANGE * qual)
             # Near expiry tighten further.
-            if mins_left <= 3.5:
-                no_leader_cap = min(no_leader_cap, 8.0)
+            if mins_left <= NOLEADER_NEAR_END_MIN_LEFT:
+                no_leader_cap = min(no_leader_cap, NOLEADER_NEAR_END_CAP)
             hard_cap = min(hard_cap, max(MIN_BET_ABS, no_leader_cap))
         model_size = round(
             min(
@@ -5094,7 +5394,7 @@ class LiveTrader:
             and (not booster_eval)
             and score >= HIGH_EV_MIN_SCORE
             and execution_ev >= HIGH_EV_MIN_EXEC_EV
-            and entry <= 0.50
+            and entry <= HIGH_EV_ENTRY_MAX
         ):
             boost = min(HIGH_EV_SIZE_BOOST_MAX, max(1.0, HIGH_EV_SIZE_BOOST))
             model_size = round(min(hard_cap, model_size * boost), 2)
@@ -5104,28 +5404,28 @@ class LiveTrader:
         if (
             duration >= 15
             and (not booster_eval)
-            and 0.30 <= entry <= 0.55
-            and score >= 12
-            and true_prob >= 0.70
-            and execution_ev >= max(min_ev_req + 0.008, 0.020)
+            and MID_FLOOR_ENTRY_MIN <= entry <= MID_FLOOR_ENTRY_MAX
+            and score >= MID_FLOOR_MIN_SCORE
+            and true_prob >= MID_FLOOR_MIN_TRUE_PROB
+            and execution_ev >= max(min_ev_req + MID_FLOOR_EV_MARGIN, MID_FLOOR_EV_ABS)
             and cl_agree
         ):
             dyn_floor = max(
                 dyn_floor,
-                min(hard_cap, max(4.0, self.bankroll * 0.012)),
+                min(hard_cap, max(MID_FLOOR_MIN_USDC, self.bankroll * MID_FLOOR_BANKROLL_PCT)),
             )
         # Never force a big floor size on ultra-cheap tails or near-expiry entries.
-        if entry <= 0.10 or (duration >= 15 and mins_left <= 3.5):
+        if entry <= FORCE_MIN_ENTRY_TAIL or (duration >= 15 and mins_left <= FORCE_MIN_LEFT_TAIL):
             dyn_floor = min(dyn_floor, MIN_BET_ABS)
         # If model size is too small and setup is not top quality, skip instead of forcing a noisy tiny bet.
         if model_size < dyn_floor:
-            hi_conf = (score >= 12 and true_prob >= 0.62 and edge >= 0.03)
+            hi_conf = (score >= MODEL_HICONF_MIN_SCORE and true_prob >= MODEL_HICONF_MIN_TRUE_PROB and edge >= MODEL_HICONF_MIN_EDGE)
             if not hi_conf:
                 return None
             size = round(dyn_floor, 2)
         else:
             size = model_size
-        size = max(0.50, min(hard_cap, size))
+        size = max(ABS_MIN_SIZE_USDC, min(hard_cap, size))
 
         # Super-bet floor:
         # for high-multiple entries (very low price), keep at least a meaningful notional.
@@ -5158,10 +5458,10 @@ class LiveTrader:
         if SUPER_BET_MAX_SIZE_ENABLED:
             payout_mult = (1.0 / max(entry, 1e-9))
             if duration >= 15 and entry <= SUPER_BET_ENTRY_MAX and payout_mult >= SUPER_BET_MIN_PAYOUT:
-                max_super = max(0.50, min(SUPER_BET_MAX_SIZE_USDC, self.bankroll * SUPER_BET_MAX_BANKROLL_PCT))
+                max_super = max(ABS_MIN_SIZE_USDC, min(SUPER_BET_MAX_SIZE_USDC, self.bankroll * SUPER_BET_MAX_BANKROLL_PCT))
                 if size > max_super:
                     old_size = size
-                    size = round(max(0.50, max_super), 2)
+                    size = round(max(ABS_MIN_SIZE_USDC, max_super), 2)
                     if self._noisy_log_enabled(f"superbet-cap:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                         print(
                             f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet cap "
@@ -5193,7 +5493,7 @@ class LiveTrader:
                     score >= CONTRARIAN_STRONG_SCORE
                     and execution_ev >= CONTRARIAN_STRONG_EV
                 )
-                mult = 1.0 if strong_contra else max(0.20, min(1.0, CONTRARIAN_SIZE_MULT))
+                mult = 1.0 if strong_contra else max(CONTRARIAN_SIZE_MIN_MULT, min(1.0, CONTRARIAN_SIZE_MULT))
                 old_size = float(size)
                 size = round(max(float(MIN_EXEC_NOTIONAL_USDC), min(hard_cap, size * mult)), 2)
                 if self._noisy_log_enabled(f"contra-size-mult:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
@@ -5206,7 +5506,7 @@ class LiveTrader:
         # Event-context size modifier from soft alignment model.
         if duration >= 15 and (not booster_mode):
             try:
-                e_mult = max(0.20, min(1.20, float(event_align_size_mult)))
+                e_mult = max(EVENT_ALIGN_SIZE_MIN, min(EVENT_ALIGN_SIZE_MAX, float(event_align_size_mult)))
             except Exception:
                 e_mult = 1.0
             if abs(e_mult - 1.0) > 1e-9:
@@ -5238,26 +5538,26 @@ class LiveTrader:
             if (not MID_BOOSTER_ANYTIME_15M) and (not in_ideal_window):
                 return None
 
-            taker_conf = (side_up and taker_ratio > 0.54) or ((not side_up) and taker_ratio < 0.46)
+            taker_conf = (side_up and taker_ratio > BOOSTER_TAKER_CONF_UP_MIN) or ((not side_up) and taker_ratio < BOOSTER_TAKER_CONF_DN_MAX)
             # Mathematical conviction model (15m intraround):
             # combines microstructure + trend persistence + oracle alignment.
-            ob_c = max(-1.0, min(1.0, ob_sig / 0.35))
-            tf_c = max(0.0, min(1.0, (tf_votes - 1.0) / 3.0))
-            flow_c = max(-1.0, min(1.0, ((taker_ratio - 0.5) * 2.0) if side_up else ((0.5 - taker_ratio) * 2.0)))
-            vol_c = max(0.0, min(1.0, (vol_ratio - 1.0) / 1.5))
+            ob_c = max(-1.0, min(1.0, ob_sig / BOOSTER_OB_SCALE))
+            tf_c = max(0.0, min(1.0, (tf_votes - BOOSTER_TF_BASE) / BOOSTER_TF_SCALE))
+            flow_c = max(-1.0, min(1.0, ((taker_ratio - 0.5) * BOOSTER_FLOW_SCALE) if side_up else ((0.5 - taker_ratio) * BOOSTER_FLOW_SCALE)))
+            vol_c = max(0.0, min(1.0, (vol_ratio - BOOSTER_VOL_BASE) / BOOSTER_VOL_SCALE))
             basis_signed = perp_basis if side_up else -perp_basis
-            basis_c = max(-1.0, min(1.0, basis_signed / 0.0008))
+            basis_c = max(-1.0, min(1.0, basis_signed / BOOSTER_BASIS_SCALE))
             vwap_signed = vwap_dev if side_up else -vwap_dev
-            vwap_c = max(-1.0, min(1.0, vwap_signed / 0.0012))
+            vwap_c = max(-1.0, min(1.0, vwap_signed / BOOSTER_VWAP_SCALE))
             oracle_c = 1.0 if cl_agree else -1.0
             booster_conv = (
-                0.24 * tf_c
-                + 0.20 * max(0.0, ob_c)
-                + 0.16 * max(0.0, flow_c)
-                + 0.12 * vol_c
-                + 0.10 * max(0.0, basis_c)
-                + 0.10 * max(0.0, vwap_c)
-                + 0.08 * max(0.0, oracle_c)
+                BOOSTER_W_TF * tf_c
+                + BOOSTER_W_OB * max(0.0, ob_c)
+                + BOOSTER_W_FLOW * max(0.0, flow_c)
+                + BOOSTER_W_VOL * vol_c
+                + BOOSTER_W_BASIS * max(0.0, basis_c)
+                + BOOSTER_W_VWAP * max(0.0, vwap_c)
+                + BOOSTER_W_ORACLE * max(0.0, oracle_c)
             )
             base_quality = (
                 score >= MID_BOOSTER_MIN_SCORE
@@ -5266,31 +5566,31 @@ class LiveTrader:
                 and execution_ev >= MID_BOOSTER_MIN_EV_NET
                 and payout_mult >= MID_BOOSTER_MIN_PAYOUT
                 and entry <= MID_BOOSTER_MAX_ENTRY
-                and ((cl_agree and imbalance_confirms) or score >= (MID_BOOSTER_MIN_SCORE + 3))
-                and (taker_conf or edge >= (MID_BOOSTER_MIN_EDGE + 0.02))
-                and vol_ratio >= 0.90
-                and booster_conv >= 0.50
+                and ((cl_agree and imbalance_confirms) or score >= (MID_BOOSTER_MIN_SCORE + BOOSTER_STRONG_SCORE_DELTA))
+                and (taker_conf or edge >= (MID_BOOSTER_MIN_EDGE + BOOSTER_STRONG_EDGE_DELTA))
+                and vol_ratio >= BOOSTER_MIN_VOL_RATIO
+                and booster_conv >= BOOSTER_MIN_CONV
             )
             if not base_quality:
                 return None
             # Outside ideal window keep booster much stricter.
             if not in_ideal_window:
                 if not (
-                    score >= (MID_BOOSTER_MIN_SCORE + 2)
-                    and true_prob >= (MID_BOOSTER_MIN_TRUE_PROB + 0.02)
-                    and execution_ev >= (MID_BOOSTER_MIN_EV_NET + 0.015)
-                    and booster_conv >= 0.66
+                    score >= (MID_BOOSTER_MIN_SCORE + BOOSTER_OUTSIDE_SCORE_DELTA)
+                    and true_prob >= (MID_BOOSTER_MIN_TRUE_PROB + BOOSTER_OUTSIDE_PROB_DELTA)
+                    and execution_ev >= (MID_BOOSTER_MIN_EV_NET + BOOSTER_OUTSIDE_EV_DELTA)
+                    and booster_conv >= BOOSTER_OUTSIDE_MIN_CONV
                 ):
                     return None
 
             prev_size = float((self.pending.get(cid, ({}, {}))[1] or {}).get("size", 0.0) or 0.0)
             b_pct = MID_BOOSTER_SIZE_PCT
-            if score >= (MID_BOOSTER_MIN_SCORE + 3) and true_prob >= (MID_BOOSTER_MIN_TRUE_PROB + 0.03):
+            if score >= (MID_BOOSTER_MIN_SCORE + BOOSTER_STRONG_SIZE_SCORE_DELTA) and true_prob >= (MID_BOOSTER_MIN_TRUE_PROB + BOOSTER_STRONG_SIZE_PROB_DELTA):
                 b_pct = MID_BOOSTER_SIZE_PCT_HIGH
             b_size = round(max(MIN_BET_ABS, self.bankroll * b_pct), 2)
             # Keep additive booster small vs existing exposure.
             if prev_size > 0:
-                b_size = min(b_size, max(MIN_BET_ABS, prev_size * 0.35))
+                b_size = min(b_size, max(MIN_BET_ABS, prev_size * BOOSTER_PREV_SIZE_CAP_MULT))
             size = max(MIN_BET_ABS, min(size, b_size, hard_cap))
             booster_mode = True
             booster_note = "mid" if in_ideal_window else "anytime"
@@ -5422,8 +5722,8 @@ class LiveTrader:
         # Immediate fills: FOK on strong signal, GTC limit otherwise
         # Limit orders (use_limit=True) are always GTC — force_taker stays False
         force_taker = (not use_limit) and (
-            (score >= 12 and very_strong_mom and imbalance_confirms and move_pct > 0.0015) or
-            (score >= 12 and is_early_continuation)
+            (score >= FORCE_TAKER_SCORE and very_strong_mom and imbalance_confirms and move_pct > FORCE_TAKER_MOVE_MIN) or
+            (score >= FORCE_TAKER_SCORE and is_early_continuation)
         )
         if FAST_EXEC_ENABLED and (not use_limit):
             if score >= FAST_EXEC_SCORE and edge >= FAST_EXEC_EDGE and entry <= MAX_ENTRY_PRICE:
@@ -8831,6 +9131,9 @@ class LiveTrader:
                             continue
                         if sig["side"] == "Down" and pending_dn >= MAX_SAME_DIR:
                             continue
+                        # Unified direction: correlated assets move together — never hold Up + Down simultaneously
+                        if pending_dn > 0 and sig["side"] == "Up":   continue
+                        if pending_up > 0 and sig["side"] == "Down":  continue
                     to_exec.append(sig)
                     m_sig = sig.get("m", {}) if isinstance(sig.get("m", {}), dict) else {}
                     t_sig = {
