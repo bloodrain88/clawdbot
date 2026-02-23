@@ -173,6 +173,12 @@ BLOCK_OPPOSITE_SIDE_SAME_CID = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_CID", "t
 BLOCK_OPPOSITE_SIDE_SAME_ROUND = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_ROUND", "true").lower() == "true"
 ROUND_STACK_SIZE_DECAY = float(os.environ.get("ROUND_STACK_SIZE_DECAY", "0.72"))
 ROUND_STACK_SIZE_MIN = float(os.environ.get("ROUND_STACK_SIZE_MIN", "0.45"))
+# Extra round-level decay to reduce clustered exposure across multiple assets
+# in the same 15m window while keeping trading active.
+ROUND_TOTAL_SIZE_DECAY = float(os.environ.get("ROUND_TOTAL_SIZE_DECAY", "0.82"))
+ROUND_TOTAL_SIZE_MIN = float(os.environ.get("ROUND_TOTAL_SIZE_MIN", "0.40"))
+ROUND_CORR_SAME_SIDE_DECAY = float(os.environ.get("ROUND_CORR_SAME_SIDE_DECAY", "0.70"))
+ROUND_CORR_SAME_SIDE_MIN = float(os.environ.get("ROUND_CORR_SAME_SIDE_MIN", "0.35"))
 LOW_ENTRY_SIZE_HAIRCUT_ENABLED = os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_ENABLED", "true").lower() == "true"
 LOW_ENTRY_SIZE_HAIRCUT_PX = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_PX", "0.30"))
 LOW_ENTRY_SIZE_HAIRCUT_MULT = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_MULT", "0.65"))
@@ -284,6 +290,9 @@ LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
 LOG_LIVE_DETAIL = os.environ.get("LOG_LIVE_DETAIL", "true").lower() == "true"
 LOG_LIVE_RK_MAX = int(os.environ.get("LOG_LIVE_RK_MAX", "12"))
 LIVE_RK_REAL_ONLY = os.environ.get("LIVE_RK_REAL_ONLY", "false").lower() == "true"
+LOG_TAIL_EQ_ENABLED = os.environ.get("LOG_TAIL_EQ_ENABLED", "true").lower() == "true"
+LOG_TAIL_EQ_EVERY_SEC = int(os.environ.get("LOG_TAIL_EQ_EVERY_SEC", "15"))
+LOG_TAIL_EQ_MAX_ROWS = int(os.environ.get("LOG_TAIL_EQ_MAX_ROWS", "20"))
 # Keep freshly-filled local positions visible while on-chain position APIs catch up.
 LIVE_LOCAL_GRACE_SEC = float(os.environ.get("LIVE_LOCAL_GRACE_SEC", "120"))
 LOG_ROUND_SIGNAL_MIN_SEC = float(os.environ.get("LOG_ROUND_SIGNAL_MIN_SEC", "5"))
@@ -482,6 +491,10 @@ SUPER_BET_MIN_SIZE_USDC = float(os.environ.get("SUPER_BET_MIN_SIZE_USDC", "5.0")
 SUPER_BET_MAX_SIZE_ENABLED = os.environ.get("SUPER_BET_MAX_SIZE_ENABLED", "true").lower() == "true"
 SUPER_BET_MAX_SIZE_USDC = float(os.environ.get("SUPER_BET_MAX_SIZE_USDC", "10.0"))
 SUPER_BET_MAX_BANKROLL_PCT = float(os.environ.get("SUPER_BET_MAX_BANKROLL_PCT", "0.02"))
+# Hard absolute cap for very cheap-tail entries after all tuning steps.
+TAIL_ENTRY_ABS_CAP_ENABLED = os.environ.get("TAIL_ENTRY_ABS_CAP_ENABLED", "true").lower() == "true"
+TAIL_ENTRY_CAP_PX = float(os.environ.get("TAIL_ENTRY_CAP_PX", "0.30"))
+TAIL_ENTRY_MAX_SIZE_USDC = float(os.environ.get("TAIL_ENTRY_MAX_SIZE_USDC", "10.0"))
 ROLLING_15M_CALIB_ENABLED = os.environ.get("ROLLING_15M_CALIB_ENABLED", "true").lower() == "true"
 ROLLING_15M_CALIB_MIN_N = int(os.environ.get("ROLLING_15M_CALIB_MIN_N", "20"))
 ROLLING_15M_CALIB_WINDOW = int(os.environ.get("ROLLING_15M_CALIB_WINDOW", "400"))
@@ -1047,6 +1060,15 @@ class LiveTrader:
             return str(int.from_bytes(position_id, "big"))
         except Exception:
             return ""
+
+    @staticmethod
+    def _normalize_side_label(side_raw: str) -> str:
+        s = str(side_raw or "").strip().lower()
+        if s in ("up", "yes", "higher", "above"):
+            return "Up"
+        if s in ("down", "no", "lower", "below"):
+            return "Down"
+        return str(side_raw or "").strip()
 
     def _is_exact_round_bounds(self, start_ts: float, end_ts: float, dur: int) -> bool:
         if start_ts <= 0 or end_ts <= 0 or dur <= 0:
@@ -2361,7 +2383,7 @@ class LiveTrader:
             for p in positions:
                 cid        = p.get("conditionId", "")
                 redeemable = p.get("redeemable", False)
-                outcome    = p.get("outcome", "")
+                outcome    = self._normalize_side_label(p.get("outcome", ""))
                 val        = float(p.get("currentValue", 0))
                 title      = p.get("title", "")
                 # Keep seen aligned to active exposure only.
@@ -2622,6 +2644,7 @@ class LiveTrader:
         now_ts = _time.time()
         shown_live_cids = set()
         live_by_rk = {}
+        tail_rows = []
         for cid, (m, t) in list(self.pending.items()):
             recently_filled_local = False
             if self.onchain_snapshot_ts > 0 and cid not in self.onchain_open_cids:
@@ -2897,6 +2920,25 @@ class LiveTrader:
                         f"{B}x{RS}{mult:.2f} | "
                         f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c"
                     )
+                tail_rows.append({
+                    "rk": rk,
+                    "state": "OPEN(unsettled)",
+                    "trades": n,
+                    "side": side_lbl,
+                    "side_stake": round(side_stake, 6),
+                    "event_now": event_state,
+                    "event_lead": lead,
+                    "event_total": n,
+                    "mark_now": mark_state,
+                    "spent": round(spent, 6),
+                    "real_mark": round(value_now, 6),
+                    "real_pnl_now": round(mark_pnl, 6),
+                    "real_roi_now_pct": round(mark_roi, 4),
+                    "scenario_if_win": round(win_payout, 6),
+                    "scenario_profit_if_win": round(win_profit, 6),
+                    "scenario_mult_if_win": round(mult, 6),
+                    "avg_entry_c": round(avg_entry * 100.0, 4),
+                })
         elif self._should_log("live-rk-empty", 15):
             print(f"  {Y}[LIVE-RK]{RS} none | trades=0 | no active on-chain positions")
             now_fix = _time.time()
@@ -2910,6 +2952,32 @@ class LiveTrader:
                     self._sync_open_positions()
                 except Exception as e:
                     self._errors.tick("live_rk_repair", print, err=e, every=10)
+        if LOG_TAIL_EQ_ENABLED and self._should_log("tail-eq", max(1, LOG_TAIL_EQ_EVERY_SEC)):
+            try:
+                rows_sorted = sorted(
+                    tail_rows,
+                    key=lambda r: abs(float(r.get("real_pnl_now", 0.0) or 0.0)),
+                    reverse=True,
+                )[:max(1, LOG_TAIL_EQ_MAX_ROWS)]
+                payload = {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "network": NETWORK,
+                    "session_min": int(max(0.0, (datetime.now(timezone.utc) - self.start_time).total_seconds()) // 60),
+                    "onchain_usdc": round(float(self.onchain_usdc_balance or 0.0), 6),
+                    "onchain_open_stake": round(float(self.onchain_open_stake_total or 0.0), 6),
+                    "onchain_open_mark": round(float(self.onchain_open_mark_value or 0.0), 6),
+                    "onchain_settling_claimable": round(float(self.onchain_redeemable_usdc or 0.0), 6),
+                    "onchain_open_count": int(self.onchain_open_count or 0),
+                    "onchain_redeemable_count": int(self.onchain_redeemable_count or 0),
+                    "pending_redeem_count": int(len(self.pending_redeem)),
+                    "total_trades": int(self.total),
+                    "wins": int(self.wins),
+                    "win_rate_pct": round((self.wins / self.total * 100.0), 4) if self.total > 0 else 0.0,
+                    "rows": rows_sorted,
+                }
+                print(f"{B}[TAIL-EQ]{RS} " + json.dumps(payload, separators=(",", ":")))
+            except Exception as e:
+                self._errors.tick("tail_eq_log", print, err=e, every=10)
         # Show settling (pending_redeem) positions
         for cid, val in list(self.pending_redeem.items()):
             if isinstance(val[0], dict):
@@ -4784,7 +4852,7 @@ class LiveTrader:
         raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
         max_single = min(100.0, self.bankroll * bankroll_pct)
         cid_cap    = max(0.50, self.bankroll * MAX_CID_EXPOSURE_PCT)
-        hard_cap   = max(0.50, min(max_single, cid_cap, self.bankroll * MAX_BANKROLL_PCT))
+        hard_cap   = max(0.50, min(max_single, cid_cap, self.bankroll * MAX_BANKROLL_PCT, float(MAX_ABS_BET)))
         # Avoid oversized tail bets: these entries can look high-multiple but are low-quality fills.
         if entry <= 0.05:
             hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * 0.015))
@@ -5044,6 +5112,79 @@ class LiveTrader:
                     print(
                         f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} round-stack x{mult:.2f} "
                         f"(legs={same_round_same_side+1}) ${old_size:.2f}->${size:.2f}"
+                    )
+            # Additional non-blocking round concentration decay:
+            # keep entries active but damp clustered same-window risk across assets.
+            same_round_total = 0
+            same_round_corr_side = 0
+            for c_p, (m_p, t_p) in self.pending.items():
+                try:
+                    if self._round_fingerprint(cid=c_p, m=m_p, t=t_p) != sig_fp:
+                        continue
+                    same_round_total += 1
+                    if str(t_p.get("side", "")) == side:
+                        same_round_corr_side += 1
+                except Exception:
+                    continue
+            if same_round_total > 0:
+                d_tot = max(0.05, min(1.0, ROUND_TOTAL_SIZE_DECAY))
+                f_tot = max(0.05, min(1.0, ROUND_TOTAL_SIZE_MIN))
+                mult_tot = max(f_tot, d_tot ** same_round_total)
+                old_size = float(size)
+                size = max(float(MIN_EXEC_NOTIONAL_USDC), round(old_size * mult_tot, 2))
+                if self._noisy_log_enabled(f"round-total-size:{asset}:{side}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} round-total x{mult_tot:.2f} "
+                        f"(open_legs={same_round_total}) ${old_size:.2f}->${size:.2f}"
+                    )
+            if same_round_corr_side > 0:
+                d_cor = max(0.05, min(1.0, ROUND_CORR_SAME_SIDE_DECAY))
+                f_cor = max(0.05, min(1.0, ROUND_CORR_SAME_SIDE_MIN))
+                mult_cor = max(f_cor, d_cor ** same_round_corr_side)
+                old_size = float(size)
+                size = max(float(MIN_EXEC_NOTIONAL_USDC), round(old_size * mult_cor, 2))
+                if self._noisy_log_enabled(f"round-corr-size:{asset}:{side}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} round-corr x{mult_cor:.2f} "
+                        f"(same_side_legs={same_round_corr_side}) ${old_size:.2f}->${size:.2f}"
+                    )
+
+        # Final superbet/tail normalization after all decays.
+        payout_mult = (1.0 / max(entry, 1e-9))
+        if SUPER_BET_MIN_SIZE_ENABLED:
+            if (
+                duration >= 15
+                and entry <= SUPER_BET_ENTRY_MAX
+                and payout_mult >= SUPER_BET_MIN_PAYOUT
+                and size < SUPER_BET_MIN_SIZE_USDC
+            ):
+                old_size = float(size)
+                size = max(float(MIN_EXEC_NOTIONAL_USDC), min(hard_cap, float(SUPER_BET_MIN_SIZE_USDC)))
+                if self._noisy_log_enabled(f"superbet-floor-final:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet floor(final) "
+                        f"x={payout_mult:.2f} ${old_size:.2f}->${size:.2f}"
+                    )
+        if SUPER_BET_MAX_SIZE_ENABLED:
+            if duration >= 15 and entry <= SUPER_BET_ENTRY_MAX and payout_mult >= SUPER_BET_MIN_PAYOUT:
+                max_super = max(0.50, min(SUPER_BET_MAX_SIZE_USDC, self.bankroll * SUPER_BET_MAX_BANKROLL_PCT))
+                if size > max_super:
+                    old_size = float(size)
+                    size = round(max(0.50, max_super), 2)
+                    if self._noisy_log_enabled(f"superbet-cap-final:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet cap(final) "
+                            f"x={payout_mult:.2f} ${old_size:.2f}->${size:.2f}"
+                        )
+        if TAIL_ENTRY_ABS_CAP_ENABLED and duration >= 15 and entry <= TAIL_ENTRY_CAP_PX:
+            tail_cap = max(0.50, min(float(TAIL_ENTRY_MAX_SIZE_USDC), hard_cap))
+            if size > tail_cap:
+                old_size = float(size)
+                size = round(tail_cap, 2)
+                if self._noisy_log_enabled(f"tail-cap-final:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} tail-cap(final) "
+                        f"entry={entry:.3f} ${old_size:.2f}->${size:.2f}"
                     )
 
         # Immediate fills: FOK on strong signal, GTC limit otherwise
@@ -6694,7 +6835,7 @@ class LiveTrader:
         for pos in positions:
             cid        = pos.get("conditionId", "")
             redeemable = pos.get("redeemable", False)
-            outcome    = pos.get("outcome", "")   # "Up" or "Down"
+            outcome    = self._normalize_side_label(pos.get("outcome", ""))   # canonical Up/Down
             val        = float(pos.get("currentValue", 0))
             size_tok   = float(pos.get("size", 0))
             title      = pos.get("title", "")
@@ -6867,7 +7008,7 @@ class LiveTrader:
             cid        = pos.get("conditionId", "")
             redeemable = pos.get("redeemable", False)
             val        = float(pos.get("currentValue", 0))
-            outcome    = pos.get("outcome", "")
+            outcome    = self._normalize_side_label(pos.get("outcome", ""))
             title      = pos.get("title", "")[:40]
 
             if not redeemable or val < 0.01 or not outcome or not cid:
@@ -7223,7 +7364,10 @@ class LiveTrader:
             edge_adj = 0.0
             # Crowd-extreme filter: when public flow is concentrated at very high cents,
             # treat matching-side dominance as overpay risk (anti-EV), not a buy signal.
-            overcrowded_highcent = (avg_c >= 85.0 and high_share >= 0.55 and abs(dom) >= PM_PUBLIC_PATTERN_DOM_MED)
+            overcrowded_highcent = (
+                (avg_c >= 90.0 and abs(dom) >= PM_PUBLIC_PATTERN_DOM_MED)
+                or (avg_c >= 85.0 and high_share >= 0.55 and abs(dom) >= PM_PUBLIC_PATTERN_DOM_MED)
+            )
             if overcrowded_highcent:
                 if dom >= PM_PUBLIC_PATTERN_DOM_MED:
                     score_adj -= 1
@@ -8363,7 +8507,7 @@ class LiveTrader:
                     cid = str(p.get("conditionId", "") or "")
                     if not cid:
                         continue
-                    side = str(p.get("outcome", "") or "")
+                    side = self._normalize_side_label(str(p.get("outcome", "") or ""))
                     val = float(p.get("currentValue", 0) or 0.0)
                     size_tok = self._as_float(p.get("size", 0.0), 0.0)
                     spent_probe = 0.0
@@ -8601,7 +8745,7 @@ class LiveTrader:
                     if p.get("redeemable", False):
                         continue
                     cid_p = p.get("conditionId", "")
-                    side_p = p.get("outcome", "")
+                    side_p = self._normalize_side_label(p.get("outcome", ""))
                     if not cid_p or not side_p:
                         continue
                     val_p = float(p.get("currentValue", 0) or 0.0)
@@ -8653,7 +8797,7 @@ class LiveTrader:
                     cid  = p.get("conditionId", "")
                     rdm  = p.get("redeemable", False)
                     val  = float(p.get("currentValue", 0))
-                    side = p.get("outcome", "")
+                    side = self._normalize_side_label(p.get("outcome", ""))
                     title = p.get("title", "")
                     rec_size_tok = self._as_float(p.get("size", 0.0), 0.0)
                     rec_spent_probe = 0.0
@@ -8841,7 +8985,7 @@ class LiveTrader:
                     cid        = pos.get("conditionId", "")
                     redeemable = pos.get("redeemable", False)
                     val        = float(pos.get("currentValue", 0))
-                    outcome    = pos.get("outcome", "")
+                    outcome    = self._normalize_side_label(pos.get("outcome", ""))
                     title      = pos.get("title", "")[:45]
                     if not redeemable or val < 0.01 or not outcome or not cid:
                         continue
@@ -8906,7 +9050,7 @@ class LiveTrader:
                     if typ == "REDEEM":
                         d["redeem"] = True
                     elif typ in ("BUY", "TRADE", "PURCHASE"):
-                        outcome = evt.get("outcome") or ""
+                        outcome = self._normalize_side_label(evt.get("outcome") or "")
                         if not outcome:
                             continue
                         side = (evt.get("side") or "BUY").upper()
@@ -8983,7 +9127,7 @@ class LiveTrader:
                     cid  = pos.get("conditionId", "")
                     rdm  = pos.get("redeemable", False)
                     val  = float(pos.get("currentValue", 0))
-                    side = pos.get("outcome", "")
+                    side = self._normalize_side_label(pos.get("outcome", ""))
                     if rdm or not side or not cid:
                         continue
                     self.seen.add(cid)
