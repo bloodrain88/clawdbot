@@ -472,6 +472,10 @@ HIGH_EV_SIZE_BOOST = float(os.environ.get("HIGH_EV_SIZE_BOOST", "1.25"))
 HIGH_EV_SIZE_BOOST_MAX = float(os.environ.get("HIGH_EV_SIZE_BOOST_MAX", "1.40"))
 HIGH_EV_MIN_EXEC_EV = float(os.environ.get("HIGH_EV_MIN_EXEC_EV", "0.035"))
 HIGH_EV_MIN_SCORE = int(os.environ.get("HIGH_EV_MIN_SCORE", "14"))
+SUPER_BET_MIN_SIZE_ENABLED = os.environ.get("SUPER_BET_MIN_SIZE_ENABLED", "true").lower() == "true"
+SUPER_BET_ENTRY_MAX = float(os.environ.get("SUPER_BET_ENTRY_MAX", "0.30"))
+SUPER_BET_MIN_PAYOUT = float(os.environ.get("SUPER_BET_MIN_PAYOUT", "3.00"))
+SUPER_BET_MIN_SIZE_USDC = float(os.environ.get("SUPER_BET_MIN_SIZE_USDC", "5.0"))
 ROLLING_15M_CALIB_ENABLED = os.environ.get("ROLLING_15M_CALIB_ENABLED", "true").lower() == "true"
 ROLLING_15M_CALIB_MIN_N = int(os.environ.get("ROLLING_15M_CALIB_MIN_N", "20"))
 ROLLING_15M_CALIB_WINDOW = int(os.environ.get("ROLLING_15M_CALIB_WINDOW", "400"))
@@ -4756,6 +4760,26 @@ class LiveTrader:
         else:
             size = model_size
         size = max(0.50, min(hard_cap, size))
+
+        # Super-bet floor:
+        # for high-multiple entries (very low price), keep at least a meaningful notional.
+        if SUPER_BET_MIN_SIZE_ENABLED:
+            payout_mult = (1.0 / max(entry, 1e-9))
+            if (
+                duration >= 15
+                and entry <= SUPER_BET_ENTRY_MAX
+                and payout_mult >= SUPER_BET_MIN_PAYOUT
+                and size < SUPER_BET_MIN_SIZE_USDC
+            ):
+                old_size = size
+                size = min(hard_cap, max(size, SUPER_BET_MIN_SIZE_USDC))
+                if self._noisy_log_enabled(f"superbet-floor:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet floor "
+                        f"x={payout_mult:.2f} entry={entry:.3f} "
+                        f"${old_size:.2f}->${size:.2f}"
+                    )
+
         if size < MIN_EXEC_NOTIONAL_USDC:
             return None
 
@@ -8171,17 +8195,7 @@ class LiveTrader:
                                 f"~${val:.2f} | cid={self._short_cid(cid)}"
                             )
                         continue
-                    open_val += val
-                    open_count += 1
-                    onchain_open_cids.add(cid)
-                    onchain_open_usdc_by_cid[cid] = round(
-                        float(onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0) + val, 6
-                    )
                     size_tok = self._as_float(p.get("size", 0.0), 0.0)
-                    if size_tok > 0:
-                        onchain_open_shares_by_cid[cid] = round(
-                            float(onchain_open_shares_by_cid.get(cid, 0.0) or 0.0) + size_tok, 6
-                        )
                     avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
                     stake_guess = 0.0
                     stake_src = "value_fallback"
@@ -8197,6 +8211,16 @@ class LiveTrader:
                     if stake_guess <= 0:
                         stake_guess = val
                         stake_src = "value_fallback"
+                    open_val += val
+                    open_count += 1
+                    onchain_open_cids.add(cid)
+                    onchain_open_usdc_by_cid[cid] = round(
+                        float(onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0) + val, 6
+                    )
+                    if size_tok > 0:
+                        onchain_open_shares_by_cid[cid] = round(
+                            float(onchain_open_shares_by_cid.get(cid, 0.0) or 0.0) + size_tok, 6
+                        )
                     open_stake_total += stake_guess
                     onchain_open_stake_by_cid[cid] = round(
                         float(onchain_open_stake_by_cid.get(cid, 0.0) or 0.0) + stake_guess, 6
