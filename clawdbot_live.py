@@ -2792,7 +2792,11 @@ class LiveTrader:
             now_ts = datetime.now(timezone.utc).timestamp()
             loaded = 0
             for k, (m, t) in data.items():
-                end_ts = m.get("end_ts", 0)
+                end_ts = float(m.get("end_ts", 0) or t.get("end_ts", 0) or 0)
+                if end_ts <= 0:   # H-5: fallback expiry from placed_ts + duration window
+                    placed = float(t.get("placed_ts", 0) or 0)
+                    dur = int(t.get("duration", 15) or 15)
+                    end_ts = placed + dur * 60 + 300 if placed > 0 else 0
                 # Drop entries that already expired — _sync_open_positions handles resolution
                 if end_ts > 0 and end_ts < now_ts - 300:   # expired >5min ago
                     print(f"{Y}[RESUME] Dropped expired: {m.get('question','')[:40]}{RS}")
@@ -2950,8 +2954,12 @@ class LiveTrader:
         """Local counters for logging: only active open positions and redeem queue size."""
         now_ts = _time.time()
         open_local = 0
-        for _, (m, _) in list(self.pending.items()):
-            end_ts = float(m.get("end_ts", 0) or 0)
+        for _, (m, t) in list(self.pending.items()):
+            end_ts = float(m.get("end_ts", 0) or t.get("end_ts", 0) or 0)
+            if end_ts <= 0:   # H-5: fallback expiry from placed_ts + duration window
+                placed = float(t.get("placed_ts", 0) or 0)
+                dur = int(t.get("duration", 15) or 15)
+                end_ts = placed + dur * 60 + 300 if placed > 0 else 0
             if end_ts <= 0 or end_ts > now_ts:
                 open_local += 1
         return open_local, len(self.pending_redeem)
@@ -3171,6 +3179,10 @@ class LiveTrader:
             side = str(meta.get("side", "?") or "?")
             title = str(meta.get("title", "") or "")[:38]
             end_ts = float(meta.get("end_ts", 0) or 0)
+            if end_ts <= 0:   # H-5: fallback from start_ts + duration
+                start_ts_m = float(meta.get("start_ts", 0) or 0)
+                dur_m = int(meta.get("duration", 15) or 15)
+                end_ts = start_ts_m + dur_m * 60 if start_ts_m > 0 else 0
             mins_left = max(0.0, (end_ts - now_ts) / 60.0) if end_ts > 0 else 0.0
             if end_ts > 0 and end_ts <= now_ts and cid not in self.pending_redeem:
                 continue
@@ -5421,6 +5433,7 @@ class LiveTrader:
             )
         booster_mode = False
         booster_note = ""
+        superbet_floor_applied = False   # H-1: track whether superbet floor was activated
         fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= FORCE_TAKER_CL_AGE_FRESH)
 
         # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
@@ -5581,7 +5594,7 @@ class LiveTrader:
             ):
                 old_size = size
                 size = min(hard_cap, max(size, SUPER_BET_MIN_SIZE_USDC))
-                self._last_superbet_ts = _time.time()
+                superbet_floor_applied = True   # H-1: set timestamp after confirmed fill, not here
                 if self._noisy_log_enabled(f"superbet-floor:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                     print(
                         f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet floor "
@@ -5853,7 +5866,7 @@ class LiveTrader:
             ):
                 old_size = float(size)
                 size = max(float(MIN_EXEC_NOTIONAL_USDC), min(hard_cap, float(SUPER_BET_MIN_SIZE_USDC)))
-                self._last_superbet_ts = _time.time()
+                superbet_floor_applied = True   # H-1: set timestamp after confirmed fill, not here
                 if self._noisy_log_enabled(f"superbet-floor-final:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                     print(
                         f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet floor(final) "
@@ -5946,6 +5959,7 @@ class LiveTrader:
             "leader_size_scale": leader_size_scale,
             "booster_mode": booster_mode,
             "booster_note": booster_note,
+            "superbet_floor_applied": superbet_floor_applied,
             "book_age_ms": book_age_ms,
             "quote_age_ms": quote_age_ms,
             "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
@@ -6144,6 +6158,8 @@ class LiveTrader:
             stat_bucket = self._bucket_key(sig["duration"], sig["score"], sig["entry"])
             if filled:
                 self._bucket_stats.add_fill(stat_bucket, slip_bps)
+                if sig.get("superbet_floor_applied"):   # H-1: only consume cooldown on actual fill
+                    self._last_superbet_ts = _time.time()
             trade = {
                 "side": sig["side"], "size": actual_size_usdc, "entry": sig["entry"],
                 "open_price": sig["open_price"], "current_price": sig["current"],
@@ -6316,6 +6332,9 @@ class LiveTrader:
                 return sig
 
             deadline = _time.time() + max(0.0, ENTRY_WAIT_WINDOW_15M_SEC)
+            # M-4: block copyflow on-demand refreshes during the wait window — data was just fetched
+            _cf_block_until = deadline + 1.0
+            self._copyflow_cid_on_demand_ts[sig["cid"]] = _cf_block_until
             best = sig
             improved = False
             while _time.time() < deadline:
@@ -10032,6 +10051,12 @@ class LiveTrader:
                         )
                         attempts += 1
                         self.redeemed_cids.add(cid)
+                        self.wins += 1; self.total += 1   # H-6: record silent win in stats
+                        self._log_onchain_event("RESOLVE-BACKFILL", cid, {
+                            "side": winner, "result": "WIN",
+                            "held_shares": round(held, 4),
+                            "title": d.get("title", "")[:40],
+                        })
                         print(
                             f"{G}[FORCE-REDEEM]{RS} {winner} {d['title'][:36]} | tx={tx_hash[:16]} | "
                             f"cid={self._short_cid(cid)}"
