@@ -493,6 +493,12 @@ PM_PUBLIC_PATTERN_MIN_N = int(os.environ.get("PM_PUBLIC_PATTERN_MIN_N", "24"))
 PM_PUBLIC_PATTERN_MAX_EDGE_ADJ = float(os.environ.get("PM_PUBLIC_PATTERN_MAX_EDGE_ADJ", "0.006"))
 PM_PUBLIC_PATTERN_DOM_MED = float(os.environ.get("PM_PUBLIC_PATTERN_DOM_MED", "0.12"))
 PM_PUBLIC_PATTERN_DOM_STRONG = float(os.environ.get("PM_PUBLIC_PATTERN_DOM_STRONG", "0.22"))
+RECENT_SIDE_PRIOR_ENABLED = os.environ.get("RECENT_SIDE_PRIOR_ENABLED", "true").lower() == "true"
+RECENT_SIDE_PRIOR_MIN_N = int(os.environ.get("RECENT_SIDE_PRIOR_MIN_N", "8"))
+RECENT_SIDE_PRIOR_LOOKBACK_H = float(os.environ.get("RECENT_SIDE_PRIOR_LOOKBACK_H", "12"))
+RECENT_SIDE_PRIOR_MAX_PROB_ADJ = float(os.environ.get("RECENT_SIDE_PRIOR_MAX_PROB_ADJ", "0.025"))
+RECENT_SIDE_PRIOR_MAX_EDGE_ADJ = float(os.environ.get("RECENT_SIDE_PRIOR_MAX_EDGE_ADJ", "0.010"))
+RECENT_SIDE_PRIOR_MAX_SCORE_ADJ = int(os.environ.get("RECENT_SIDE_PRIOR_MAX_SCORE_ADJ", "2"))
 CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M = float(os.environ.get("CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M", "0.78"))
 CONSISTENCY_STRONG_MIN_SCORE_15M = int(os.environ.get("CONSISTENCY_STRONG_MIN_SCORE_15M", "14"))
 CONSISTENCY_STRONG_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_STRONG_MIN_TRUE_PROB_15M", "0.72"))
@@ -3870,8 +3876,8 @@ class LiveTrader:
         llr *= regime_mult
         # Sigmoid → prob_up
         p_up_ll   = 1.0 / (1.0 + math.exp(-max(-6.0, min(6.0, llr))))
-        bias_up   = self._direction_bias(asset, "Up")
-        bias_down = self._direction_bias(asset, "Down")
+        bias_up   = self._direction_bias(asset, "Up", duration)
+        bias_down = self._direction_bias(asset, "Down", duration)
         prob_up   = max(0.05, min(0.95, p_up_ll + bias_up))
         prob_down = max(0.05, min(0.95, 1.0 - p_up_ll + bias_down))
 
@@ -3899,6 +3905,19 @@ class LiveTrader:
         prob_up = 0.5 + (prob_up - 0.5) * shrink
         prob_up = max(0.05, min(0.95, prob_up))
         prob_down = 1.0 - prob_up
+
+        # Recent on-chain side prior (asset+duration+side), non-blocking directional calibration.
+        up_recent = self._recent_side_profile(asset, duration, "Up")
+        dn_recent = self._recent_side_profile(asset, duration, "Down")
+        up_adj = float(up_recent.get("prob_adj", 0.0) or 0.0)
+        dn_adj = float(dn_recent.get("prob_adj", 0.0) or 0.0)
+        if abs(up_adj) > 1e-9 or abs(dn_adj) > 1e-9:
+            pu = max(0.01, min(0.99, prob_up + up_adj))
+            pd = max(0.01, min(0.99, prob_down + dn_adj))
+            z = pu + pd
+            if z > 0:
+                prob_up = max(0.05, min(0.95, pu / z))
+                prob_down = 1.0 - prob_up
 
         edge_up   = prob_up   - up_price
         edge_down = prob_down - (1 - up_price)
@@ -3936,6 +3955,22 @@ class LiveTrader:
 
         # Keep signal components aligned to the effective side.
         side_up = side == "Up"
+        recent_side = up_recent if side_up else dn_recent
+        recent_side_n = int(recent_side.get("n", 0) or 0)
+        recent_side_exp = float(recent_side.get("exp", 0.0) or 0.0)
+        recent_side_wr_lb = float(recent_side.get("wr_lb", 0.5) or 0.5)
+        recent_side_score_adj = int(recent_side.get("score_adj", 0) or 0)
+        recent_side_edge_adj = float(recent_side.get("edge_adj", 0.0) or 0.0)
+        recent_side_prob_adj = float(recent_side.get("prob_adj", 0.0) or 0.0)
+        if recent_side_score_adj != 0 or abs(recent_side_edge_adj) > 1e-9:
+            score += recent_side_score_adj
+            edge += recent_side_edge_adj
+            if self._noisy_log_enabled(f"recent-side:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{B}[RECENT-SIDE]{RS} {asset} {duration}m {side} "
+                    f"adj(score={recent_side_score_adj:+d},edge={recent_side_edge_adj:+.3f},prob={recent_side_prob_adj:+.3f}) "
+                    f"n={recent_side_n} exp={recent_side_exp:+.2f} wr_lb={recent_side_wr_lb:.2f}"
+                )
         tf_votes = tf_up_votes if side_up else tf_dn_votes
         ob_sig = dw_ob if side_up else -dw_ob
         cl_agree = True
@@ -4036,6 +4071,12 @@ class LiveTrader:
         pm_public_pattern_n = 0
         pm_public_pattern_dom = 0.0
         pm_public_pattern_avg_c = 0.0
+        recent_side_n = 0
+        recent_side_exp = 0.0
+        recent_side_wr_lb = 0.5
+        recent_side_score_adj = 0
+        recent_side_edge_adj = 0.0
+        recent_side_prob_adj = 0.0
         if isinstance(flow, dict):
             up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
             dn_conf = float(flow.get("Down", flow.get("down", 0.0)) or 0.0)
@@ -4302,6 +4343,18 @@ class LiveTrader:
         prob_up = 0.5 + (prob_up - 0.5) * quality_scale
         prob_up = max(0.05, min(0.95, prob_up))
         prob_down = 1.0 - prob_up
+        # Apply recent side prior again after quality rescale (keeps final posterior aligned to live outcomes).
+        up_recent = self._recent_side_profile(asset, duration, "Up")
+        dn_recent = self._recent_side_profile(asset, duration, "Down")
+        up_adj = float(up_recent.get("prob_adj", 0.0) or 0.0)
+        dn_adj = float(dn_recent.get("prob_adj", 0.0) or 0.0)
+        if abs(up_adj) > 1e-9 or abs(dn_adj) > 1e-9:
+            pu = max(0.01, min(0.99, prob_up + up_adj))
+            pd = max(0.01, min(0.99, prob_down + dn_adj))
+            z = pu + pd
+            if z > 0:
+                prob_up = max(0.05, min(0.95, pu / z))
+                prob_down = 1.0 - prob_up
         edge_up = prob_up - up_price
         edge_down = prob_down - (1 - up_price)
 
@@ -5047,6 +5100,12 @@ class LiveTrader:
             "pm_public_pattern_n": pm_public_pattern_n,
             "pm_public_pattern_dom": pm_public_pattern_dom,
             "pm_public_pattern_avg_c": pm_public_pattern_avg_c,
+            "recent_side_n": recent_side_n,
+            "recent_side_exp": recent_side_exp,
+            "recent_side_wr_lb": recent_side_wr_lb,
+            "recent_side_score_adj": recent_side_score_adj,
+            "recent_side_edge_adj": recent_side_edge_adj,
+            "recent_side_prob_adj": recent_side_prob_adj,
             "rolling_n": int(rolling_profile.get("n", 0) or 0),
             "rolling_exp": float(rolling_profile.get("exp", 0.0) or 0.0),
             "rolling_wr_lb": float(rolling_profile.get("wr_lb", 0.5) or 0.5),
@@ -5267,6 +5326,12 @@ class LiveTrader:
                 "pm_public_pattern_n": sig.get("pm_public_pattern_n", 0),
                 "pm_public_pattern_dom": sig.get("pm_public_pattern_dom", 0.0),
                 "pm_public_pattern_avg_c": sig.get("pm_public_pattern_avg_c", 0.0),
+                "recent_side_n": sig.get("recent_side_n", 0),
+                "recent_side_exp": sig.get("recent_side_exp", 0.0),
+                "recent_side_wr_lb": sig.get("recent_side_wr_lb", 0.5),
+                "recent_side_score_adj": sig.get("recent_side_score_adj", 0),
+                "recent_side_edge_adj": sig.get("recent_side_edge_adj", 0.0),
+                "recent_side_prob_adj": sig.get("recent_side_prob_adj", 0.0),
                 "rolling_n": sig.get("rolling_n", 0),
                 "rolling_exp": sig.get("rolling_exp", 0.0),
                 "rolling_wr_lb": sig.get("rolling_wr_lb", 0.5),
@@ -5327,6 +5392,9 @@ class LiveTrader:
                     f"(n={int(sig.get('pm_pattern_n',0) or 0)} exp={float(sig.get('pm_pattern_exp',0.0) or 0.0):+.2f}) "
                     f"pub={int(sig.get('pm_public_pattern_score_adj',0) or 0):+d}/{float(sig.get('pm_public_pattern_edge_adj',0.0) or 0.0):+.3f}"
                     f"(n={int(sig.get('pm_public_pattern_n',0) or 0)} dom={float(sig.get('pm_public_pattern_dom',0.0) or 0.0):+.2f}) "
+                    f"rec={int(sig.get('recent_side_score_adj',0) or 0):+d}/{float(sig.get('recent_side_edge_adj',0.0) or 0.0):+.3f}"
+                    f"(n={int(sig.get('recent_side_n',0) or 0)} exp={float(sig.get('recent_side_exp',0.0) or 0.0):+.2f} "
+                    f"wr_lb={float(sig.get('recent_side_wr_lb',0.5) or 0.5):.2f}) "
                     f"roll(n={int(sig.get('rolling_n',0) or 0)} exp={float(sig.get('rolling_exp',0.0) or 0.0):+.2f} "
                     f"wr_lb={float(sig.get('rolling_wr_lb',0.5) or 0.5):.2f})"
                 )
@@ -6406,6 +6474,7 @@ class LiveTrader:
                                 f"payout={1.0/max(float(trade.get('entry',0.5) or 0.5),1e-9):.2f}x "
                                 f"pm={int(trade.get('pm_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_pattern_edge_adj',0.0) or 0.0):+.3f} "
                                 f"pub={int(trade.get('pm_public_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_public_pattern_edge_adj',0.0) or 0.0):+.3f} "
+                                f"rec={int(trade.get('recent_side_score_adj',0) or 0):+d}/{float(trade.get('recent_side_edge_adj',0.0) or 0.0):+.3f} "
                                 f"roll_n={int(trade.get('rolling_n',0) or 0)} roll_exp={float(trade.get('rolling_exp',0.0) or 0.0):+.2f}"
                             )
                         if tx_hash_full:
@@ -6492,6 +6561,7 @@ class LiveTrader:
                                     f"payout={1.0/max(float(trade.get('entry',0.5) or 0.5),1e-9):.2f}x "
                                     f"pm={int(trade.get('pm_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_pattern_edge_adj',0.0) or 0.0):+.3f} "
                                     f"pub={int(trade.get('pm_public_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_public_pattern_edge_adj',0.0) or 0.0):+.3f} "
+                                    f"rec={int(trade.get('recent_side_score_adj',0) or 0):+d}/{float(trade.get('recent_side_edge_adj',0.0) or 0.0):+.3f} "
                                     f"roll_n={int(trade.get('rolling_n',0) or 0)} roll_exp={float(trade.get('rolling_exp',0.0) or 0.0):+.2f}"
                                 )
                             self._settled_outcomes[cid] = {
@@ -7047,6 +7117,8 @@ class LiveTrader:
         try:
             self._resolved_samples.append({
                 "ts": _time.time(),
+                "asset": str(trade.get("asset", "") or ""),
+                "side": str(trade.get("side", "") or ""),
                 "duration": int(trade.get("duration", 0) or 0),
                 "entry": float(trade.get("entry", 0.0) or 0.0),
                 "source": str(trade.get("open_price_source", "?") or "?"),
@@ -7194,6 +7266,64 @@ class LiveTrader:
             }
         except Exception:
             return {"score_adj": 0, "edge_adj": 0.0, "n": 0, "dom": 0.0, "avg_c": 0.0, "min_n": PM_PUBLIC_PATTERN_MIN_N}
+
+    def _recent_side_profile(self, asset: str, duration: int, side: str) -> dict:
+        """Recent on-chain-only side quality profile for adaptive scoring (non-blocking)."""
+        if not RECENT_SIDE_PRIOR_ENABLED:
+            return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "n": 0, "exp": 0.0, "wr_lb": 0.5}
+        try:
+            now_ts = _time.time()
+            lookback_s = max(0.0, float(RECENT_SIDE_PRIOR_LOOKBACK_H) * 3600.0)
+            vals = []
+            for s in list(self._resolved_samples)[-600:]:
+                if str(s.get("asset", "") or "") != asset:
+                    continue
+                if int(s.get("duration", 0) or 0) != int(duration):
+                    continue
+                if str(s.get("side", "") or "") != side:
+                    continue
+                ts = float(s.get("ts", 0.0) or 0.0)
+                if ts <= 0:
+                    continue
+                if lookback_s > 0 and (now_ts - ts) > lookback_s:
+                    continue
+                vals.append(s)
+            n = len(vals)
+            if n < max(1, RECENT_SIDE_PRIOR_MIN_N):
+                return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "n": n, "exp": 0.0, "wr_lb": 0.5}
+            wins = sum(1 for x in vals if bool(x.get("won", False)))
+            pnl = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals)
+            exp = pnl / max(1, n)
+            wr_lb = self._wilson_lower_bound(wins, n)
+            score_adj = 0
+            edge_adj = 0.0
+            prob_adj = 0.0
+            if wr_lb >= 0.55 and exp >= 0.20:
+                score_adj = min(RECENT_SIDE_PRIOR_MAX_SCORE_ADJ, 2)
+                edge_adj = min(RECENT_SIDE_PRIOR_MAX_EDGE_ADJ, 0.004 + min(0.006, exp / 80.0))
+                prob_adj = min(RECENT_SIDE_PRIOR_MAX_PROB_ADJ, 0.010 + min(0.015, exp / 40.0))
+            elif wr_lb >= 0.51 and exp > 0.0:
+                score_adj = min(RECENT_SIDE_PRIOR_MAX_SCORE_ADJ, 1)
+                edge_adj = min(RECENT_SIDE_PRIOR_MAX_EDGE_ADJ, 0.003)
+                prob_adj = min(RECENT_SIDE_PRIOR_MAX_PROB_ADJ, 0.008)
+            elif wr_lb <= 0.45 and exp <= -0.20:
+                score_adj = -min(RECENT_SIDE_PRIOR_MAX_SCORE_ADJ, 2)
+                edge_adj = -min(RECENT_SIDE_PRIOR_MAX_EDGE_ADJ, 0.004 + min(0.006, abs(exp) / 80.0))
+                prob_adj = -min(RECENT_SIDE_PRIOR_MAX_PROB_ADJ, 0.010 + min(0.015, abs(exp) / 40.0))
+            elif wr_lb < 0.49 and exp < 0.0:
+                score_adj = -min(RECENT_SIDE_PRIOR_MAX_SCORE_ADJ, 1)
+                edge_adj = -min(RECENT_SIDE_PRIOR_MAX_EDGE_ADJ, 0.003)
+                prob_adj = -min(RECENT_SIDE_PRIOR_MAX_PROB_ADJ, 0.008)
+            return {
+                "score_adj": int(score_adj),
+                "edge_adj": float(edge_adj),
+                "prob_adj": float(prob_adj),
+                "n": int(n),
+                "exp": float(exp),
+                "wr_lb": float(wr_lb),
+            }
+        except Exception:
+            return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "n": 0, "exp": 0.0, "wr_lb": 0.5}
 
     def _rolling_15m_profile(self, duration: int, entry: float, open_src: str, cl_age_s) -> dict:
         if (not ROLLING_15M_CALIB_ENABLED) or duration < 15:
@@ -7499,8 +7629,16 @@ class LiveTrader:
             return False
         return True
 
-    def _direction_bias(self, asset: str, side: str) -> float:
-        """Small additive bias from realized side expectancy/profit factor."""
+    def _direction_bias(self, asset: str, side: str, duration: int | None = None) -> float:
+        """Small additive bias from realized side quality.
+        Prefers recent on-chain outcomes over long-lived persisted aggregates."""
+        if duration is not None and RECENT_SIDE_PRIOR_ENABLED:
+            rs = self._recent_side_profile(asset, int(duration), side)
+            rn = int(rs.get("n", 0) or 0)
+            if rn >= max(1, RECENT_SIDE_PRIOR_MIN_N):
+                # Convert recent posterior prior into a compact additive bias.
+                rb = float(rs.get("prob_adj", 0.0) or 0.0) * 0.80
+                return max(-0.05, min(0.05, rb))
         k = f"{asset}|{side}"
         s = self.side_perf.get(k, {})
         n = int(s.get("n", 0))
