@@ -174,8 +174,8 @@ MIN_PARTIAL_TRACK_USDC = float(os.environ.get("MIN_PARTIAL_TRACK_USDC", "5.0"))
 OPEN_PRESENCE_MIN = float(os.environ.get("OPEN_PRESENCE_MIN", "0.01"))
 MAX_ABS_BET    = float(os.environ.get("MAX_ABS_BET", "14.0"))     # hard ceiling
 MAX_BANKROLL_PCT = float(os.environ.get("MAX_BANKROLL_PCT", "0.25"))
-MAX_OPEN       = int(os.environ.get("MAX_OPEN", "8"))
-MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "8"))
+MAX_OPEN       = int(os.environ.get("MAX_OPEN", "2"))
+MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "2"))
 MAX_CID_EXPOSURE_PCT = float(os.environ.get("MAX_CID_EXPOSURE_PCT", "0.10"))
 BLOCK_OPPOSITE_SIDE_SAME_CID = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_CID", "true").lower() == "true"
 BLOCK_OPPOSITE_SIDE_SAME_ROUND = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_ROUND", "true").lower() == "true"
@@ -193,7 +193,7 @@ LOW_ENTRY_SIZE_HAIRCUT_MULT = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_MULT"
 LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE = int(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE", "18"))
 LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB", "0.80"))
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
-ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
+ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "true").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "10"))   # raised 8→10
 MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "9"))  # raised 7→9
@@ -212,6 +212,11 @@ LATE_PAYOUT_RELAX_PCT_LEFT  = float(os.environ.get("LATE_PAYOUT_RELAX_PCT_LEFT",
 LATE_PAYOUT_RELAX_MIN_MOVE  = float(os.environ.get("LATE_PAYOUT_RELAX_MIN_MOVE", "0.0025")) # 0.25% price move confirming direction
 LATE_PAYOUT_RELAX_FLOOR     = float(os.environ.get("LATE_PAYOUT_RELAX_FLOOR", "1.65"))      # accept 1.65x when late+locked
 LATE_PAYOUT_PROB_BOOST      = float(os.environ.get("LATE_PAYOUT_PROB_BOOST", "0.04"))       # true_prob boost for locked-direction entries
+# Must-fire: guarantee at least 1 trade per 15m window in last N minutes by relaxing score gate
+LATE_MUST_FIRE_ENABLED     = os.environ.get("LATE_MUST_FIRE_ENABLED", "true").lower() == "true"
+LATE_MUST_FIRE_MINS_LEFT   = float(os.environ.get("LATE_MUST_FIRE_MINS_LEFT", "5.0"))    # relax in last 5 min
+LATE_MUST_FIRE_SCORE_RELAX = int(os.environ.get("LATE_MUST_FIRE_SCORE_RELAX", "2"))      # lower gate by 2 pts
+LATE_MUST_FIRE_MIN_SCORE   = int(os.environ.get("LATE_MUST_FIRE_MIN_SCORE", "6"))        # absolute floor after relax
 MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.019"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
 HC15_ENABLED = os.environ.get("HC15_ENABLED", "false").lower() == "true"
@@ -3980,9 +3985,10 @@ class LiveTrader:
         except Exception:
             return None
 
-    async def _score_market(self, m: dict) -> dict | None:
+    async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
         """Score a market opportunity. Returns signal dict or None if hard-blocked.
-        Pure analysis — no side effects, no order placement."""
+        Pure analysis — no side effects, no order placement.
+        late_relax=True: relax score gate by LATE_MUST_FIRE_SCORE_RELAX (must-fire last N min)."""
         score_started = _time.perf_counter()
         cid       = m["conditionId"]
         booster_eval = False
@@ -5087,6 +5093,9 @@ class LiveTrader:
             and duration >= 15
         ):
             min_score_local = max(4, min_score_local - CROSS_CONSENSUS_SCORE_RELAX)
+        # Must-fire late-window relaxation: lower gate in last N minutes to guarantee entry
+        if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
+            min_score_local = max(LATE_MUST_FIRE_MIN_SCORE, min_score_local - LATE_MUST_FIRE_SCORE_RELAX)
         if score < min_score_local:
             return None
 
@@ -9322,6 +9331,21 @@ class LiveTrader:
                 if candidates:
                     self._perf_update("score_ms", elapsed_ms / max(1, len(candidates)))
                 valid   = sorted([s for s in signals if s is not None], key=lambda x: -x["score"])
+                # Must-fire: if no signal passed gate and we're in last N min of a 15m window, relax gate
+                if not valid and LATE_MUST_FIRE_ENABLED:
+                    late_cands = [
+                        c for c in candidates
+                        if c.get("duration", 0) >= 15 and c.get("mins_left", 99) <= LATE_MUST_FIRE_MINS_LEFT
+                    ]
+                    if late_cands:
+                        late_sigs = list(await asyncio.gather(*[self._score_market(c, late_relax=True) for c in late_cands]))
+                        late_valid = sorted([s for s in late_sigs if s is not None], key=lambda x: -x["score"])
+                        if late_valid:
+                            print(
+                                f"{Y}[MUST-FIRE]{RS} last {LATE_MUST_FIRE_MINS_LEFT:.0f}min: gate relaxed → "
+                                f"{late_valid[0]['asset']} {late_valid[0]['side']} score={late_valid[0]['score']}"
+                            )
+                            valid = late_valid
                 if valid:
                     best = valid[0]
                     other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
