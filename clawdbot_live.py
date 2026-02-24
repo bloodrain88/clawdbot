@@ -5338,6 +5338,7 @@ class LiveTrader:
             self._skip_tick("ev_below")
             return None
         if duration >= 15 and (not booster_eval) and CONSISTENCY_CORE_ENABLED:
+            must_fire_active = late_relax and LATE_MUST_FIRE_ENABLED
             core_payout = 1.0 / max(entry, 1e-9)
             dyn_prob_floor = max(
                 0.50,
@@ -5353,7 +5354,11 @@ class LiveTrader:
                     CONSISTENCY_MIN_EXEC_EV_15M + float(rolling_profile.get("ev_add", 0.0) or 0.0),
                 ),
             )
-            if EV_FRONTIER_ENABLED:
+            # Must-fire: relax all consistency floors so at least one trade fires per 15m round
+            if must_fire_active:
+                dyn_prob_floor = max(0.48, dyn_prob_floor - LATE_MUST_FIRE_PROB_RELAX)
+                dyn_ev_floor   = max(0.001, dyn_ev_floor - 0.010)
+            if EV_FRONTIER_ENABLED and (not must_fire_active):
                 # Entry-aware minimum probability: allow sub-2x only when posterior is strong enough.
                 # required_prob = breakeven(entry+fees) + safety margin increasing with expensive entries.
                 req_prob = (
@@ -5380,15 +5385,16 @@ class LiveTrader:
                 and tf_votes >= 3
                 and cl_agree
             )
-            if core_payout + 1e-9 < CONSISTENCY_MIN_PAYOUT_15M:
+            _min_payout_consistency = max(1.30, CONSISTENCY_MIN_PAYOUT_15M) if not must_fire_active else 1.30
+            if core_payout + 1e-9 < _min_payout_consistency:
                 if self._noisy_log_enabled(f"skip-consistency-payout:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(
                         f"{Y}[SKIP] {asset} {duration}m consistency payout="
-                        f"{core_payout:.3f}x<{CONSISTENCY_MIN_PAYOUT_15M:.3f}x{RS}"
+                        f"{core_payout:.3f}x<{_min_payout_consistency:.3f}x{RS}"
                     )
                 self._skip_tick("consistency_payout_low")
                 return None
-            if CONSISTENCY_REQUIRE_CL_AGREE_15M and (not cl_agree):
+            if CONSISTENCY_REQUIRE_CL_AGREE_15M and (not cl_agree) and (not must_fire_active):
                 if self._noisy_log_enabled(f"skip-consistency-cl:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(f"{Y}[SKIP] {asset} {duration}m consistency: CL disagree on core trade{RS}")
                 self._skip_tick("consistency_cl_disagree")
@@ -5409,7 +5415,7 @@ class LiveTrader:
                     )
                 self._skip_tick("consistency_ev_low")
                 return None
-            if tf_votes < CONSISTENCY_MIN_TF_VOTES_15M and not (late_relax and LATE_MUST_FIRE_ENABLED):
+            if tf_votes < CONSISTENCY_MIN_TF_VOTES_15M and not must_fire_active:
                 if self._noisy_log_enabled(f"skip-consistency-tf:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(
                         f"{Y}[SKIP] {asset} {duration}m consistency tf_votes "
@@ -5418,20 +5424,21 @@ class LiveTrader:
                 self._skip_tick("consistency_tf_low")
                 return None
             # Propagate strict payout rule to execution layer so maker/fallback cannot overpay.
-            core_entry_cap = min(0.99, 1.0 / max(1e-9, CONSISTENCY_MIN_PAYOUT_15M))
+            core_entry_cap = min(0.99, 1.0 / max(1e-9, _min_payout_consistency))
             if max_entry_allowed > core_entry_cap:
                 max_entry_allowed = core_entry_cap
                 if min_entry_allowed >= max_entry_allowed:
                     min_entry_allowed = max(0.01, max_entry_allowed - 0.01)
-            if entry > CONSISTENCY_MAX_ENTRY_15M and (not core_strong):
+            _entry_cap_consistency = CONSISTENCY_MAX_ENTRY_15M if not must_fire_active else max(CONSISTENCY_MAX_ENTRY_15M, 0.70)
+            if entry > _entry_cap_consistency and (not core_strong):
                 if self._noisy_log_enabled(f"skip-consistency-entry:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(
                         f"{Y}[SKIP] {asset} {duration}m consistency entry={entry:.3f} "
-                        f"> cap={CONSISTENCY_MAX_ENTRY_15M:.3f} (not strong-core){RS}"
+                        f"> cap={_entry_cap_consistency:.3f} (not strong-core){RS}"
                     )
                 self._skip_tick("consistency_entry_high")
                 return None
-            if not core_lead_now:
+            if not core_lead_now and not must_fire_active:
                 trail_ok = pct_remaining >= CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M and core_strong
                 if not trail_ok:
                     if self._noisy_log_enabled(f"skip-consistency-trail:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
@@ -6022,6 +6029,7 @@ class LiveTrader:
             "quote_age_ms": quote_age_ms,
             "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
             "prebid_arm": arm_active,
+            "must_fire": bool(late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15),
         }
 
     async def _execute_trade(self, sig: dict):
@@ -6951,7 +6959,12 @@ class LiveTrader:
                             return None
                     fresh_payout = 1.0 / max(fresh_ask, 1e-9)
                     min_payout_fb, min_ev_fb, _ = self._adaptive_thresholds(duration)
-                    if core_position and duration >= 15 and CONSISTENCY_CORE_ENABLED:
+                    _must_fire_exec = bool(sig.get("must_fire", False))
+                    if _must_fire_exec:
+                        # Must-fire: accept any EV-positive payout (>= 1.30x minimum)
+                        min_payout_fb = max(1.30, min_payout_fb - 0.35)
+                        min_ev_fb     = max(-0.005, min_ev_fb - 0.015)
+                    elif core_position and duration >= 15 and CONSISTENCY_CORE_ENABLED:
                         # Keep execution fully aligned with core 15m consistency floor.
                         min_payout_fb = max(min_payout_fb, CONSISTENCY_MIN_PAYOUT_15M)
                     elif strong_exec:
