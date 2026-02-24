@@ -4676,7 +4676,8 @@ class LiveTrader:
             conf += 1
         if cl_agree:
             conf += 1
-        if conf < 2:
+        min_conf = 1 if (late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15) else 2
+        if conf < min_conf:
             if self._noisy_log_enabled(f"skip-low-confluence:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
                     f"{Y}[SKIP]{RS} {asset} {duration}m low confluence "
@@ -5012,6 +5013,10 @@ class LiveTrader:
                 conviction_floor += ANALYSIS_SIDE_BAD_CONV_DELTA
         quality_floor = max(ANALYSIS_QUAL_FLOOR_MIN, min(ANALYSIS_QUAL_FLOOR_MAX, quality_floor))
         conviction_floor = max(ANALYSIS_CONV_FLOOR_MIN, min(ANALYSIS_CONV_FLOOR_MAX, conviction_floor))
+        # Must-fire window: relax conviction and quality floors to guarantee at least one entry per round
+        if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
+            conviction_floor = max(0.44, conviction_floor - 0.03)
+            quality_floor    = max(0.44, quality_floor    - 0.02)
 
         if analysis_quality + DEFAULT_CMP_EPS < quality_floor:
             if self._noisy_log_enabled(f"skip-analysis-quality:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
@@ -5423,7 +5428,7 @@ class LiveTrader:
                     )
                 self._skip_tick("consistency_ev_low")
                 return None
-            if tf_votes < CONSISTENCY_MIN_TF_VOTES_15M:
+            if tf_votes < CONSISTENCY_MIN_TF_VOTES_15M and not (late_relax and LATE_MUST_FIRE_ENABLED):
                 if self._noisy_log_enabled(f"skip-consistency-tf:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                     print(
                         f"{Y}[SKIP] {asset} {duration}m consistency tf_votes "
@@ -10141,8 +10146,10 @@ class LiveTrader:
                     self.pending_redeem[cid] = (m_s, t_s)
                     print(f"{G}[SCAN-REDEEM] Queued: {title} {outcome} ~${val:.2f}{RS}")
             except Exception as e:
-                self._errors.tick("redeemable_scan", print, err=e, every=10)
-                print(f"{Y}[SCAN-REDEEM] Error: {e}{RS}")
+                _es = str(e).lower()
+                if "429" not in _es and "backoff active" not in _es:
+                    self._errors.tick("redeemable_scan", print, err=e, every=10)
+                    print(f"{Y}[SCAN-REDEEM] Error: {e}{RS}")
             await asyncio.sleep(REDEEMABLE_SCAN_SEC)
 
     async def _force_redeem_backfill_loop(self):
