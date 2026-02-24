@@ -314,6 +314,10 @@ PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false
 LOSS_STREAK_PAUSE_ENABLED = os.environ.get("LOSS_STREAK_PAUSE_ENABLED", "false").lower() == "true"
 LOSS_STREAK_PAUSE_N = int(os.environ.get("LOSS_STREAK_PAUSE_N", "3"))     # tightened 4→3
 LOSS_STREAK_PAUSE_SEC = float(os.environ.get("LOSS_STREAK_PAUSE_SEC", "1800"))  # 900→1800s
+MACRO_BLACKOUT_ENABLED    = os.environ.get("MACRO_BLACKOUT_ENABLED", "true").lower() == "true"
+MACRO_BLACKOUT_FILE       = os.environ.get("MACRO_BLACKOUT_FILE", "/data/macro_events.json")
+MACRO_BLACKOUT_MINS_BEFORE = float(os.environ.get("MACRO_BLACKOUT_MINS_BEFORE", "5"))   # skip 5 min before event
+MACRO_BLACKOUT_MINS_AFTER  = float(os.environ.get("MACRO_BLACKOUT_MINS_AFTER",  "10"))  # skip 10 min after event
 RUNTIME_JSON_LOG_ENABLED = os.environ.get("RUNTIME_JSON_LOG_ENABLED", "true").lower() == "true"
 RUNTIME_JSON_LOG_ROTATE_DAILY = os.environ.get("RUNTIME_JSON_LOG_ROTATE_DAILY", "true").lower() == "true"
 
@@ -404,8 +408,9 @@ COPYFLOW_INTEL_REFRESH_SEC = int(os.environ.get("COPYFLOW_INTEL_REFRESH_SEC", "6
 COPYFLOW_INTEL_TRADES_PER_MARKET = int(os.environ.get("COPYFLOW_INTEL_TRADES_PER_MARKET", "120"))
 COPYFLOW_INTEL_MAX_WALLETS = int(os.environ.get("COPYFLOW_INTEL_MAX_WALLETS", "40"))
 COPYFLOW_INTEL_ACTIVITY_LIMIT = int(os.environ.get("COPYFLOW_INTEL_ACTIVITY_LIMIT", "250"))
-COPYFLOW_INTEL_MIN_SETTLED = int(os.environ.get("COPYFLOW_INTEL_MIN_SETTLED", "12"))
-COPYFLOW_INTEL_MIN_ROI = float(os.environ.get("COPYFLOW_INTEL_MIN_ROI", "0.02"))
+COPYFLOW_INTEL_MIN_SETTLED = int(os.environ.get("COPYFLOW_INTEL_MIN_SETTLED", "25"))    # was 12 — need real sample
+COPYFLOW_INTEL_MIN_ROI     = float(os.environ.get("COPYFLOW_INTEL_MIN_ROI", "0.10"))    # was 0.02 — require 10% ROI
+COPYFLOW_INTEL_MIN_WR      = float(os.environ.get("COPYFLOW_INTEL_MIN_WR", "0.52"))     # require >50% win rate
 COPYFLOW_INTEL_WINDOW_SEC = int(os.environ.get("COPYFLOW_INTEL_WINDOW_SEC", "86400"))
 COPYFLOW_INTEL_SETTLE_LAG_SEC = int(os.environ.get("COPYFLOW_INTEL_SETTLE_LAG_SEC", "1200"))
 COPYFLOW_INTEL_MIN_SETTLED_FAMILY_24H = int(os.environ.get("COPYFLOW_INTEL_MIN_SETTLED_FAMILY_24H", "6"))
@@ -2129,7 +2134,7 @@ class LiveTrader:
                     if isinstance(rows, Exception) or not isinstance(rows, list):
                         continue
                     settled, wins, wr, roi = self._score_wallet_activity_24h(rows, now_ts)
-                    if settled < COPYFLOW_INTEL_MIN_SETTLED or roi < COPYFLOW_INTEL_MIN_ROI:
+                    if settled < COPYFLOW_INTEL_MIN_SETTLED or roi < COPYFLOW_INTEL_MIN_ROI or wr < COPYFLOW_INTEL_MIN_WR:
                         continue
                     sample_n = min(1.0, math.log1p(settled) / math.log1p(80))
                     wr_n = max(0.0, min(1.0, (wr - 0.50) / 0.30))
@@ -5218,6 +5223,7 @@ class LiveTrader:
         base_min_ev_req = float(min_ev_base)
         base_min_payout_req = float(MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT)
         model_cap = true_prob / max(1.0 + FEE_RATE_EST + max(0.003, min_ev_base), 1e-9)
+        model_cap = min(model_cap, MAX_ENTRY_PRICE + MAX_ENTRY_TOL)  # never override hard entry cap
         if score >= 9:
             max_entry_allowed = max(max_entry_allowed, min(0.85, model_cap))
         # Adaptive protection against poor payout fills from realized outcomes.
@@ -8570,6 +8576,26 @@ class LiveTrader:
             return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "size_mult": 1.0, "n": 0, "exp": 0.0, "wr_lb": 0.5, "pf": 1.0, "band": "na"}
 
     @staticmethod
+    def _macro_blackout_active(self) -> str:
+        """Return event name if current time is within macro blackout window, else empty string."""
+        if not MACRO_BLACKOUT_ENABLED:
+            return ""
+        import time as _t
+        try:
+            with open(MACRO_BLACKOUT_FILE, "r") as f:
+                events = json.load(f)
+        except Exception:
+            return ""
+        now = _t.time()
+        before_s = MACRO_BLACKOUT_MINS_BEFORE * 60
+        after_s  = MACRO_BLACKOUT_MINS_AFTER  * 60
+        for ev in events:
+            ev_ts = float(ev.get("ts", 0))
+            if (now >= ev_ts - before_s) and (now <= ev_ts + after_s):
+                return str(ev.get("name", "MACRO"))
+        return ""
+
+    @staticmethod
     def _wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
         """Conservative confidence lower-bound for Bernoulli win-rate."""
         if n <= 0:
@@ -8727,7 +8753,7 @@ class LiveTrader:
         """Calibrate model confidence to realized PnL quality (anti-overconfidence)."""
         snap = self._growth_snapshot()
         if snap["outcomes"] < 8:
-            return 0.75
+            return 0.70
         shrink = 0.82
         if snap["pf"] < 1.0:
             shrink -= min(0.25, (1.0 - snap["pf"]) * 0.50)
@@ -8739,7 +8765,14 @@ class LiveTrader:
             shrink += 0.05
         if self.consec_losses >= 2:
             shrink -= min(0.15, 0.04 * self.consec_losses)
-        return max(0.40, min(0.92, shrink))
+        # Anchor to realized win rate: if recent WR is below 50%, model is overconfident
+        if snap["recent_n"] >= 10:
+            rwr = snap["recent_wr_lb"]  # Wilson lower bound on last 20 trades
+            if rwr < 0.50:
+                shrink -= min(0.20, (0.50 - rwr) * 2.5)
+            elif rwr > 0.55:
+                shrink += min(0.05, (rwr - 0.55) * 0.50)
+        return max(0.35, min(0.92, shrink))
 
     def _signal_growth_score(self, sig: dict) -> float:
         """Rank candidates by growth quality (higher is better)."""
@@ -9522,9 +9555,15 @@ class LiveTrader:
                             self._last_round_pick = picks
                             self._last_round_pick_ts = now_log
                             print(f"{B}[ROUND-PICK]{RS} {picks}")
+                blackout_ev = self._macro_blackout_active()
+                if blackout_ev:
+                    if self._should_log("macro-blackout", 120):
+                        print(f"{Y}[MACRO-BLACKOUT]{RS} skipping trades — {blackout_ev} event window active")
                 for sig in selected:
                     if len(to_exec) >= slots:
                         break
+                    if blackout_ev:
+                        continue
                     if not self._exposure_ok(sig, shadow_pending):
                         continue
                     if not TRADE_ALL_MARKETS:
