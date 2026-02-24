@@ -633,13 +633,14 @@ ANALYSIS_VWAP_SCALE = float(os.environ.get("ANALYSIS_VWAP_SCALE", "0.0024"))
 ANALYSIS_LEADER_BASE = float(os.environ.get("ANALYSIS_LEADER_BASE", "0.5"))
 ANALYSIS_LEADER_OFFSET = float(os.environ.get("ANALYSIS_LEADER_OFFSET", "0.12"))
 ANALYSIS_LEADER_SCALE = float(os.environ.get("ANALYSIS_LEADER_SCALE", "0.34"))
-ANALYSIS_CONV_W_OB = float(os.environ.get("ANALYSIS_CONV_W_OB", "0.18"))
-ANALYSIS_CONV_W_TK = float(os.environ.get("ANALYSIS_CONV_W_TK", "0.18"))
-ANALYSIS_CONV_W_TF = float(os.environ.get("ANALYSIS_CONV_W_TF", "0.18"))
-ANALYSIS_CONV_W_BASIS = float(os.environ.get("ANALYSIS_CONV_W_BASIS", "0.12"))
-ANALYSIS_CONV_W_VWAP = float(os.environ.get("ANALYSIS_CONV_W_VWAP", "0.12"))
-ANALYSIS_CONV_W_CL = float(os.environ.get("ANALYSIS_CONV_W_CL", "0.12"))
+ANALYSIS_CONV_W_OB     = float(os.environ.get("ANALYSIS_CONV_W_OB",     "0.16"))
+ANALYSIS_CONV_W_TK     = float(os.environ.get("ANALYSIS_CONV_W_TK",     "0.16"))
+ANALYSIS_CONV_W_TF     = float(os.environ.get("ANALYSIS_CONV_W_TF",     "0.16"))
+ANALYSIS_CONV_W_BASIS  = float(os.environ.get("ANALYSIS_CONV_W_BASIS",  "0.10"))
+ANALYSIS_CONV_W_VWAP   = float(os.environ.get("ANALYSIS_CONV_W_VWAP",   "0.10"))
+ANALYSIS_CONV_W_CL     = float(os.environ.get("ANALYSIS_CONV_W_CL",     "0.10"))
 ANALYSIS_CONV_W_LEADER = float(os.environ.get("ANALYSIS_CONV_W_LEADER", "0.10"))
+ANALYSIS_CONV_W_BINARY = float(os.environ.get("ANALYSIS_CONV_W_BINARY", "0.12"))
 ANALYSIS_FLOOR_GOODDATA_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_GOODDATA_QUAL_DELTA", "0.03"))
 ANALYSIS_FLOOR_NOLEADER_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_NOLEADER_QUAL_DELTA", "0.02"))
 ANALYSIS_FLOOR_LATE_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_LATE_QUAL_DELTA", "0.02"))
@@ -3113,16 +3114,6 @@ class LiveTrader:
             # NOT the bot's trade entry price — market determines outcome from its own start
             open_p     = float(self.open_prices.get(cid, 0.0) or 0.0)
             src        = self.open_prices_source.get(cid, "?")
-            if open_p <= 0:
-                trade_open = float(
-                    (t or {}).get("open_price", 0.0)
-                    or meta_cid.get("open_price", 0.0)
-                    or (m or {}).get("open_price", 0.0)
-                    or 0.0
-                )
-                if trade_open > 0:
-                    open_p = trade_open
-                    src = "TRADE"
             # If no open price yet, try Polymarket API inline (best effort)
             if open_p <= 0:
                 start_ts_m = m.get("start_ts", 0)
@@ -4978,14 +4969,26 @@ class LiveTrader:
         leader_c = ANALYSIS_LEADER_BASE
         if leader_fresh:
             leader_c = max(0.0, min(1.0, ((copy_net) + ANALYSIS_LEADER_OFFSET) / ANALYSIS_LEADER_SCALE))
+        # Binary-option time-lock signal: N(d2) from Black-Scholes, probability
+        # that current price ends on our side at window close. Always computable
+        # from (current vs open_price, time remaining, realized vol). Strong
+        # near end of window when price has clearly moved; neutral (0.5) in flat markets.
+        _sigma_ann = self.vols.get(asset, 0.70)
+        _T_years   = max(mins_left / 525600.0, 1e-9)   # 365*24*60 = 525600 min/year
+        if open_price and open_price > 0 and current > 0 and _sigma_ann > 0:
+            _d2  = (math.log(current / open_price) - 0.5 * _sigma_ann ** 2 * _T_years) / (_sigma_ann * math.sqrt(_T_years))
+            bin_c = float(norm.cdf(_d2 if side_up else -_d2))
+        else:
+            bin_c = 0.5
         analysis_conviction = (
-            ANALYSIS_CONV_W_OB * ob_c
-            + ANALYSIS_CONV_W_TK * tk_c
-            + ANALYSIS_CONV_W_TF * tf_c
-            + ANALYSIS_CONV_W_BASIS * basis_c
-            + ANALYSIS_CONV_W_VWAP * vwap_c
-            + ANALYSIS_CONV_W_CL * cl_c
+            ANALYSIS_CONV_W_OB     * ob_c
+            + ANALYSIS_CONV_W_TK     * tk_c
+            + ANALYSIS_CONV_W_TF     * tf_c
+            + ANALYSIS_CONV_W_BASIS  * basis_c
+            + ANALYSIS_CONV_W_VWAP   * vwap_c
+            + ANALYSIS_CONV_W_CL     * cl_c
             + ANALYSIS_CONV_W_LEADER * leader_c
+            + ANALYSIS_CONV_W_BINARY * bin_c
         )
 
         quality_floor = float(MIN_ANALYSIS_QUALITY)
@@ -6029,6 +6032,7 @@ class LiveTrader:
             "min_ev_req": min_ev_req,
             "analysis_quality": analysis_quality,
             "analysis_conviction": analysis_conviction,
+            "bin_c": bin_c,
             "analysis_prob_scale": quality_scale,
             "signal_tier": signal_tier,
             "signal_source": signal_source,
@@ -8575,7 +8579,6 @@ class LiveTrader:
         except Exception:
             return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "size_mult": 1.0, "n": 0, "exp": 0.0, "wr_lb": 0.5, "pf": 1.0, "band": "na"}
 
-    @staticmethod
     def _macro_blackout_active(self) -> str:
         """Return event name if current time is within macro blackout window, else empty string."""
         if not MACRO_BLACKOUT_ENABLED:
