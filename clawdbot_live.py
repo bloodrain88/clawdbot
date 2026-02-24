@@ -5283,6 +5283,17 @@ class LiveTrader:
             and ((side == "Up" and current >= open_price) or (side == "Down" and current < open_price))
         ):
             min_payout_req = min(min_payout_req, LATE_PAYOUT_RELAX_FLOOR)
+        # Trend-confirmed payout relax: when Chainlink + binary model both confirm direction,
+        # cap min_payout_req at 1.72x throughout the window (not just last 45%).
+        # Prevents paralysis in trending markets where trend-side tokens cost 55-58¢.
+        # Break-even at 1.72x = entry ≤ 58¢ (vs 1.85x base = ≤54¢).
+        if (
+            duration >= CORE_DURATION_MIN
+            and cl_agree
+            and bin_c >= 0.54
+            and move_pct >= LATE_PAYOUT_RELAX_MIN_MOVE
+        ):
+            min_payout_req = min(min_payout_req, 1.72)
         min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
         if (ws_fresh or rest_fresh) and cl_fresh and vol_fresh and mins_left >= (FRESH_RELAX_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else FRESH_RELAX_MIN_LEFT_5M):
             max_entry_allowed = min(FRESH_RELAX_ENTRY_CAP, max_entry_allowed + FRESH_RELAX_ENTRY_ADD)
