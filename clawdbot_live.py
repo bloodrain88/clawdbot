@@ -201,6 +201,7 @@ MIN_TRUE_PROB_GATE_15M = float(os.environ.get("MIN_TRUE_PROB_GATE_15M", "0.60"))
 MIN_TRUE_PROB_GATE_5M  = float(os.environ.get("MIN_TRUE_PROB_GATE_5M",  "0.62"))
 ROLLING3_WIN_SCORE_PEN = int(os.environ.get("ROLLING3_WIN_SCORE_PEN", "2"))      # extra score needed when 0-1 wins in last 3
 MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
+SKIP_DOWN_BETS  = os.environ.get("SKIP_DOWN_BETS", "true").lower() == "true"   # Down WR=47.5% vs Up WR=92.3%
 MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.015"))
 MIN_ENTRY_PRICE_15M = float(os.environ.get("MIN_ENTRY_PRICE_15M", "0.20"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.35"))
@@ -9525,6 +9526,8 @@ class LiveTrader:
                 for sig in selected:
                     if len(to_exec) >= slots:
                         break
+                    if SKIP_DOWN_BETS and sig["side"] == "Down":
+                        continue
                     if not self._exposure_ok(sig, shadow_pending):
                         continue
                     if not TRADE_ALL_MARKETS:
