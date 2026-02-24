@@ -3369,7 +3369,9 @@ class LiveTrader:
         elif self._should_log("live-rk-empty", 15):
             print(f"  {Y}[LIVE-RK]{RS} none | trades=0 | no active on-chain positions")
             now_fix = _time.time()
-            if int(self.onchain_open_count or 0) > 0 and (now_fix - float(self._live_rk_repair_ts or 0.0)) >= 20.0:
+            # Only trigger mismatch for CIDs not already handled in pending_redeem / redeemed
+            _unaccounted = set(self.onchain_open_cids) - set(self.pending_redeem.keys()) - self.redeemed_cids
+            if _unaccounted and (now_fix - float(self._live_rk_repair_ts or 0.0)) >= 20.0:
                 self._live_rk_repair_ts = now_fix
                 print(
                     f"{Y}[LIVE-RK-MISMATCH]{RS} onchain_open={self.onchain_open_count} "
@@ -9643,8 +9645,12 @@ class LiveTrader:
                         continue
                     title = str(p.get("title", "") or "")
                     redeemable = bool(p.get("redeemable", False))
-                    if (not redeemable) and self._is_historical_expired_position(p, now_ts) and val < OPEN_PRESENCE_MIN:
-                        continue
+                    # Filter expired worthless positions: losing tokens have size_tok>0 but val≈0
+                    # and are never marked redeemable by Polymarket — use 90s grace (not 1200s)
+                    # to stop them counting as "open" for 20 minutes after round end.
+                    if (not redeemable) and val < OPEN_PRESENCE_MIN:
+                        if self._is_historical_expired_position(p, now_ts, grace_sec=90.0):
+                            continue
                     if redeemable:
                         # Ignore dust/zero redeemables to avoid huge stale settling queues.
                         if val < 0.01:
