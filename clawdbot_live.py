@@ -195,8 +195,11 @@ LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
-MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "8"))
-MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "7"))
+MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "10"))   # raised 8→10
+MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "9"))  # raised 7→9
+MIN_TRUE_PROB_GATE_15M = float(os.environ.get("MIN_TRUE_PROB_GATE_15M", "0.60"))  # 2/3-rule prob floor
+MIN_TRUE_PROB_GATE_5M  = float(os.environ.get("MIN_TRUE_PROB_GATE_5M",  "0.62"))
+ROLLING3_WIN_SCORE_PEN = int(os.environ.get("ROLLING3_WIN_SCORE_PEN", "2"))      # extra score needed when 0-1 wins in last 3
 MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
 MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.015"))
 MIN_ENTRY_PRICE_15M = float(os.environ.get("MIN_ENTRY_PRICE_15M", "0.20"))
@@ -303,8 +306,8 @@ PNL_BASELINE_FILE = os.path.join(_DATA_DIR, "clawdbot_pnl_baseline.json")
 SETTLED_FILE   = os.path.join(_DATA_DIR, "clawdbot_settled_cids.json")
 PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false").lower() == "true"
 LOSS_STREAK_PAUSE_ENABLED = os.environ.get("LOSS_STREAK_PAUSE_ENABLED", "true").lower() == "true"
-LOSS_STREAK_PAUSE_N = int(os.environ.get("LOSS_STREAK_PAUSE_N", "4"))
-LOSS_STREAK_PAUSE_SEC = float(os.environ.get("LOSS_STREAK_PAUSE_SEC", "900"))
+LOSS_STREAK_PAUSE_N = int(os.environ.get("LOSS_STREAK_PAUSE_N", "3"))     # tightened 4→3
+LOSS_STREAK_PAUSE_SEC = float(os.environ.get("LOSS_STREAK_PAUSE_SEC", "1800"))  # 900→1800s
 RUNTIME_JSON_LOG_ENABLED = os.environ.get("RUNTIME_JSON_LOG_ENABLED", "true").lower() == "true"
 RUNTIME_JSON_LOG_ROTATE_DAILY = os.environ.get("RUNTIME_JSON_LOG_ROTATE_DAILY", "true").lower() == "true"
 
@@ -425,7 +428,7 @@ REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() 
 STRICT_REQUIRE_FRESH_LEADER = os.environ.get("STRICT_REQUIRE_FRESH_LEADER", "false").lower() == "true"
 STRICT_REQUIRE_FRESH_BOOK_WS = os.environ.get("STRICT_REQUIRE_FRESH_BOOK_WS", "true").lower() == "true"
 MIN_ANALYSIS_QUALITY = float(os.environ.get("MIN_ANALYSIS_QUALITY", "0.53"))
-MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.45"))
+MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.52"))  # raised 0.45→0.52
 WS_BOOK_SOFT_MAX_AGE_MS = float(os.environ.get("WS_BOOK_SOFT_MAX_AGE_MS", "20000"))
 ANALYSIS_PROB_SCALE_MIN = float(os.environ.get("ANALYSIS_PROB_SCALE_MIN", "0.65"))
 ANALYSIS_PROB_SCALE_MAX = float(os.environ.get("ANALYSIS_PROB_SCALE_MAX", "1.20"))
@@ -5046,12 +5049,22 @@ class LiveTrader:
             if edge < WINMODE_MIN_EDGE:
                 return None
 
+        # ── Minimum true_prob gate (2/3-rule: need ≥60% confidence) ─────────
+        min_tp = MIN_TRUE_PROB_GATE_5M if duration <= 5 else MIN_TRUE_PROB_GATE_15M
+        if true_prob < min_tp:
+            self._skip_tick("prob_below_gate")
+            return None
+
         # ── Score gate (duration-aware) ─────────────────────────────────────
         min_score_local = MIN_SCORE_GATE
         if duration <= 5:
             min_score_local = max(min_score_local, MIN_SCORE_GATE_5M)
         else:
             min_score_local = max(min_score_local, MIN_SCORE_GATE_15M)
+        # Rolling 3-trade gate: if last 3 trades had <2 wins, require higher score
+        _r3 = list(self.recent_trades)[-3:]
+        if len(_r3) >= 3 and sum(_r3) < 2:
+            min_score_local += ROLLING3_WIN_SCORE_PEN
         if arm_active:
             min_score_local = max(0, min_score_local - 2)
         # Cross-asset 3/4 consensus override: all other assets confirm same direction.
