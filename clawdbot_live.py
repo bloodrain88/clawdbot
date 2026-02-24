@@ -9453,6 +9453,10 @@ class LiveTrader:
             await asyncio.sleep(max(0.8, ONCHAIN_SYNC_SEC))
             if DRY_RUN or self.w3 is None:
                 continue
+            # Skip API calls if data-api is in 429 backoff — don't compound rate limits
+            _data_api_backoff = self._http_429_backoff.get("data-api.polymarket.com", 0.0)
+            if _data_api_backoff > _time.time():
+                continue
             tick += 1
             try:
                 loop = asyncio.get_running_loop()
@@ -9905,8 +9909,12 @@ class LiveTrader:
                     await self._sync_stats_from_api()
 
             except Exception as e:
-                self._errors.tick("refresh_balance", print, err=e, every=10)
-                print(f"{Y}[BANK] refresh error: {e}{RS}")
+                _es = str(e).lower()
+                if "429" in _es or "backoff active" in _es:
+                    pass  # 429 backoff is expected when other loops hit rate limit — not an error
+                else:
+                    self._errors.tick("refresh_balance", print, err=e, every=10)
+                    print(f"{Y}[BANK] refresh error: {e}{RS}")
 
     async def _sync_stats_from_api(self):
         """Sync win/loss stats from Polymarket activity API (on-chain truth).
