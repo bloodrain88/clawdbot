@@ -5167,25 +5167,6 @@ class LiveTrader:
                 return 0.0
 
         fair_side_entry = up_price if side == "Up" else (1.0 - up_price)
-        cur_ask = _best_ask_from(pm_book_data)
-        if fair_side_entry > 0 and cur_ask > 0 and abs(cur_ask - fair_side_entry) > FAIR_SIDE_MISMATCH_SWAP:
-            alt_token_id = m["token_down"] if side == "Up" else m["token_up"]
-            alt_book = self._get_clob_ws_book(alt_token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
-            if alt_book is None:
-                alt_book = await self._fetch_pm_book_safe(alt_token_id)
-            alt_ask = _best_ask_from(alt_book)
-            if alt_ask > 0:
-                cur_err = abs(cur_ask - fair_side_entry)
-                alt_fair = 1.0 - fair_side_entry  # alt token's fair price is complement
-                alt_err = abs(alt_ask - alt_fair)
-                if (alt_err + FAIR_SIDE_SWAP_ERR_MARGIN) < cur_err:
-                    if self._noisy_log_enabled(f"token-swap:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
-                        print(
-                            f"{Y}[TOKEN-SWAP]{RS} {asset} {duration}m {side} "
-                            f"ask(cur={cur_ask:.3f},alt={alt_ask:.3f},fair={fair_side_entry:.3f})"
-                        )
-                    token_id = alt_token_id
-                    pm_book_data = alt_book
 
         # ── Live CLOB price (more accurate than Gamma up_price) ──────────────
         live_entry = entry
