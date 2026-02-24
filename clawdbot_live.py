@@ -214,9 +214,10 @@ LATE_PAYOUT_RELAX_FLOOR     = float(os.environ.get("LATE_PAYOUT_RELAX_FLOOR", "1
 LATE_PAYOUT_PROB_BOOST      = float(os.environ.get("LATE_PAYOUT_PROB_BOOST", "0.04"))       # true_prob boost for locked-direction entries
 # Must-fire: guarantee at least 1 trade per 15m window in last N minutes by relaxing score gate
 LATE_MUST_FIRE_ENABLED     = os.environ.get("LATE_MUST_FIRE_ENABLED", "true").lower() == "true"
-LATE_MUST_FIRE_MINS_LEFT   = float(os.environ.get("LATE_MUST_FIRE_MINS_LEFT", "5.0"))    # relax in last 5 min
-LATE_MUST_FIRE_SCORE_RELAX = int(os.environ.get("LATE_MUST_FIRE_SCORE_RELAX", "2"))      # lower gate by 2 pts
-LATE_MUST_FIRE_MIN_SCORE   = int(os.environ.get("LATE_MUST_FIRE_MIN_SCORE", "6"))        # absolute floor after relax
+LATE_MUST_FIRE_MINS_LEFT   = float(os.environ.get("LATE_MUST_FIRE_MINS_LEFT", "7.0"))    # relax in last 7 min
+LATE_MUST_FIRE_SCORE_RELAX = int(os.environ.get("LATE_MUST_FIRE_SCORE_RELAX", "3"))      # lower gate by 3 pts
+LATE_MUST_FIRE_MIN_SCORE   = int(os.environ.get("LATE_MUST_FIRE_MIN_SCORE", "5"))        # absolute floor after relax
+LATE_MUST_FIRE_PROB_RELAX  = float(os.environ.get("LATE_MUST_FIRE_PROB_RELAX", "0.05")) # relax true_prob gate by this
 MIN_EV_NET = float(os.environ.get("MIN_EV_NET", "0.019"))
 FEE_RATE_EST = float(os.environ.get("FEE_RATE_EST", "0.0156"))
 HC15_ENABLED = os.environ.get("HC15_ENABLED", "false").lower() == "true"
@@ -5097,6 +5098,8 @@ class LiveTrader:
 
         # ── Minimum true_prob gate (2/3-rule: need ≥60% confidence) ─────────
         min_tp = MIN_TRUE_PROB_GATE_5M if duration <= 5 else MIN_TRUE_PROB_GATE_15M
+        if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
+            min_tp = max(0.50, min_tp - LATE_MUST_FIRE_PROB_RELAX)   # 0.60 → 0.55 in must-fire window
         _payout_mult_local = 1.0 / max(entry, 1e-9)
         _highpayout_bypass = (   # 10x+ entries get a lower prob floor — still profitable at 45% win rate
             _payout_mult_local >= HIGHPAYOUT_MIN_PAYOUT
