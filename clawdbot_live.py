@@ -805,6 +805,18 @@ FUNDING_POS_STRONG = float(os.environ.get("FUNDING_POS_STRONG", "0.0005"))
 FUNDING_NEG_CONFIRM = float(os.environ.get("FUNDING_NEG_CONFIRM", "-0.0002"))
 FUNDING_POS_EXTREME = float(os.environ.get("FUNDING_POS_EXTREME", "0.0010"))
 FUNDING_NEG_STRONG = float(os.environ.get("FUNDING_NEG_STRONG", "-0.0005"))
+# Liquidation signal (free Binance futures WS — !forceOrder@arr)
+LIQ_WINDOW_SEC    = float(os.environ.get("LIQ_WINDOW_SEC",  "60"))
+LIQ_SCORE_USD_1   = float(os.environ.get("LIQ_SCORE_USD_1", "500000"))    # $500K opp-side liq = +1
+LIQ_SCORE_USD_2   = float(os.environ.get("LIQ_SCORE_USD_2", "2000000"))   # $2M  opp-side liq = +2
+# Open Interest delta (free Binance REST — fapi/v1/openInterest)
+OI_ENABLED        = os.environ.get("OI_ENABLED", "true").lower() == "true"
+OI_POLL_SEC       = float(os.environ.get("OI_POLL_SEC", "30"))
+OI_DELTA_UP       = float(os.environ.get("OI_DELTA_UP",  "0.003"))   # +0.3% OI confirms direction
+OI_DELTA_DN       = float(os.environ.get("OI_DELTA_DN", "-0.003"))   # −0.3% OI confirms direction
+# Long/Short ratio (free Binance REST — futures/data/globalLongShortAccountRatio)
+LS_LONG_EXT       = float(os.environ.get("LS_LONG_EXT",  "0.60"))    # >60% longs = crowded → contrarian Down signal
+LS_SHORT_EXT      = float(os.environ.get("LS_SHORT_EXT", "0.40"))    # <40% longs = crowded → contrarian Up signal
 VWAP_SCORE_T2 = float(os.environ.get("VWAP_SCORE_T2", "0.0015"))
 VWAP_SCORE_T1 = float(os.environ.get("VWAP_SCORE_T1", "0.0008"))
 DISP_SIGMA_STRONG = float(os.environ.get("DISP_SIGMA_STRONG", "1.0"))
@@ -1165,6 +1177,10 @@ class LiveTrader:
         self._booster_used_by_cid = {}            # cid -> count of executed booster add-ons
         self._booster_consec_losses = 0
         self._booster_lock_until = 0.0
+        # Free Binance gap-closer: liquidations / OI / long-short ratio
+        self._liq_buf  = {a: deque(maxlen=200) for a in ["BTC","ETH","SOL","XRP"]}
+        self._oi       = {a: {"cur": 0.0, "prev": 0.0, "ts": 0.0} for a in ["BTC","ETH","SOL","XRP"]}
+        self._ls_ratio = {"BTC": 1.0, "ETH": 1.0, "SOL": 1.0, "XRP": 1.0}
         self._last_superbet_ts = 0.0
         self._redeem_tx_lock    = asyncio.Lock()  # serialize redeem txs to avoid nonce clashes
         self._nonce_mgr         = None
@@ -4319,6 +4335,23 @@ class LiveTrader:
         elif (is_up     and funding_rate <  FUNDING_NEG_CONFIRM): score += 1
         elif (is_up     and funding_rate >  FUNDING_POS_EXTREME): score -= 1
         elif (not is_up and funding_rate <  FUNDING_NEG_STRONG): score -= 1
+
+        # Liquidation signal: opposing-side liq confirms direction (0 to +2 pts)
+        score += self._liq_signal(asset, direction)
+
+        # Open Interest delta: growing OI confirms momentum (−1 to +1 pt)
+        oi_data = self._oi.get(asset, {})
+        if oi_data.get("prev", 0) > 0 and oi_data.get("cur", 0) > 0:
+            oi_delta = (oi_data["cur"] - oi_data["prev"]) / oi_data["prev"]
+            if   (is_up     and oi_delta >  OI_DELTA_UP):  score += 1
+            elif (not is_up and oi_delta <  OI_DELTA_DN):  score += 1
+            elif (is_up     and oi_delta <  OI_DELTA_DN):  score -= 1
+            elif (not is_up and oi_delta >  OI_DELTA_UP):  score -= 1
+
+        # L/S ratio: extreme crowding = contrarian (0 to −1 pt)
+        ls_long = self._ls_ratio.get(asset, 1.0)
+        if   (is_up     and ls_long > LS_LONG_EXT):  score -= 1   # too crowded long → risky Up
+        elif (not is_up and ls_long < LS_SHORT_EXT): score -= 1   # too crowded short → risky Down
 
         # VWAP: momentum signal (−2 to +2 pts)
         # Price ABOVE window VWAP in our direction = momentum confirms = good
@@ -8036,6 +8069,91 @@ class LiveTrader:
         total = buy_q + sell_q
         return round(buy_q / total, 4) if total > 0 else 0.5
 
+    # ── Free Binance gap-closer streams ──────────────────────────────────────
+
+    async def _stream_binance_liquidations(self):
+        """Subscribe to all-market forced-liquidation stream (free, no auth).
+        Opposing-side liquidations confirm our direction signal."""
+        import time as _t, json as _json
+        url  = "wss://fstream.binance.com/ws/!forceOrder@arr"
+        SYMS = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL", "XRPUSDT": "XRP"}
+        delay = 5
+        while True:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                    delay = 5
+                    async for raw in ws:
+                        data  = _json.loads(raw)
+                        order = data.get("o", {})
+                        sym   = order.get("s", "")
+                        asset = SYMS.get(sym)
+                        if asset is None:
+                            continue
+                        side  = order.get("S", "")   # "BUY"=liquidated long, "SELL"=liquidated short
+                        qty   = float(order.get("q", 0) or 0)
+                        price = float(order.get("p", 0) or 0)
+                        usd   = qty * price
+                        self._liq_buf[asset].append((_t.time(), side, usd))
+            except Exception as e:
+                print(f"{Y}[BNB-LIQ] {e} — reconnect in {delay}s{RS}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
+    def _liq_signal(self, asset: str, direction: str) -> int:
+        """Score from liquidation stream: opposing-side liquidations confirm our direction.
+        BUY-side liquidated = leveraged longs blown out = bearish pressure (Down confirms).
+        SELL-side liquidated = leveraged shorts blown out = bullish pressure (Up confirms).
+        Returns 0..+2."""
+        import time as _t
+        buf = self._liq_buf.get(asset)
+        if not buf:
+            return 0
+        cutoff = _t.time() - LIQ_WINDOW_SEC
+        is_up  = direction == "Up"
+        # Opposing-side liq = confirms our direction
+        opp_usd = sum(usd for ts, side, usd in buf
+                      if ts >= cutoff and ((is_up and side == "SELL") or (not is_up and side == "BUY")))
+        if   opp_usd >= LIQ_SCORE_USD_2: return 2
+        elif opp_usd >= LIQ_SCORE_USD_1: return 1
+        return 0
+
+    async def _oi_ls_loop(self):
+        """Poll Open Interest and global Long/Short ratio every OI_POLL_SEC (free Binance REST)."""
+        import aiohttp, time as _t
+        SYMS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
+        while True:
+            await asyncio.sleep(OI_POLL_SEC)
+            if not OI_ENABLED:
+                continue
+            async with aiohttp.ClientSession() as sess:
+                for asset, sym in SYMS.items():
+                    # Open Interest
+                    try:
+                        async with sess.get(
+                            f"https://fapi.binance.com/fapi/v1/openInterest?symbol={sym}",
+                            timeout=aiohttp.ClientTimeout(total=5)
+                        ) as r:
+                            d = await r.json()
+                            oi_now = float(d.get("openInterest", 0) or 0)
+                            if oi_now > 0:
+                                prev = self._oi[asset]["cur"]
+                                self._oi[asset] = {"cur": oi_now, "prev": prev, "ts": _t.time()}
+                    except Exception:
+                        pass
+                    # Global Long/Short ratio
+                    try:
+                        async with sess.get(
+                            f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+                            f"?symbol={sym}&period=5m&limit=1",
+                            timeout=aiohttp.ClientTimeout(total=5)
+                        ) as r:
+                            rows = await r.json()
+                            if rows and isinstance(rows, list):
+                                long_pct = float(rows[0].get("longAccount", 0.5) or 0.5)
+                                self._ls_ratio[asset] = long_pct
+                    except Exception:
+                        pass
+
     def _cross_asset_direction(self, asset: str, direction: str) -> int:
         """Count how many OTHER assets are trending in the same direction right now.
         Uses current Binance RTDS price vs each market's Chainlink open_price.
@@ -10450,6 +10568,8 @@ class LiveTrader:
             _guard("_rpc_optimizer_loop",   self._rpc_optimizer_loop),
             _guard("_redeemable_scan",      self._redeemable_scan),
             _guard("_position_sync_loop",   self._position_sync_loop),
+            _guard("_stream_binance_liquidations", self._stream_binance_liquidations),
+            _guard("_oi_ls_loop",           self._oi_ls_loop),
         )
 
 
