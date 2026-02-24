@@ -5026,6 +5026,13 @@ class LiveTrader:
                 conviction_floor += ANALYSIS_SIDE_BAD_CONV_DELTA
         quality_floor = max(ANALYSIS_QUAL_FLOOR_MIN, min(ANALYSIS_QUAL_FLOOR_MAX, quality_floor))
         conviction_floor = max(ANALYSIS_CONV_FLOOR_MIN, min(ANALYSIS_CONV_FLOOR_MAX, conviction_floor))
+        # Price-against-direction guard: if both CL price and binary signal oppose our side,
+        # require substantially stronger other signals to trade.
+        # This prevents entering Up when ETH is already below the beat (and vice-versa).
+        if not cl_agree:
+            conviction_floor = min(ANALYSIS_CONV_FLOOR_MAX, conviction_floor + 0.06)
+        if not cl_agree and bin_c < 0.48:
+            conviction_floor = min(ANALYSIS_CONV_FLOOR_MAX, conviction_floor + 0.05)
         # Must-fire window: relax conviction and quality floors to guarantee at least one entry per round
         if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
             conviction_floor = max(0.40, conviction_floor - 0.06)
