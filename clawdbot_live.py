@@ -3885,6 +3885,7 @@ class LiveTrader:
             return
         import websockets as _ws
         delay = 2
+        _conn_start = 0.0
         while True:
             try:
                 async with _ws.connect(
@@ -3897,6 +3898,7 @@ class LiveTrader:
                     self._clob_market_ws = ws
                     self._clob_ws_assets_subscribed = set()
                     print(f"{G}[CLOB-WS] market connected{RS}")
+                    _conn_start = _time.time()
                     delay = 2
                     async def _app_heartbeat():
                         # Polymarket market WS expects app-level "PING" heartbeat every ~10s.
@@ -3960,9 +3962,12 @@ class LiveTrader:
                         hb_task.cancel()
             except Exception as e:
                 self._errors.tick("clob_market_ws", print, err=e, every=8)
+                # Only reset delay if connection lived >= 30s (server-restart loop keeps delay growing)
+                if _time.time() - _conn_start >= 30:
+                    delay = 2
                 print(f"{Y}[CLOB-WS] {e} — reconnect in {delay}s{RS}")
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, 20)
+                delay = min(delay * 2, 60)
             finally:
                 self._clob_market_ws = None
                 self._clob_ws_assets_subscribed = set()
