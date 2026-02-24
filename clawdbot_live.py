@@ -174,8 +174,8 @@ MIN_PARTIAL_TRACK_USDC = float(os.environ.get("MIN_PARTIAL_TRACK_USDC", "5.0"))
 OPEN_PRESENCE_MIN = float(os.environ.get("OPEN_PRESENCE_MIN", "0.01"))
 MAX_ABS_BET    = float(os.environ.get("MAX_ABS_BET", "14.0"))     # hard ceiling
 MAX_BANKROLL_PCT = float(os.environ.get("MAX_BANKROLL_PCT", "0.25"))
-MAX_OPEN       = int(os.environ.get("MAX_OPEN", "2"))
-MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "2"))
+MAX_OPEN       = int(os.environ.get("MAX_OPEN", "4"))
+MAX_SAME_DIR   = int(os.environ.get("MAX_SAME_DIR", "4"))
 MAX_CID_EXPOSURE_PCT = float(os.environ.get("MAX_CID_EXPOSURE_PCT", "0.10"))
 BLOCK_OPPOSITE_SIDE_SAME_CID = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_CID", "true").lower() == "true"
 BLOCK_OPPOSITE_SIDE_SAME_ROUND = os.environ.get("BLOCK_OPPOSITE_SIDE_SAME_ROUND", "true").lower() == "true"
@@ -193,7 +193,7 @@ LOW_ENTRY_SIZE_HAIRCUT_MULT = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_MULT"
 LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE = int(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE", "18"))
 LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB", "0.80"))
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
-ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "true").lower() == "true"
+ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "10"))   # raised 8→10
 MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "9"))  # raised 7→9
