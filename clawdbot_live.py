@@ -385,8 +385,8 @@ CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "2
 CLOB_MARKET_WS_SOFT_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_SOFT_AGE_MS", "6000"))
 CLOB_REST_FALLBACK_ENABLED = os.environ.get("CLOB_REST_FALLBACK_ENABLED", "true").lower() == "true"
 CLOB_REST_FRESH_MAX_AGE_MS = float(os.environ.get("CLOB_REST_FRESH_MAX_AGE_MS", "4000"))  # was 1500; REST scan cycle can be 2-3s
-CLOB_WS_STALE_HEAL_HITS = int(os.environ.get("CLOB_WS_STALE_HEAL_HITS", "3"))
-CLOB_WS_STALE_HEAL_COOLDOWN_SEC = float(os.environ.get("CLOB_WS_STALE_HEAL_COOLDOWN_SEC", "20"))
+CLOB_WS_STALE_HEAL_HITS = int(os.environ.get("CLOB_WS_STALE_HEAL_HITS", "1"))         # was 3; detect in 0.5s not 1.5s
+CLOB_WS_STALE_HEAL_COOLDOWN_SEC = float(os.environ.get("CLOB_WS_STALE_HEAL_COOLDOWN_SEC", "10"))  # was 20
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
 COPYFLOW_RELOAD_SEC = int(os.environ.get("COPYFLOW_RELOAD_SEC", "20"))
 COPYFLOW_BONUS_MAX = int(os.environ.get("COPYFLOW_BONUS_MAX", "2"))
@@ -394,7 +394,7 @@ COPYFLOW_REFRESH_ENABLED = os.environ.get("COPYFLOW_REFRESH_ENABLED", "true").lo
 COPYFLOW_REFRESH_SEC = int(os.environ.get("COPYFLOW_REFRESH_SEC", "300"))
 COPYFLOW_MIN_ROI = float(os.environ.get("COPYFLOW_MIN_ROI", "-0.03"))
 COPYFLOW_LIVE_ENABLED = os.environ.get("COPYFLOW_LIVE_ENABLED", "true").lower() == "true"
-COPYFLOW_LIVE_REFRESH_SEC = int(os.environ.get("COPYFLOW_LIVE_REFRESH_SEC", "5"))
+COPYFLOW_LIVE_REFRESH_SEC = int(os.environ.get("COPYFLOW_LIVE_REFRESH_SEC", "2"))   # was 5
 COPYFLOW_LIVE_TRADES_LIMIT = int(os.environ.get("COPYFLOW_LIVE_TRADES_LIMIT", "80"))
 COPYFLOW_LIVE_MAX_MARKETS = int(os.environ.get("COPYFLOW_LIVE_MAX_MARKETS", "8"))
 COPYFLOW_LIVE_MAX_AGE_SEC = float(os.environ.get("COPYFLOW_LIVE_MAX_AGE_SEC", "180"))
@@ -404,7 +404,7 @@ COPYFLOW_CID_ONDEMAND_COOLDOWN_SEC = float(os.environ.get("COPYFLOW_CID_ONDEMAND
 COPYFLOW_HEALTH_FORCE_REFRESH_SEC = float(os.environ.get("COPYFLOW_HEALTH_FORCE_REFRESH_SEC", "12"))
 LOG_HEALTH_EVERY_SEC = int(os.environ.get("LOG_HEALTH_EVERY_SEC", "30"))
 COPYFLOW_INTEL_ENABLED = os.environ.get("COPYFLOW_INTEL_ENABLED", "true").lower() == "true"
-COPYFLOW_INTEL_REFRESH_SEC = int(os.environ.get("COPYFLOW_INTEL_REFRESH_SEC", "60"))
+COPYFLOW_INTEL_REFRESH_SEC = int(os.environ.get("COPYFLOW_INTEL_REFRESH_SEC", "30"))  # was 60
 COPYFLOW_INTEL_TRADES_PER_MARKET = int(os.environ.get("COPYFLOW_INTEL_TRADES_PER_MARKET", "120"))
 COPYFLOW_INTEL_MAX_WALLETS = int(os.environ.get("COPYFLOW_INTEL_MAX_WALLETS", "40"))
 COPYFLOW_INTEL_ACTIVITY_LIMIT = int(os.environ.get("COPYFLOW_INTEL_ACTIVITY_LIMIT", "250"))
@@ -474,12 +474,12 @@ LOW_ENTRY_SOFT_THRESHOLD = float(os.environ.get("LOW_ENTRY_SOFT_THRESHOLD", "0.3
 LOW_ENTRY_BASE_SOFT_MAX = float(os.environ.get("LOW_ENTRY_BASE_SOFT_MAX", "10.0"))
 LOW_ENTRY_HIGH_CONV_SOFT_MAX = float(os.environ.get("LOW_ENTRY_HIGH_CONV_SOFT_MAX", "30.0"))
 PREBID_ARM_ENABLED = os.environ.get("PREBID_ARM_ENABLED", "true").lower() == "true"
-PREBID_MIN_CONF = float(os.environ.get("PREBID_MIN_CONF", "0.58"))
+PREBID_MIN_CONF = float(os.environ.get("PREBID_MIN_CONF", "0.54"))   # was 0.58; allow more pre-bids
 PREBID_ARM_WINDOW_SEC = float(os.environ.get("PREBID_ARM_WINDOW_SEC", "30"))
 NEXT_MARKET_ANALYSIS_ENABLED = os.environ.get("NEXT_MARKET_ANALYSIS_ENABLED", "true").lower() == "true"
 NEXT_MARKET_ANALYSIS_WINDOW_SEC = float(os.environ.get("NEXT_MARKET_ANALYSIS_WINDOW_SEC", "180"))
 NEXT_MARKET_ANALYSIS_LOG_EVERY_SEC = float(os.environ.get("NEXT_MARKET_ANALYSIS_LOG_EVERY_SEC", "15"))
-NEXT_MARKET_ANALYSIS_MIN_CONF = float(os.environ.get("NEXT_MARKET_ANALYSIS_MIN_CONF", "0.56"))
+NEXT_MARKET_ANALYSIS_MIN_CONF = float(os.environ.get("NEXT_MARKET_ANALYSIS_MIN_CONF", "0.54"))  # was 0.56
 ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
 ORDER_FAST_MODE = os.environ.get("ORDER_FAST_MODE", "true").lower() == "true"
 MAKER_POLL_5M_SEC = float(os.environ.get("MAKER_POLL_5M_SEC", "0.15"))
