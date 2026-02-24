@@ -534,8 +534,13 @@ SUPER_BET_FLOOR_MIN_SCORE = int(os.environ.get("SUPER_BET_FLOOR_MIN_SCORE", "18"
 SUPER_BET_FLOOR_MIN_EV = float(os.environ.get("SUPER_BET_FLOOR_MIN_EV", "0.030"))
 SUPER_BET_COOLDOWN_SEC = float(os.environ.get("SUPER_BET_COOLDOWN_SEC", "420"))
 SUPER_BET_MAX_SIZE_ENABLED = os.environ.get("SUPER_BET_MAX_SIZE_ENABLED", "true").lower() == "true"
-SUPER_BET_MAX_SIZE_USDC = float(os.environ.get("SUPER_BET_MAX_SIZE_USDC", "10.0"))
-SUPER_BET_MAX_BANKROLL_PCT = float(os.environ.get("SUPER_BET_MAX_BANKROLL_PCT", "0.02"))
+SUPER_BET_MAX_SIZE_USDC = float(os.environ.get("SUPER_BET_MAX_SIZE_USDC", "12.0"))    # raised 10→12
+SUPER_BET_MAX_BANKROLL_PCT = float(os.environ.get("SUPER_BET_MAX_BANKROLL_PCT", "0.035"))  # 2%→3.5% (allows $7 on $200)
+# High-payout path: 10x+ entries (≤10¢) can bypass the 2/3-rule prob gate
+HIGHPAYOUT_MIN_PAYOUT = float(os.environ.get("HIGHPAYOUT_MIN_PAYOUT", "10.0"))  # ≥10x payout
+HIGHPAYOUT_MIN_SCORE  = int(os.environ.get("HIGHPAYOUT_MIN_SCORE",  "15"))      # strong signal required
+HIGHPAYOUT_MIN_PROB   = float(os.environ.get("HIGHPAYOUT_MIN_PROB",  "0.45"))   # model must say ≥45% (vs market's ≤10%)
+HIGHPAYOUT_MIN_EDGE   = float(os.environ.get("HIGHPAYOUT_MIN_EDGE",  "0.06"))   # ≥6% execution edge
 ROLLING_15M_CALIB_ENABLED = os.environ.get("ROLLING_15M_CALIB_ENABLED", "true").lower() == "true"
 ROLLING_15M_CALIB_MIN_N = int(os.environ.get("ROLLING_15M_CALIB_MIN_N", "20"))
 ROLLING_15M_CALIB_WINDOW = int(os.environ.get("ROLLING_15M_CALIB_WINDOW", "400"))
@@ -653,9 +658,9 @@ PROB_REBALANCE_MIN = float(os.environ.get("PROB_REBALANCE_MIN", "0.01"))
 PROB_REBALANCE_MAX = float(os.environ.get("PROB_REBALANCE_MAX", "0.99"))
 PREBID_SCORE_BONUS = int(os.environ.get("PREBID_SCORE_BONUS", "2"))
 PREBID_EDGE_MULT = float(os.environ.get("PREBID_EDGE_MULT", "0.05"))
-LOWCENT_NEW_MIN_SCORE = int(os.environ.get("LOWCENT_NEW_MIN_SCORE", "18"))
-LOWCENT_NEW_MIN_TRUE_PROB = float(os.environ.get("LOWCENT_NEW_MIN_TRUE_PROB", "0.74"))
-LOWCENT_NEW_MIN_EXEC_EV = float(os.environ.get("LOWCENT_NEW_MIN_EXEC_EV", "0.035"))
+LOWCENT_NEW_MIN_SCORE = int(os.environ.get("LOWCENT_NEW_MIN_SCORE", "15"))       # lowered 18→15
+LOWCENT_NEW_MIN_TRUE_PROB = float(os.environ.get("LOWCENT_NEW_MIN_TRUE_PROB", "0.60"))  # lowered 0.74→0.60
+LOWCENT_NEW_MIN_EXEC_EV = float(os.environ.get("LOWCENT_NEW_MIN_EXEC_EV", "0.05"))     # raised 0.035→0.05
 LOWCENT_NEW_MIN_PAYOUT = float(os.environ.get("LOWCENT_NEW_MIN_PAYOUT", "3.0"))
 ENTRY_TIER_SCORE_HIGH = int(os.environ.get("ENTRY_TIER_SCORE_HIGH", "12"))
 ENTRY_TIER_SCORE_MID = int(os.environ.get("ENTRY_TIER_SCORE_MID", "8"))
@@ -5051,7 +5056,14 @@ class LiveTrader:
 
         # ── Minimum true_prob gate (2/3-rule: need ≥60% confidence) ─────────
         min_tp = MIN_TRUE_PROB_GATE_5M if duration <= 5 else MIN_TRUE_PROB_GATE_15M
-        if true_prob < min_tp:
+        _payout_mult_local = 1.0 / max(entry, 1e-9)
+        _highpayout_bypass = (   # 10x+ entries get a lower prob floor — still profitable at 45% win rate
+            _payout_mult_local >= HIGHPAYOUT_MIN_PAYOUT
+            and score >= HIGHPAYOUT_MIN_SCORE
+            and edge >= HIGHPAYOUT_MIN_EDGE
+            and true_prob >= HIGHPAYOUT_MIN_PROB
+        )
+        if true_prob < min_tp and not _highpayout_bypass:
             self._skip_tick("prob_below_gate")
             return None
 
@@ -5422,9 +5434,9 @@ class LiveTrader:
             # Allow low-cent first entries too, but only for very strong setups.
             lowcent_new_ok = (
                 duration >= 15
-                and score >= max(SUPER_BET_FLOOR_MIN_SCORE, LOWCENT_NEW_MIN_SCORE)
+                and score >= LOWCENT_NEW_MIN_SCORE
                 and true_prob >= LOWCENT_NEW_MIN_TRUE_PROB
-                and execution_ev >= max(SUPER_BET_FLOOR_MIN_EV, LOWCENT_NEW_MIN_EXEC_EV)
+                and execution_ev >= LOWCENT_NEW_MIN_EXEC_EV
                 and payout_mult >= LOWCENT_NEW_MIN_PAYOUT
                 and cl_agree
             )
