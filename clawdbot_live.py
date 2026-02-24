@@ -208,13 +208,13 @@ MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.52"))
 MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "1.85"))
 # Late-window payout relaxation: aligned entry in last 28% of window → lower payout OK, win rate is higher
 LATE_PAYOUT_RELAX_ENABLED   = os.environ.get("LATE_PAYOUT_RELAX_ENABLED", "true").lower() == "true"
-LATE_PAYOUT_RELAX_PCT_LEFT  = float(os.environ.get("LATE_PAYOUT_RELAX_PCT_LEFT", "0.28"))   # last 28% of window
+LATE_PAYOUT_RELAX_PCT_LEFT  = float(os.environ.get("LATE_PAYOUT_RELAX_PCT_LEFT", "0.45"))   # last 45% of window (was 0.28)
 LATE_PAYOUT_RELAX_MIN_MOVE  = float(os.environ.get("LATE_PAYOUT_RELAX_MIN_MOVE", "0.0025")) # 0.25% price move confirming direction
 LATE_PAYOUT_RELAX_FLOOR     = float(os.environ.get("LATE_PAYOUT_RELAX_FLOOR", "1.65"))      # accept 1.65x when late+locked
 LATE_PAYOUT_PROB_BOOST      = float(os.environ.get("LATE_PAYOUT_PROB_BOOST", "0.04"))       # true_prob boost for locked-direction entries
 # Must-fire: guarantee at least 1 trade per 15m window in last N minutes by relaxing score gate
 LATE_MUST_FIRE_ENABLED     = os.environ.get("LATE_MUST_FIRE_ENABLED", "true").lower() == "true"
-LATE_MUST_FIRE_MINS_LEFT   = float(os.environ.get("LATE_MUST_FIRE_MINS_LEFT", "7.0"))    # relax in last 7 min
+LATE_MUST_FIRE_MINS_LEFT   = float(os.environ.get("LATE_MUST_FIRE_MINS_LEFT", "10.0"))   # relax in last 10 min (was 7)
 LATE_MUST_FIRE_SCORE_RELAX = int(os.environ.get("LATE_MUST_FIRE_SCORE_RELAX", "3"))      # lower gate by 3 pts
 LATE_MUST_FIRE_MIN_SCORE   = int(os.environ.get("LATE_MUST_FIRE_MIN_SCORE", "5"))        # absolute floor after relax
 LATE_MUST_FIRE_PROB_RELAX  = float(os.environ.get("LATE_MUST_FIRE_PROB_RELAX", "0.05")) # relax true_prob gate by this
@@ -384,7 +384,7 @@ CLOB_MARKET_WS_SYNC_SEC = float(os.environ.get("CLOB_MARKET_WS_SYNC_SEC", "2.0")
 CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "2000"))
 CLOB_MARKET_WS_SOFT_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_SOFT_AGE_MS", "6000"))
 CLOB_REST_FALLBACK_ENABLED = os.environ.get("CLOB_REST_FALLBACK_ENABLED", "true").lower() == "true"
-CLOB_REST_FRESH_MAX_AGE_MS = float(os.environ.get("CLOB_REST_FRESH_MAX_AGE_MS", "1500"))
+CLOB_REST_FRESH_MAX_AGE_MS = float(os.environ.get("CLOB_REST_FRESH_MAX_AGE_MS", "4000"))  # was 1500; REST scan cycle can be 2-3s
 CLOB_WS_STALE_HEAL_HITS = int(os.environ.get("CLOB_WS_STALE_HEAL_HITS", "3"))
 CLOB_WS_STALE_HEAL_COOLDOWN_SEC = float(os.environ.get("CLOB_WS_STALE_HEAL_COOLDOWN_SEC", "20"))
 COPYFLOW_FILE = os.environ.get("COPYFLOW_FILE", os.path.join(_DATA_DIR, "clawdbot_copyflow.json"))
@@ -430,9 +430,9 @@ LEADER_FRESH_SIZE_SCALE = float(os.environ.get("LEADER_FRESH_SIZE_SCALE", "1.00"
 LEADER_STALE_SIZE_SCALE = float(os.environ.get("LEADER_STALE_SIZE_SCALE", "0.75"))
 LEADER_SYNTH_SIZE_SCALE = float(os.environ.get("LEADER_SYNTH_SIZE_SCALE", "0.55"))
 REQUIRE_ORDERBOOK_WS = os.environ.get("REQUIRE_ORDERBOOK_WS", "true").lower() == "true"
-WS_BOOK_FALLBACK_ENABLED = os.environ.get("WS_BOOK_FALLBACK_ENABLED", "false").lower() == "true"
-WS_BOOK_FALLBACK_MAX_AGE_MS = float(os.environ.get("WS_BOOK_FALLBACK_MAX_AGE_MS", "2500"))
-PM_BOOK_FALLBACK_ENABLED = os.environ.get("PM_BOOK_FALLBACK_ENABLED", "false").lower() == "true"
+WS_BOOK_FALLBACK_ENABLED = os.environ.get("WS_BOOK_FALLBACK_ENABLED", "true").lower() == "true"   # was false
+WS_BOOK_FALLBACK_MAX_AGE_MS = float(os.environ.get("WS_BOOK_FALLBACK_MAX_AGE_MS", "6000"))         # was 2500
+PM_BOOK_FALLBACK_ENABLED = os.environ.get("PM_BOOK_FALLBACK_ENABLED", "true").lower() == "true"   # was false
 LEADER_FLOW_FALLBACK_ENABLED = os.environ.get("LEADER_FLOW_FALLBACK_ENABLED", "true").lower() == "true"
 LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MAX_AGE_SEC", "90"))
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
@@ -5028,8 +5028,8 @@ class LiveTrader:
         conviction_floor = max(ANALYSIS_CONV_FLOOR_MIN, min(ANALYSIS_CONV_FLOOR_MAX, conviction_floor))
         # Must-fire window: relax conviction and quality floors to guarantee at least one entry per round
         if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
-            conviction_floor = max(0.44, conviction_floor - 0.03)
-            quality_floor    = max(0.44, quality_floor    - 0.02)
+            conviction_floor = max(0.40, conviction_floor - 0.06)
+            quality_floor    = max(0.40, quality_floor    - 0.04)
 
         if analysis_quality + DEFAULT_CMP_EPS < quality_floor:
             if self._noisy_log_enabled(f"skip-analysis-quality:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
