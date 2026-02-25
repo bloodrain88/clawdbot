@@ -438,8 +438,8 @@ LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MA
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
 STRICT_REQUIRE_FRESH_LEADER = os.environ.get("STRICT_REQUIRE_FRESH_LEADER", "false").lower() == "true"
 STRICT_REQUIRE_FRESH_BOOK_WS = os.environ.get("STRICT_REQUIRE_FRESH_BOOK_WS", "true").lower() == "true"
-MIN_ANALYSIS_QUALITY = float(os.environ.get("MIN_ANALYSIS_QUALITY", "0.53"))
-MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.40"))  # lowered 0.52→0.45→0.40
+MIN_ANALYSIS_QUALITY = float(os.environ.get("MIN_ANALYSIS_QUALITY", "0.20"))
+MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.15"))  # near-disabled: bet every round
 WS_BOOK_SOFT_MAX_AGE_MS = float(os.environ.get("WS_BOOK_SOFT_MAX_AGE_MS", "20000"))
 ANALYSIS_PROB_SCALE_MIN = float(os.environ.get("ANALYSIS_PROB_SCALE_MIN", "0.65"))
 ANALYSIS_PROB_SCALE_MAX = float(os.environ.get("ANALYSIS_PROB_SCALE_MAX", "1.20"))
@@ -451,7 +451,7 @@ PAYOUT_NEAR_MISS_TOL = float(os.environ.get("PAYOUT_NEAR_MISS_TOL", "0.03"))
 EARLY_ENTRY_ONLY           = os.environ.get("EARLY_ENTRY_ONLY", "true").lower() == "true"
 EARLY_ENTRY_ELAPSED_MAX_MIN = float(os.environ.get("EARLY_ENTRY_ELAPSED_MAX_MIN", "4.0"))   # first 4 min of 15m window
 EARLY_MIN_MOVE_PCT         = float(os.environ.get("EARLY_MIN_MOVE_PCT", "0.0"))             # disabled: trade even flat markets
-REQUIRE_CL_AGREE           = os.environ.get("REQUIRE_CL_AGREE", "true").lower() == "true"   # momentum bets only
+REQUIRE_CL_AGREE           = os.environ.get("REQUIRE_CL_AGREE", "false").lower() == "true"  # disabled: predict every round
 ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M", "0.02"))
 ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M", "0.05"))
 # Mid-round booster (15m only): small additive bet at high payout/high conviction.
@@ -665,10 +665,10 @@ ANALYSIS_SIDE_GOOD_QUAL_DELTA = float(os.environ.get("ANALYSIS_SIDE_GOOD_QUAL_DE
 ANALYSIS_SIDE_GOOD_CONV_DELTA = float(os.environ.get("ANALYSIS_SIDE_GOOD_CONV_DELTA", "0.04"))
 ANALYSIS_SIDE_BAD_QUAL_DELTA = float(os.environ.get("ANALYSIS_SIDE_BAD_QUAL_DELTA", "0.02"))
 ANALYSIS_SIDE_BAD_CONV_DELTA = float(os.environ.get("ANALYSIS_SIDE_BAD_CONV_DELTA", "0.0"))
-ANALYSIS_QUAL_FLOOR_MIN = float(os.environ.get("ANALYSIS_QUAL_FLOOR_MIN", "0.42"))
-ANALYSIS_QUAL_FLOOR_MAX = float(os.environ.get("ANALYSIS_QUAL_FLOOR_MAX", "0.75"))
-ANALYSIS_CONV_FLOOR_MIN = float(os.environ.get("ANALYSIS_CONV_FLOOR_MIN", "0.35"))
-ANALYSIS_CONV_FLOOR_MAX = float(os.environ.get("ANALYSIS_CONV_FLOOR_MAX", "0.72"))
+ANALYSIS_QUAL_FLOOR_MIN = float(os.environ.get("ANALYSIS_QUAL_FLOOR_MIN", "0.10"))
+ANALYSIS_QUAL_FLOOR_MAX = float(os.environ.get("ANALYSIS_QUAL_FLOOR_MAX", "0.30"))
+ANALYSIS_CONV_FLOOR_MIN = float(os.environ.get("ANALYSIS_CONV_FLOOR_MIN", "0.10"))
+ANALYSIS_CONV_FLOOR_MAX = float(os.environ.get("ANALYSIS_CONV_FLOOR_MAX", "0.20"))
 ANALYSIS_LATE_MIN_LEFT_15M = float(os.environ.get("ANALYSIS_LATE_MIN_LEFT_15M", "3.5"))
 ANALYSIS_LATE_MIN_LEFT_5M = float(os.environ.get("ANALYSIS_LATE_MIN_LEFT_5M", "1.8"))
 PROB_CLAMP_MIN = float(os.environ.get("PROB_CLAMP_MIN", "0.05"))
