@@ -743,14 +743,14 @@ DEFAULT_CMP_EPS = float(os.environ.get("DEFAULT_CMP_EPS", "1e-6"))
 # Core score model thresholds (env-tunable; no fixed literals in scoring path).
 PCT_REMAINING_MIN = float(os.environ.get("PCT_REMAINING_MIN", "0.02"))  # allow entry until ~18s before close
 ORACLE_LATENCY_ONLY_MODE = os.environ.get("ORACLE_LATENCY_ONLY_MODE", "true").lower() == "true"
-ORACLE_FRESH_AGE_S   = float(os.environ.get("ORACLE_FRESH_AGE_S",  "20.0"))   # CL updated within N sec
+ORACLE_FRESH_AGE_S   = float(os.environ.get("ORACLE_FRESH_AGE_S",  "35.0"))   # CL updated within N sec (cl_med~33.8s)
 ORACLE_MAX_MINS_LEFT = float(os.environ.get("ORACLE_MAX_MINS_LEFT", "2.5"))    # only enter in last 2.5min
 ORACLE_MIN_MOVE_PCT  = float(os.environ.get("ORACLE_MIN_MOVE_PCT",  "0.001"))  # 0.1% move from open
 ORACLE_SIZE_MULT     = float(os.environ.get("ORACLE_SIZE_MULT",     "4.0"))    # 4x size on near-certain bet
 CONTRARIAN_TAIL_ENABLED      = os.environ.get("CONTRARIAN_TAIL_ENABLED", "true").lower() == "true"
 CONTRARIAN_TAIL_MAX_ENTRY    = float(os.environ.get("CONTRARIAN_TAIL_MAX_ENTRY",    "0.45"))  # buy when cheap side ≤45¢
 CONTRARIAN_TAIL_MIN_MINS_LEFT= float(os.environ.get("CONTRARIAN_TAIL_MIN_MINS_LEFT","7.0"))   # at least 7min remaining
-CONTRARIAN_TAIL_MIN_MOVE_PCT = float(os.environ.get("CONTRARIAN_TAIL_MIN_MOVE_PCT", "0.0015"))# 0.15% move triggered
+CONTRARIAN_TAIL_MIN_MOVE_PCT = float(os.environ.get("CONTRARIAN_TAIL_MIN_MOVE_PCT", "0.0008"))# 0.08% move triggered (5m moves 0.04-0.12%)
 CONTRARIAN_TAIL_SIZE_MULT    = float(os.environ.get("CONTRARIAN_TAIL_SIZE_MULT",    "2.0"))   # 2x size (prediction, not arb)
 PREV_WIN_DIR_MOVE_MIN = float(os.environ.get("PREV_WIN_DIR_MOVE_MIN", "0.0002"))
 MOM_THRESH_UP = float(os.environ.get("MOM_THRESH_UP", "0.53"))
