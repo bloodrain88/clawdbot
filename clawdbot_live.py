@@ -3194,7 +3194,7 @@ class LiveTrader:
                 dur_m = int(meta.get("duration", 15) or 15)
                 end_ts = start_ts_m + dur_m * 60 if start_ts_m > 0 else 0
             mins_left = max(0.0, (end_ts - now_ts) / 60.0) if end_ts > 0 else 0.0
-            if end_ts > 0 and end_ts <= now_ts and cid not in self.pending_redeem:
+            if end_ts > 0 and end_ts <= now_ts - 120.0 and cid not in self.pending_redeem:
                 continue
             open_p = float(self.open_prices.get(cid, 0.0) or 0.0)
             src = self.open_prices_source.get(cid, "?")
