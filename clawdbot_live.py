@@ -195,12 +195,12 @@ LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
-MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "10"))   # raised 8→10
-MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "9"))  # raised 7→9
-MIN_TRUE_PROB_GATE_15M = float(os.environ.get("MIN_TRUE_PROB_GATE_15M", "0.60"))  # 2/3-rule prob floor
-MIN_TRUE_PROB_GATE_5M  = float(os.environ.get("MIN_TRUE_PROB_GATE_5M",  "0.62"))
-ROLLING3_WIN_SCORE_PEN = int(os.environ.get("ROLLING3_WIN_SCORE_PEN", "2"))      # extra score needed when 0-1 wins in last 3
-MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.45"))
+MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "0"))
+MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "0"))
+MIN_TRUE_PROB_GATE_15M = float(os.environ.get("MIN_TRUE_PROB_GATE_15M", "0.50"))
+MIN_TRUE_PROB_GATE_5M  = float(os.environ.get("MIN_TRUE_PROB_GATE_5M",  "0.50"))
+ROLLING3_WIN_SCORE_PEN = int(os.environ.get("ROLLING3_WIN_SCORE_PEN", "0"))
+MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.65"))
 MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.015"))
 MIN_ENTRY_PRICE_15M = float(os.environ.get("MIN_ENTRY_PRICE_15M", "0.20"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.35"))
