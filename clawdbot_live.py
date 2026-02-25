@@ -3116,9 +3116,21 @@ class LiveTrader:
                     # status() is sync: avoid blocking I/O here.
                     # open price will be refreshed by scan/market loops.
                     _ = (start_ts_m, end_ts_m, dur_m)
-            # Use Chainlink (resolution source) for win/loss; fall back to RTDS if unavailable
-            cl_p       = self.cl_prices.get(asset, 0)
-            cur_p      = cl_p if cl_p > 0 else self.prices.get(asset, 0)
+            # Use most-recent price: CL or RTDS, whichever has the fresher timestamp
+            cl_p   = self.cl_prices.get(asset, 0)
+            cl_ts  = self.cl_updated.get(asset, 0)
+            rtds_p = self.prices.get(asset, 0)
+            _ph    = self.price_history.get(asset)
+            rtds_ts = _ph[-1][0] if _ph else 0
+            if rtds_ts > cl_ts and rtds_p > 0:
+                cur_p = rtds_p
+                cur_p_src = "RTDS"
+            elif cl_p > 0:
+                cur_p = cl_p
+                cur_p_src = "CL"
+            else:
+                cur_p = rtds_p
+                cur_p_src = "RTDS"
             end_ts     = t.get("end_ts", 0)
             mins_left  = max(0, (end_ts - now_ts) / 60)
             title      = m.get("question", "")[:38]
@@ -3147,7 +3159,7 @@ class LiveTrader:
                 tok_str = "@n/a"
             if LOG_LIVE_DETAIL:
                 print(f"  {c}[{status_str}]{RS} {asset} {side} | {title} | "
-                      f"beat={open_p:.6f}[{src}] now={cur_p:.6f} {move_str} | "
+                      f"beat={open_p:.6f}[{src}] now={cur_p:.6f}[{cur_p_src}] {move_str} | "
                       f"{stake_label}=${(value_now if stake_label=='value_now' else stake):.2f} {tok_str} est=${payout_est:.2f} proj={proj_str} | "
                       f"{mins_left:.1f}min left | rk={rk} cid={self._short_cid(cid)}")
             shown_live_cids.add(cid)
@@ -3212,8 +3224,20 @@ class LiveTrader:
                 if meta_open > 0:
                     open_p = meta_open
                     src = "TRADE"
-            cl_p = float(self.cl_prices.get(asset, 0.0) or 0.0)
-            cur_p = cl_p if cl_p > 0 else float(self.prices.get(asset, 0.0) or 0.0)
+            cl_p   = float(self.cl_prices.get(asset, 0.0) or 0.0)
+            cl_ts  = self.cl_updated.get(asset, 0)
+            rtds_p = float(self.prices.get(asset, 0.0) or 0.0)
+            _ph2   = self.price_history.get(asset)
+            rtds_ts2 = _ph2[-1][0] if _ph2 else 0
+            if rtds_ts2 > cl_ts and rtds_p > 0:
+                cur_p = rtds_p
+                cur_p_src = "RTDS"
+            elif cl_p > 0:
+                cur_p = cl_p
+                cur_p_src = "CL"
+            else:
+                cur_p = rtds_p
+                cur_p_src = "RTDS"
             if open_p > 0 and cur_p > 0:
                 pred_winner = "Up" if cur_p >= open_p else "Down"
                 projected_win = (side == pred_winner)
