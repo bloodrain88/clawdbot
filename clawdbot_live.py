@@ -438,20 +438,11 @@ LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MA
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
 STRICT_REQUIRE_FRESH_LEADER = os.environ.get("STRICT_REQUIRE_FRESH_LEADER", "false").lower() == "true"
 STRICT_REQUIRE_FRESH_BOOK_WS = os.environ.get("STRICT_REQUIRE_FRESH_BOOK_WS", "true").lower() == "true"
-MIN_ANALYSIS_QUALITY = float(os.environ.get("MIN_ANALYSIS_QUALITY", "0.20"))
-MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.15"))  # near-disabled: bet every round
 WS_BOOK_SOFT_MAX_AGE_MS = float(os.environ.get("WS_BOOK_SOFT_MAX_AGE_MS", "20000"))
 ANALYSIS_PROB_SCALE_MIN = float(os.environ.get("ANALYSIS_PROB_SCALE_MIN", "0.65"))
 ANALYSIS_PROB_SCALE_MAX = float(os.environ.get("ANALYSIS_PROB_SCALE_MAX", "1.20"))
 # Small tolerance for payout threshold to avoid dead-zone misses (e.g. 1.98x vs 2.00x).
 PAYOUT_NEAR_MISS_TOL = float(os.environ.get("PAYOUT_NEAR_MISS_TOL", "0.03"))
-# Early Momentum Capture strategy: enter ONLY in first N minutes of window when momentum starts.
-# Prediction markets reprice slowly — at window open, tokens still at ~50c even when CL already moved.
-# Entering early WITH momentum (cl_agree=True, move started) gives 60-70% WR vs 46% late/contrarian.
-EARLY_ENTRY_ONLY           = os.environ.get("EARLY_ENTRY_ONLY", "true").lower() == "true"
-EARLY_ENTRY_ELAPSED_MAX_MIN = float(os.environ.get("EARLY_ENTRY_ELAPSED_MAX_MIN", "4.0"))   # first 4 min of 15m window
-EARLY_MIN_MOVE_PCT         = float(os.environ.get("EARLY_MIN_MOVE_PCT", "0.0"))             # disabled: trade even flat markets
-REQUIRE_CL_AGREE           = os.environ.get("REQUIRE_CL_AGREE", "false").lower() == "true"  # disabled: predict every round
 ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M", "0.02"))
 ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M", "0.05"))
 # Mid-round booster (15m only): small additive bet at high payout/high conviction.
@@ -533,7 +524,6 @@ CONSISTENCY_CORE_ENABLED = os.environ.get("CONSISTENCY_CORE_ENABLED", "true").lo
 CONSISTENCY_REQUIRE_CL_AGREE_15M = os.environ.get("CONSISTENCY_REQUIRE_CL_AGREE_15M", "false").lower() == "true"
 CONSISTENCY_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_MIN_TRUE_PROB_15M", "0.54"))
 CONSISTENCY_MIN_EXEC_EV_15M = float(os.environ.get("CONSISTENCY_MIN_EXEC_EV_15M", "0.010"))
-CONSISTENCY_MIN_TF_VOTES_15M = int(os.environ.get("CONSISTENCY_MIN_TF_VOTES_15M", "1"))
 CONSISTENCY_MAX_ENTRY_15M = float(os.environ.get("CONSISTENCY_MAX_ENTRY_15M", "0.60"))
 CONSISTENCY_MIN_PAYOUT_15M = float(os.environ.get("CONSISTENCY_MIN_PAYOUT_15M", "1.82"))
 EV_FRONTIER_ENABLED = os.environ.get("EV_FRONTIER_ENABLED", "true").lower() == "true"
@@ -648,29 +638,6 @@ ANALYSIS_CONV_W_VWAP   = float(os.environ.get("ANALYSIS_CONV_W_VWAP",   "0.05"))
 ANALYSIS_CONV_W_CL     = float(os.environ.get("ANALYSIS_CONV_W_CL",     "0.20"))  # doubled: momentum is the strongest 15m signal
 ANALYSIS_CONV_W_LEADER = float(os.environ.get("ANALYSIS_CONV_W_LEADER", "0.10"))
 ANALYSIS_CONV_W_BINARY = float(os.environ.get("ANALYSIS_CONV_W_BINARY", "0.12"))
-ANALYSIS_FLOOR_GOODDATA_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_GOODDATA_QUAL_DELTA", "0.03"))
-ANALYSIS_FLOOR_NOLEADER_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_NOLEADER_QUAL_DELTA", "0.02"))
-ANALYSIS_FLOOR_LATE_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_LATE_QUAL_DELTA", "0.02"))
-ANALYSIS_FLOOR_LATE_CONV_DELTA = float(os.environ.get("ANALYSIS_FLOOR_LATE_CONV_DELTA", "0.01"))
-ANALYSIS_FLOOR_OLDQUOTE_MS = float(os.environ.get("ANALYSIS_FLOOR_OLDQUOTE_MS", "900.0"))
-ANALYSIS_FLOOR_OLDQUOTE_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_OLDQUOTE_QUAL_DELTA", "0.02"))
-ANALYSIS_FLOOR_NOBOOK_QUAL_DELTA = float(os.environ.get("ANALYSIS_FLOOR_NOBOOK_QUAL_DELTA", "0.03"))
-ANALYSIS_FLOOR_NOBOOK_CONV_DELTA = float(os.environ.get("ANALYSIS_FLOOR_NOBOOK_CONV_DELTA", "0.0"))
-ANALYSIS_FLOOR_RESTONLY_CONV_DELTA = float(os.environ.get("ANALYSIS_FLOOR_RESTONLY_CONV_DELTA", "0.005"))
-ANALYSIS_FLOOR_NOCL_CONV_DELTA = float(os.environ.get("ANALYSIS_FLOOR_NOCL_CONV_DELTA", "0.03"))
-ANALYSIS_SIDE_MIN_N = int(os.environ.get("ANALYSIS_SIDE_MIN_N", "6"))
-ANALYSIS_SIDE_GOOD_WR_LB = float(os.environ.get("ANALYSIS_SIDE_GOOD_WR_LB", "0.54"))
-ANALYSIS_SIDE_BAD_WR_LB = float(os.environ.get("ANALYSIS_SIDE_BAD_WR_LB", "0.45"))
-ANALYSIS_SIDE_GOOD_QUAL_DELTA = float(os.environ.get("ANALYSIS_SIDE_GOOD_QUAL_DELTA", "0.02"))
-ANALYSIS_SIDE_GOOD_CONV_DELTA = float(os.environ.get("ANALYSIS_SIDE_GOOD_CONV_DELTA", "0.04"))
-ANALYSIS_SIDE_BAD_QUAL_DELTA = float(os.environ.get("ANALYSIS_SIDE_BAD_QUAL_DELTA", "0.02"))
-ANALYSIS_SIDE_BAD_CONV_DELTA = float(os.environ.get("ANALYSIS_SIDE_BAD_CONV_DELTA", "0.0"))
-ANALYSIS_QUAL_FLOOR_MIN = float(os.environ.get("ANALYSIS_QUAL_FLOOR_MIN", "0.10"))
-ANALYSIS_QUAL_FLOOR_MAX = float(os.environ.get("ANALYSIS_QUAL_FLOOR_MAX", "0.30"))
-ANALYSIS_CONV_FLOOR_MIN = float(os.environ.get("ANALYSIS_CONV_FLOOR_MIN", "0.10"))
-ANALYSIS_CONV_FLOOR_MAX = float(os.environ.get("ANALYSIS_CONV_FLOOR_MAX", "0.20"))
-ANALYSIS_LATE_MIN_LEFT_15M = float(os.environ.get("ANALYSIS_LATE_MIN_LEFT_15M", "3.5"))
-ANALYSIS_LATE_MIN_LEFT_5M = float(os.environ.get("ANALYSIS_LATE_MIN_LEFT_5M", "1.8"))
 PROB_CLAMP_MIN = float(os.environ.get("PROB_CLAMP_MIN", "0.05"))
 PROB_CLAMP_MAX = float(os.environ.get("PROB_CLAMP_MAX", "0.95"))
 PROB_REBALANCE_MIN = float(os.environ.get("PROB_REBALANCE_MIN", "0.01"))
@@ -4674,25 +4641,6 @@ class LiveTrader:
                         )
         imbalance_confirms = ob_sig > 0.10
 
-        # Anti-random guard: require multi-signal confluence before any sizing.
-        conf = 0
-        if ob_sig > 0.05:
-            conf += 1
-        if (side_up and taker_ratio > 0.52) or ((not side_up) and taker_ratio < 0.48):
-            conf += 1
-        if tf_votes >= 2:
-            conf += 1
-        if cl_agree:
-            conf += 1
-        min_conf = 1  # need at least one confirming signal (cl_agree or tf_votes≥2 or ob/taker)
-        if conf < min_conf:
-            if self._noisy_log_enabled(f"skip-low-confluence:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                print(
-                    f"{Y}[SKIP]{RS} {asset} {duration}m low confluence "
-                    f"(conf={conf}/4 side={side})"
-                )
-            self._skip_tick("low_confluence")
-            return None
 
         # Late-window direction lock: avoid betting against the beat direction
         # when the move is already clear near expiry.
@@ -4998,66 +4946,6 @@ class LiveTrader:
             + ANALYSIS_CONV_W_BINARY * bin_c
         )
 
-        quality_floor = float(MIN_ANALYSIS_QUALITY)
-        conviction_floor = float(MIN_ANALYSIS_CONVICTION)
-        # Dynamic gates by realtime data quality and timing (position-aware, not fixed-only).
-        if book_fresh and cl_fresh and vol_fresh:
-            quality_floor -= ANALYSIS_FLOOR_GOODDATA_QUAL_DELTA
-        if (not leader_fresh) and book_fresh and cl_fresh:
-            quality_floor -= ANALYSIS_FLOOR_NOLEADER_QUAL_DELTA
-        if mins_left <= (ANALYSIS_LATE_MIN_LEFT_15M if duration >= 15 else ANALYSIS_LATE_MIN_LEFT_5M):
-            quality_floor -= ANALYSIS_FLOOR_LATE_QUAL_DELTA
-            conviction_floor -= ANALYSIS_FLOOR_LATE_CONV_DELTA
-        if quote_age_ms > ANALYSIS_FLOOR_OLDQUOTE_MS:
-            quality_floor += ANALYSIS_FLOOR_OLDQUOTE_QUAL_DELTA
-        if not book_fresh:
-            quality_floor += ANALYSIS_FLOOR_NOBOOK_QUAL_DELTA
-            conviction_floor += ANALYSIS_FLOOR_NOBOOK_CONV_DELTA
-        elif rest_fresh and (not ws_fresh):
-            # REST fresh is acceptable, but slightly weaker than strict WS.
-            conviction_floor += ANALYSIS_FLOOR_RESTONLY_CONV_DELTA
-        if not cl_fresh:
-            conviction_floor += ANALYSIS_FLOOR_NOCL_CONV_DELTA
-        # Data-driven floor adaptation from recent settled on-chain outcomes
-        # for this exact (asset, duration, side) cluster.
-        side_prof_live = self._recent_side_profile(asset, duration, side)
-        side_n_live = int(side_prof_live.get("n", 0) or 0)
-        side_exp_live = float(side_prof_live.get("exp", 0.0) or 0.0)
-        side_wr_lb_live = float(side_prof_live.get("wr_lb", 0.5) or 0.5)
-        if side_n_live >= max(ANALYSIS_SIDE_MIN_N, int(RECENT_SIDE_PRIOR_MIN_N)):
-            if side_wr_lb_live >= ANALYSIS_SIDE_GOOD_WR_LB and side_exp_live > 0:
-                quality_floor -= ANALYSIS_SIDE_GOOD_QUAL_DELTA
-                conviction_floor -= ANALYSIS_SIDE_GOOD_CONV_DELTA
-            elif side_wr_lb_live <= ANALYSIS_SIDE_BAD_WR_LB and side_exp_live < 0:
-                quality_floor += ANALYSIS_SIDE_BAD_QUAL_DELTA
-                conviction_floor += ANALYSIS_SIDE_BAD_CONV_DELTA
-        quality_floor = max(ANALYSIS_QUAL_FLOOR_MIN, min(ANALYSIS_QUAL_FLOOR_MAX, quality_floor))
-        conviction_floor = max(ANALYSIS_CONV_FLOOR_MIN, min(ANALYSIS_CONV_FLOOR_MAX, conviction_floor))
-        # When price is temporarily against our direction, the token is CHEAP (e.g. 30¢ Up token
-        # when price is currently down). High payout compensates — these are quality entries.
-        # EV gate below handles quality: cheap tokens easily pass EV even at lower conviction.
-        # No conviction penalty for cl_agree=False.
-        # Must-fire window: relax conviction and quality floors to guarantee at least one entry per round
-        if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
-            conviction_floor = max(0.40, conviction_floor - 0.06)
-            quality_floor    = max(0.40, quality_floor    - 0.04)
-
-        if analysis_quality + DEFAULT_CMP_EPS < quality_floor:
-            if self._noisy_log_enabled(f"skip-analysis-quality:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                print(
-                    f"{Y}[SKIP] {asset} {duration}m low analysis quality "
-                    f"q={analysis_quality:.3f}<{quality_floor:.3f}{RS}"
-                )
-            self._skip_tick("analysis_quality_low")
-            return None
-        if analysis_conviction + DEFAULT_CMP_EPS < conviction_floor:
-            if self._noisy_log_enabled(f"skip-analysis-conv:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                print(
-                    f"{Y}[SKIP] {asset} {duration}m low analysis conviction "
-                    f"c={analysis_conviction:.3f}<{conviction_floor:.3f}{RS}"
-                )
-            self._skip_tick("analysis_conviction_low")
-            return None
 
         # Recalibrate posterior using measured analysis quality.
         # Higher quality allows stronger posterior; weaker quality shrinks toward 50%.
@@ -5107,24 +4995,6 @@ class LiveTrader:
             cl_agree = (cl_now > open_price) == side_up
         imbalance_confirms = ob_sig > IMBALANCE_CONFIRM_MIN
 
-        # Direction quality gate: at window start (minute 0-2) we trust the PREBID prediction
-        # (computed 45-15s before open). After minute 2, the actual CL price must confirm.
-        # Contrarian mid/late bets (cl_agree=False after minute 2) have ~25% WR — always losing.
-        _elapsed_min = duration - mins_left
-        if REQUIRE_CL_AGREE and not cl_agree and _elapsed_min >= 2.0:
-            if self._noisy_log_enabled(f"skip-no-momentum:{asset}:{side}", LOG_SKIP_EVERY_SEC):
-                print(f"{Y}[SKIP] {asset} {side} no momentum (cl_agree=False at t+{_elapsed_min:.1f}min){RS}")
-            self._skip_tick("no_momentum")
-            return None
-
-        # Minimum move gate: after minute 2, require price has actually moved in our direction.
-        # At minute 0-2 the prediction drives entry (no move required yet).
-        # After minute 2 in a flat market (no move) = no signal = 50/50, skip.
-        if EARLY_MIN_MOVE_PCT > 0 and move_pct < EARLY_MIN_MOVE_PCT and _elapsed_min >= 2.0:
-            if self._noisy_log_enabled(f"skip-flat:{asset}:{side}", LOG_SKIP_EVERY_SEC):
-                print(f"{Y}[SKIP] {asset} {side} flat market (move={move_pct:.4%} < {EARLY_MIN_MOVE_PCT:.4%}){RS}")
-            self._skip_tick("flat_market")
-            return None
 
         # Bet the signal direction — EV_net and execution quality drive growth.
         entry = up_price if side == "Up" else (1 - up_price)
@@ -5472,14 +5342,6 @@ class LiveTrader:
                         f"{execution_ev:.3f}<{dyn_ev_floor:.3f}{RS}"
                     )
                 self._skip_tick("consistency_ev_low")
-                return None
-            if tf_votes < CONSISTENCY_MIN_TF_VOTES_15M and not must_fire_active:
-                if self._noisy_log_enabled(f"skip-consistency-tf:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    print(
-                        f"{Y}[SKIP] {asset} {duration}m consistency tf_votes "
-                        f"{tf_votes}<{CONSISTENCY_MIN_TF_VOTES_15M}{RS}"
-                    )
-                self._skip_tick("consistency_tf_low")
                 return None
             # Propagate strict payout rule to execution layer so maker/fallback cannot overpay.
             core_entry_cap = min(0.99, 1.0 / max(1e-9, _min_payout_consistency))
