@@ -439,7 +439,7 @@ REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() 
 STRICT_REQUIRE_FRESH_LEADER = os.environ.get("STRICT_REQUIRE_FRESH_LEADER", "false").lower() == "true"
 STRICT_REQUIRE_FRESH_BOOK_WS = os.environ.get("STRICT_REQUIRE_FRESH_BOOK_WS", "true").lower() == "true"
 MIN_ANALYSIS_QUALITY = float(os.environ.get("MIN_ANALYSIS_QUALITY", "0.53"))
-MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.45"))  # lowered 0.52→0.45
+MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.40"))  # lowered 0.52→0.45→0.40
 WS_BOOK_SOFT_MAX_AGE_MS = float(os.environ.get("WS_BOOK_SOFT_MAX_AGE_MS", "20000"))
 ANALYSIS_PROB_SCALE_MIN = float(os.environ.get("ANALYSIS_PROB_SCALE_MIN", "0.65"))
 ANALYSIS_PROB_SCALE_MAX = float(os.environ.get("ANALYSIS_PROB_SCALE_MAX", "1.20"))
@@ -533,7 +533,7 @@ CONSISTENCY_CORE_ENABLED = os.environ.get("CONSISTENCY_CORE_ENABLED", "true").lo
 CONSISTENCY_REQUIRE_CL_AGREE_15M = os.environ.get("CONSISTENCY_REQUIRE_CL_AGREE_15M", "false").lower() == "true"
 CONSISTENCY_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_MIN_TRUE_PROB_15M", "0.54"))
 CONSISTENCY_MIN_EXEC_EV_15M = float(os.environ.get("CONSISTENCY_MIN_EXEC_EV_15M", "0.010"))
-CONSISTENCY_MIN_TF_VOTES_15M = int(os.environ.get("CONSISTENCY_MIN_TF_VOTES_15M", "2"))
+CONSISTENCY_MIN_TF_VOTES_15M = int(os.environ.get("CONSISTENCY_MIN_TF_VOTES_15M", "1"))
 CONSISTENCY_MAX_ENTRY_15M = float(os.environ.get("CONSISTENCY_MAX_ENTRY_15M", "0.60"))
 CONSISTENCY_MIN_PAYOUT_15M = float(os.environ.get("CONSISTENCY_MIN_PAYOUT_15M", "1.82"))
 EV_FRONTIER_ENABLED = os.environ.get("EV_FRONTIER_ENABLED", "true").lower() == "true"
@@ -4684,7 +4684,7 @@ class LiveTrader:
             conf += 1
         if cl_agree:
             conf += 1
-        min_conf = 1 if (late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15) else 2
+        min_conf = 1  # need at least one confirming signal (cl_agree or tf_votes≥2 or ob/taker)
         if conf < min_conf:
             if self._noisy_log_enabled(f"skip-low-confluence:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
