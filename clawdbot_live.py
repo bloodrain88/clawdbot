@@ -127,6 +127,11 @@ POLYGON_RPCS = [
     "https://polygon.drpc.org",
     "https://rpc.ankr.com/polygon",
 ]
+POLYGON_WS_RPCS = [
+    "wss://polygon-mainnet.public.blastapi.io",
+    "wss://polygon-bor-rpc.publicnode.com",
+    "wss://polygon.drpc.org",
+]
 USDC_E_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_ABI = [
     {"inputs":[{"name":"collateralToken","type":"address"},
@@ -295,7 +300,11 @@ CHAINLINK_ABI = [
         {"name":"startedAt","type":"uint256"},{"name":"updatedAt","type":"uint256"},
         {"name":"answeredInRound","type":"uint80"}],
      "stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"aggregator","outputs":[{"name":"","type":"address"}],
+     "stateMutability":"view","type":"function"},
 ]
+# keccak256("AnswerUpdated(int256,uint256,uint256)") — Chainlink aggregator event
+CL_ANSWER_UPDATED_TOPIC = "0x0559884fd3a460db3073b7fc896cc77986f16e378210ded43186175bf646fc5f"
 SCAN_INTERVAL  = float(os.environ.get("SCAN_INTERVAL", "0.5"))
 MARKET_REFRESH_SEC = float(os.environ.get("MARKET_REFRESH_SEC", "30.0"))  # how often to re-fetch Gamma API (was every 0.5s = 600 req/min!)
 PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "5"))
@@ -3562,7 +3571,90 @@ class LiveTrader:
                         self.cl_updated[asset] = updated
                 except Exception:
                     pass
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)   # reduced from 5s — fallback for when WS is active
+
+    async def chainlink_ws_loop(self):
+        """Subscribe to Chainlink AnswerUpdated events via Polygon WebSocket for <100ms detection."""
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                if self.w3 is None:
+                    await asyncio.sleep(5)
+                    continue
+                # Fetch aggregator addresses from proxy contracts
+                agg_to_asset: dict[str, str] = {}
+                for asset, proxy_addr in CHAINLINK_FEEDS.items():
+                    try:
+                        proxy = self.w3.eth.contract(
+                            address=Web3.to_checksum_address(proxy_addr), abi=CHAINLINK_ABI
+                        )
+                        agg_addr = await loop.run_in_executor(None, proxy.functions.aggregator().call)
+                        agg_to_asset[agg_addr.lower()] = asset
+                    except Exception as e:
+                        print(f"{Y}[CL-WS] aggregator lookup failed {asset}: {e}{RS}")
+                if not agg_to_asset:
+                    await asyncio.sleep(10)
+                    continue
+                agg_addrs = list(agg_to_asset.keys())
+                print(f"{G}[CL-WS] subscribing to {len(agg_to_asset)} aggregators via WS{RS}")
+                # Try each WS RPC in order
+                connected = False
+                for ws_url in POLYGON_WS_RPCS:
+                    try:
+                        async with websockets.connect(
+                            ws_url, ping_interval=20, open_timeout=10
+                        ) as ws:
+                            sub_req = json.dumps({
+                                "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
+                                "params": ["logs", {
+                                    "address": agg_addrs,
+                                    "topics": [CL_ANSWER_UPDATED_TOPIC],
+                                }],
+                            })
+                            await ws.send(sub_req)
+                            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                            if "error" in resp or "result" not in resp:
+                                raise RuntimeError(f"sub error: {resp}")
+                            print(f"{G}[CL-WS] connected {ws_url} sub={resp['result']}{RS}")
+                            connected = True
+                            # Refresh aggregator addresses every 6h
+                            refresh_at = _time.time() + 21600
+                            async for raw in ws:
+                                msg = json.loads(raw)
+                                if msg.get("method") != "eth_subscription":
+                                    continue
+                                log = msg["params"]["result"]
+                                asset = agg_to_asset.get(log.get("address", "").lower())
+                                if not asset:
+                                    continue
+                                try:
+                                    # topics[1] = current (int256 indexed) = price × 1e8
+                                    price_raw = int(log["topics"][1], 16)
+                                    if price_raw >= 2**255:
+                                        price_raw -= 2**256
+                                    price = price_raw / 1e8
+                                    # data = updatedAt (uint256)
+                                    updated_at = int(log.get("data", "0x0"), 16)
+                                    now = _time.time()
+                                    detect_lag = now - updated_at
+                                    if 0 < price and detect_lag < 60:
+                                        self.cl_prices[asset]  = price
+                                        self.cl_updated[asset] = updated_at
+                                        if LOG_VERBOSE:
+                                            print(f"{G}[CL-WS]{RS} {asset} {price:.4f} detect={detect_lag*1000:.0f}ms")
+                                except Exception:
+                                    pass
+                                if _time.time() >= refresh_at:
+                                    break   # reconnect to refresh aggregator addresses
+                        if connected:
+                            break   # successful connection ended, retry
+                    except Exception as e:
+                        print(f"{Y}[CL-WS] {ws_url} failed: {e}{RS}")
+                        continue
+                await asyncio.sleep(2)
+            except Exception as e:
+                print(f"{Y}[CL-WS] outer error: {e}{RS}")
+                await asyncio.sleep(5)
 
     async def _rpc_optimizer_loop(self):
         """Continuously measure RPC latency and switch to fastest healthy endpoint."""
@@ -10575,6 +10667,7 @@ class LiveTrader:
             _guard("_user_events_loop",     self._user_events_loop),
             _guard("_force_redeem_backfill_loop", self._force_redeem_backfill_loop),
             _guard("chainlink_loop",        self.chainlink_loop),
+            _guard("chainlink_ws_loop",     self.chainlink_ws_loop),
             _guard("_copyflow_refresh_loop", self._copyflow_refresh_loop),
             _guard("_copyflow_live_loop",   self._copyflow_live_loop),
             _guard("_copyflow_intel_loop",  self._copyflow_intel_loop),
