@@ -4031,6 +4031,7 @@ class LiveTrader:
         if cl_now > 0 and cl_age_s is not None and cl_age_s <= CL_FRESH_PRICE_AGE_SEC:
             current = cl_now
             px_src = "CL"
+            quote_age_ms = 0.0   # CL is the resolution oracle; Binance WS freshness irrelevant
         elif rtds_now > 0 and quote_age_ms <= MAX_QUOTE_STALENESS_MS:
             current = rtds_now
             px_src = "RTDS"
