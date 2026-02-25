@@ -163,7 +163,7 @@ MIN_MOVE       = float(os.environ.get("MIN_MOVE", "0.0003"))   # flat filter thr
 MOMENTUM_WEIGHT = float(os.environ.get("MOMENTUM_WEIGHT", "0.40"))
 DUST_BET       = float(os.environ.get("DUST_BET", "5.0"))
 MIN_BET_ABS    = float(os.environ.get("MIN_BET_ABS", "2.50"))
-MIN_EXEC_NOTIONAL_USDC = float(os.environ.get("MIN_EXEC_NOTIONAL_USDC", "5.0"))
+MIN_EXEC_NOTIONAL_USDC = float(os.environ.get("MIN_EXEC_NOTIONAL_USDC", "1.0"))
 MIN_ORDER_SIZE_SHARES = float(os.environ.get("MIN_ORDER_SIZE_SHARES", "5.0"))
 ORDER_SIZE_PAD_SHARES = float(os.environ.get("ORDER_SIZE_PAD_SHARES", "0.02"))
 MIN_BET_PCT    = float(os.environ.get("MIN_BET_PCT", "0.022"))
@@ -520,13 +520,13 @@ ENTRY_WAIT_TARGET_DROP_ABS = float(os.environ.get("ENTRY_WAIT_TARGET_DROP_ABS", 
 ENTRY_WAIT_MAX_SCORE_DECAY = int(os.environ.get("ENTRY_WAIT_MAX_SCORE_DECAY", "2"))
 ENTRY_WAIT_MAX_PROB_DECAY = float(os.environ.get("ENTRY_WAIT_MAX_PROB_DECAY", "0.03"))
 ENTRY_WAIT_MAX_EDGE_DECAY = float(os.environ.get("ENTRY_WAIT_MAX_EDGE_DECAY", "0.02"))
-CONSISTENCY_CORE_ENABLED = os.environ.get("CONSISTENCY_CORE_ENABLED", "true").lower() == "true"
+CONSISTENCY_CORE_ENABLED = os.environ.get("CONSISTENCY_CORE_ENABLED", "false").lower() == "true"
 CONSISTENCY_REQUIRE_CL_AGREE_15M = os.environ.get("CONSISTENCY_REQUIRE_CL_AGREE_15M", "false").lower() == "true"
 CONSISTENCY_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_MIN_TRUE_PROB_15M", "0.54"))
 CONSISTENCY_MIN_EXEC_EV_15M = float(os.environ.get("CONSISTENCY_MIN_EXEC_EV_15M", "0.010"))
 CONSISTENCY_MAX_ENTRY_15M = float(os.environ.get("CONSISTENCY_MAX_ENTRY_15M", "0.60"))
 CONSISTENCY_MIN_PAYOUT_15M = float(os.environ.get("CONSISTENCY_MIN_PAYOUT_15M", "1.82"))
-EV_FRONTIER_ENABLED = os.environ.get("EV_FRONTIER_ENABLED", "true").lower() == "true"
+EV_FRONTIER_ENABLED = os.environ.get("EV_FRONTIER_ENABLED", "false").lower() == "true"
 EV_FRONTIER_MARGIN_BASE = float(os.environ.get("EV_FRONTIER_MARGIN_BASE", "0.010"))
 EV_FRONTIER_MARGIN_HIGH_ENTRY = float(os.environ.get("EV_FRONTIER_MARGIN_HIGH_ENTRY", "0.050"))
 HIGH_EV_SIZE_BOOST_ENABLED = os.environ.get("HIGH_EV_SIZE_BOOST_ENABLED", "true").lower() == "true"
@@ -5551,14 +5551,7 @@ class LiveTrader:
         # Never force a big floor size on ultra-cheap tails or near-expiry entries.
         if entry <= FORCE_MIN_ENTRY_TAIL or (duration >= 15 and mins_left <= FORCE_MIN_LEFT_TAIL):
             dyn_floor = min(dyn_floor, MIN_BET_ABS)
-        # If model size is too small and setup is not top quality, skip instead of forcing a noisy tiny bet.
-        if model_size < dyn_floor:
-            hi_conf = (score >= MODEL_HICONF_MIN_SCORE and true_prob >= MODEL_HICONF_MIN_TRUE_PROB and edge >= MODEL_HICONF_MIN_EDGE)
-            if not hi_conf:
-                return None
-            size = round(dyn_floor, 2)
-        else:
-            size = model_size
+        size = round(max(model_size, dyn_floor), 2)
         size = max(ABS_MIN_SIZE_USDC, min(hard_cap, size))
 
         # Super-bet floor:
