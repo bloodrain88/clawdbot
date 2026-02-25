@@ -450,7 +450,7 @@ PAYOUT_NEAR_MISS_TOL = float(os.environ.get("PAYOUT_NEAR_MISS_TOL", "0.03"))
 # Entering early WITH momentum (cl_agree=True, move started) gives 60-70% WR vs 46% late/contrarian.
 EARLY_ENTRY_ONLY           = os.environ.get("EARLY_ENTRY_ONLY", "true").lower() == "true"
 EARLY_ENTRY_ELAPSED_MAX_MIN = float(os.environ.get("EARLY_ENTRY_ELAPSED_MAX_MIN", "4.0"))   # first 4 min of 15m window
-EARLY_MIN_MOVE_PCT         = float(os.environ.get("EARLY_MIN_MOVE_PCT", "0.0003"))          # 0.03% CL move from open required
+EARLY_MIN_MOVE_PCT         = float(os.environ.get("EARLY_MIN_MOVE_PCT", "0.0"))             # disabled: trade even flat markets
 REQUIRE_CL_AGREE           = os.environ.get("REQUIRE_CL_AGREE", "true").lower() == "true"   # momentum bets only
 ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M", "0.02"))
 ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M", "0.05"))
