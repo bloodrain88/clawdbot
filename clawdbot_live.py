@@ -747,6 +747,11 @@ ORACLE_FRESH_AGE_S   = float(os.environ.get("ORACLE_FRESH_AGE_S",  "10.0"))   # 
 ORACLE_MAX_MINS_LEFT = float(os.environ.get("ORACLE_MAX_MINS_LEFT", "2.5"))    # only enter in last 2.5min
 ORACLE_MIN_MOVE_PCT  = float(os.environ.get("ORACLE_MIN_MOVE_PCT",  "0.001"))  # 0.1% move from open
 ORACLE_SIZE_MULT     = float(os.environ.get("ORACLE_SIZE_MULT",     "4.0"))    # 4x size on near-certain bet
+CONTRARIAN_TAIL_ENABLED      = os.environ.get("CONTRARIAN_TAIL_ENABLED", "true").lower() == "true"
+CONTRARIAN_TAIL_MAX_ENTRY    = float(os.environ.get("CONTRARIAN_TAIL_MAX_ENTRY",    "0.40"))  # buy when cheap side ≤40¢
+CONTRARIAN_TAIL_MIN_MINS_LEFT= float(os.environ.get("CONTRARIAN_TAIL_MIN_MINS_LEFT","7.0"))   # at least 7min remaining
+CONTRARIAN_TAIL_MIN_MOVE_PCT = float(os.environ.get("CONTRARIAN_TAIL_MIN_MOVE_PCT", "0.0015"))# 0.15% move triggered
+CONTRARIAN_TAIL_SIZE_MULT    = float(os.environ.get("CONTRARIAN_TAIL_SIZE_MULT",    "2.0"))   # 2x size (prediction, not arb)
 PREV_WIN_DIR_MOVE_MIN = float(os.environ.get("PREV_WIN_DIR_MOVE_MIN", "0.0002"))
 MOM_THRESH_UP = float(os.environ.get("MOM_THRESH_UP", "0.53"))
 MOM_THRESH_DN = float(os.environ.get("MOM_THRESH_DN", "0.47"))
@@ -4052,7 +4057,7 @@ class LiveTrader:
             return None   # too close to close
 
         # Oracle latency mode: only enter when Chainlink JUST updated in the final window.
-        # This is near-arb: we know the oracle value with high certainty until next CL update (~27s).
+        # Also allows contrarian tail entries early in the window (cheap tokens, mean-reversion).
         if ORACLE_LATENCY_ONLY_MODE:
             move_now = abs(current - open_price) / max(open_price, 1e-9)
             oracle_window = (
@@ -4061,7 +4066,13 @@ class LiveTrader:
                 and mins_left <= ORACLE_MAX_MINS_LEFT
                 and move_now >= ORACLE_MIN_MOVE_PCT
             )
-            if not oracle_window:
+            tail_window = (
+                CONTRARIAN_TAIL_ENABLED
+                and min(up_price, 1.0 - up_price) <= CONTRARIAN_TAIL_MAX_ENTRY
+                and mins_left >= CONTRARIAN_TAIL_MIN_MINS_LEFT
+                and move_now >= CONTRARIAN_TAIL_MIN_MOVE_PCT
+            )
+            if not oracle_window and not tail_window:
                 return None
 
         # Previous window direction from CL prices (used as one signal among others).
@@ -5014,6 +5025,27 @@ class LiveTrader:
         imbalance_confirms = ob_sig > IMBALANCE_CONFIRM_MIN
 
 
+        # Contrarian tail: buy the cheap/trailing side when market overreacts early in window.
+        # Mean-reversion edge: cheap side at 25-40¢ with 7+ min left → EV strongly positive.
+        contrarian_tail_active = False
+        if CONTRARIAN_TAIL_ENABLED:
+            cheap_side = "Up" if up_price <= (1.0 - up_price) else "Down"
+            cheap_entry_now = min(up_price, 1.0 - up_price)
+            if (
+                cheap_entry_now <= CONTRARIAN_TAIL_MAX_ENTRY
+                and mins_left >= CONTRARIAN_TAIL_MIN_MINS_LEFT
+                and move_pct >= CONTRARIAN_TAIL_MIN_MOVE_PCT
+                and cheap_side != direction   # contrarian to the current move
+            ):
+                side = cheap_side
+                side_up = (side == "Up")
+                contrarian_tail_active = True
+                if self._noisy_log_enabled(f"tail-contra:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{B}[TAIL]{RS} {asset} {duration}m contrarian {side} "
+                        f"entry={cheap_entry_now:.2f} move={move_pct*100:.2f}% mins_left={mins_left:.1f}"
+                    )
+
         # Bet the signal direction — EV_net and execution quality drive growth.
         entry = up_price if side == "Up" else (1 - up_price)
         # Keep edge/prob aligned with final side after pre-bid/copyflow adjustments.
@@ -5570,7 +5602,9 @@ class LiveTrader:
         if entry <= FORCE_MIN_ENTRY_TAIL or (duration >= 15 and mins_left <= FORCE_MIN_LEFT_TAIL):
             dyn_floor = min(dyn_floor, MIN_BET_ABS)
         size = round(max(model_size, dyn_floor), 2)
-        if ORACLE_LATENCY_ONLY_MODE:
+        if contrarian_tail_active:
+            size = round(min(hard_cap, size * CONTRARIAN_TAIL_SIZE_MULT), 2)
+        elif ORACLE_LATENCY_ONLY_MODE:
             size = round(min(hard_cap, size * ORACLE_SIZE_MULT), 2)
         size = max(ABS_MIN_SIZE_USDC, min(hard_cap, size))
 
