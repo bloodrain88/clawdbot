@@ -3280,7 +3280,9 @@ class LiveTrader:
                 else:
                     side_lbl = f"MIX U{up_n}/D{down_n}"
                     side_stake = spent
-                mark_pnl = value_now - spent
+                # CL-based mark: stable indicator from oracle direction, not volatile token price
+                cl_mark = win_payout if (n > 0 and lead >= n) else (0.0 if (n > 0 and lead == 0) else value_now)
+                mark_pnl = cl_mark - spent
                 c_mark = G if mark_pnl > 0 else (R if mark_pnl < 0 else Y)
                 mark_roi = (mark_pnl / spent * 100.0) if spent > 0 else 0.0
                 if lead >= n and n > 0:
@@ -3308,7 +3310,7 @@ class LiveTrader:
                         f"{c_event}EVENT_NOW{RS}={c_event}{event_state}{RS}({lead}/{n}) | "
                         f"{c_mark_state}MARK_NOW{RS}={c_mark_state}{mark_state}{RS} | "
                         f"{Y}SPENT{RS}=${spent:.2f} | "
-                        f"{B}REAL_MARK{RS}=${value_now:.2f} | "
+                        f"{B}REAL_MARK{RS}=${cl_mark:.2f} | "
                         f"{c_mark}REAL_PNL_NOW{RS}={c_mark}${mark_pnl:+.2f}{RS} | "
                         f"{c_mark}REAL_ROI_NOW{RS}={c_mark}{mark_roi:+.1f}%{RS} | "
                         f"{B}AVG_ENTRY{RS}={(avg_entry*100):.1f}c"
@@ -3320,7 +3322,7 @@ class LiveTrader:
                         f"{c_event}EVENT_NOW{RS}={c_event}{event_state}{RS}({lead}/{n}) | "
                         f"{c_mark_state}MARK_NOW{RS}={c_mark_state}{mark_state}{RS} | "
                         f"{Y}SPENT{RS}=${spent:.2f} | "
-                        f"{B}REAL_MARK{RS}=${value_now:.2f} | "
+                        f"{B}REAL_MARK{RS}=${cl_mark:.2f} | "
                         f"{c_mark}REAL_PNL_NOW{RS}={c_mark}${mark_pnl:+.2f}{RS} | "
                         f"{c_mark}REAL_ROI_NOW{RS}={c_mark}{mark_roi:+.1f}%{RS} | "
                         f"{G}SCENARIO_IF_WIN{RS}=${win_payout:.2f} | "
@@ -3339,7 +3341,7 @@ class LiveTrader:
                     "event_total": n,
                     "mark_now": mark_state,
                     "spent": round(spent, 6),
-                    "real_mark": round(value_now, 6),
+                    "real_mark": round(cl_mark, 6),
                     "real_pnl_now": round(mark_pnl, 6),
                     "real_roi_now_pct": round(mark_roi, 4),
                     "scenario_if_win": round(win_payout, 6),
