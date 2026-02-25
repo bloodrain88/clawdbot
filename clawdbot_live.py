@@ -487,7 +487,7 @@ NEXT_MARKET_ANALYSIS_ENABLED = os.environ.get("NEXT_MARKET_ANALYSIS_ENABLED", "t
 NEXT_MARKET_ANALYSIS_WINDOW_SEC = float(os.environ.get("NEXT_MARKET_ANALYSIS_WINDOW_SEC", "180"))
 NEXT_MARKET_ANALYSIS_LOG_EVERY_SEC = float(os.environ.get("NEXT_MARKET_ANALYSIS_LOG_EVERY_SEC", "15"))
 NEXT_MARKET_ANALYSIS_MIN_CONF = float(os.environ.get("NEXT_MARKET_ANALYSIS_MIN_CONF", "0.54"))  # was 0.56
-ENABLE_5M = os.environ.get("ENABLE_5M", "true").lower() == "true"
+ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
 ORDER_FAST_MODE = os.environ.get("ORDER_FAST_MODE", "true").lower() == "true"
 MAKER_POLL_5M_SEC = float(os.environ.get("MAKER_POLL_5M_SEC", "0.15"))
 MAKER_POLL_15M_SEC = float(os.environ.get("MAKER_POLL_15M_SEC", "0.25"))
@@ -751,12 +751,12 @@ DEFAULT_EPS = float(os.environ.get("DEFAULT_EPS", "1e-9"))
 DEFAULT_CMP_EPS = float(os.environ.get("DEFAULT_CMP_EPS", "1e-6"))
 # Core score model thresholds (env-tunable; no fixed literals in scoring path).
 PCT_REMAINING_MIN = float(os.environ.get("PCT_REMAINING_MIN", "0.02"))  # allow entry until ~18s before close
-ORACLE_LATENCY_ONLY_MODE = os.environ.get("ORACLE_LATENCY_ONLY_MODE", "true").lower() == "true"
+ORACLE_LATENCY_ONLY_MODE = os.environ.get("ORACLE_LATENCY_ONLY_MODE", "false").lower() == "true"
 ORACLE_FRESH_AGE_S   = float(os.environ.get("ORACLE_FRESH_AGE_S",  "35.0"))   # CL updated within N sec (cl_med~33.8s)
 ORACLE_MAX_MINS_LEFT = float(os.environ.get("ORACLE_MAX_MINS_LEFT", "2.5"))    # only enter in last 2.5min
 ORACLE_MIN_MOVE_PCT  = float(os.environ.get("ORACLE_MIN_MOVE_PCT",  "0.001"))  # 0.1% move from open
 ORACLE_SIZE_MULT     = float(os.environ.get("ORACLE_SIZE_MULT",     "4.0"))    # 4x size on near-certain bet
-CONTRARIAN_TAIL_ENABLED      = os.environ.get("CONTRARIAN_TAIL_ENABLED", "true").lower() == "true"
+CONTRARIAN_TAIL_ENABLED      = os.environ.get("CONTRARIAN_TAIL_ENABLED", "false").lower() == "true"
 CONTRARIAN_TAIL_MAX_ENTRY    = float(os.environ.get("CONTRARIAN_TAIL_MAX_ENTRY",    "0.45"))  # buy when cheap side ≤45¢
 CONTRARIAN_TAIL_MIN_MINS_LEFT= float(os.environ.get("CONTRARIAN_TAIL_MIN_MINS_LEFT","7.0"))   # at least 7min remaining
 CONTRARIAN_TAIL_MIN_MOVE_PCT = float(os.environ.get("CONTRARIAN_TAIL_MIN_MOVE_PCT", "0.0008"))# 0.08% move triggered (5m moves 0.04-0.12%)
