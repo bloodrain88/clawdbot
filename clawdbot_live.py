@@ -3573,8 +3573,49 @@ class LiveTrader:
                     pass
             await asyncio.sleep(2)   # reduced from 5s — fallback for when WS is active
 
+    async def _cl_ws_one(self, ws_url: str, agg_to_asset: dict, agg_addrs: list):
+        """One parallel WS subscriber — first to deliver an event wins (race pattern)."""
+        sub_req = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
+            "params": ["logs", {"address": agg_addrs, "topics": [CL_ANSWER_UPDATED_TOPIC]}],
+        })
+        refresh_at = _time.time() + 21600
+        async with websockets.connect(ws_url, ping_interval=20, open_timeout=10) as ws:
+            await ws.send(sub_req)
+            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            if "error" in resp or "result" not in resp:
+                raise RuntimeError(f"sub rejected: {resp}")
+            print(f"{G}[CL-WS]{RS} {ws_url.split('//')[1].split('/')[0]} ready")
+            async for raw in ws:
+                msg = json.loads(raw)
+                if msg.get("method") != "eth_subscription":
+                    continue
+                log = msg["params"]["result"]
+                asset = agg_to_asset.get(log.get("address", "").lower())
+                if not asset:
+                    continue
+                try:
+                    price_raw = int(log["topics"][1], 16)
+                    if price_raw >= 2**255:
+                        price_raw -= 2**256
+                    price = price_raw / 1e8
+                    updated_at = int(log.get("data", "0x0"), 16)
+                    now = _time.time()
+                    detect_lag = now - updated_at
+                    if 0 < price and detect_lag < 60:
+                        prev_ts = self.cl_updated.get(asset, 0)
+                        if updated_at > prev_ts:   # only update if newer round
+                            self.cl_prices[asset]  = price
+                            self.cl_updated[asset] = updated_at
+                            print(f"{G}[CL-WS]{RS} {asset} {price:.4f} detect={detect_lag*1000:.0f}ms "
+                                  f"via {ws_url.split('//')[1].split('/')[0]}")
+                except Exception:
+                    pass
+                if _time.time() >= refresh_at:
+                    return   # signal parent to refresh aggregator addresses
+
     async def chainlink_ws_loop(self):
-        """Subscribe to Chainlink AnswerUpdated events via Polygon WebSocket for <100ms detection."""
+        """Subscribe to Chainlink AnswerUpdated events — ALL WS RPCs in parallel (race pattern)."""
         loop = asyncio.get_running_loop()
         while True:
             try:
@@ -3596,62 +3637,20 @@ class LiveTrader:
                     await asyncio.sleep(10)
                     continue
                 agg_addrs = list(agg_to_asset.keys())
-                print(f"{G}[CL-WS] subscribing to {len(agg_to_asset)} aggregators via WS{RS}")
-                # Try each WS RPC in order
-                connected = False
-                for ws_url in POLYGON_WS_RPCS:
-                    try:
-                        async with websockets.connect(
-                            ws_url, ping_interval=20, open_timeout=10
-                        ) as ws:
-                            sub_req = json.dumps({
-                                "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
-                                "params": ["logs", {
-                                    "address": agg_addrs,
-                                    "topics": [CL_ANSWER_UPDATED_TOPIC],
-                                }],
-                            })
-                            await ws.send(sub_req)
-                            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-                            if "error" in resp or "result" not in resp:
-                                raise RuntimeError(f"sub error: {resp}")
-                            print(f"{G}[CL-WS] connected {ws_url} sub={resp['result']}{RS}")
-                            connected = True
-                            # Refresh aggregator addresses every 6h
-                            refresh_at = _time.time() + 21600
-                            async for raw in ws:
-                                msg = json.loads(raw)
-                                if msg.get("method") != "eth_subscription":
-                                    continue
-                                log = msg["params"]["result"]
-                                asset = agg_to_asset.get(log.get("address", "").lower())
-                                if not asset:
-                                    continue
-                                try:
-                                    # topics[1] = current (int256 indexed) = price × 1e8
-                                    price_raw = int(log["topics"][1], 16)
-                                    if price_raw >= 2**255:
-                                        price_raw -= 2**256
-                                    price = price_raw / 1e8
-                                    # data = updatedAt (uint256)
-                                    updated_at = int(log.get("data", "0x0"), 16)
-                                    now = _time.time()
-                                    detect_lag = now - updated_at
-                                    if 0 < price and detect_lag < 60:
-                                        self.cl_prices[asset]  = price
-                                        self.cl_updated[asset] = updated_at
-                                        if LOG_VERBOSE:
-                                            print(f"{G}[CL-WS]{RS} {asset} {price:.4f} detect={detect_lag*1000:.0f}ms")
-                                except Exception:
-                                    pass
-                                if _time.time() >= refresh_at:
-                                    break   # reconnect to refresh aggregator addresses
-                        if connected:
-                            break   # successful connection ended, retry
-                    except Exception as e:
-                        print(f"{Y}[CL-WS] {ws_url} failed: {e}{RS}")
-                        continue
-                await asyncio.sleep(2)
+                print(f"{G}[CL-WS] racing {len(POLYGON_WS_RPCS)} WS RPCs for {len(agg_to_asset)} aggregators{RS}")
+                # Launch all WS connections in parallel — fastest delivery wins each round
+                tasks = [
+                    asyncio.ensure_future(self._cl_ws_one(url, agg_to_asset, agg_addrs))
+                    for url in POLYGON_WS_RPCS
+                ]
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+                for t in pending:
+                    t.cancel()
+                # Check for errors
+                errs = [t.exception() for t in done if t.exception()]
+                if errs:
+                    print(f"{Y}[CL-WS] errors: {[str(e) for e in errs[:2]]}{RS}")
+                await asyncio.sleep(1)   # brief pause before refresh
             except Exception as e:
                 print(f"{Y}[CL-WS] outer error: {e}{RS}")
                 await asyncio.sleep(5)
