@@ -778,8 +778,8 @@ PCT_REMAINING_MIN = float(os.environ.get("PCT_REMAINING_MIN", "0.15"))
 PREV_WIN_DIR_MOVE_MIN = float(os.environ.get("PREV_WIN_DIR_MOVE_MIN", "0.0002"))
 MOM_THRESH_UP = float(os.environ.get("MOM_THRESH_UP", "0.53"))
 MOM_THRESH_DN = float(os.environ.get("MOM_THRESH_DN", "0.47"))
-CL_DIRECTION_MOVE_MIN = float(os.environ.get("CL_DIRECTION_MOVE_MIN", "0.0002"))
-DIR_MOVE_MIN = float(os.environ.get("DIR_MOVE_MIN", "0.0003"))
+CL_DIRECTION_MOVE_MIN = float(os.environ.get("CL_DIRECTION_MOVE_MIN", "0.0"))  # any move picks direction
+DIR_MOVE_MIN = float(os.environ.get("DIR_MOVE_MIN", "0.0"))                  # any move picks direction
 DIR_CONFLICT_MOVE_MAX = float(os.environ.get("DIR_CONFLICT_MOVE_MAX", "0.0010"))
 DIR_CONFLICT_CL_AGE_MAX = float(os.environ.get("DIR_CONFLICT_CL_AGE_MAX", "20.0"))
 DIR_CONFLICT_SCORE_PEN = int(os.environ.get("DIR_CONFLICT_SCORE_PEN", "3"))
@@ -4134,7 +4134,7 @@ class LiveTrader:
         elif tf_dn_votes > tf_up_votes:
             direction = "Down"
         else:
-            return None   # no clear signal — don't guess
+            direction = "Up" if cl_now >= open_price else "Down"  # always bet — binary resolves either way
 
         is_up    = (direction == "Up")
         tf_votes = tf_up_votes if is_up else tf_dn_votes
