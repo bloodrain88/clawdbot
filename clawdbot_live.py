@@ -5996,7 +5996,7 @@ class LiveTrader:
             "booster_note": booster_note,
             "superbet_floor_applied": superbet_floor_applied,
             "book_age_ms": book_age_ms,
-            "quote_age_ms": quote_age_ms,
+            "quote_age_ms": 0.0 if px_src == "CL" else quote_age_ms,
             "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
             "prebid_arm": arm_active,
             "must_fire": bool(late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15),
