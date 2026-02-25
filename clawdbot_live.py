@@ -5047,13 +5047,22 @@ class LiveTrader:
             self._skip_tick("analysis_quality_low")
             return None
         if analysis_conviction + DEFAULT_CMP_EPS < conviction_floor:
-            if self._noisy_log_enabled(f"skip-analysis-conv:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                print(
-                    f"{Y}[SKIP] {asset} {duration}m low analysis conviction "
-                    f"c={analysis_conviction:.3f}<{conviction_floor:.3f}{RS}"
-                )
-            self._skip_tick("analysis_conviction_low")
-            return None
+            # Contrarian value bypass: when price moved against our direction the token is cheap
+            # (e.g. Down token at 36¢ in a bullish window). High payout compensates for lower
+            # conviction. EV gate below validates profitability at the actual token price.
+            _contrarian_value = (
+                not cl_agree
+                and move_pct >= 0.004          # price moved 0.4%+ against our direction
+                and analysis_conviction >= ANALYSIS_CONV_FLOOR_MIN  # absolute floor still required
+            )
+            if not _contrarian_value:
+                if self._noisy_log_enabled(f"skip-analysis-conv:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m low analysis conviction "
+                        f"c={analysis_conviction:.3f}<{conviction_floor:.3f}{RS}"
+                    )
+                self._skip_tick("analysis_conviction_low")
+                return None
 
         # Recalibrate posterior using measured analysis quality.
         # Higher quality allows stronger posterior; weaker quality shrinks toward 50%.
@@ -5284,16 +5293,16 @@ class LiveTrader:
         ):
             min_payout_req = min(min_payout_req, LATE_PAYOUT_RELAX_FLOOR)
         # Trend-confirmed payout relax: when Chainlink + binary model both confirm direction,
-        # cap min_payout_req at 1.72x throughout the window (not just last 45%).
-        # Prevents paralysis in trending markets where trend-side tokens cost 55-58¢.
-        # Break-even at 1.72x = entry ≤ 58¢ (vs 1.85x base = ≤54¢).
+        # cap min_payout_req at 1.55x and allow max_entry up to 65¢.
+        # Break-even at 1.55x = entry ≤ 64.5¢. EV gate still validates profitability.
         if (
             duration >= CORE_DURATION_MIN
             and cl_agree
             and bin_c >= 0.54
             and move_pct >= LATE_PAYOUT_RELAX_MIN_MOVE
         ):
-            min_payout_req = min(min_payout_req, 1.72)
+            min_payout_req = min(min_payout_req, 1.55)
+            max_entry_allowed = max(max_entry_allowed, 0.65)
         min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
         if (ws_fresh or rest_fresh) and cl_fresh and vol_fresh and mins_left >= (FRESH_RELAX_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else FRESH_RELAX_MIN_LEFT_5M):
             max_entry_allowed = min(FRESH_RELAX_ENTRY_CAP, max_entry_allowed + FRESH_RELAX_ENTRY_ADD)
