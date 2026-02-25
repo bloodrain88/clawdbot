@@ -741,7 +741,12 @@ FORCE_TAKER_MOVE_MIN = float(os.environ.get("FORCE_TAKER_MOVE_MIN", "0.0015"))
 DEFAULT_EPS = float(os.environ.get("DEFAULT_EPS", "1e-9"))
 DEFAULT_CMP_EPS = float(os.environ.get("DEFAULT_CMP_EPS", "1e-6"))
 # Core score model thresholds (env-tunable; no fixed literals in scoring path).
-PCT_REMAINING_MIN = float(os.environ.get("PCT_REMAINING_MIN", "0.15"))
+PCT_REMAINING_MIN = float(os.environ.get("PCT_REMAINING_MIN", "0.02"))  # allow entry until ~18s before close
+ORACLE_LATENCY_ONLY_MODE = os.environ.get("ORACLE_LATENCY_ONLY_MODE", "true").lower() == "true"
+ORACLE_FRESH_AGE_S   = float(os.environ.get("ORACLE_FRESH_AGE_S",  "10.0"))   # CL updated within N sec
+ORACLE_MAX_MINS_LEFT = float(os.environ.get("ORACLE_MAX_MINS_LEFT", "2.5"))    # only enter in last 2.5min
+ORACLE_MIN_MOVE_PCT  = float(os.environ.get("ORACLE_MIN_MOVE_PCT",  "0.001"))  # 0.1% move from open
+ORACLE_SIZE_MULT     = float(os.environ.get("ORACLE_SIZE_MULT",     "4.0"))    # 4x size on near-certain bet
 PREV_WIN_DIR_MOVE_MIN = float(os.environ.get("PREV_WIN_DIR_MOVE_MIN", "0.0002"))
 MOM_THRESH_UP = float(os.environ.get("MOM_THRESH_UP", "0.53"))
 MOM_THRESH_DN = float(os.environ.get("MOM_THRESH_DN", "0.47"))
@@ -4040,11 +4045,24 @@ class LiveTrader:
         src = self.open_prices_source.get(cid, "?")
         src_tag = f"[{src}]"
 
-        # Timing gate: only block final 2 min (price already moved fully, no edge).
+        # Timing gate
         total_life    = m["end_ts"] - m["start_ts"]
         pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
         if pct_remaining < PCT_REMAINING_MIN:
-            return None   # last ~2 min — too late to fill at good price
+            return None   # too close to close
+
+        # Oracle latency mode: only enter when Chainlink JUST updated in the final window.
+        # This is near-arb: we know the oracle value with high certainty until next CL update (~27s).
+        if ORACLE_LATENCY_ONLY_MODE:
+            move_now = abs(current - open_price) / max(open_price, 1e-9)
+            oracle_window = (
+                cl_age_s is not None
+                and cl_age_s <= ORACLE_FRESH_AGE_S
+                and mins_left <= ORACLE_MAX_MINS_LEFT
+                and move_now >= ORACLE_MIN_MOVE_PCT
+            )
+            if not oracle_window:
+                return None
 
         # Previous window direction from CL prices (used as one signal among others).
         prev_open     = self.asset_prev_open.get(asset, 0)
@@ -5552,6 +5570,8 @@ class LiveTrader:
         if entry <= FORCE_MIN_ENTRY_TAIL or (duration >= 15 and mins_left <= FORCE_MIN_LEFT_TAIL):
             dyn_floor = min(dyn_floor, MIN_BET_ABS)
         size = round(max(model_size, dyn_floor), 2)
+        if ORACLE_LATENCY_ONLY_MODE:
+            size = round(min(hard_cap, size * ORACLE_SIZE_MULT), 2)
         size = max(ABS_MIN_SIZE_USDC, min(hard_cap, size))
 
         # Super-bet floor:
