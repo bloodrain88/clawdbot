@@ -210,10 +210,10 @@ MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "1.82"))
 LATE_PAYOUT_RELAX_ENABLED   = os.environ.get("LATE_PAYOUT_RELAX_ENABLED", "true").lower() == "true"
 LATE_PAYOUT_RELAX_PCT_LEFT  = float(os.environ.get("LATE_PAYOUT_RELAX_PCT_LEFT", "0.45"))   # last 45% of window (was 0.28)
 LATE_PAYOUT_RELAX_MIN_MOVE  = float(os.environ.get("LATE_PAYOUT_RELAX_MIN_MOVE", "0.0025")) # 0.25% price move confirming direction
-LATE_PAYOUT_RELAX_FLOOR     = float(os.environ.get("LATE_PAYOUT_RELAX_FLOOR", "1.65"))      # accept 1.65x when late+locked
+LATE_PAYOUT_RELAX_FLOOR     = float(os.environ.get("LATE_PAYOUT_RELAX_FLOOR", "1.40"))      # accept 1.40x when late+locked (momentum confirmed, WR ~75-80%)
 LATE_PAYOUT_PROB_BOOST      = float(os.environ.get("LATE_PAYOUT_PROB_BOOST", "0.04"))       # true_prob boost for locked-direction entries
 # Must-fire: guarantee at least 1 trade per 15m window in last N minutes by relaxing score gate
-LATE_MUST_FIRE_ENABLED     = os.environ.get("LATE_MUST_FIRE_ENABLED", "true").lower() == "true"
+LATE_MUST_FIRE_ENABLED     = os.environ.get("LATE_MUST_FIRE_ENABLED", "false").lower() == "true"  # disabled: early-entry strategy
 LATE_MUST_FIRE_MINS_LEFT   = float(os.environ.get("LATE_MUST_FIRE_MINS_LEFT", "10.0"))   # relax in last 10 min (was 7)
 LATE_MUST_FIRE_SCORE_RELAX = int(os.environ.get("LATE_MUST_FIRE_SCORE_RELAX", "3"))      # lower gate by 3 pts
 LATE_MUST_FIRE_MIN_SCORE   = int(os.environ.get("LATE_MUST_FIRE_MIN_SCORE", "5"))        # absolute floor after relax
@@ -439,12 +439,19 @@ REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() 
 STRICT_REQUIRE_FRESH_LEADER = os.environ.get("STRICT_REQUIRE_FRESH_LEADER", "false").lower() == "true"
 STRICT_REQUIRE_FRESH_BOOK_WS = os.environ.get("STRICT_REQUIRE_FRESH_BOOK_WS", "true").lower() == "true"
 MIN_ANALYSIS_QUALITY = float(os.environ.get("MIN_ANALYSIS_QUALITY", "0.53"))
-MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.50"))  # lowered 0.52→0.50
+MIN_ANALYSIS_CONVICTION = float(os.environ.get("MIN_ANALYSIS_CONVICTION", "0.45"))  # lowered 0.52→0.45
 WS_BOOK_SOFT_MAX_AGE_MS = float(os.environ.get("WS_BOOK_SOFT_MAX_AGE_MS", "20000"))
 ANALYSIS_PROB_SCALE_MIN = float(os.environ.get("ANALYSIS_PROB_SCALE_MIN", "0.65"))
 ANALYSIS_PROB_SCALE_MAX = float(os.environ.get("ANALYSIS_PROB_SCALE_MAX", "1.20"))
 # Small tolerance for payout threshold to avoid dead-zone misses (e.g. 1.98x vs 2.00x).
 PAYOUT_NEAR_MISS_TOL = float(os.environ.get("PAYOUT_NEAR_MISS_TOL", "0.03"))
+# Early Momentum Capture strategy: enter ONLY in first N minutes of window when momentum starts.
+# Prediction markets reprice slowly — at window open, tokens still at ~50c even when CL already moved.
+# Entering early WITH momentum (cl_agree=True, move started) gives 60-70% WR vs 46% late/contrarian.
+EARLY_ENTRY_ONLY           = os.environ.get("EARLY_ENTRY_ONLY", "true").lower() == "true"
+EARLY_ENTRY_ELAPSED_MAX_MIN = float(os.environ.get("EARLY_ENTRY_ELAPSED_MAX_MIN", "4.0"))   # first 4 min of 15m window
+EARLY_MIN_MOVE_PCT         = float(os.environ.get("EARLY_MIN_MOVE_PCT", "0.0003"))          # 0.03% CL move from open required
+REQUIRE_CL_AGREE           = os.environ.get("REQUIRE_CL_AGREE", "true").lower() == "true"   # momentum bets only
 ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M", "0.02"))
 ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M = float(os.environ.get("ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M", "0.05"))
 # Mid-round booster (15m only): small additive bet at high payout/high conviction.
@@ -5100,6 +5107,25 @@ class LiveTrader:
             cl_agree = (cl_now > open_price) == side_up
         imbalance_confirms = ob_sig > IMBALANCE_CONFIRM_MIN
 
+        # Direction quality gate: at window start (minute 0-2) we trust the PREBID prediction
+        # (computed 45-15s before open). After minute 2, the actual CL price must confirm.
+        # Contrarian mid/late bets (cl_agree=False after minute 2) have ~25% WR — always losing.
+        _elapsed_min = duration - mins_left
+        if REQUIRE_CL_AGREE and not cl_agree and _elapsed_min >= 2.0:
+            if self._noisy_log_enabled(f"skip-no-momentum:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                print(f"{Y}[SKIP] {asset} {side} no momentum (cl_agree=False at t+{_elapsed_min:.1f}min){RS}")
+            self._skip_tick("no_momentum")
+            return None
+
+        # Minimum move gate: after minute 2, require price has actually moved in our direction.
+        # At minute 0-2 the prediction drives entry (no move required yet).
+        # After minute 2 in a flat market (no move) = no signal = 50/50, skip.
+        if EARLY_MIN_MOVE_PCT > 0 and move_pct < EARLY_MIN_MOVE_PCT and _elapsed_min >= 2.0:
+            if self._noisy_log_enabled(f"skip-flat:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                print(f"{Y}[SKIP] {asset} {side} flat market (move={move_pct:.4%} < {EARLY_MIN_MOVE_PCT:.4%}){RS}")
+            self._skip_tick("flat_market")
+            return None
+
         # Bet the signal direction — EV_net and execution quality drive growth.
         entry = up_price if side == "Up" else (1 - up_price)
         # Keep edge/prob aligned with final side after pre-bid/copyflow adjustments.
@@ -5354,17 +5380,6 @@ class LiveTrader:
                     )
                 self._skip_tick("payout_below")
                 return None
-        # Contrarian quality gate: when betting against current momentum (cl_agree=False),
-        # require payout >= 2.50x (entry <= 0.40). At lower payout, contrarian WR ~25-35%
-        # does not compensate — only take contrarian bets when tokens are genuinely cheap.
-        if not cl_agree and payout_mult < 2.50:
-            if self._noisy_log_enabled(f"skip-contra-payout:{asset}:{side}", LOG_SKIP_EVERY_SEC):
-                print(
-                    f"{Y}[SKIP] {asset} {side} contrarian payout={payout_mult:.2f}x < 2.50x "
-                    f"(cl_agree=False, entry={entry:.2f}){RS}"
-                )
-            self._skip_tick("contrarian_low_payout")
-            return None
         # Polymarket fee is price-dependent: p*(1-p)*6.24% (parabolic, peaks at p=0.5).
         # FEE_RATE_EST (flat 1.56%) overcounts fees on high-payout entries (e.g. p=0.20 → actual=1.0%).
         _fee_dyn = max(0.001, entry * (1.0 - entry) * 0.0624)
