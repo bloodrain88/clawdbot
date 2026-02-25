@@ -5203,7 +5203,7 @@ class LiveTrader:
         elif setup_q <= SETUP_Q_TIGHTEN_MIN:
             tighten = min(SETUP_Q_TIGHTEN_MAX, (SETUP_Q_TIGHTEN_MIN - setup_q) * SETUP_Q_TIGHTEN_MULT)
             min_entry_dyn = min(0.45, min_entry_dyn + tighten)
-        if mins_left <= (ANALYSIS_LATE_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else ANALYSIS_LATE_MIN_LEFT_5M):
+        if mins_left <= (3.5 if duration >= CORE_DURATION_MIN else 1.8):
             # Near expiry, avoid ultra-low entries that are mostly noise/fill artifacts.
             min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + ENTRY_TIGHTEN_ADD)
         if not (ws_fresh or rest_fresh):   # only tighten when both WS and REST are stale
