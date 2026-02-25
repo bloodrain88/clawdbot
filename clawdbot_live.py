@@ -233,7 +233,7 @@ ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.54"))
 ENTRY_HARD_CAP_15M = float(os.environ.get("ENTRY_HARD_CAP_15M", "0.65"))
 ENTRY_NEAR_MISS_TOL = float(os.environ.get("ENTRY_NEAR_MISS_TOL", "0.030"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
-PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.25"))
+PULLBACK_LIMIT_MIN_PCT_LEFT = float(os.environ.get("PULLBACK_LIMIT_MIN_PCT_LEFT", "0.10"))
 FAST_EXEC_ENABLED = os.environ.get("FAST_EXEC_ENABLED", "false").lower() == "true"
 FAST_EXEC_SCORE = int(os.environ.get("FAST_EXEC_SCORE", "6"))
 FAST_EXEC_EDGE = float(os.environ.get("FAST_EXEC_EDGE", "0.02"))
@@ -928,7 +928,7 @@ SETUP_Q_TIGHTEN_MAX = float(os.environ.get("SETUP_Q_TIGHTEN_MAX", "0.06"))
 SETUP_Q_TIGHTEN_MULT = float(os.environ.get("SETUP_Q_TIGHTEN_MULT", "0.25"))
 SETUP_VOL_RELAX_MIN = float(os.environ.get("SETUP_VOL_RELAX_MIN", "1.10"))
 ENTRY_TIGHTEN_ADD = float(os.environ.get("ENTRY_TIGHTEN_ADD", "0.01"))
-PULLBACK_MIN_ENTRY_FLOOR = float(os.environ.get("PULLBACK_MIN_ENTRY_FLOOR", "0.20"))
+PULLBACK_MIN_ENTRY_FLOOR = float(os.environ.get("PULLBACK_MIN_ENTRY_FLOOR", "0.10"))
 FORCE_TAKER_CL_AGE_FRESH = float(os.environ.get("FORCE_TAKER_CL_AGE_FRESH", "45"))
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
@@ -5354,6 +5354,17 @@ class LiveTrader:
                     )
                 self._skip_tick("payout_below")
                 return None
+        # Contrarian quality gate: when betting against current momentum (cl_agree=False),
+        # require payout >= 2.50x (entry <= 0.40). At lower payout, contrarian WR ~25-35%
+        # does not compensate — only take contrarian bets when tokens are genuinely cheap.
+        if not cl_agree and payout_mult < 2.50:
+            if self._noisy_log_enabled(f"skip-contra-payout:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP] {asset} {side} contrarian payout={payout_mult:.2f}x < 2.50x "
+                    f"(cl_agree=False, entry={entry:.2f}){RS}"
+                )
+            self._skip_tick("contrarian_low_payout")
+            return None
         # Polymarket fee is price-dependent: p*(1-p)*6.24% (parabolic, peaks at p=0.5).
         # FEE_RATE_EST (flat 1.56%) overcounts fees on high-payout entries (e.g. p=0.20 → actual=1.0%).
         _fee_dyn = max(0.001, entry * (1.0 - entry) * 0.0624)
