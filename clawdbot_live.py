@@ -10758,7 +10758,7 @@ class LiveTrader:
             positions.append({
                 "asset": asset, "side": side, "entry": round(entry, 3),
                 "stake": round(stake, 2), "cur_p": round(cur_p, 2),
-                "open_p": round(open_p, 2), "move_pct": round(move_pct, 3),
+                "open_p": round(open_p, 6), "move_pct": round(move_pct, 3),
                 "lead": lead, "mins_left": round(mins_left, 1),
                 "cid": cid[:12], "start_ts": start_ts, "end_ts": end_ts,
                 "duration": duration, "token_id": token_id,
@@ -10932,20 +10932,30 @@ function drawChart(canvasId, pts, openP, startTs, endTs, nowTs) {
   const isLead = openP > 0 ? last >= openP : null;
   const lineColor = isLead === null ? '#8b949e' : (isLead ? '#3fb950' : '#f85149');
 
+  const datasets = [{
+    data,
+    borderColor: lineColor,
+    borderWidth: 2,
+    pointRadius: 0,
+    pointHoverRadius: 4,
+    tension: 0.3,
+    fill: false,
+  }];
+  if(openP > 0) {
+    datasets.push({
+      data: wPts.map(() => openP),
+      borderColor: 'rgba(255,255,255,0.35)',
+      borderWidth: 1.5,
+      borderDash: [4,3],
+      pointRadius: 0,
+      fill: false,
+      tension: 0,
+    });
+  }
+
   charts[canvasId] = new Chart(ctx, {
     type: 'line',
-    data: {
-      labels,
-      datasets: [{
-        data,
-        borderColor: lineColor,
-        borderWidth: 2,
-        pointRadius: 0,
-        pointHoverRadius: 4,
-        tension: 0.3,
-        fill: false,
-      }]
-    },
+    data: { labels, datasets },
     options: {
       animation: false,
       responsive: true,
@@ -10956,44 +10966,20 @@ function drawChart(canvasId, pts, openP, startTs, endTs, nowTs) {
           mode: 'index', intersect: false,
           callbacks: { label: ctx => '$' + fmt(ctx.raw, dec) }
         },
-        // price-to-beat line via annotation would need plugin; use dataset instead:
       },
       scales: {
         x: {
-          ticks: {
-            maxTicksLimit: 5,
-            color: '#484f58',
-            font: {size:9}
-          },
+          ticks: { maxTicksLimit: 5, color: '#484f58', font: {size:9} },
           grid: {color:'#161b22'}
         },
         y: {
           position: 'right',
-          ticks: {
-            color: '#8b949e',
-            font: {size:9},
-            callback: v => '$' + fmt(v, dec)
-          },
+          ticks: { color: '#8b949e', font: {size:9}, callback: v => '$' + fmt(v, dec) },
           grid: {color:'rgba(255,255,255,0.04)'}
         }
       }
     }
   });
-
-  // Draw price-to-beat dashed line manually on the chart canvas after render
-  if(openP > 0) {
-    // Add a second dataset as a constant line at openP
-    charts[canvasId].data.datasets.push({
-      data: wPts.map(() => openP),
-      borderColor: 'rgba(255,255,255,0.35)',
-      borderWidth: 1.5,
-      borderDash: [4,3],
-      pointRadius: 0,
-      fill: false,
-      tension: 0,
-    });
-    charts[canvasId].update('none');
-  }
 }
 
 function renderCards(d) {
