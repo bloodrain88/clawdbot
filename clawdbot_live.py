@@ -10643,6 +10643,232 @@ class LiveTrader:
                 self._errors.tick("health_check", print, err=e, every=20)
             self.status()
 
+    # ── WEB DASHBOARD ─────────────────────────────────────────────────────────
+    def _dashboard_data(self) -> dict:
+        """Collect current bot state as a JSON-serialisable dict for the web dashboard."""
+        import time as _t
+        now_ts = _t.time()
+        el = datetime.now(timezone.utc) - self.start_time
+        h, m = int(el.total_seconds() // 3600), int(el.total_seconds() % 3600 // 60)
+        display_bank = self.onchain_total_equity if self.onchain_snapshot_ts > 0 else self.bankroll
+        pnl = display_bank - self.start_bank
+        roi = pnl / self.start_bank * 100 if self.start_bank > 0 else 0
+        wr = round(self.wins / self.total * 100, 1) if self.total else 0
+
+        # Open positions
+        positions = []
+        for cid, (mkt, trade) in list(self.pending.items()):
+            if self.onchain_snapshot_ts > 0 and cid not in self.onchain_open_cids:
+                continue
+            asset = trade.get("asset", "?")
+            side  = trade.get("side", "?")
+            stake = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
+            if stake <= 0:
+                stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
+            if stake <= 0:
+                continue
+            entry     = float(trade.get("fill_price", trade.get("entry", 0.5)) or 0.5)
+            open_p    = float(self.open_prices.get(cid, 0.0) or 0.0)
+            cl_p      = self.cl_prices.get(asset, 0)
+            cl_ts     = self.cl_updated.get(asset, 0)
+            rtds_p    = self.prices.get(asset, 0)
+            _ph       = self.price_history.get(asset)
+            rtds_ts   = _ph[-1][0] if _ph else 0
+            cur_p     = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
+            end_ts    = float(trade.get("end_ts", mkt.get("end_ts", 0)) or 0)
+            mins_left = max(0.0, (end_ts - now_ts) / 60)
+            if open_p > 0 and cur_p > 0:
+                pred_winner = "Up" if cur_p >= open_p else "Down"
+                lead = side == pred_winner
+                move_pct = (cur_p - open_p) / open_p * 100
+            else:
+                lead, move_pct = None, 0.0
+            positions.append({
+                "asset": asset, "side": side, "entry": round(entry, 3),
+                "stake": round(stake, 2), "cur_p": round(cur_p, 4),
+                "open_p": round(open_p, 4), "move_pct": round(move_pct, 3),
+                "lead": lead, "mins_left": round(mins_left, 1),
+                "cid": cid[:12],
+            })
+
+        # Skip top reasons (last 15m)
+        skip_top = []
+        try:
+            _, top = self._skip_top(900, 6)
+            skip_top = [{"reason": r, "count": c} for r, c in top]
+        except Exception:
+            pass
+
+        # ExecQ best bucket
+        execq = {}
+        try:
+            if self._bucket_stats.rows:
+                top_bucket = sorted(self._bucket_stats.rows.items(),
+                                    key=lambda kv: kv[1].get("n", 0), reverse=True)[0]
+                k, v = top_bucket
+                outcomes = int(v.get("outcomes", v.get("wins", 0) + v.get("losses", 0)))
+                fills    = int(v.get("fills", 0) or 0)
+                wr_b     = round(v["wins"] / outcomes * 100, 1) if outcomes > 0 else 0
+                pf_b     = (float(v.get("gross_win", 0)) / float(v.get("gross_loss", 1e-9))
+                            if float(v.get("gross_loss", 0)) > 0 else 0)
+                execq    = {"bucket": k, "fills": fills, "outcomes": outcomes,
+                            "wr": wr_b, "pf": round(pf_b, 2),
+                            "pnl": round(float(v.get("pnl", 0)), 2)}
+        except Exception:
+            pass
+
+        # Health
+        cl_ages = {a: round(now_ts - float(self.cl_updated.get(a, 0) or 0), 1)
+                   for a in ("BTC", "ETH", "SOL", "XRP")}
+
+        return {
+            "ts": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+            "session": f"{h}h{m:02d}m",
+            "network": NETWORK,
+            "rtds_ok": self.rtds_ok,
+            "trades": self.total, "wins": self.wins, "wr": wr,
+            "pnl": round(pnl, 2), "roi": round(roi, 1),
+            "usdc": round(self.onchain_usdc_balance, 2),
+            "open_stake": round(self.onchain_open_stake_total, 2),
+            "open_count": self.onchain_open_count,
+            "open_mark": round(self.onchain_open_mark_value, 2),
+            "total_equity": round(display_bank, 2),
+            "prices": {a: round(p, 4) for a, p in self.prices.items() if p > 0},
+            "cl_ages": cl_ages,
+            "positions": positions,
+            "skip_top": skip_top,
+            "execq": execq,
+            "dry_run": DRY_RUN,
+        }
+
+    async def _dashboard_loop(self):
+        """Serve a minimal web dashboard on DASHBOARD_PORT (default 8080)."""
+        port = int(os.environ.get("DASHBOARD_PORT", "8080"))
+        from aiohttp import web
+
+        HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="30">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClawdBot</title>
+<style>
+  body{font-family:monospace;background:#0d1117;color:#e6edf3;margin:0;padding:16px}
+  h2{color:#58a6ff;margin:0 0 12px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-bottom:14px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px}
+  .card h3{margin:0 0 8px;font-size:.85em;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}
+  .big{font-size:1.5em;font-weight:700}
+  .green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.grey{color:#8b949e}
+  table{width:100%;border-collapse:collapse;font-size:.85em}
+  th{color:#8b949e;text-align:left;padding:4px 6px;border-bottom:1px solid #30363d}
+  td{padding:4px 6px;border-bottom:1px solid #21262d}
+  .badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:.78em;font-weight:700}
+  .badge.lead{background:#1a4731;color:#3fb950}
+  .badge.trail{background:#4d1a1a;color:#f85149}
+  .badge.unk{background:#2d2d2d;color:#8b949e}
+  footer{margin-top:16px;font-size:.75em;color:#484f58}
+  .tag{font-size:.75em;padding:2px 5px;border-radius:3px;background:#21262d;margin-left:4px}
+</style>
+</head>
+<body>
+<h2>ClawdBot <span id="ts" class="grey" style="font-size:.6em"></span>
+  <span id="dry" class="tag" style="display:none;color:#d29922">DRY-RUN</span>
+</h2>
+<div class="grid" id="cards"></div>
+<div id="positions-wrap"></div>
+<div id="skip-wrap"></div>
+<footer>Auto-refresh every 30s &mdash; <a href="/api" style="color:#58a6ff">raw JSON</a></footer>
+
+<script>
+async function load(){
+  const d = await fetch('/api').then(r=>r.json());
+  document.getElementById('ts').textContent = d.ts;
+  if(d.dry_run) document.getElementById('dry').style.display='';
+
+  const pnlC = d.pnl >= 0 ? 'green' : 'red';
+  const wrC   = d.wr >= 52 ? 'green' : d.wr >= 48 ? 'yellow' : 'red';
+  const cards = [
+    {t:'Balance', body: `<div class="big">\$${d.total_equity.toFixed(2)}</div>
+      <div>USDC: \$${d.usdc.toFixed(2)} &nbsp; Stake: \$${d.open_stake.toFixed(2)} (${d.open_count})</div>
+      <div>Mark: \$${d.open_mark.toFixed(2)}</div>`},
+    {t:'Performance', body: `<div class="big ${pnlC}">${d.pnl>=0?'+':''}\$${d.pnl.toFixed(2)}</div>
+      <div>ROI: <span class="${pnlC}">${d.roi>0?'+':''}${d.roi.toFixed(1)}%</span></div>
+      <div>Trades: ${d.trades} &nbsp; WR: <span class="${wrC}">${d.wr}%</span> (${d.wins}W/${d.trades-d.wins}L)</div>`},
+    {t:'Session', body: `<div class="big">${d.session}</div>
+      <div>Network: ${d.network}</div>
+      <div>RTDS: <span class="${d.rtds_ok?'green':'red'}">${d.rtds_ok?'✓':'✗'}</span></div>`},
+    {t:'Prices', body: Object.entries(d.prices).map(([a,p])=>`<div><b>${a}</b> \$${p.toLocaleString()}</div>`).join('')},
+  ];
+  if(d.execq && d.execq.outcomes>0){
+    const wrc = d.execq.wr>=52?'green':d.execq.wr>=48?'yellow':'red';
+    cards.push({t:'ExecQ (best bucket)', body:`<div style="font-size:.8em;color:#8b949e">${d.execq.bucket}</div>
+      <div>WR: <span class="${wrc}">${d.execq.wr}%</span> (${d.execq.fills}/${d.execq.outcomes})</div>
+      <div>PF: ${d.execq.pf} &nbsp; PnL: <span class="${d.execq.pnl>=0?'green':'red'}">${d.execq.pnl>=0?'+':''}$${d.execq.pnl.toFixed(2)}</span></div>`});
+  }
+
+  document.getElementById('cards').innerHTML = cards.map(c=>`
+    <div class="card"><h3>${c.t}</h3>${c.body}</div>`).join('');
+
+  // Positions
+  if(d.positions.length){
+    const rows = d.positions.map(p=>{
+      const badge = p.lead===null ? '<span class="badge unk">?</span>'
+                  : p.lead ? '<span class="badge lead">LEAD</span>'
+                  : '<span class="badge trail">TRAIL</span>';
+      const mc = p.move_pct>0?'green':p.move_pct<0?'red':'grey';
+      return `<tr>
+        <td><b>${p.asset}</b> ${p.side}</td>
+        <td>${badge}</td>
+        <td>${p.entry.toFixed(3)}</td>
+        <td>\$${p.stake.toFixed(2)}</td>
+        <td class="${mc}">${p.move_pct>0?'+':''}${p.move_pct.toFixed(2)}%</td>
+        <td>${p.mins_left.toFixed(1)}m</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('positions-wrap').innerHTML = `
+      <div class="card" style="margin-bottom:12px">
+        <h3>Open Positions (${d.positions.length})</h3>
+        <table><tr><th>Asset</th><th>Status</th><th>Entry</th><th>Stake</th><th>Move</th><th>Left</th></tr>
+        ${rows}</table></div>`;
+  } else {
+    document.getElementById('positions-wrap').innerHTML = `<div class="card" style="margin-bottom:12px"><h3>Open Positions</h3><span class="grey">No open positions</span></div>`;
+  }
+
+  // Skips
+  if(d.skip_top.length){
+    const rows = d.skip_top.map(s=>`<tr><td>${s.reason}</td><td>${s.count}</td></tr>`).join('');
+    document.getElementById('skip-wrap').innerHTML = `
+      <div class="card"><h3>Skip Reasons (15m)</h3>
+      <table><tr><th>Reason</th><th>Count</th></tr>${rows}</table></div>`;
+  }
+}
+load();
+</script>
+</body></html>"""
+
+        async def handle_html(request):
+            return web.Response(text=HTML, content_type="text/html")
+
+        async def handle_api(request):
+            try:
+                data = self._dashboard_data()
+            except Exception as e:
+                data = {"error": str(e)}
+            return web.Response(text=json.dumps(data), content_type="application/json")
+
+        app = web.Application()
+        app.router.add_get("/", handle_html)
+        app.router.add_get("/api", handle_api)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"[DASH] Dashboard running on http://0.0.0.0:{port}")
+        while True:
+            await asyncio.sleep(3600)
+
     # ── MAIN ──────────────────────────────────────────────────────────────────
     async def run(self):
         print(f"""
@@ -10699,6 +10925,7 @@ class LiveTrader:
             _guard("_position_sync_loop",   self._position_sync_loop),
             _guard("_stream_binance_liquidations", self._stream_binance_liquidations),
             _guard("_oi_ls_loop",           self._oi_ls_loop),
+            _guard("_dashboard_loop",       self._dashboard_loop),
         )
 
 
