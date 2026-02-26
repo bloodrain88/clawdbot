@@ -10655,6 +10655,15 @@ class LiveTrader:
         roi = pnl / self.start_bank * 100 if self.start_bank > 0 else 0
         wr = round(self.wins / self.total * 100, 1) if self.total else 0
 
+        # Price history for charts (last 20 min, ~4 pts/s max → cap at 600 pts)
+        charts = {}
+        for asset, ph in self.price_history.items():
+            cutoff = now_ts - 1200
+            pts = [{"t": round(ts, 1), "p": round(px, 2)}
+                   for ts, px in ph if ts >= cutoff and px > 0]
+            if pts:
+                charts[asset] = pts
+
         # Open positions
         positions = []
         for cid, (mkt, trade) in list(self.pending.items()):
@@ -10676,7 +10685,9 @@ class LiveTrader:
             rtds_ts   = _ph[-1][0] if _ph else 0
             cur_p     = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
             end_ts    = float(trade.get("end_ts", mkt.get("end_ts", 0)) or 0)
+            start_ts  = float(mkt.get("start_ts", 0) or 0)
             mins_left = max(0.0, (end_ts - now_ts) / 60)
+            duration  = int(trade.get("duration", mkt.get("duration", 15)) or 15)
             if open_p > 0 and cur_p > 0:
                 pred_winner = "Up" if cur_p >= open_p else "Down"
                 lead = side == pred_winner
@@ -10685,10 +10696,11 @@ class LiveTrader:
                 lead, move_pct = None, 0.0
             positions.append({
                 "asset": asset, "side": side, "entry": round(entry, 3),
-                "stake": round(stake, 2), "cur_p": round(cur_p, 4),
-                "open_p": round(open_p, 4), "move_pct": round(move_pct, 3),
+                "stake": round(stake, 2), "cur_p": round(cur_p, 2),
+                "open_p": round(open_p, 2), "move_pct": round(move_pct, 3),
                 "lead": lead, "mins_left": round(mins_left, 1),
-                "cid": cid[:12],
+                "cid": cid[:12], "start_ts": start_ts, "end_ts": end_ts,
+                "duration": duration,
             })
 
         # Skip top reasons (last 15m)
@@ -10723,6 +10735,7 @@ class LiveTrader:
 
         return {
             "ts": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+            "now_ts": round(now_ts, 1),
             "session": f"{h}h{m:02d}m",
             "network": NETWORK,
             "rtds_ok": self.rtds_ok,
@@ -10733,8 +10746,9 @@ class LiveTrader:
             "open_count": self.onchain_open_count,
             "open_mark": round(self.onchain_open_mark_value, 2),
             "total_equity": round(display_bank, 2),
-            "prices": {a: round(p, 4) for a, p in self.prices.items() if p > 0},
+            "prices": {a: round(p, 2) for a, p in self.prices.items() if p > 0},
             "cl_ages": cl_ages,
+            "charts": charts,
             "positions": positions,
             "skip_top": skip_top,
             "execq": execq,
@@ -10742,109 +10756,246 @@ class LiveTrader:
         }
 
     async def _dashboard_loop(self):
-        """Serve a minimal web dashboard on DASHBOARD_PORT (default 8080)."""
+        """Serve a live web dashboard on DASHBOARD_PORT (default 8080)."""
         port = int(os.environ.get("DASHBOARD_PORT", "8080"))
         from aiohttp import web
 
-        HTML = """<!DOCTYPE html>
+        HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="refresh" content="30">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ClawdBot</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
-  body{font-family:monospace;background:#0d1117;color:#e6edf3;margin:0;padding:16px}
-  h2{color:#58a6ff;margin:0 0 12px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-bottom:14px}
-  .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px}
-  .card h3{margin:0 0 8px;font-size:.85em;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}
-  .big{font-size:1.5em;font-weight:700}
-  .green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.grey{color:#8b949e}
-  table{width:100%;border-collapse:collapse;font-size:.85em}
-  th{color:#8b949e;text-align:left;padding:4px 6px;border-bottom:1px solid #30363d}
-  td{padding:4px 6px;border-bottom:1px solid #21262d}
-  .badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:.78em;font-weight:700}
-  .badge.lead{background:#1a4731;color:#3fb950}
-  .badge.trail{background:#4d1a1a;color:#f85149}
-  .badge.unk{background:#2d2d2d;color:#8b949e}
-  footer{margin-top:16px;font-size:.75em;color:#484f58}
-  .tag{font-size:.75em;padding:2px 5px;border-radius:3px;background:#21262d;margin-left:4px}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace;background:#0d0f14;color:#e6edf3;margin:0;padding:12px 16px}
+h1{color:#fff;margin:0 0 4px;font-size:1.1em;font-weight:600;display:flex;align-items:center;gap:8px}
+.subtitle{font-size:.75em;color:#6e7681;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px;margin-bottom:14px}
+.card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px}
+.card h3{margin:0 0 6px;font-size:.7em;color:#6e7681;text-transform:uppercase;letter-spacing:.06em}
+.big{font-size:1.6em;font-weight:700;line-height:1.1}
+.sub{font-size:.78em;color:#8b949e;margin-top:3px}
+.green{color:#3fb950}.red{color:#f85149}.yellow{color:#e3b341}.grey{color:#6e7681}
+.tag{font-size:.68em;padding:2px 6px;border-radius:4px;background:#21262d;color:#8b949e;margin-left:5px;vertical-align:middle}
+.tag.dry{color:#e3b341}
+
+/* position cards */
+.pos-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;margin-bottom:14px}
+.pos-card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:14px}
+.pos-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.pos-title{font-size:1em;font-weight:700}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.75em;font-weight:700;letter-spacing:.04em}
+.badge.lead{background:#1a4731;color:#3fb950;border:1px solid #2ea043}
+.badge.trail{background:#3d1a1a;color:#f85149;border:1px solid #da3633}
+.badge.unk{background:#21262d;color:#8b949e}
+.pos-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:10px;font-size:.78em}
+.pos-stat-label{color:#6e7681}
+.pos-stat-value{font-weight:600}
+
+/* chart */
+.chart-wrap{position:relative;height:160px;background:#0d0f14;border-radius:6px;overflow:hidden}
+canvas{display:block}
+
+/* price-to-beat banner */
+.ptb{font-size:.72em;color:#8b949e;margin-top:6px;display:flex;justify-content:space-between}
+
+/* skip table */
+table{width:100%;border-collapse:collapse;font-size:.8em}
+th{color:#6e7681;text-align:left;padding:4px 6px;border-bottom:1px solid #21262d}
+td{padding:4px 6px;border-bottom:1px solid #161b22}
+
+/* timer bar */
+.timer-bar-wrap{height:3px;background:#21262d;border-radius:2px;margin-top:8px;overflow:hidden}
+.timer-bar{height:100%;border-radius:2px;transition:width .5s}
+
+footer{margin-top:16px;font-size:.72em;color:#484f58}
+#dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#3fb950;margin-right:4px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 </style>
 </head>
 <body>
-<h2>ClawdBot <span id="ts" class="grey" style="font-size:.6em"></span>
-  <span id="dry" class="tag" style="display:none;color:#d29922">DRY-RUN</span>
-</h2>
+<h1><span id="dot"></span>ClawdBot <span id="ts" style="font-weight:400;font-size:.75em;color:#6e7681"></span><span id="dry" class="tag dry" style="display:none">DRY-RUN</span></h1>
+<div class="subtitle" id="sub"></div>
 <div class="grid" id="cards"></div>
-<div id="positions-wrap"></div>
+<div class="pos-grid" id="positions"></div>
 <div id="skip-wrap"></div>
-<footer>Auto-refresh every 30s &mdash; <a href="/api" style="color:#58a6ff">raw JSON</a></footer>
+<footer>Updates every 5s &mdash; <a href="/api" style="color:#58a6ff">raw JSON</a></footer>
 
 <script>
-async function load(){
-  const d = await fetch('/api').then(r=>r.json());
-  document.getElementById('ts').textContent = d.ts;
-  if(d.dry_run) document.getElementById('dry').style.display='';
+const charts = {};
 
-  const pnlC = d.pnl >= 0 ? 'green' : 'red';
-  const wrC   = d.wr >= 52 ? 'green' : d.wr >= 48 ? 'yellow' : 'red';
-  const cards = [
-    {t:'Balance', body: `<div class="big">\$${d.total_equity.toFixed(2)}</div>
-      <div>USDC: \$${d.usdc.toFixed(2)} &nbsp; Stake: \$${d.open_stake.toFixed(2)} (${d.open_count})</div>
-      <div>Mark: \$${d.open_mark.toFixed(2)}</div>`},
-    {t:'Performance', body: `<div class="big ${pnlC}">${d.pnl>=0?'+':''}\$${d.pnl.toFixed(2)}</div>
-      <div>ROI: <span class="${pnlC}">${d.roi>0?'+':''}${d.roi.toFixed(1)}%</span></div>
-      <div>Trades: ${d.trades} &nbsp; WR: <span class="${wrC}">${d.wr}%</span> (${d.wins}W/${d.trades-d.wins}L)</div>`},
-    {t:'Session', body: `<div class="big">${d.session}</div>
-      <div>Network: ${d.network}</div>
-      <div>RTDS: <span class="${d.rtds_ok?'green':'red'}">${d.rtds_ok?'✓':'✗'}</span></div>`},
-    {t:'Prices', body: Object.entries(d.prices).map(([a,p])=>`<div><b>${a}</b> \$${p.toLocaleString()}</div>`).join('')},
-  ];
-  if(d.execq && d.execq.outcomes>0){
-    const wrc = d.execq.wr>=52?'green':d.execq.wr>=48?'yellow':'red';
-    cards.push({t:'ExecQ (best bucket)', body:`<div style="font-size:.8em;color:#8b949e">${d.execq.bucket}</div>
-      <div>WR: <span class="${wrc}">${d.execq.wr}%</span> (${d.execq.fills}/${d.execq.outcomes})</div>
-      <div>PF: ${d.execq.pf} &nbsp; PnL: <span class="${d.execq.pnl>=0?'green':'red'}">${d.execq.pnl>=0?'+':''}$${d.execq.pnl.toFixed(2)}</span></div>`});
-  }
+function fmt(n,dec=2){return n.toLocaleString('en-US',{minimumFractionDigits:dec,maximumFractionDigits:dec})}
+function fmtT(ts){const d=new Date(ts*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}
 
-  document.getElementById('cards').innerHTML = cards.map(c=>`
-    <div class="card"><h3>${c.t}</h3>${c.body}</div>`).join('');
+function drawChart(canvasId, pts, openP, startTs, endTs, nowTs) {
+  const ctx = document.getElementById(canvasId);
+  if(!ctx) return;
+  if(charts[canvasId]) { charts[canvasId].destroy(); }
 
-  // Positions
-  if(d.positions.length){
-    const rows = d.positions.map(p=>{
-      const badge = p.lead===null ? '<span class="badge unk">?</span>'
-                  : p.lead ? '<span class="badge lead">LEAD</span>'
-                  : '<span class="badge trail">TRAIL</span>';
-      const mc = p.move_pct>0?'green':p.move_pct<0?'red':'grey';
-      return `<tr>
-        <td><b>${p.asset}</b> ${p.side}</td>
-        <td>${badge}</td>
-        <td>${p.entry.toFixed(3)}</td>
-        <td>\$${p.stake.toFixed(2)}</td>
-        <td class="${mc}">${p.move_pct>0?'+':''}${p.move_pct.toFixed(2)}%</td>
-        <td>${p.mins_left.toFixed(1)}m</td>
-      </tr>`;
-    }).join('');
-    document.getElementById('positions-wrap').innerHTML = `
-      <div class="card" style="margin-bottom:12px">
-        <h3>Open Positions (${d.positions.length})</h3>
-        <table><tr><th>Asset</th><th>Status</th><th>Entry</th><th>Stake</th><th>Move</th><th>Left</th></tr>
-        ${rows}</table></div>`;
-  } else {
-    document.getElementById('positions-wrap').innerHTML = `<div class="card" style="margin-bottom:12px"><h3>Open Positions</h3><span class="grey">No open positions</span></div>`;
-  }
+  // filter pts to window
+  const wPts = pts.filter(p => p.t >= startTs - 5);
+  if(wPts.length === 0) return;
 
-  // Skips
-  if(d.skip_top.length){
-    const rows = d.skip_top.map(s=>`<tr><td>${s.reason}</td><td>${s.count}</td></tr>`).join('');
-    document.getElementById('skip-wrap').innerHTML = `
-      <div class="card"><h3>Skip Reasons (15m)</h3>
-      <table><tr><th>Reason</th><th>Count</th></tr>${rows}</table></div>`;
+  const labels = wPts.map(p => fmtT(p.t));
+  const data   = wPts.map(p => p.p);
+  const last   = data[data.length-1];
+  const isLead = openP > 0 ? last >= openP : null;
+  const lineColor = isLead === null ? '#8b949e' : (isLead ? '#3fb950' : '#f85149');
+
+  charts[canvasId] = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        data,
+        borderColor: lineColor,
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        tension: 0.3,
+        fill: false,
+      }]
+    },
+    options: {
+      animation: false,
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {display:false},
+        tooltip: {
+          mode: 'index', intersect: false,
+          callbacks: { label: ctx => '$' + fmt(ctx.raw) }
+        },
+        // price-to-beat line via annotation would need plugin; use dataset instead:
+      },
+      scales: {
+        x: {
+          ticks: {
+            maxTicksLimit: 5,
+            color: '#484f58',
+            font: {size:9}
+          },
+          grid: {color:'#161b22'}
+        },
+        y: {
+          position: 'right',
+          ticks: {
+            color: '#8b949e',
+            font: {size:9},
+            callback: v => '$' + fmt(v)
+          },
+          grid: {color:'rgba(255,255,255,0.04)'}
+        }
+      }
+    }
+  });
+
+  // Draw price-to-beat dashed line manually on the chart canvas after render
+  if(openP > 0) {
+    // Add a second dataset as a constant line at openP
+    charts[canvasId].data.datasets.push({
+      data: wPts.map(() => openP),
+      borderColor: 'rgba(255,255,255,0.35)',
+      borderWidth: 1.5,
+      borderDash: [4,3],
+      pointRadius: 0,
+      fill: false,
+      tension: 0,
+    });
+    charts[canvasId].update('none');
   }
 }
-load();
+
+function renderCards(d) {
+  const pnlC = d.pnl >= 0 ? 'green' : 'red';
+  const wrC  = d.wr >= 52 ? 'green' : d.wr >= 48 ? 'yellow' : 'red';
+  const cards = [
+    {t:'Portfolio',  body:`<div class="big">$${fmt(d.total_equity)}</div>
+      <div class="sub">Free: $${fmt(d.usdc)} &nbsp;|&nbsp; Stake: $${fmt(d.open_stake)} (${d.open_count})</div>
+      <div class="sub">Mark: $${fmt(d.open_mark)}</div>`},
+    {t:'P&L',  body:`<div class="big ${pnlC}">${d.pnl>=0?'+':''}$${fmt(d.pnl)}</div>
+      <div class="sub">ROI <span class="${pnlC}">${d.roi>0?'+':''}${d.roi.toFixed(1)}%</span></div>`},
+    {t:'Win Rate',  body:`<div class="big ${wrC}">${d.wr}%</div>
+      <div class="sub">${d.wins}W / ${d.trades-d.wins}L of ${d.trades}</div>`},
+    {t:'Session',  body:`<div class="big">${d.session}</div>
+      <div class="sub">${d.network} &nbsp; RTDS <span class="${d.rtds_ok?'green':'red'}">${d.rtds_ok?'✓':'✗'}</span></div>`},
+    {t:'Prices',  body:Object.entries(d.prices).map(([a,p])=>`<div><b style="color:#8b949e">${a}</b> $${fmt(p,2)}</div>`).join('')},
+  ];
+  if(d.execq && d.execq.outcomes > 0){
+    const wrc = d.execq.wr>=52?'green':d.execq.wr>=48?'yellow':'red';
+    cards.push({t:'ExecQ',  body:`<div style="font-size:.72em;color:#6e7681;margin-bottom:4px">${d.execq.bucket}</div>
+      <div><span class="${wrc}">${d.execq.wr}%</span> WR &nbsp; ${d.execq.fills}/${d.execq.outcomes}</div>
+      <div>PF ${d.execq.pf} &nbsp; PnL <span class="${d.execq.pnl>=0?'green':'red'}">${d.execq.pnl>=0?'+':''}$${fmt(d.execq.pnl)}</span></div>`});
+  }
+  document.getElementById('cards').innerHTML = cards.map(c=>`<div class="card"><h3>${c.t}</h3>${c.body}</div>`).join('');
+}
+
+function renderPositions(d) {
+  if(!d.positions.length){
+    document.getElementById('positions').innerHTML = `<div class="card"><h3>Open Positions</h3><span class="grey">None</span></div>`;
+    return;
+  }
+  const nowTs = d.now_ts;
+  const html = d.positions.map(p => {
+    const badge = p.lead===null ? '<span class="badge unk">?</span>'
+                : p.lead ? '<span class="badge lead">▲ LEAD</span>'
+                : '<span class="badge trail">▼ TRAIL</span>';
+    const mc  = p.move_pct > 0 ? 'green' : p.move_pct < 0 ? 'red' : 'grey';
+    const cid = `chart-${p.cid}`;
+    const totalSec = p.end_ts - p.start_ts;
+    const elapsed  = Math.max(0, nowTs - p.start_ts);
+    const pct      = totalSec > 0 ? Math.min(100, elapsed/totalSec*100) : 0;
+    const barColor = p.lead ? '#3fb950' : (p.lead===false ? '#f85149' : '#8b949e');
+    return `<div class="pos-card">
+      <div class="pos-header">
+        <div class="pos-title">${p.asset} <span style="color:#8b949e">${p.side}</span> &nbsp; ${badge}</div>
+        <div style="font-size:.8em;color:#6e7681">${p.mins_left.toFixed(1)}m left</div>
+      </div>
+      <div class="pos-stats">
+        <div><div class="pos-stat-label">Entry</div><div class="pos-stat-value">${p.entry.toFixed(3)}</div></div>
+        <div><div class="pos-stat-label">Stake</div><div class="pos-stat-value">$${fmt(p.stake)}</div></div>
+        <div><div class="pos-stat-label">Move</div><div class="pos-stat-value ${mc}">${p.move_pct>0?'+':''}${p.move_pct.toFixed(2)}%</div></div>
+      </div>
+      <div class="chart-wrap"><canvas id="${cid}" height="160"></canvas></div>
+      <div class="ptb">
+        <span>Price to beat: <b style="color:#fff">$${fmt(p.open_p,2)}</b></span>
+        <span>Now: <b style="color:#fff">$${fmt(p.cur_p,2)}</b></span>
+      </div>
+      <div class="timer-bar-wrap"><div class="timer-bar" style="width:${pct}%;background:${barColor}"></div></div>
+    </div>`;
+  }).join('');
+  document.getElementById('positions').innerHTML = html;
+
+  // draw charts
+  d.positions.forEach(p => {
+    const pts = d.charts[p.asset] || [];
+    drawChart(`chart-${p.cid}`, pts, p.open_p, p.start_ts, p.end_ts, nowTs);
+  });
+}
+
+function renderSkips(d) {
+  if(!d.skip_top.length){ document.getElementById('skip-wrap').innerHTML=''; return; }
+  const rows = d.skip_top.map(s=>`<tr><td>${s.reason}</td><td>${s.count}</td></tr>`).join('');
+  document.getElementById('skip-wrap').innerHTML = `<div class="card"><h3>Skips (15m)</h3>
+    <table><tr><th>Reason</th><th>#</th></tr>${rows}</table></div>`;
+}
+
+async function refresh(){
+  try {
+    const d = await fetch('/api').then(r=>r.json());
+    document.getElementById('ts').textContent = d.ts;
+    document.getElementById('sub').textContent = d.network + (d.dry_run?' · DRY-RUN':'');
+    if(d.dry_run) document.getElementById('dry').style.display='';
+    renderCards(d);
+    renderPositions(d);
+    renderSkips(d);
+  } catch(e){ console.warn('fetch error', e); }
+}
+
+refresh();
+setInterval(refresh, 5000);
 </script>
 </body></html>"""
 
@@ -10856,7 +11007,11 @@ load();
                 data = self._dashboard_data()
             except Exception as e:
                 data = {"error": str(e)}
-            return web.Response(text=json.dumps(data), content_type="application/json")
+            return web.Response(
+                text=json.dumps(data),
+                content_type="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
 
         app = web.Application()
         app.router.add_get("/", handle_html)
