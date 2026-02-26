@@ -11137,9 +11137,24 @@ setInterval(pollMidpoints, 2000);
                 headers={"Access-Control-Allow-Origin": "*"},
             )
 
+        async def handle_reload_buckets(request):
+            try:
+                self._bucket_stats.rows.clear()
+                _bs_load(self._bucket_stats)
+                n = sum(v.get("outcomes", 0) for v in self._bucket_stats.rows.values())
+                return web.Response(
+                    text=json.dumps({"ok": True, "outcomes": n, "buckets": len(self._bucket_stats.rows)}),
+                    content_type="application/json",
+                    headers={"Access-Control-Allow-Origin": "*"},
+                )
+            except Exception as e:
+                return web.Response(text=json.dumps({"ok": False, "error": str(e)}),
+                                    content_type="application/json")
+
         app = web.Application()
         app.router.add_get("/", handle_html)
         app.router.add_get("/api", handle_api)
+        app.router.add_get("/reload-buckets", handle_reload_buckets)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)
