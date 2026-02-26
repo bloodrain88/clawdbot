@@ -95,6 +95,23 @@ except ModuleNotFoundError:
                     "fills": 0,
                 }
             )
+            self._load()
+
+        def _load(self):
+            try:
+                with open(BUCKET_STATS_PATH) as f:
+                    data = json.load(f)
+                for k, v in data.items():
+                    self.rows[k].update(v)
+            except Exception:
+                pass
+
+        def _save(self):
+            try:
+                with open(BUCKET_STATS_PATH, "w") as f:
+                    json.dump(dict(self.rows), f)
+            except Exception:
+                pass
 
         def add_fill(self, bucket: str, slip_bps: float):
             r = self.rows[bucket]
@@ -113,6 +130,9 @@ except ModuleNotFoundError:
                 r["losses"] += 1
                 r["gross_loss"] += max(0.0, -float(pnl))
             r["pnl"] += pnl
+            self._save()
+
+BUCKET_STATS_PATH = "/data/bucket_stats.json"
 
 load_dotenv(os.path.expanduser("~/.clawdbot.env"))
 
@@ -208,6 +228,9 @@ ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "0"))
 MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "0"))
+BLOCK_SCORE_S0_8_15M  = os.environ.get("BLOCK_SCORE_S0_8_15M",  "false").lower() == "true"
+BLOCK_SCORE_S9_11_15M = os.environ.get("BLOCK_SCORE_S9_11_15M", "false").lower() == "true"
+BLOCK_SCORE_S12P_15M  = os.environ.get("BLOCK_SCORE_S12P_15M",  "false").lower() == "true"
 MIN_TRUE_PROB_GATE_15M = float(os.environ.get("MIN_TRUE_PROB_GATE_15M", "0.50"))
 MIN_TRUE_PROB_GATE_5M  = float(os.environ.get("MIN_TRUE_PROB_GATE_5M",  "0.50"))
 ROLLING3_WIN_SCORE_PEN = int(os.environ.get("ROLLING3_WIN_SCORE_PEN", "0"))
@@ -5228,6 +5251,18 @@ class LiveTrader:
             min_score_local = max(LATE_MUST_FIRE_MIN_SCORE, min_score_local - LATE_MUST_FIRE_SCORE_RELAX)
         if score < min_score_local:
             return None
+        # Per-tier blocking via env vars (default all off)
+        if duration >= 15:
+            score_tier = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
+            if score_tier == "s0-8"  and BLOCK_SCORE_S0_8_15M:
+                self._skip_tick("score_tier_blocked_s0_8")
+                return None
+            if score_tier == "s9-11" and BLOCK_SCORE_S9_11_15M:
+                self._skip_tick("score_tier_blocked_s9_11")
+                return None
+            if score_tier == "s12+"  and BLOCK_SCORE_S12P_15M:
+                self._skip_tick("score_tier_blocked_s12p")
+                return None
 
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
@@ -10719,21 +10754,30 @@ class LiveTrader:
         except Exception:
             pass
 
-        # ExecQ best bucket
+        # ExecQ all buckets
+        execq_all = []
         execq = {}
         try:
             if self._bucket_stats.rows:
-                top_bucket = sorted(self._bucket_stats.rows.items(),
-                                    key=lambda kv: kv[1].get("n", 0), reverse=True)[0]
-                k, v = top_bucket
-                outcomes = int(v.get("outcomes", v.get("wins", 0) + v.get("losses", 0)))
-                fills    = int(v.get("fills", 0) or 0)
-                wr_b     = round(v["wins"] / outcomes * 100, 1) if outcomes > 0 else 0
-                pf_b     = (float(v.get("gross_win", 0)) / float(v.get("gross_loss", 1e-9))
-                            if float(v.get("gross_loss", 0)) > 0 else 0)
-                execq    = {"bucket": k, "fills": fills, "outcomes": outcomes,
-                            "wr": wr_b, "pf": round(pf_b, 2),
-                            "pnl": round(float(v.get("pnl", 0)), 2)}
+                sorted_rows = sorted(
+                    self._bucket_stats.rows.items(),
+                    key=lambda kv: kv[1].get("fills", 0), reverse=True
+                )
+                for k, v in sorted_rows:
+                    outcomes = int(v.get("outcomes", v.get("wins", 0) + v.get("losses", 0)))
+                    fills    = int(v.get("fills", 0) or 0)
+                    if fills == 0 and outcomes == 0:
+                        continue
+                    wr_b = round(v["wins"] / outcomes * 100, 1) if outcomes > 0 else None
+                    pf_b = (float(v.get("gross_win", 0)) / float(v.get("gross_loss", 1e-9))
+                            if float(v.get("gross_loss", 0)) > 0 else None)
+                    execq_all.append({
+                        "bucket": k, "fills": fills, "outcomes": outcomes,
+                        "wr": wr_b, "pf": round(pf_b, 2) if pf_b else None,
+                        "pnl": round(float(v.get("pnl", 0)), 2),
+                    })
+                if execq_all:
+                    execq = execq_all[0]
         except Exception:
             pass
 
@@ -10760,6 +10804,7 @@ class LiveTrader:
             "positions": positions,
             "skip_top": skip_top,
             "execq": execq,
+            "execq_all": execq_all,
             "dry_run": DRY_RUN,
         }
 
@@ -10829,6 +10874,7 @@ footer{margin-top:16px;font-size:.72em;color:#484f58}
 <div class="grid" id="cards"></div>
 <div class="pos-grid" id="positions"></div>
 <div id="skip-wrap"></div>
+<div id="buckets-wrap"></div>
 <footer>Updates every 5s &mdash; <a href="/api" style="color:#58a6ff">raw JSON</a></footer>
 
 <script>
@@ -11012,6 +11058,26 @@ function renderSkips(d) {
     <table><tr><th>Reason</th><th>#</th></tr>${rows}</table></div>`;
 }
 
+function renderBuckets(rows) {
+  const el = document.getElementById('buckets-wrap');
+  if(!rows || !rows.length){ el.innerHTML=''; return; }
+  const trs = rows.map(r => {
+    const wrc = r.wr===null?'grey':r.wr>=52?'green':r.wr>=48?'yellow':'red';
+    const pnlc = r.pnl>=0?'green':'red';
+    return `<tr>
+      <td style="font-size:.78em">${r.bucket}</td>
+      <td>${r.fills}/${r.outcomes}</td>
+      <td class="${wrc}">${r.wr===null?'–':r.wr+'%'}</td>
+      <td>${r.pf===null?'–':r.pf}</td>
+      <td class="${pnlc}">${r.pnl>=0?'+':''}$${r.pnl.toFixed(2)}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<div class="card" style="margin-bottom:12px">
+    <h3>ExecQ — All Buckets</h3>
+    <table><tr><th>Bucket</th><th>F/O</th><th>WR</th><th>PF</th><th>PnL</th></tr>
+    ${trs}</table></div>`;
+}
+
 async function refresh(){
   try {
     const d = await fetch('/api').then(r=>r.json());
@@ -11021,6 +11087,7 @@ async function refresh(){
     renderCards(d);
     renderPositions(d);
     renderSkips(d);
+    renderBuckets(d.execq_all);
   } catch(e){ console.warn('fetch error', e); }
 }
 
