@@ -10659,7 +10659,7 @@ class LiveTrader:
         charts = {}
         for asset, ph in self.price_history.items():
             cutoff = now_ts - 1200
-            pts = [{"t": round(ts, 1), "p": round(px, 2)}
+            pts = [{"t": round(ts, 1), "p": round(px, 6)}
                    for ts, px in ph if ts >= cutoff and px > 0]
             if pts:
                 charts[asset] = pts
@@ -10831,6 +10831,17 @@ const charts = {};
 function fmt(n,dec=2){return n.toLocaleString('en-US',{minimumFractionDigits:dec,maximumFractionDigits:dec})}
 function fmtT(ts){const d=new Date(ts*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}
 
+function priceDec(price) {
+  // choose decimal places from the magnitude of the price
+  if (price <= 0)   return 5;
+  if (price < 0.1)  return 6;
+  if (price < 1)    return 5;
+  if (price < 10)   return 4;
+  if (price < 100)  return 3;
+  if (price < 1000) return 2;
+  return 2;
+}
+
 function drawChart(canvasId, pts, openP, startTs, endTs, nowTs) {
   const ctx = document.getElementById(canvasId);
   if(!ctx) return;
@@ -10839,6 +10850,11 @@ function drawChart(canvasId, pts, openP, startTs, endTs, nowTs) {
   // filter pts to window
   const wPts = pts.filter(p => p.t >= startTs - 5);
   if(wPts.length === 0) return;
+
+  // compute decimals from actual price range so tiny moves are visible
+  const allPrices = wPts.map(p => p.p).concat(openP > 0 ? [openP] : []);
+  const midPrice  = allPrices.reduce((a,b)=>a+b,0) / allPrices.length;
+  const dec       = priceDec(midPrice);
 
   const labels = wPts.map(p => fmtT(p.t));
   const data   = wPts.map(p => p.p);
@@ -10868,7 +10884,7 @@ function drawChart(canvasId, pts, openP, startTs, endTs, nowTs) {
         legend: {display:false},
         tooltip: {
           mode: 'index', intersect: false,
-          callbacks: { label: ctx => '$' + fmt(ctx.raw) }
+          callbacks: { label: ctx => '$' + fmt(ctx.raw, dec) }
         },
         // price-to-beat line via annotation would need plugin; use dataset instead:
       },
@@ -10886,7 +10902,7 @@ function drawChart(canvasId, pts, openP, startTs, endTs, nowTs) {
           ticks: {
             color: '#8b949e',
             font: {size:9},
-            callback: v => '$' + fmt(v)
+            callback: v => '$' + fmt(v, dec)
           },
           grid: {color:'rgba(255,255,255,0.04)'}
         }
