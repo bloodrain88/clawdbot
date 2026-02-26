@@ -134,6 +134,21 @@ except ModuleNotFoundError:
 
 BUCKET_STATS_PATH = "/data/bucket_stats.json"
 
+def _bs_load(bs):
+    try:
+        with open(BUCKET_STATS_PATH) as f:
+            for k, v in json.load(f).items():
+                bs.rows[k].update(v)
+    except Exception:
+        pass
+
+def _bs_save(bs):
+    try:
+        with open(BUCKET_STATS_PATH, "w") as f:
+            json.dump(dict(bs.rows), f)
+    except Exception:
+        pass
+
 load_dotenv(os.path.expanduser("~/.clawdbot.env"))
 
 from py_clob_client.client import ClobClient
@@ -1215,6 +1230,7 @@ class LiveTrader:
         self._nonce_mgr         = None
         self._errors            = ErrorTracker()
         self._bucket_stats      = BucketStats()
+        _bs_load(self._bucket_stats)
         self._copyflow_map      = {}
         self._copyflow_leaders  = {}
         self._copyflow_leaders_live = {}
@@ -7503,6 +7519,7 @@ class LiveTrader:
                             self.daily_pnl += pnl
                             self.total += 1; self.wins += 1
                             self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
+                            _bs_save(self._bucket_stats)
                             self._record_result(asset, side, True, trade.get("structural", False), pnl=pnl)
                             self._record_resolved_sample(trade, pnl, True)
                             self._record_pm_pattern_outcome(trade, pnl, True)
@@ -7591,6 +7608,7 @@ class LiveTrader:
                                 self.daily_pnl += pnl
                                 self.total += 1
                                 self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
+                                _bs_save(self._bucket_stats)
                                 self._record_result(asset, side, False, trade.get("structural", False), pnl=pnl)
                                 self._record_resolved_sample(trade, pnl, False)
                                 self._record_pm_pattern_outcome(trade, pnl, False)
