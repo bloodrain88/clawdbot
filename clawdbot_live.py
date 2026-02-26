@@ -121,16 +121,22 @@ from py_clob_client.constants import POLYGON, AMOY
 from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType, AssetType, BalanceAllowanceParams, ApiCreds
 from py_clob_client.config import get_contract_config
 
+_ALCHEMY_KEY = os.environ.get("ALCHEMY_KEY", "")
+_QUICKNODE_WS = os.environ.get("QUICKNODE_WS", "")   # wss://xxx.quiknode.pro/KEY/
+
 POLYGON_RPCS = [
     "https://polygon-mainnet.public.blastapi.io",
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.drpc.org",
     "https://rpc.ankr.com/polygon",
+    *([f"https://polygon-mainnet.g.alchemy.com/v2/{_ALCHEMY_KEY}"] if _ALCHEMY_KEY else []),
 ]
 POLYGON_WS_RPCS = [
     "wss://polygon-mainnet.public.blastapi.io",
     "wss://polygon-bor-rpc.publicnode.com",
     "wss://polygon.drpc.org",
+    *([f"wss://polygon-mainnet.g.alchemy.com/v2/{_ALCHEMY_KEY}"] if _ALCHEMY_KEY else []),
+    *([_QUICKNODE_WS] if _QUICKNODE_WS else []),
 ]
 USDC_E_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_ABI = [
