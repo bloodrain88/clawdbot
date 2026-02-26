@@ -10694,13 +10694,15 @@ class LiveTrader:
                 move_pct = (cur_p - open_p) / open_p * 100
             else:
                 lead, move_pct = None, 0.0
+            token_id = (trade.get("token_id") or
+                        self._token_id_from_cid_side(cid, side) or "")
             positions.append({
                 "asset": asset, "side": side, "entry": round(entry, 3),
                 "stake": round(stake, 2), "cur_p": round(cur_p, 2),
                 "open_p": round(open_p, 2), "move_pct": round(move_pct, 3),
                 "lead": lead, "mins_left": round(mins_left, 1),
                 "cid": cid[:12], "start_ts": start_ts, "end_ts": end_ts,
-                "duration": duration,
+                "duration": duration, "token_id": token_id,
             })
 
         # Skip top reasons (last 15m)
@@ -10963,6 +10965,10 @@ function renderPositions(d) {
         <span>Price to beat: <b style="color:#fff">$${fmt(p.open_p,2)}</b></span>
         <span>Now: <b style="color:#fff">$${fmt(p.cur_p,2)}</b></span>
       </div>
+      <div class="ptb" style="margin-top:4px">
+        <span>PM token: <b id="mid-${p.cid}" style="color:#e3b341">…</b></span>
+        <span style="color:#6e7681;font-size:.68em">${p.token_id ? p.token_id.slice(0,12)+'…' : ''}</span>
+      </div>
       <div class="timer-bar-wrap"><div class="timer-bar" style="width:${pct}%;background:${barColor}"></div></div>
     </div>`;
   }).join('');
@@ -10973,6 +10979,8 @@ function renderPositions(d) {
     const pts = d.charts[p.asset] || [];
     drawChart(`chart-${p.cid}`, pts, p.open_p, p.start_ts, p.end_ts, nowTs);
   });
+  updateMidTokens(d.positions);
+  pollMidpoints();
 }
 
 function renderSkips(d) {
@@ -10994,8 +11002,31 @@ async function refresh(){
   } catch(e){ console.warn('fetch error', e); }
 }
 
+// Poll Polymarket CLOB midpoint for open positions every 2s
+let _midTokens = {};
+async function pollMidpoints() {
+  for(const [cid, tid] of Object.entries(_midTokens)) {
+    if(!tid) continue;
+    try {
+      const r = await fetch(`https://clob.polymarket.com/midpoint?token_id=${tid}`);
+      const j = await r.json();
+      const el = document.getElementById(`mid-${cid}`);
+      if(el && j.mid != null) {
+        const v = parseFloat(j.mid);
+        el.textContent = v.toFixed(3) + 'c';
+        el.style.color = v >= 0.5 ? '#3fb950' : '#f85149';
+      }
+    } catch(e){}
+  }
+}
+function updateMidTokens(positions) {
+  _midTokens = {};
+  positions.forEach(p => { if(p.token_id) _midTokens[p.cid] = p.token_id; });
+}
+
 refresh();
 setInterval(refresh, 5000);
+setInterval(pollMidpoints, 2000);
 </script>
 </body></html>"""
 
