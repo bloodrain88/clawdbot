@@ -545,6 +545,14 @@ FIVE_M_GUARD_REENABLE_PF = float(os.environ.get("FIVE_M_GUARD_REENABLE_PF", "1.1
 FIVE_M_GUARD_REENABLE_WR = float(os.environ.get("FIVE_M_GUARD_REENABLE_WR", "0.52"))
 FIVE_M_GUARD_MIN_DISABLE_SEC = float(os.environ.get("FIVE_M_GUARD_MIN_DISABLE_SEC", "900"))
 FIVE_M_GUARD_CHECK_EVERY_SEC = float(os.environ.get("FIVE_M_GUARD_CHECK_EVERY_SEC", "20"))
+FIVE_M_DYNAMIC_SCORE_ENABLED = os.environ.get("FIVE_M_DYNAMIC_SCORE_ENABLED", "true").lower() == "true"
+FIVE_M_DYNAMIC_SCORE_MIN_OUTCOMES = int(os.environ.get("FIVE_M_DYNAMIC_SCORE_MIN_OUTCOMES", "8"))
+FIVE_M_DYNAMIC_SCORE_BAD_WR = float(os.environ.get("FIVE_M_DYNAMIC_SCORE_BAD_WR", "0.45"))
+FIVE_M_DYNAMIC_SCORE_BAD_PF = float(os.environ.get("FIVE_M_DYNAMIC_SCORE_BAD_PF", "1.00"))
+FIVE_M_DYNAMIC_SCORE_WORSE_WR = float(os.environ.get("FIVE_M_DYNAMIC_SCORE_WORSE_WR", "0.40"))
+FIVE_M_DYNAMIC_SCORE_WORSE_PF = float(os.environ.get("FIVE_M_DYNAMIC_SCORE_WORSE_PF", "0.85"))
+FIVE_M_DYNAMIC_SCORE_ADD_BAD = int(os.environ.get("FIVE_M_DYNAMIC_SCORE_ADD_BAD", "2"))
+FIVE_M_DYNAMIC_SCORE_ADD_WORSE = int(os.environ.get("FIVE_M_DYNAMIC_SCORE_ADD_WORSE", "3"))
 ORDER_FAST_MODE = os.environ.get("ORDER_FAST_MODE", "true").lower() == "true"
 MAKER_POLL_5M_SEC = float(os.environ.get("MAKER_POLL_5M_SEC", "0.15"))
 MAKER_POLL_15M_SEC = float(os.environ.get("MAKER_POLL_15M_SEC", "0.25"))
@@ -4286,6 +4294,8 @@ class LiveTrader:
         score = 0
         # Keep initialized for any early quality penalties before final side selection.
         edge = 0.0
+        px_align_conflict = False
+        data_div_pen_applied = False
 
         # Compute momentum — EMA-based (O(1) from cache) + Kalman velocity signal
         mom_5s   = self._momentum_prob(asset, seconds=5)
@@ -4308,6 +4318,7 @@ class LiveTrader:
             if cl_direction and cl_direction != direction and move_pct < DIR_CONFLICT_MOVE_MAX:
                 score -= DIR_CONFLICT_SCORE_PEN
                 edge -= DIR_CONFLICT_EDGE_PEN
+                px_align_conflict = True
                 if cl_age_s is not None and cl_age_s <= DIR_CONFLICT_CL_AGE_MAX:
                     direction = cl_direction
                 if self._noisy_log_enabled(f"px-align:{asset}:{duration}", LOG_FLOW_EVERY_SEC):
@@ -4361,6 +4372,7 @@ class LiveTrader:
                 div_pen = min(DIV_PEN_MAX_SCORE, max(1, int(div / DIV_PEN_START)))
                 score -= div_pen
                 edge -= min(DIV_PEN_EDGE_CAP, div * DIV_PEN_EDGE_MULT)
+                data_div_pen_applied = True
                 if self._noisy_log_enabled(f"data-div:{asset}:{duration}", LOG_FLOW_EVERY_SEC):
                     print(
                         f"{Y}[DATA-DIV]{RS} {asset} {duration}m cl={cl_now:.4f} rtds={rtds_now:.4f} "
@@ -5248,6 +5260,14 @@ class LiveTrader:
         # Always take the best estimate: preserves aq/prior adjustments over plain base_prob
         true_prob = max(true_prob, base_prob)
         edge      = max(edge, base_edge)
+        if duration <= 5 and px_align_conflict and data_div_pen_applied:
+            if self._noisy_log_enabled(f"skip-5m-pxalign-div:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP]{RS} {asset} 5m hard conflict px-align+data-div "
+                    f"(src={px_src} cl_age={(-1.0 if cl_age_s is None else cl_age_s):.1f}s)"
+                )
+            self._skip_tick("5m_pxalign_datadiv_conflict")
+            return None
 
         if MAX_WIN_MODE:
             if WINMODE_REQUIRE_CL_AGREE and not cl_agree:
@@ -5296,6 +5316,24 @@ class LiveTrader:
         # Must-fire late-window relaxation: lower gate in last N minutes to guarantee entry
         if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
             min_score_local = max(LATE_MUST_FIRE_MIN_SCORE, min_score_local - LATE_MUST_FIRE_SCORE_RELAX)
+        if duration <= 5 and FIVE_M_DYNAMIC_SCORE_ENABLED:
+            snap5 = self._five_m_quality_snapshot(max(FIVE_M_GUARD_WINDOW, FIVE_M_DYNAMIC_SCORE_MIN_OUTCOMES))
+            n5 = int(snap5.get("n", 0) or 0)
+            wr5 = float(snap5.get("wr", 0.0) or 0.0)
+            pf5 = float(snap5.get("pf", 1.0) or 1.0)
+            if n5 >= max(1, FIVE_M_DYNAMIC_SCORE_MIN_OUTCOMES):
+                add_gate = 0
+                if (wr5 < FIVE_M_DYNAMIC_SCORE_BAD_WR) or (pf5 < FIVE_M_DYNAMIC_SCORE_BAD_PF):
+                    add_gate = max(add_gate, FIVE_M_DYNAMIC_SCORE_ADD_BAD)
+                if (wr5 < FIVE_M_DYNAMIC_SCORE_WORSE_WR) or (pf5 < FIVE_M_DYNAMIC_SCORE_WORSE_PF):
+                    add_gate = max(add_gate, FIVE_M_DYNAMIC_SCORE_ADD_WORSE)
+                if add_gate > 0:
+                    min_score_local += add_gate
+                    if self._noisy_log_enabled(f"5m-adapt:{asset}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{B}[5M-ADAPT]{RS} gate+{add_gate} => min_score={min_score_local} "
+                            f"(n={n5} wr={wr5*100:.1f}% pf={pf5:.2f})"
+                        )
         if score < min_score_local:
             return None
         # Per-asset blocking for 15m
@@ -9152,6 +9190,14 @@ class LiveTrader:
         cid_cap = bankroll_ref * MAX_CID_EXPOSURE_PCT
         sig_m = sig.get("m", {}) if isinstance(sig.get("m", {}), dict) else {}
         sig_fp = self._round_fingerprint(cid=cid, m=sig_m, t=sig)
+        sig_asset = str(sig.get("asset", "") or "").upper()
+        sig_dur = int(sig.get("duration", 0) or 0)
+        sig_end = float(sig.get("end_ts", sig_m.get("end_ts", 0)) or 0)
+        sig_exact = self._is_exact_round_bounds(
+            float(sig_m.get("start_ts", 0) or 0),
+            sig_end,
+            sig_dur,
+        )
         same_cid = [(m, t) for c, (m, t) in active_pending.items() if c == cid]
         if same_cid:
             same_side_open = sum(max(0.0, t.get("size", 0.0)) for _, t in same_cid if t.get("side") == side)
@@ -9179,6 +9225,47 @@ class LiveTrader:
                 if LOG_VERBOSE:
                     print(f"{Y}[RISK] skip {sig.get('asset')} round exposure {(round_same_side + sig.get('size', 0.0)):.2f}>{cid_cap:.2f}{RS}")
                 return False
+        # Ambiguous-round safeguard:
+        # if either side lacks exact round bounds (fallback cid/question identity),
+        # never allow opposite-side overlap on same asset+duration.
+        if BLOCK_OPPOSITE_SIDE_SAME_ROUND:
+            for c, (m, t) in active_pending.items():
+                p_asset = str((t or {}).get("asset", (m or {}).get("asset", "") or "")).upper()
+                p_dur = int((t or {}).get("duration", (m or {}).get("duration", 0) or 0))
+                if p_asset != sig_asset or p_dur != sig_dur:
+                    continue
+                p_side = str((t or {}).get("side", "") or "")
+                if not p_side or p_side == side:
+                    continue
+                p_exact = self._is_exact_round_bounds(
+                    float((m or {}).get("start_ts", 0) or 0),
+                    float((t or {}).get("end_ts", (m or {}).get("end_ts", 0)) or 0),
+                    p_dur,
+                )
+                if (not sig_exact) or (not p_exact):
+                    if LOG_VERBOSE:
+                        print(
+                            f"{Y}[RISK] skip {sig.get('asset')} {side} opposite-side with ambiguous round "
+                            f"(sig_exact={sig_exact} pending_exact={p_exact}){RS}"
+                        )
+                    return False
+        # 5m same-side duplicate safeguard:
+        # do not stack same asset/side in the same 5m round due to cid/fallback drift.
+        if sig_dur <= 5 and sig_end > 0:
+            for c, (m, t) in active_pending.items():
+                p_asset = str((t or {}).get("asset", (m or {}).get("asset", "") or "")).upper()
+                p_dur = int((t or {}).get("duration", (m or {}).get("duration", 0) or 0))
+                p_side = str((t or {}).get("side", "") or "")
+                if p_asset != sig_asset or p_dur != sig_dur or p_side != side:
+                    continue
+                p_end = float((t or {}).get("end_ts", (m or {}).get("end_ts", 0)) or 0)
+                if p_end > 0 and abs(p_end - sig_end) <= 60.0:
+                    if LOG_VERBOSE:
+                        print(
+                            f"{Y}[RISK] skip {sig_asset} {sig_dur}m {side} duplicate same-side round "
+                            f"(sig_end={sig_end:.0f} pending_end={p_end:.0f}){RS}"
+                        )
+                    return False
         total_cap, side_cap = self._regime_caps()
         total_open = sum(max(0.0, t.get("size", 0.0)) for _, t in active_pending.values())
         side_open = sum(
@@ -11177,7 +11264,7 @@ class LiveTrader:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ClawdBot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
 :root{
@@ -11191,9 +11278,10 @@ class LiveTrader:
   --rd:8px;--rdl:12px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html{font-size:14px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+html{font-size:16px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 body{
-  font-family:'Inter',system-ui,sans-serif;
+  font-family:'Space Grotesk','Manrope',system-ui,-apple-system,sans-serif;
+  font-variant-numeric:tabular-nums;
   background:var(--bg);color:var(--t1);min-height:100vh;
   background-image:
     radial-gradient(ellipse 90% 50% at 50% -5%,rgba(85,119,255,.05) 0%,transparent 60%),
@@ -11215,13 +11303,13 @@ body{
 .ld{width:5px;height:5px;border-radius:50%;background:var(--g);flex-shrink:0;animation:lp 2.8s ease-in-out infinite}
 @keyframes lp{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(0,204,120,.6)}55%{opacity:.85;box-shadow:0 0 0 5px rgba(0,204,120,0)}}
 .logo b{color:var(--g)}
-.tbadge{font-family:'JetBrains Mono',monospace;font-size:.63rem;color:var(--t3);padding:2px 7px;background:var(--s1);border:1px solid var(--b1);border-radius:3px}
+.tbadge{font-size:.7rem;color:var(--t3);padding:2px 7px;background:var(--s1);border:1px solid var(--b1);border-radius:3px}
 .drybadge{font-size:.58rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 8px;border-radius:4px;background:var(--yb);color:var(--y);border:1px solid rgba(245,166,35,.3);display:none}
 .Hr{display:flex;align-items:center}
 .hs{display:flex;flex-direction:column;align-items:flex-end;gap:1px;padding:5px 14px;border-right:1px solid var(--b1)}
 .hs:first-child{border-left:1px solid var(--b1)}
 .hsl{font-size:.52rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.1em}
-.hsv{font-family:'JetBrains Mono',monospace;font-size:.84rem;font-weight:500}
+.hsv{font-size:.95rem;font-weight:600}
 
 /* WRAP */
 .W{padding:16px 22px;max-width:1800px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
@@ -11231,7 +11319,7 @@ body{
 .pc{display:flex;align-items:center;gap:6px;background:var(--s1);border:1px solid var(--b1);border-radius:5px;padding:5px 10px;cursor:default;transition:border-color .15s}
 .pc:hover{border-color:var(--b2)}
 .pc .a{font-size:.61rem;font-weight:700;color:var(--t3);letter-spacing:.07em;text-transform:uppercase}
-.pc .v{font-family:'JetBrains Mono',monospace;font-size:.74rem;font-weight:500}
+.pc .v{font-size:.86rem;font-weight:600}
 
 /* METRICS BAR */
 .mbar{display:grid;grid-template-columns:repeat(6,1fr);background:var(--s1);border:1px solid var(--b1);border-radius:var(--rdl);overflow:hidden}
@@ -11239,7 +11327,7 @@ body{
 .mi:last-child{border-right:none}
 .mi:hover{background:var(--s2)}
 .mi-l{font-size:.52rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.1em}
-.mi-v{font-family:'JetBrains Mono',monospace;font-size:1.28rem;font-weight:600;letter-spacing:-.03em;line-height:1}
+.mi-v{font-size:1.45rem;font-weight:700;letter-spacing:-.03em;line-height:1}
 .mi-s{font-size:.63rem;color:var(--t2);margin-top:1px}
 .mi-s b{color:var(--t1);font-weight:500}
 
@@ -11256,24 +11344,24 @@ body{
 .ph{padding:10px 13px 0;display:flex;align-items:center;justify-content:space-between}
 .phl{display:flex;align-items:center;gap:6px}
 .psym{font-size:.88rem;font-weight:700;letter-spacing:-.02em}
-.pdur{font-size:.58rem;color:var(--t3);background:var(--s2);border:1px solid var(--b1);padding:2px 5px;border-radius:3px;font-family:'JetBrains Mono',monospace}
+.pdur{font-size:.62rem;color:var(--t3);background:var(--s2);border:1px solid var(--b1);padding:2px 5px;border-radius:3px}
 .pup{font-size:.62rem;font-weight:600;padding:2px 7px;border-radius:3px;background:var(--blb);color:var(--bl);border:1px solid var(--blbd)}
 .pdn{font-size:.62rem;font-weight:600;padding:2px 7px;border-radius:3px;background:var(--rb);color:var(--r);border:1px solid var(--rbd)}
 .phr{display:flex;align-items:center;gap:5px}
 .blead{font-size:.58rem;font-weight:700;letter-spacing:.05em;padding:2px 7px;border-radius:3px;background:var(--gb);color:var(--g);border:1px solid var(--gbd)}
 .btrail{font-size:.58rem;font-weight:700;letter-spacing:.05em;padding:2px 7px;border-radius:3px;background:var(--rb);color:var(--r);border:1px solid var(--rbd)}
 .bunk{font-size:.58rem;font-weight:600;padding:2px 6px;border-radius:3px;background:var(--s2);color:var(--t3);border:1px solid var(--b1)}
-.stag{font-size:.58rem;color:var(--t3);font-family:'JetBrains Mono',monospace}
+.stag{font-size:.62rem;color:var(--t3)}
 .pdata{display:grid;grid-template-columns:repeat(4,1fr);padding:9px 13px;gap:5px}
 .di{display:flex;flex-direction:column;gap:3px}
 .dl{font-size:.52rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.08em}
-.dv{font-size:.78rem;font-weight:600;font-family:'JetBrains Mono',monospace}
+.dv{font-size:.9rem;font-weight:650}
 .ca{height:120px;border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);background:var(--bg);position:relative}
 canvas{display:block;width:100%!important}
 .pf{padding:7px 13px;display:flex;justify-content:space-between;align-items:center;font-size:.65rem}
 .pf .lbl{color:var(--t2)}
-.pf b{color:var(--t1);font-family:'JetBrains Mono',monospace;font-size:.68rem}
-.pf .rk{color:var(--t3);font-size:.58rem;font-family:'JetBrains Mono',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px}
+.pf b{color:var(--t1);font-size:.75rem}
+.pf .rk{color:var(--t3);font-size:.64rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px}
 .tb{height:2px;background:var(--b1)}
 .tbf{height:100%;transition:width .5s linear}
 
@@ -11292,28 +11380,28 @@ canvas{display:block;width:100%!important}
 .skrow:last-child{border-bottom:none}
 .skrow:hover{background:var(--s2)}
 .skr{font-size:.64rem;color:var(--t2);line-height:1.4}
-.skc{font-family:'JetBrains Mono',monospace;font-size:.7rem;font-weight:500;color:var(--t1)}
+.skc{font-size:.76rem;font-weight:600;color:var(--t1)}
 
 /* EXECQ TABLE */
 .etw{background:var(--s1);border:1px solid var(--b1);border-radius:var(--rdl);overflow:hidden}
 .eth{padding:9px 15px;border-bottom:1px solid var(--b1);display:flex;align-items:center;justify-content:space-between}
 .etl{font-size:.58rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.1em}
-.ett{font-size:.7rem;font-family:'JetBrains Mono',monospace;font-weight:500}
+.ett{font-size:.78rem;font-weight:600}
 .et{width:100%;border-collapse:collapse}
 .et th{font-size:.54rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.09em;padding:7px 13px;border-bottom:1px solid var(--b1);text-align:left}
 .et th:last-child{text-align:right}
 .et td{padding:7px 13px;border-bottom:1px solid var(--b1);vertical-align:middle}
 .et tr:last-child td{border-bottom:none}
 .et tr:hover td{background:var(--s2)}
-.etbk{font-family:'JetBrains Mono',monospace;font-size:.68rem;color:var(--t1)}
-.etfo{font-family:'JetBrains Mono',monospace;font-size:.68rem;color:var(--t2)}
+.etbk{font-size:.76rem;color:var(--t1)}
+.etfo{font-size:.76rem;color:var(--t2)}
 .wrc{display:flex;align-items:center;gap:7px}
 .wrt{flex:1;height:3px;background:var(--b1);border-radius:2px;overflow:hidden;min-width:55px;position:relative}
 .wrt::after{content:'';position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--b2)}
 .wrf{height:100%;border-radius:2px;transition:width .5s ease}
-.wrn{font-family:'JetBrains Mono',monospace;font-size:.68rem;font-weight:500;min-width:40px;text-align:right}
-.etpf{font-family:'JetBrains Mono',monospace;font-size:.68rem;color:var(--t2)}
-.etpnl{font-family:'JetBrains Mono',monospace;font-size:.7rem;font-weight:600;text-align:right}
+.wrn{font-size:.76rem;font-weight:600;min-width:40px;text-align:right}
+.etpf{font-size:.76rem;color:var(--t2)}
+.etpnl{font-size:.78rem;font-weight:700;text-align:right}
 
 /* UTILS */
 .g{color:var(--g)}.r{color:var(--r)}.y{color:var(--y)}.d{color:var(--t2)}.dm{color:var(--t3)}
@@ -11393,7 +11481,11 @@ function renderMetrics(d){
 
 function drawChart(id,pts,openP,sTs,eTs,now){
   const ctx=document.getElementById(id);if(!ctx)return;
-  const wp=pts.filter(x=>x.t>=sTs-5);if(!wp.length)return;
+  let wp=(pts||[]).filter(x=>x.t>=sTs-5);
+  if(!wp.length){
+    const cp=(typeof openP==='number'&&openP>0)?openP:0.5;
+    wp=[{t:Math.max((sTs||now)-2,0),p:cp},{t:now,p:cp}];
+  }
   const avg=wp.reduce((s,x)=>s+x.p,0)/wp.length;
   const dec=pdec(avg);
   const labels=wp.map(x=>fmtT(x.t));
@@ -11426,9 +11518,9 @@ function drawChart(id,pts,openP,sTs,eTs,now){
       titleColor:'#303050',bodyColor:'#d8d8f0',padding:8,
       callbacks:{label:c=>'$'+fmt(c.raw,dec)}}},
     scales:{
-      x:{ticks:{maxTicksLimit:4,color:'#303050',font:{size:9,family:'JetBrains Mono'}},
+      x:{ticks:{maxTicksLimit:4,color:'#303050',font:{size:10,family:'Space Grotesk'}},
         grid:{color:'rgba(20,20,40,.9)'},border:{display:false}},
-      y:{position:'right',ticks:{color:'#404060',font:{size:9,family:'JetBrains Mono'},callback:v=>'$'+fmt(v,dec)},
+      y:{position:'right',ticks:{color:'#404060',font:{size:10,family:'Space Grotesk'},callback:v=>'$'+fmt(v,dec)},
         grid:{color:'rgba(255,255,255,.02)'},border:{display:false}}
     }
   }});
@@ -11439,8 +11531,9 @@ function renderPositions(d){
   document.getElementById('pos-title').textContent='Open Positions'+(d.positions.length?' · '+d.positions.length:'');
   const el=document.getElementById('positions');
   if(!d.positions.length){el.innerHTML='';return;}
-  el.innerHTML=d.positions.map(p=>{
-    const cid='c'+p.cid;
+  el.innerHTML=d.positions.map((p,idx)=>{
+    const uid=(p.cid||'x')+'_'+idx;
+    const cid='c'+uid;
     const pct=Math.min(100,Math.max(0,(now-p.start_ts)/((p.end_ts-p.start_ts)||1)*100));
     const cls=p.lead===null?'':p.lead?' lead':' trail';
     const sideH=p.side==='Up'?'<span class="pup">UP ▲</span>':'<span class="pdn">DOWN ▼</span>';
@@ -11457,7 +11550,7 @@ function renderPositions(d){
 <div class="di"><div class="dl">Entry</div><div class="dv">${p.entry.toFixed(3)}</div></div>
 <div class="di"><div class="dl">Stake</div><div class="dv">$${fmt(p.stake)}</div></div>
 <div class="di"><div class="dl">Move</div><div class="dv ${mc}">${pfx(p.move_pct)}${p.move_pct.toFixed(2)}%</div></div>
-<div class="di"><div class="dl">Mid</div><div class="dv d" id="m${p.cid}">—</div></div>
+<div class="di"><div class="dl">Mid</div><div class="dv d" id="m${uid}">—</div></div>
 </div>
 <div class="ca"><canvas id="${cid}" height="120"></canvas></div>
 <div class="pf"><span class="lbl">Open <b>$${fmt(p.open_p,pdec(p.open_p))}</b> → <b>$${fmt(p.cur_p,pdec(p.cur_p))}</b></span>
@@ -11465,8 +11558,8 @@ function renderPositions(d){
 <div class="tb"><div class="tbf" style="width:${pct}%;background:${bc}"></div></div>
 </div>`;
   }).join('');
-  d.positions.forEach(p=>drawChart('c'+p.cid,d.charts[p.asset]||[],p.open_p,p.start_ts,p.end_ts,now));
-  _mt={};d.positions.forEach(p=>{if(p.token_id)_mt[p.cid]=p.token_id;});
+  d.positions.forEach((p,idx)=>drawChart('c'+(p.cid||'x')+'_'+idx,d.charts[p.asset]||[],p.open_p,p.start_ts,p.end_ts,now));
+  _mt={};d.positions.forEach((p,idx)=>{if(p.token_id)_mt[(p.cid||'x')+'_'+idx]=p.token_id;});
   pollMid();
 }
 
