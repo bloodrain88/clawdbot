@@ -11177,7 +11177,13 @@ setInterval(pollMidpoints, 2000);
                             elif entry < 0.61: eb = "51-60c"
                             elif entry < 0.71: eb = "61-70c"
                             else:              eb = ">70c"
-                            k = sc + "|" + eb
+                            by = request.rel_url.query.get("by", "bucket")
+                            if by == "asset":
+                                k = asset
+                            elif by == "asset-score":
+                                k = asset + "|" + sc
+                            else:
+                                k = sc + "|" + eb
                             rows[k]["outcomes"] += 1
                             rows[k]["pnl"] += pnl
                             if won:
