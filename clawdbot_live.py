@@ -11739,10 +11739,7 @@ function renderPositions(d){
     const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
     _posMeta[uid]={open_p:p.open_p,cur_p:p.cur_p,start_ts:p.start_ts,end_ts:p.end_ts};
     const basePts=d.charts[p.asset]||[];
-    if(!_midSeries[uid] || !_midSeries[uid].length){
-      _midSeries[uid]=basePts.map(x=>({t:parseFloat(x.t),p:parseFloat(x.p)})).filter(x=>Number.isFinite(x.t)&&Number.isFinite(x.p));
-    }
-    drawChart('c'+uid,(_midSeries[uid]&&_midSeries[uid].length)?_midSeries[uid]:basePts,p.open_p,p.cur_p,p.start_ts,p.end_ts,now);
+    drawChart('c'+uid,basePts,p.open_p,p.cur_p,p.start_ts,p.end_ts,now);
   });
   _mt={};d.positions.forEach((p,idx)=>{
     const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
@@ -11825,14 +11822,14 @@ async function pollMid(){
           if(Number.isFinite(v)){
             el.textContent=v.toFixed(3);
             el.className='dv '+(v>=0.5?'g':'r');
-            const now=Math.floor(Date.now()/1000);
-            const s=_midSeries[cid]||[];
-            s.push({t:now,p:v});
-            if(s.length>320)s.splice(0,s.length-320);
-            _midSeries[cid]=s;
             const pm=_posMeta[cid];
-            if(pm){
-              drawChart('c'+cid,s,pm.open_p,pm.cur_p,pm.start_ts,pm.end_ts,now);
+            // Keep midpoint as metric text only; chart uses underlying asset price series.
+            if(pm && Number(pm.open_p)<=2){
+              const now=Math.floor(Date.now()/1000);
+              const s=_midSeries[cid]||[];
+              s.push({t:now,p:v});
+              if(s.length>320)s.splice(0,s.length-320);
+              _midSeries[cid]=s;
             }
           }
         }else{
