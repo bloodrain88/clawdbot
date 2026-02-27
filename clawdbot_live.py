@@ -11129,26 +11129,9 @@ class LiveTrader:
                 ),
             })
 
-        # Remove fallback duplicate rows:
-        # if we have an exact round key (timestamped), hide cid-fallback row
-        # for the same asset+duration+side.
-        if positions:
-            by_triplet = {}
-            for p in positions:
-                k = (p.get("asset", "?"), int(p.get("duration", 0) or 0), p.get("side", "?"))
-                by_triplet.setdefault(k, []).append(p)
-            filtered = []
-            for _, rows_k in by_triplet.items():
-                exact = [r for r in rows_k if "-cid" not in str(r.get("rk", ""))]
-                base = exact if exact else rows_k
-                seen_rk = set()
-                for r in sorted(base, key=lambda x: (float(x.get("end_ts", 0) or 0), float(x.get("stake", 0) or 0)), reverse=True):
-                    rk = str(r.get("rk", "") or "")
-                    if rk in seen_rk:
-                        continue
-                    seen_rk.add(rk)
-                    filtered.append(r)
-            positions = filtered
+        # Keep one row per CID (already ensured by seen_cids_norm above).
+        # Do not collapse by asset/duration/side: multiple real opens can share
+        # the same triplet and must stay visible to match on-chain open_count.
 
         # Skip top reasons (last 15m)
         skip_top = []
