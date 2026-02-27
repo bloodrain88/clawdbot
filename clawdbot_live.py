@@ -11593,8 +11593,14 @@ function renderPositions(d){
 <div class="tb"><div class="tbf" style="width:${pct}%;background:${bc}"></div></div>
 </div>`;
   }).join('');
-  d.positions.forEach((p,idx)=>drawChart('c'+(p.cid||'x')+'_'+idx,d.charts[p.asset]||[],p.open_p,p.cur_p,p.start_ts,p.end_ts,now));
-  _mt={};d.positions.forEach((p,idx)=>{if(p.token_id)_mt[(p.cid||'x')+'_'+idx]=p.token_id;});
+  d.positions.forEach((p,idx)=>{
+    const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
+    drawChart('c'+uid,d.charts[p.asset]||[],p.open_p,p.cur_p,p.start_ts,p.end_ts,now);
+  });
+  _mt={};d.positions.forEach((p,idx)=>{
+    const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
+    if(p.token_id)_mt[uid]=p.token_id;
+  });
   pollMid();
 }
 
