@@ -11302,71 +11302,93 @@ setInterval(pollMidpoints, 2000);
                 return web.Response(text=json.dumps({"error": str(e)}),
                                     content_type="application/json")
 
-        async def handle_corr(request):
-            """Token direction correlation from Polymarket historical data (~16k windows)."""
+        _CORR_CACHE_PATH = "/data/corr_cache.json"
+        _corr_cache = {"source": "polymarket", "windows": 0, "rows": [], "built_at": ""}
+
+        async def _build_corr_cache():
+            """Fetch Polymarket historical data and compute direction correlation."""
+            import urllib.request as _ur
+            from collections import defaultdict as _dd
+            from itertools import combinations
+            _SERIES = {"BTC": 10192, "ETH": 10191, "SOL": 10423, "XRP": 10422}
+            _HDRS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+            windows = _dd(dict)
+            for asset, sid in _SERIES.items():
+                offset = 0
+                while True:
+                    url = (f"https://gamma-api.polymarket.com/events"
+                           f"?series_id={sid}&closed=true&limit=200&offset={offset}")
+                    req = _ur.Request(url, headers=_HDRS)
+                    try:
+                        with _ur.urlopen(req, timeout=15) as resp:
+                            events = json.loads(resp.read())
+                    except Exception:
+                        break
+                    if not events:
+                        break
+                    for ev in events:
+                        for mkt in ev.get("markets", []):
+                            end = str(ev.get("endDate", ""))[:16]
+                            if not end:
+                                continue
+                            try:
+                                prices   = json.loads(mkt["outcomePrices"]) if isinstance(mkt.get("outcomePrices"), str) else mkt.get("outcomePrices", [])
+                                outcomes = json.loads(mkt["outcomes"])      if isinstance(mkt.get("outcomes"), str)      else mkt.get("outcomes", [])
+                                p0, p1 = float(prices[0]), float(prices[1])
+                            except Exception:
+                                continue
+                            if p0 > 0.95:   winner = outcomes[0]
+                            elif p1 > 0.95: winner = outcomes[1]
+                            else:           continue
+                            if asset not in windows[end]:
+                                windows[end][asset] = winner
+                    offset += 200
+                    if len(events) < 200:
+                        break
+            pairs = _dd(lambda: {"uu": 0, "dd": 0, "sp": 0, "n": 0})
+            for slot, assets in windows.items():
+                for (a1, d1), (a2, d2) in combinations(list(assets.items()), 2):
+                    key = "|".join(sorted([a1, a2]))
+                    pairs[key]["n"] += 1
+                    if d1 == "Up"   and d2 == "Up":   pairs[key]["uu"] += 1
+                    elif d1 == "Down" and d2 == "Down": pairs[key]["dd"] += 1
+                    else:                               pairs[key]["sp"] += 1
+            out = []
+            for k, v in sorted(pairs.items()):
+                n = v["n"]
+                if n == 0: continue
+                same_pct = round((v["uu"] + v["dd"]) / n * 100, 1)
+                out.append({"pair": k, "n": n, "up_up": v["uu"],
+                            "down_down": v["dd"], "split": v["sp"],
+                            "same_pct": same_pct})
+            result = {"source": "polymarket", "windows": len(windows),
+                      "rows": out, "built_at": datetime.now(timezone.utc).isoformat()}
+            _corr_cache.update(result)
             try:
-                import urllib.request as _ur
-                from collections import defaultdict as _dd
-                from itertools import combinations
-                import math as _math
-                _SERIES = {"BTC": 10192, "ETH": 10191, "SOL": 10423, "XRP": 10422}
-                _HDRS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-                windows = _dd(dict)
-                for asset, sid in _SERIES.items():
-                    offset = 0
-                    while True:
-                        url = (f"https://gamma-api.polymarket.com/events"
-                               f"?series_id={sid}&closed=true&limit=200&offset={offset}")
-                        req = _ur.Request(url, headers=_HDRS)
-                        try:
-                            with _ur.urlopen(req, timeout=15) as resp:
-                                events = json.loads(resp.read())
-                        except Exception:
-                            break
-                        if not events:
-                            break
-                        for ev in events:
-                            for mkt in ev.get("markets", []):
-                                end = str(ev.get("endDate", ""))[:16]
-                                if not end:
-                                    continue
-                                try:
-                                    prices   = json.loads(mkt["outcomePrices"]) if isinstance(mkt.get("outcomePrices"), str) else mkt.get("outcomePrices", [])
-                                    outcomes = json.loads(mkt["outcomes"])      if isinstance(mkt.get("outcomes"), str)      else mkt.get("outcomes", [])
-                                    p0, p1 = float(prices[0]), float(prices[1])
-                                except Exception:
-                                    continue
-                                if p0 > 0.95:   winner = outcomes[0]
-                                elif p1 > 0.95: winner = outcomes[1]
-                                else:           continue
-                                if asset not in windows[end]:
-                                    windows[end][asset] = winner
-                        offset += 200
-                        if len(events) < 200:
-                            break
-                pairs = _dd(lambda: {"uu": 0, "dd": 0, "sp": 0, "n": 0})
-                for slot, assets in windows.items():
-                    for (a1, d1), (a2, d2) in combinations(list(assets.items()), 2):
-                        key = "|".join(sorted([a1, a2]))
-                        pairs[key]["n"] += 1
-                        if d1 == "Up"   and d2 == "Up":   pairs[key]["uu"] += 1
-                        elif d1 == "Down" and d2 == "Down": pairs[key]["dd"] += 1
-                        else:                               pairs[key]["sp"] += 1
-                out = []
-                for k, v in sorted(pairs.items()):
-                    n = v["n"]
-                    if n == 0: continue
-                    same = v["uu"] + v["dd"]
-                    same_pct = round(same / n * 100, 1)
-                    out.append({"pair": k, "n": n, "up_up": v["uu"],
-                                "down_down": v["dd"], "split": v["sp"],
-                                "same_pct": same_pct})
-                return web.Response(text=json.dumps({"source": "polymarket", "windows": len(windows), "rows": out}),
-                                    content_type="application/json",
-                                    headers={"Access-Control-Allow-Origin": "*"})
-            except Exception as e:
-                return web.Response(text=json.dumps({"error": str(e)}),
-                                    content_type="application/json")
+                with open(_CORR_CACHE_PATH, "w") as _f:
+                    json.dump(result, _f)
+            except Exception:
+                pass
+
+        async def _corr_refresh_loop():
+            """Rebuild correlation cache once at startup then every 6 hours."""
+            try:
+                with open(_CORR_CACHE_PATH) as _f:
+                    _corr_cache.update(json.load(_f))
+            except Exception:
+                pass
+            while True:
+                try:
+                    await _build_corr_cache()
+                except Exception:
+                    pass
+                await asyncio.sleep(6 * 3600)
+
+        async def handle_corr(request):
+            """Token direction correlation from Polymarket historical data (cached)."""
+            return web.Response(text=json.dumps(_corr_cache),
+                                content_type="application/json",
+                                headers={"Access-Control-Allow-Origin": "*"})
 
         app = web.Application()
         app.router.add_get("/", handle_html)
@@ -11381,6 +11403,7 @@ setInterval(pollMidpoints, 2000);
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
         print(f"[DASH] Dashboard running on http://0.0.0.0:{port}")
+        asyncio.ensure_future(_corr_refresh_loop())
         while True:
             await asyncio.sleep(3600)
 
