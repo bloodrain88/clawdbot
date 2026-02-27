@@ -11467,6 +11467,7 @@ canvas{display:block;width:100%!important}
 
 <script>
 const ch={},cm={};
+const _mid404=new Set();
 function fmt(n,d=2){return Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d})}
 function fmtT(ts){const x=new Date(ts*1e3);return x.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}
 function pfx(v){return v>0?'+':''}
@@ -11671,7 +11672,8 @@ function renderPositions(d){
   });
   _mt={};d.positions.forEach((p,idx)=>{
     const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
-    if(p.token_id)_mt[uid]=p.token_id;
+    const tid=String(p.token_id||'').trim();
+    if(tid && !_mid404.has(tid))_mt[uid]=tid;
   });
   pollMid();
 }
@@ -11736,6 +11738,7 @@ async function pollMid(){
       const el=document.getElementById('m'+cid);
       if(r.status===404){
         // Invalid or stale token id for this market side; stop polling this row.
+        _mid404.add(String(tid));
         if(el){el.textContent='n/a';el.className='dv dm';}
         delete _mt[cid];
         continue;
