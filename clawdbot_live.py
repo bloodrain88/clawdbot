@@ -11326,8 +11326,10 @@ setInterval(pollMidpoints, 2000);
         _CORR_CACHE_PATH = "/data/corr_cache.json"
         _corr_cache = {"source": "polymarket", "windows": 0, "rows": [], "built_at": ""}
 
-        async def _build_corr_cache():
-            """Fetch Polymarket historical data (15m + 5m) and compute direction correlation."""
+        def _build_corr_cache_sync():
+            """Fetch Polymarket historical data (15m + 5m) and compute direction correlation.
+            Runs in a worker thread to avoid blocking the main asyncio event loop.
+            """
             import urllib.request as _ur
             from collections import defaultdict as _dd
             from itertools import combinations
@@ -11407,6 +11409,10 @@ setInterval(pollMidpoints, 2000);
             except Exception:
                 pass
 
+        async def _build_corr_cache_async():
+            # Offload blocking urllib/file work so trading loops stay responsive.
+            await asyncio.to_thread(_build_corr_cache_sync)
+
         async def _corr_refresh_loop():
             """Rebuild correlation cache once at startup then every 6 hours."""
             try:
@@ -11414,9 +11420,11 @@ setInterval(pollMidpoints, 2000);
                     _corr_cache.update(json.load(_f))
             except Exception:
                 pass
+            # Let trading loops settle first; correlation cache is non-critical.
+            await asyncio.sleep(2)
             while True:
                 try:
-                    await _build_corr_cache()
+                    await asyncio.wait_for(_build_corr_cache_async(), timeout=120)
                 except Exception:
                     pass
                 await asyncio.sleep(6 * 3600)
