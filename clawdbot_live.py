@@ -11673,6 +11673,15 @@ function drawChart(id,pts,openP,curP,sTs,eTs,now){
   const dec=pdec(avg);
   const labels=wp.map(x=>fmtT(x.t));
   const data=wp.map(x=>x.p);
+  const dMin=Math.min(...data);
+  const dMax=Math.max(...data);
+  const dMid=(dMin+dMax)/2;
+  let span=Math.max(1e-9,dMax-dMin);
+  // Keep y-range tight to expose micro-movements.
+  if(span<Math.max(Math.abs(dMid)*0.000004,1e-6))span=Math.max(Math.abs(dMid)*0.000004,1e-6);
+  const pad=span*0.18;
+  const yMin=dMid-(span/2)-pad;
+  const yMax=dMid+(span/2)+pad;
   const last=data[data.length-1];
   const lead=openP>0?last>=openP:null;
   const lc=lead===null?'#3a3a5a':(lead?'#00cc78':'#ff3d3d');
@@ -11687,6 +11696,10 @@ function drawChart(id,pts,openP,curP,sTs,eTs,now){
       const c=ch[id];
       c.data.labels=labels;c.data.datasets[0].data=data;
       if(c.data.datasets[1])c.data.datasets[1].data=wp.map(()=>openP);
+      if(c.options&&c.options.scales&&c.options.scales.y){
+        c.options.scales.y.min=yMin;
+        c.options.scales.y.max=yMax;
+      }
       c.update('none');return;
     }catch(e){
       if(ch[id]){try{ch[id].destroy()}catch(e2){}delete ch[id];}
@@ -11697,8 +11710,8 @@ function drawChart(id,pts,openP,curP,sTs,eTs,now){
   if(ch[id]){ch[id].destroy();delete ch[id];}
   cm[id]={lead};
   const ds=[{
-    data,borderColor:lc,borderWidth:2,pointRadius:0,pointHoverRadius:2,
-    tension:0.22,fill:'origin',
+    data,borderColor:lc,borderWidth:1.8,pointRadius:0,pointHoverRadius:2,
+    tension:0.08,fill:'origin',
     backgroundColor(cx){
       const g=cx.chart.ctx.createLinearGradient(0,0,0,120);
       g.addColorStop(0,fg);g.addColorStop(1,'rgba(0,0,0,0)');return g;
@@ -11717,6 +11730,7 @@ function drawChart(id,pts,openP,curP,sTs,eTs,now){
       scales:{
         x:{display:false,grid:{display:false},border:{display:false}},
         y:{display:false,grid:{display:false},border:{display:false},
+          min:yMin,max:yMax,
           ticks:{callback:v=>'$'+fmt(v,dec)}}
       }
     }});
