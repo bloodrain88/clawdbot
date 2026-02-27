@@ -10802,6 +10802,54 @@ class LiveTrader:
                 "rk": self._round_key(cid=cid_norm, m=mkt, t=trade),
             })
 
+        # On-chain fallback rows (for positions not present in local pending state).
+        for cid, meta in list((self.onchain_open_meta_by_cid or {}).items()):
+            cid_norm = str(cid or "").strip().lower()
+            if not cid_norm or cid_norm in seen_cids_norm:
+                continue
+            seen_cids_norm.add(cid_norm)
+            stake = float((self.onchain_open_stake_by_cid or {}).get(cid, 0.0) or 0.0)
+            if stake <= 0:
+                stake = float((self.onchain_open_usdc_by_cid or {}).get(cid, 0.0) or 0.0)
+            if stake <= 0:
+                continue
+            asset = str(meta.get("asset", "?") or "?")
+            side = str(meta.get("side", "?") or "?")
+            entry = float(meta.get("entry", 0.5) or 0.5)
+            open_p = float(self.open_prices.get(cid, 0.0) or 0.0)
+            if open_p <= 0:
+                open_p = float(meta.get("open_price", 0.0) or 0.0)
+            cl_p = self.cl_prices.get(asset, 0)
+            cl_ts = self.cl_updated.get(asset, 0)
+            rtds_p = self.prices.get(asset, 0)
+            _ph = self.price_history.get(asset)
+            rtds_ts = _ph[-1][0] if _ph else 0
+            cur_p = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
+            end_ts = float(meta.get("end_ts", 0) or 0)
+            start_ts = float(meta.get("start_ts", 0) or 0)
+            duration = int(meta.get("duration", 15) or 15)
+            mins_left = max(0.0, (end_ts - now_ts) / 60.0) if end_ts > 0 else 0.0
+            if open_p > 0 and cur_p > 0:
+                pred_winner = "Up" if cur_p >= open_p else "Down"
+                lead = side == pred_winner
+                move_pct = (cur_p - open_p) / open_p * 100
+            else:
+                lead, move_pct = None, 0.0
+            token_id = self._token_id_from_cid_side(cid, side) or ""
+            positions.append({
+                "asset": asset, "side": side, "entry": round(entry, 3),
+                "stake": round(stake, 2), "cur_p": round(cur_p, 2),
+                "open_p": round(open_p, 6), "move_pct": round(move_pct, 3),
+                "lead": lead, "mins_left": round(mins_left, 1),
+                "cid": cid_norm[:12], "start_ts": start_ts, "end_ts": end_ts,
+                "duration": duration, "token_id": token_id,
+                "rk": self._round_key(
+                    cid=cid_norm,
+                    m={"asset": asset, "duration": duration, "start_ts": start_ts, "end_ts": end_ts},
+                    t={"asset": asset, "side": side, "duration": duration, "end_ts": end_ts},
+                ),
+            })
+
         # Remove fallback duplicate rows:
         # if we have an exact round key (timestamped), hide cid-fallback row
         # for the same asset+duration+side.
