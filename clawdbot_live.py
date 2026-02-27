@@ -11092,6 +11092,7 @@ function drawChart(canvasId, pts, openP, startTs, endTs, nowTs) {
 function renderCards(d) {
   const pnlC = d.pnl >= 0 ? 'green' : 'red';
   const wrC  = d.wr >= 52 ? 'green' : d.wr >= 48 ? 'yellow' : 'red';
+  const losses = Math.max(0, (d.trades || 0) - (d.wins || 0));
   const cards = [
     {t:'Portfolio',  body:`<div class="big">$${fmt(d.total_equity)}</div>
       <div class="sub">Free: $${fmt(d.usdc)} &nbsp;|&nbsp; Stake: $${fmt(d.open_stake)} (${d.open_count})</div>
@@ -11100,16 +11101,13 @@ function renderCards(d) {
       <div class="sub">ROI <span class="${pnlC}">${d.roi>0?'+':''}${d.roi.toFixed(1)}%</span></div>`},
     {t:'Win Rate',  body:`<div class="big ${wrC}">${d.wr}%</div>
       <div class="sub">${d.wins}W / ${d.trades-d.wins}L of ${d.trades}</div>`},
+    {t:'Overall',  body:`<div class="big ${wrC}">${d.wr}% WR</div>
+      <div class="sub">W/L: ${d.wins}/${losses} &nbsp; Trades: ${d.trades}</div>
+      <div class="sub">Total PnL <span class="${pnlC}">${d.pnl>=0?'+':''}$${fmt(d.pnl)}</span></div>`},
     {t:'Session',  body:`<div class="big">${d.session}</div>
       <div class="sub">${d.network} &nbsp; RTDS <span class="${d.rtds_ok?'green':'red'}">${d.rtds_ok?'✓':'✗'}</span></div>`},
     {t:'Prices',  body:Object.entries(d.prices).map(([a,p])=>`<div><b style="color:#8b949e">${a}</b> $${fmt(p,2)}</div>`).join('')},
   ];
-  if(d.execq && d.execq.outcomes > 0){
-    const wrc = d.execq.wr>=52?'green':d.execq.wr>=48?'yellow':'red';
-    cards.push({t:'ExecQ',  body:`<div style="font-size:.72em;color:#6e7681;margin-bottom:4px">${d.execq.bucket}</div>
-      <div><span class="${wrc}">${d.execq.wr}%</span> WR &nbsp; ${d.execq.fills}/${d.execq.outcomes}</div>
-      <div>PF ${d.execq.pf} &nbsp; PnL <span class="${d.execq.pnl>=0?'green':'red'}">${d.execq.pnl>=0?'+':''}$${fmt(d.execq.pnl)}</span></div>`});
-  }
   document.getElementById('cards').innerHTML = cards.map(c=>`<div class="card"><h3>${c.t}</h3>${c.body}</div>`).join('');
 }
 
