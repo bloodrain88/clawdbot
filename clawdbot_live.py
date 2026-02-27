@@ -11504,6 +11504,7 @@ canvas{display:block;width:100%!important}
 <script>
 const ch={},cm={};
 const _mid404=new Set();
+let _midSeries={},_posMeta={};
 function fmt(n,d=2){return Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d})}
 function fmtT(ts){const x=new Date(ts*1e3);return x.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}
 function pfx(v){return v>0?'+':''}
@@ -11674,6 +11675,7 @@ function renderPositions(d){
   document.getElementById('pos-title').textContent='Open Positions'+(d.positions.length?' · '+d.positions.length:'');
   const el=document.getElementById('positions');
   if(!d.positions.length){el.innerHTML='';return;}
+  _posMeta={};
   el.innerHTML=d.positions.map((p,idx)=>{
     const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
     const cid='c'+uid;
@@ -11704,7 +11706,12 @@ function renderPositions(d){
   }).join('');
   d.positions.forEach((p,idx)=>{
     const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
-    drawChart('c'+uid,d.charts[p.asset]||[],p.open_p,p.cur_p,p.start_ts,p.end_ts,now);
+    _posMeta[uid]={open_p:p.open_p,cur_p:p.cur_p,start_ts:p.start_ts,end_ts:p.end_ts};
+    const basePts=d.charts[p.asset]||[];
+    if(!_midSeries[uid] || !_midSeries[uid].length){
+      _midSeries[uid]=basePts.map(x=>({t:parseFloat(x.t),p:parseFloat(x.p)})).filter(x=>Number.isFinite(x.t)&&Number.isFinite(x.p));
+    }
+    drawChart('c'+uid,(_midSeries[uid]&&_midSeries[uid].length)?_midSeries[uid]:basePts,p.open_p,p.cur_p,p.start_ts,p.end_ts,now);
   });
   _mt={};d.positions.forEach((p,idx)=>{
     const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
@@ -11787,6 +11794,15 @@ async function pollMid(){
           if(Number.isFinite(v)){
             el.textContent=v.toFixed(3);
             el.className='dv '+(v>=0.5?'g':'r');
+            const now=Math.floor(Date.now()/1000);
+            const s=_midSeries[cid]||[];
+            s.push({t:now,p:v});
+            if(s.length>320)s.splice(0,s.length-320);
+            _midSeries[cid]=s;
+            const pm=_posMeta[cid];
+            if(pm){
+              drawChart('c'+cid,s,pm.open_p,pm.cur_p,pm.start_ts,pm.end_ts,now);
+            }
           }
         }else{
           el.textContent='—';
