@@ -11151,9 +11151,45 @@ setInterval(pollMidpoints, 2000);
                 return web.Response(text=json.dumps({"ok": False, "error": str(e)}),
                                     content_type="application/json")
 
+        async def handle_daily(request):
+            try:
+                daily = {}
+                with open(METRICS_FILE, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                            if r.get("event") != "RESOLVE":
+                                continue
+                            day = str(r.get("ts", ""))[:10]
+                            pnl = float(r.get("pnl") or 0)
+                            won = r.get("result") == "WIN"
+                            if day not in daily:
+                                daily[day] = {"wins": 0, "outcomes": 0, "pnl": 0.0}
+                            daily[day]["outcomes"] += 1
+                            daily[day]["pnl"] += pnl
+                            if won:
+                                daily[day]["wins"] += 1
+                        except Exception:
+                            pass
+                out = []
+                cumul = 0.0
+                for day in sorted(daily):
+                    v = daily[day]
+                    wr = round(v["wins"] / v["outcomes"] * 100, 1) if v["outcomes"] else 0
+                    cumul += v["pnl"]
+                    out.append({"day": day, "n": v["outcomes"], "wr": wr,
+                                "pnl": round(v["pnl"], 2), "cumul": round(cumul, 2)})
+                return web.Response(text=json.dumps(out),
+                                    content_type="application/json",
+                                    headers={"Access-Control-Allow-Origin": "*"})
+            except Exception as e:
+                return web.Response(text=json.dumps({"error": str(e)}),
+                                    content_type="application/json")
+
         app = web.Application()
         app.router.add_get("/", handle_html)
         app.router.add_get("/api", handle_api)
+        app.router.add_get("/daily", handle_daily)
         app.router.add_get("/reload-buckets", handle_reload_buckets)
         runner = web.AppRunner(app)
         await runner.setup()
