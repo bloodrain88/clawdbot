@@ -11413,10 +11413,10 @@ body::before{
 .di{display:flex;flex-direction:column;gap:3px}
 .dl{font-size:.52rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.08em}
 .dv{font-size:.98rem;font-weight:700}
-.ca{height:156px;border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);background:var(--bg);position:relative}
+.ca{height:156px;border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);background:linear-gradient(180deg,rgba(18,22,30,.95) 0%,rgba(9,11,16,.98) 100%);position:relative}
 .ca::after{
   content:"";position:absolute;inset:0;pointer-events:none;
-  background:linear-gradient(180deg,rgba(95,141,255,.02) 0%,rgba(0,0,0,0) 60%);
+  background:linear-gradient(180deg,rgba(95,141,255,.04) 0%,rgba(0,0,0,0) 65%);
 }
 canvas{display:block;width:100%!important}
 .pf{padding:9px 16px;display:flex;justify-content:space-between;align-items:center;font-size:.7rem}
@@ -11592,10 +11592,17 @@ function drawSparkline(canvas,wp,openP,lead){
     g.beginPath();g.moveTo(padX,oy);g.lineTo(padX+w,oy);g.stroke();g.setLineDash([]);
   }
 
-  g.lineWidth=1.6;g.strokeStyle=line;
+  g.lineWidth=2.0;g.strokeStyle=line;
   g.beginPath();
   pts.forEach(([x,y],i)=>{if(i===0)g.moveTo(x,y);else g.lineTo(x,y);});
   g.stroke();
+  const lp=pts[pts.length-1];
+  if(lp){
+    g.beginPath();
+    g.fillStyle=line;
+    g.arc(lp[0],lp[1],2.2,0,Math.PI*2);
+    g.fill();
+  }
 }
 
 function drawChart(id,pts,openP,curP,sTs,eTs,now){
@@ -11642,8 +11649,8 @@ function drawChart(id,pts,openP,curP,sTs,eTs,now){
   if(ch[id]){ch[id].destroy();delete ch[id];}
   cm[id]={lead};
   const ds=[{
-    data,borderColor:lc,borderWidth:1.5,pointRadius:0,pointHoverRadius:3,
-    tension:0.3,fill:'origin',
+    data,borderColor:lc,borderWidth:2,pointRadius:0,pointHoverRadius:2,
+    tension:0.22,fill:'origin',
     backgroundColor(cx){
       const g=cx.chart.ctx.createLinearGradient(0,0,0,120);
       g.addColorStop(0,fg);g.addColorStop(1,'rgba(0,0,0,0)');return g;
@@ -11653,15 +11660,16 @@ function drawChart(id,pts,openP,curP,sTs,eTs,now){
   try{
     ch[id]=new Chart(ctx,{type:'line',data:{labels,datasets:ds},options:{
       animation:false,responsive:true,maintainAspectRatio:false,
+      interaction:{mode:'nearest',intersect:false},
       plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,
-        backgroundColor:'rgba(9,9,14,.97)',borderColor:'#1c1c30',borderWidth:1,
-        titleColor:'#303050',bodyColor:'#d8d8f0',padding:8,
+        displayColors:false,
+        backgroundColor:'rgba(12,15,21,.96)',borderColor:'rgba(120,136,168,.28)',borderWidth:1,
+        titleColor:'#8e9ab4',bodyColor:'#eef3ff',padding:7,
         callbacks:{label:c=>'$'+fmt(c.raw,dec)}}},
       scales:{
-        x:{ticks:{maxTicksLimit:4,color:'#303050',font:{size:10,family:'Plus Jakarta Sans'}},
-          grid:{color:'rgba(20,20,40,.9)'},border:{display:false}},
-        y:{position:'right',ticks:{color:'#404060',font:{size:10,family:'Plus Jakarta Sans'},callback:v=>'$'+fmt(v,dec)},
-          grid:{color:'rgba(255,255,255,.02)'},border:{display:false}}
+        x:{display:false,grid:{display:false},border:{display:false}},
+        y:{display:false,grid:{display:false},border:{display:false},
+          ticks:{callback:v=>'$'+fmt(v,dec)}}
       }
     }});
   }catch(e){
