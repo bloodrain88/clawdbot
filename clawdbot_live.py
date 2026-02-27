@@ -6449,6 +6449,7 @@ class LiveTrader:
                 "round_key": round_key,
                 "booster_mode": bool(is_booster),
                 "booster_note": sig.get("booster_note", ""),
+                "duration": sig.get("duration", 15),
             })
             if filled and self._noisy_log_enabled(f"entry-stats:{sig['asset']}:{cid}", LOG_FLOW_EVERY_SEC):
                 print(
@@ -7543,6 +7544,7 @@ class LiveTrader:
                             "onchain_score_adj": trade.get("onchain_score_adj", 0),
                             "source_confidence": trade.get("source_confidence", 0.0),
                             "round_key": rk,
+                            "duration": trade.get("duration", 15),
                         })
                         wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                         rk_n = self._count_pending_redeem_by_rk(rk)
@@ -7632,6 +7634,7 @@ class LiveTrader:
                                 "onchain_score_adj": trade.get("onchain_score_adj", 0),
                                 "source_confidence": trade.get("source_confidence", 0.0),
                                 "round_key": rk,
+                                "duration": trade.get("duration", 15),
                             })
                             wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
                             rk_n = self._count_pending_redeem_by_rk(rk)
