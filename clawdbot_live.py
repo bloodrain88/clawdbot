@@ -247,6 +247,8 @@ BLOCK_SCORE_S0_8_15M  = os.environ.get("BLOCK_SCORE_S0_8_15M",  "false").lower()
 BLOCK_SCORE_S9_11_15M = os.environ.get("BLOCK_SCORE_S9_11_15M", "false").lower() == "true"
 BLOCK_SCORE_S12P_15M  = os.environ.get("BLOCK_SCORE_S12P_15M",  "false").lower() == "true"
 MIN_ENTRY_PRICE_S0_8_15M = float(os.environ.get("MIN_ENTRY_PRICE_S0_8_15M", "0.0"))  # 0=disabled
+BLOCK_ASSET_SOL_15M = os.environ.get("BLOCK_ASSET_SOL_15M", "false").lower() == "true"
+BLOCK_ASSET_XRP_15M = os.environ.get("BLOCK_ASSET_XRP_15M", "false").lower() == "true"
 MIN_TRUE_PROB_GATE_15M = float(os.environ.get("MIN_TRUE_PROB_GATE_15M", "0.50"))
 MIN_TRUE_PROB_GATE_5M  = float(os.environ.get("MIN_TRUE_PROB_GATE_5M",  "0.50"))
 ROLLING3_WIN_SCORE_PEN = int(os.environ.get("ROLLING3_WIN_SCORE_PEN", "0"))
@@ -5268,6 +5270,15 @@ class LiveTrader:
             min_score_local = max(LATE_MUST_FIRE_MIN_SCORE, min_score_local - LATE_MUST_FIRE_SCORE_RELAX)
         if score < min_score_local:
             return None
+        # Per-asset blocking for 15m
+        if duration >= 15:
+            asset = m.get("asset", "")
+            if BLOCK_ASSET_SOL_15M and asset == "SOL":
+                self._skip_tick("asset_blocked_sol")
+                return None
+            if BLOCK_ASSET_XRP_15M and asset == "XRP":
+                self._skip_tick("asset_blocked_xrp")
+                return None
         # Per-tier blocking via env vars (default all off)
         if duration >= 15:
             score_tier = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
