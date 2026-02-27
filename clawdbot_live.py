@@ -11302,12 +11302,64 @@ setInterval(pollMidpoints, 2000);
                 return web.Response(text=json.dumps({"error": str(e)}),
                                     content_type="application/json")
 
+        async def handle_corr(request):
+            """Token outcome correlation across same round_key windows."""
+            try:
+                from collections import defaultdict as _dd
+                from itertools import combinations
+                rounds = _dd(dict)
+                with open(METRICS_FILE, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                            if r.get("event") != "RESOLVE": continue
+                            rk = r.get("round_key", "")
+                            if not rk: continue
+                            asset = r.get("asset")
+                            won = 1 if r.get("result") == "WIN" else 0
+                            dur = int(r.get("duration") or 15)
+                            rounds[rk][asset] = {"won": won, "dur": dur}
+                        except Exception: pass
+                pairs = _dd(lambda: {"bw": 0, "bl": 0, "sp": 0, "n": 0})
+                for rk, assets in rounds.items():
+                    alist = list(assets.items())
+                    for (a1, d1), (a2, d2) in combinations(alist, 2):
+                        if d1["dur"] != d2["dur"]: continue
+                        key = "|".join(sorted([a1, a2])) + "|" + str(d1["dur"]) + "m"
+                        w1, w2 = d1["won"], d2["won"]
+                        pairs[key]["n"] += 1
+                        if w1 == 1 and w2 == 1:   pairs[key]["bw"] += 1
+                        elif w1 == 0 and w2 == 0: pairs[key]["bl"] += 1
+                        else:                      pairs[key]["sp"] += 1
+                out = []
+                for k, v in sorted(pairs.items()):
+                    n = v["n"]
+                    if n == 0: continue
+                    agree = round((v["bw"] + v["bl"]) / n * 100, 1)
+                    phi = 0.0
+                    try:
+                        import math
+                        a, b, c, d = v["bw"], v["sp"]//2, v["sp"] - v["sp"]//2, v["bl"]
+                        denom = math.sqrt((a+b)*(c+d)*(a+c)*(b+d))
+                        phi = round((a*d - b*c) / denom, 3) if denom > 0 else 0.0
+                    except Exception: pass
+                    out.append({"pair": k, "n": n, "both_win": v["bw"],
+                                "both_lose": v["bl"], "split": v["sp"],
+                                "agree_pct": agree, "phi": phi})
+                return web.Response(text=json.dumps(out),
+                                    content_type="application/json",
+                                    headers={"Access-Control-Allow-Origin": "*"})
+            except Exception as e:
+                return web.Response(text=json.dumps({"error": str(e)}),
+                                    content_type="application/json")
+
         app = web.Application()
         app.router.add_get("/", handle_html)
         app.router.add_get("/api", handle_api)
         app.router.add_get("/daily", handle_daily)
         app.router.add_get("/analyze", handle_analyze)
         app.router.add_get("/dur-stats", handle_dur_stats)
+        app.router.add_get("/corr", handle_corr)
         app.router.add_get("/reload-buckets", handle_reload_buckets)
         runner = web.AppRunner(app)
         await runner.setup()
