@@ -204,6 +204,8 @@ POLY_API_SECRET = _pick_env("POLY_API_SECRET")
 POLY_API_PASSPHRASE = _pick_env("POLY_API_PASSPHRASE")
 NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
+PROFIT_PUSH_MODE = os.environ.get("PROFIT_PUSH_MODE", "false").lower() == "true"
+PROFIT_PUSH_MULT = float(os.environ.get("PROFIT_PUSH_MULT", "1.0"))
 MIN_EDGE       = float(os.environ.get("MIN_EDGE", "0.20"))     # base edge floor — raised from 0.08 (data: edge>=0.20 → WR=52.7%)
 MIN_MOVE       = float(os.environ.get("MIN_MOVE", "0.0003"))   # flat filter threshold
 MOMENTUM_WEIGHT = float(os.environ.get("MOMENTUM_WEIGHT", "0.40"))
@@ -991,6 +993,21 @@ FORCE_TAKER_CL_AGE_FRESH = float(os.environ.get("FORCE_TAKER_CL_AGE_FRESH", "45"
 FIVE_MIN_ASSETS = {
     s.strip().upper() for s in os.environ.get("FIVE_MIN_ASSETS", "BTC,ETH").split(",") if s.strip()
 }
+
+if PROFIT_PUSH_MODE:
+    _pp = max(0.5, min(2.0, PROFIT_PUSH_MULT))
+    # Aggressive-but-selective profile: bigger size only on stronger setups.
+    MAX_ABS_BET = min(40.0, MAX_ABS_BET * (1.20 + 0.15 * (_pp - 1.0)))
+    MAX_BANKROLL_PCT = min(0.45, MAX_BANKROLL_PCT + 0.07 * _pp)
+    MAX_OPEN = min(6, max(MAX_OPEN, int(round(4 + _pp))))
+    CORE_SIZE_BONUS = max(CORE_SIZE_BONUS, 1.18 + 0.06 * (_pp - 1.0))
+    HIGH_EV_SIZE_BOOST = max(HIGH_EV_SIZE_BOOST, 1.40 + 0.10 * (_pp - 1.0))
+    HIGH_EV_SIZE_BOOST_MAX = max(HIGH_EV_SIZE_BOOST_MAX, 1.65 + 0.15 * (_pp - 1.0))
+    COPYFLOW_BONUS_MAX = max(COPYFLOW_BONUS_MAX, 3)
+    MID_BOOSTER_MIN_EV_NET = min(MID_BOOSTER_MIN_EV_NET, 0.024)
+    MID_BOOSTER_MIN_PAYOUT = min(MID_BOOSTER_MIN_PAYOUT, 2.00)
+    MID_BOOSTER_MAX_ENTRY = max(MID_BOOSTER_MAX_ENTRY, 0.56)
+    ENTRY_WAIT_ENABLED = True
 CHAIN_ID  = POLYGON  # CLOB API esiste solo su mainnet
 CLOB_HOST = "https://clob.polymarket.com"
 
@@ -2595,6 +2612,12 @@ class LiveTrader:
             f"ev_net>={MIN_EV_NET:.3f} fee={FEE_RATE_EST:.4f} "
             f"risk(max_open/same_dir/cid)={MAX_OPEN}/{MAX_SAME_DIR}/{MAX_CID_EXPOSURE_PCT:.0%} "
             f"block_opp(cid/round)={BLOCK_OPPOSITE_SIDE_SAME_CID}/{BLOCK_OPPOSITE_SIDE_SAME_ROUND}"
+        )
+        print(
+            f"{B}[BOOT]{RS} profit_push_mode={PROFIT_PUSH_MODE} mult={PROFIT_PUSH_MULT:.2f} "
+            f"max_abs_bet={MAX_ABS_BET:.2f} bankroll_cap={MAX_BANKROLL_PCT:.0%} "
+            f"high_ev_boost={HIGH_EV_SIZE_BOOST:.2f}/{HIGH_EV_SIZE_BOOST_MAX:.2f} "
+            f"booster(ev/payout/max_entry)>={MID_BOOSTER_MIN_EV_NET:.3f}/{MID_BOOSTER_MIN_PAYOUT:.2f}/{MID_BOOSTER_MAX_ENTRY:.2f}"
         )
         print(
             f"{B}[BOOT]{RS} leader_follow={MARKET_LEADER_FOLLOW_ENABLED} "
