@@ -246,6 +246,7 @@ MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "0"))
 BLOCK_SCORE_S0_8_15M  = os.environ.get("BLOCK_SCORE_S0_8_15M",  "false").lower() == "true"
 BLOCK_SCORE_S9_11_15M = os.environ.get("BLOCK_SCORE_S9_11_15M", "false").lower() == "true"
 BLOCK_SCORE_S12P_15M  = os.environ.get("BLOCK_SCORE_S12P_15M",  "false").lower() == "true"
+MIN_ENTRY_PRICE_S0_8_15M = float(os.environ.get("MIN_ENTRY_PRICE_S0_8_15M", "0.0"))  # 0=disabled
 MIN_TRUE_PROB_GATE_15M = float(os.environ.get("MIN_TRUE_PROB_GATE_15M", "0.50"))
 MIN_TRUE_PROB_GATE_5M  = float(os.environ.get("MIN_TRUE_PROB_GATE_5M",  "0.50"))
 ROLLING3_WIN_SCORE_PEN = int(os.environ.get("ROLLING3_WIN_SCORE_PEN", "0"))
@@ -5278,6 +5279,9 @@ class LiveTrader:
                 return None
             if score_tier == "s12+"  and BLOCK_SCORE_S12P_15M:
                 self._skip_tick("score_tier_blocked_s12p")
+                return None
+            if score_tier == "s0-8" and MIN_ENTRY_PRICE_S0_8_15M > 0 and entry < MIN_ENTRY_PRICE_S0_8_15M:
+                self._skip_tick("score_s0_8_entry_too_low")
                 return None
 
         token_id = m["token_up"] if side == "Up" else m["token_down"]
