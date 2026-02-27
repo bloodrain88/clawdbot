@@ -11392,15 +11392,16 @@ body::before{
 
 /* POSITIONS */
 .pgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:14px}
-.pcard{background:var(--s1);border:1px solid var(--b1);border-radius:var(--rdl);overflow:hidden;display:flex;flex-direction:column;transition:border-color .2s,box-shadow .2s}
+.pcard{background:#0b111b;border:1px solid #1b2a3f;border-radius:18px;overflow:hidden;display:flex;flex-direction:column;transition:border-color .2s,box-shadow .2s}
 .pcard:hover{box-shadow:0 10px 34px rgba(0,0,0,.46)}
 .pcard{animation:fadeIn .28s ease both}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
 .pcard.lead{border-color:var(--gbd)}
 .pcard.trail{border-color:var(--rbd)}
-.ph{padding:12px 16px 0;display:flex;align-items:center;justify-content:space-between}
-.phl{display:flex;align-items:center;gap:6px}
-.psym{font-size:.94rem;font-weight:800;letter-spacing:-.025em}
+.ph{padding:14px 16px 0;display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+.phl{display:flex;align-items:flex-start;gap:6px;flex-direction:column}
+.psym{font-size:1rem;font-weight:800;letter-spacing:-.02em}
+.pevt{font-size:.8rem;color:var(--t2)}
 .pdur{font-size:.62rem;color:var(--t3);background:var(--s2);border:1px solid var(--b1);padding:2px 5px;border-radius:3px}
 .pup{font-size:.62rem;font-weight:600;padding:2px 7px;border-radius:3px;background:var(--blb);color:var(--bl);border:1px solid var(--blbd)}
 .pdn{font-size:.62rem;font-weight:600;padding:2px 7px;border-radius:3px;background:var(--rb);color:var(--r);border:1px solid var(--rbd)}
@@ -11409,10 +11410,14 @@ body::before{
 .btrail{font-size:.58rem;font-weight:700;letter-spacing:.05em;padding:2px 7px;border-radius:3px;background:var(--rb);color:var(--r);border:1px solid var(--rbd)}
 .bunk{font-size:.58rem;font-weight:600;padding:2px 6px;border-radius:3px;background:var(--s2);color:var(--t3);border:1px solid var(--b1)}
 .stag{font-size:.62rem;color:var(--t3)}
-.pdata{display:grid;grid-template-columns:repeat(4,1fr);padding:11px 16px;gap:8px}
+.pdata{display:grid;grid-template-columns:1fr 1fr auto;padding:10px 16px 12px;gap:10px;border-bottom:1px solid #1a2a41}
 .di{display:flex;flex-direction:column;gap:3px}
-.dl{font-size:.52rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.08em}
-.dv{font-size:.98rem;font-weight:700}
+.dl{font-size:.56rem;font-weight:700;color:#6f85a9;text-transform:uppercase;letter-spacing:.08em}
+.dv{font-size:1.05rem;font-weight:700}
+.pcount{display:flex;flex-direction:column;align-items:flex-end;justify-content:center}
+.pcount .dl{font-size:.52rem}
+.pcv{font-size:1.8rem;font-weight:800;line-height:1;color:#ff6b6b}
+.pcv small{font-size:.65rem;color:#7f90ad;margin-left:2px}
 .ca{height:156px;border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);background:linear-gradient(180deg,rgba(18,22,30,.95) 0%,rgba(9,11,16,.98) 100%);position:relative}
 .ca::after{
   content:"";position:absolute;inset:0;pointer-events:none;
@@ -11510,6 +11515,19 @@ function fmtT(ts){const x=new Date(ts*1e3);return x.toLocaleTimeString('en-US',{
 function pfx(v){return v>0?'+':''}
 function pnl(v){return(v>=0?'+':'-')+'$'+fmt(Math.abs(v))}
 function pdec(p){if(p<=0)return 5;if(p<0.1)return 6;if(p<1)return 5;if(p<10)return 4;if(p<100)return 3;return 2}
+function fmtETRange(sTs,eTs){
+  try{
+    const opt={hour:'numeric',minute:'2-digit',hour12:true,timeZone:'America/New_York'};
+    const s=new Date((sTs||0)*1e3).toLocaleTimeString('en-US',opt);
+    const e=new Date((eTs||0)*1e3).toLocaleTimeString('en-US',opt);
+    return `${s}-${e} ET`;
+  }catch(e){return '';}
+}
+function countdown(minsLeft){
+  const t=Math.max(0,Math.floor((minsLeft||0)*60));
+  const m=Math.floor(t/60), s=t%60;
+  return {m:String(m).padStart(2,'0'),s:String(s).padStart(2,'0')};
+}
 
 function renderHeader(d){
   document.getElementById('ts').textContent=d.ts;
@@ -11698,19 +11716,21 @@ function renderPositions(d){
     const scoreH=p.score!=null?`<span class="stag">${p.score}</span>`:'';
     const mc=p.move_pct>=0?'g':'r';
     const bc=p.lead===null?'#303050':(p.lead?'var(--g)':'var(--r)');
+    const cd=countdown(p.mins_left||0);
+    const delta=(p.cur_p||0)-(p.open_p||0);
+    const dc=delta>=0?'g':'r';
     return `<div class="pcard${cls}"><div class="ph"><div class="phl">
-  <span class="psym">${p.asset}</span>
-  <span class="pdur">${p.duration||15}m</span>
-  ${sideH}</div>
+  <span class="psym">${p.asset} Up or Down - ${p.duration||15} Minutes</span>
+  <span class="pevt">${fmtETRange(p.start_ts,p.end_ts)}</span>
+  <span class="pdur">${p.duration||15}m</span>${sideH}</div>
 <div class="phr">${bH}${srcH}${scoreH}</div></div>
 <div class="pdata">
-<div class="di"><div class="dl">Entry</div><div class="dv">${p.entry.toFixed(3)}</div></div>
-<div class="di"><div class="dl">Stake</div><div class="dv">$${fmt(p.stake)}</div></div>
-<div class="di"><div class="dl">Move</div><div class="dv ${mc}">${pfx(p.move_pct)}${p.move_pct.toFixed(2)}%</div></div>
-<div class="di"><div class="dl">Mid</div><div class="dv d" id="m${uid}">—</div></div>
+<div class="di"><div class="dl">Price to beat</div><div class="dv">$${fmt(p.open_p,pdec(p.open_p))}</div></div>
+<div class="di"><div class="dl">Current price</div><div class="dv">$${fmt(p.cur_p,pdec(p.cur_p))} <span class="${dc}" style="font-size:.8rem">${pfx(delta)}${fmt(Math.abs(delta),pdec(Math.abs(delta)||0.01))}</span></div><div class="dv d" style="font-size:.82rem" id="m${uid}">—</div></div>
+<div class="pcount"><div class="dl">Time left</div><div class="pcv">${cd.m}<small>m</small> ${cd.s}<small>s</small></div></div>
 </div>
 <div class="ca"><canvas id="${cid}" height="120"></canvas></div>
-<div class="pf"><span class="lbl">Open <b>$${fmt(p.open_p,pdec(p.open_p))}</b> → <b>$${fmt(p.cur_p,pdec(p.cur_p))}</b></span>
+<div class="pf"><span class="lbl">Stake <b>$${fmt(p.stake)}</b> · Move <b class="${mc}">${pfx(p.move_pct)}${p.move_pct.toFixed(2)}%</b></span>
 <span class="rk">${p.rk||''}</span></div>
 <div class="tb"><div class="tbf" style="width:${pct}%;background:${bc}"></div></div>
 </div>`;
