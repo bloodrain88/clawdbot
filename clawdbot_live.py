@@ -1193,6 +1193,13 @@ class LiveTrader:
         self.onchain_total_equity = BANKROLL
         self.onchain_snapshot_ts = 0.0
         self.daily_pnl       = 0.0
+        self._dash_daily_cache = {
+            "ts": 0.0,
+            "day": "",
+            "pnl": 0.0,
+            "outcomes": 0,
+            "wins": 0,
+        }
         self.total           = 0
         self.wins            = 0
         self.start_time      = datetime.now(timezone.utc)
@@ -10906,6 +10913,43 @@ class LiveTrader:
         except Exception:
             pass
 
+        # Daily totals (UTC day) from metrics log, cached to keep dashboard fast.
+        day_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        dc = self._dash_daily_cache
+        if (dc.get("day") != day_utc) or (now_ts - float(dc.get("ts", 0.0) or 0.0) >= 30.0):
+            d_pnl = 0.0
+            d_outcomes = 0
+            d_wins = 0
+            try:
+                with open(METRICS_FILE, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                            if r.get("event") != "RESOLVE":
+                                continue
+                            if not str(r.get("ts", "")).startswith(day_utc):
+                                continue
+                            pnl_r = float(r.get("pnl") or 0.0)
+                            d_pnl += pnl_r
+                            d_outcomes += 1
+                            if r.get("result") == "WIN":
+                                d_wins += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            self._dash_daily_cache = {
+                "ts": now_ts,
+                "day": day_utc,
+                "pnl": round(d_pnl, 2),
+                "outcomes": int(d_outcomes),
+                "wins": int(d_wins),
+            }
+            dc = self._dash_daily_cache
+        d_out = int(dc.get("outcomes", 0) or 0)
+        d_wins = int(dc.get("wins", 0) or 0)
+        d_wr = round(d_wins / d_out * 100, 1) if d_out > 0 else 0.0
+
         # Health
         cl_ages = {a: round(now_ts - float(self.cl_updated.get(a, 0) or 0), 1)
                    for a in ("BTC", "ETH", "SOL", "XRP")}
@@ -10930,6 +10974,11 @@ class LiveTrader:
             "skip_top": skip_top,
             "execq": execq,
             "execq_all": execq_all,
+            "daily_day": day_utc,
+            "daily_pnl_total": round(float(dc.get("pnl", 0.0) or 0.0), 2),
+            "daily_outcomes": d_out,
+            "daily_wins": d_wins,
+            "daily_wr": d_wr,
             "dry_run": DRY_RUN,
         }
 
@@ -11093,6 +11142,10 @@ function renderCards(d) {
   const pnlC = d.pnl >= 0 ? 'green' : 'red';
   const wrC  = d.wr >= 52 ? 'green' : d.wr >= 48 ? 'yellow' : 'red';
   const losses = Math.max(0, (d.trades || 0) - (d.wins || 0));
+  const dPnl = Number(d.daily_pnl_total || 0);
+  const dPnlC = dPnl >= 0 ? 'green' : 'red';
+  const dWr = Number(d.daily_wr || 0);
+  const dWrC = dWr >= 52 ? 'green' : dWr >= 48 ? 'yellow' : 'red';
   const cards = [
     {t:'Portfolio',  body:`<div class="big">$${fmt(d.total_equity)}</div>
       <div class="sub">Free: $${fmt(d.usdc)} &nbsp;|&nbsp; Stake: $${fmt(d.open_stake)} (${d.open_count})</div>
@@ -11104,6 +11157,9 @@ function renderCards(d) {
     {t:'Overall',  body:`<div class="big ${wrC}">${d.wr}% WR</div>
       <div class="sub">W/L: ${d.wins}/${losses} &nbsp; Trades: ${d.trades}</div>
       <div class="sub">Total PnL <span class="${pnlC}">${d.pnl>=0?'+':''}$${fmt(d.pnl)}</span></div>`},
+    {t:'Daily',  body:`<div class="big ${dPnlC}">${dPnl>=0?'+':''}$${fmt(dPnl)}</div>
+      <div class="sub">${d.daily_day || ''} &nbsp; WR <span class="${dWrC}">${dWr.toFixed(1)}%</span></div>
+      <div class="sub">${d.daily_wins||0}W / ${Math.max(0,(d.daily_outcomes||0)-(d.daily_wins||0))}L of ${d.daily_outcomes||0}</div>`},
     {t:'Session',  body:`<div class="big">${d.session}</div>
       <div class="sub">${d.network} &nbsp; RTDS <span class="${d.rtds_ok?'green':'red'}">${d.rtds_ok?'✓':'✗'}</span></div>`},
     {t:'Prices',  body:Object.entries(d.prices).map(([a,p])=>`<div><b style="color:#8b949e">${a}</b> $${fmt(p,2)}</div>`).join('')},
