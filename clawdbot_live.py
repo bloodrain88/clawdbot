@@ -11074,6 +11074,7 @@ class LiveTrader:
                 "stake": round(stake, 2), "cur_p": round(cur_p, 2),
                 "open_p": round(open_p, 6), "move_pct": round(move_pct, 3),
                 "lead": lead, "mins_left": round(mins_left, 1),
+                "src": "pending",
                 "cid_full": cid_norm,
                 "cid": cid_norm[:12], "start_ts": start_ts, "end_ts": end_ts,
                 "duration": duration, "token_id": token_id,
@@ -11119,6 +11120,7 @@ class LiveTrader:
                 "stake": round(stake, 2), "cur_p": round(cur_p, 2),
                 "open_p": round(open_p, 6), "move_pct": round(move_pct, 3),
                 "lead": lead, "mins_left": round(mins_left, 1),
+                "src": "fallback",
                 "cid_full": cid_norm,
                 "cid": cid_norm[:12], "start_ts": start_ts, "end_ts": end_ts,
                 "duration": duration, "token_id": token_id,
@@ -11513,8 +11515,55 @@ function renderMetrics(d){
   ).join('');
 }
 
+function drawSparkline(canvas,wp,openP,lead){
+  const rect=canvas.getBoundingClientRect();
+  const cssW=Math.max(16,Math.floor(rect.width||canvas.clientWidth||320));
+  const cssH=Math.max(16,Math.floor(rect.height||canvas.clientHeight||120));
+  const dpr=Math.max(1,window.devicePixelRatio||1);
+  canvas.width=Math.floor(cssW*dpr);
+  canvas.height=Math.floor(cssH*dpr);
+  const g=canvas.getContext('2d');
+  if(!g)return;
+  g.setTransform(1,0,0,1,0,0);
+  g.scale(dpr,dpr);
+  g.clearRect(0,0,cssW,cssH);
+
+  const line=lead===null?'#3a3a5a':(lead?'#00cc78':'#ff3d3d');
+  const fill=lead===null?'rgba(58,58,90,.07)':(lead?'rgba(0,204,120,.09)':'rgba(255,61,61,.09)');
+  const minP=Math.min(...wp.map(x=>x.p));
+  const maxP=Math.max(...wp.map(x=>x.p));
+  const span=Math.max(1e-6,maxP-minP);
+  const padX=6,padY=6;
+  const w=Math.max(8,cssW-padX*2),h=Math.max(8,cssH-padY*2);
+  const pts=wp.map((x,i)=>{
+    const xx=padX+(i/(Math.max(1,wp.length-1)))*w;
+    const yy=padY+(1-(x.p-minP)/span)*h;
+    return [xx,yy];
+  });
+
+  const fg=g.createLinearGradient(0,padY,0,padY+h);
+  fg.addColorStop(0,fill);fg.addColorStop(1,'rgba(0,0,0,0)');
+  g.beginPath();
+  pts.forEach(([x,y],i)=>{if(i===0)g.moveTo(x,y);else g.lineTo(x,y);});
+  g.lineTo(padX+w,padY+h);g.lineTo(padX,padY+h);g.closePath();
+  g.fillStyle=fg;g.fill();
+
+  if(openP>0){
+    const oy=padY+(1-(openP-minP)/span)*h;
+    g.setLineDash([3,4]);g.lineWidth=1;g.strokeStyle='rgba(255,255,255,.1)';
+    g.beginPath();g.moveTo(padX,oy);g.lineTo(padX+w,oy);g.stroke();g.setLineDash([]);
+  }
+
+  g.lineWidth=1.6;g.strokeStyle=line;
+  g.beginPath();
+  pts.forEach(([x,y],i)=>{if(i===0)g.moveTo(x,y);else g.lineTo(x,y);});
+  g.stroke();
+}
+
 function drawChart(id,pts,openP,curP,sTs,eTs,now){
   const ctx=document.getElementById(id);if(!ctx)return;
+  const _w=Math.floor(ctx.getBoundingClientRect().width||ctx.clientWidth||0);
+  if(_w<=8){requestAnimationFrame(()=>drawChart(id,pts,openP,curP,sTs,eTs,now));return;}
   let wp=(pts||[]).filter(x=>x.t>=sTs-5);
   if(!wp.length){
     const op=(typeof openP==='number'&&openP>0)?openP:0.5;
@@ -11535,11 +11584,22 @@ function drawChart(id,pts,openP,curP,sTs,eTs,now){
   const lead=openP>0?last>=openP:null;
   const lc=lead===null?'#3a3a5a':(lead?'#00cc78':'#ff3d3d');
   const fg=lead===null?'rgba(58,58,90,.07)':(lead?'rgba(0,204,120,.09)':'rgba(255,61,61,.09)');
+  if(typeof Chart==='undefined'){
+    if(ch[id]){try{ch[id].destroy()}catch(e){}delete ch[id];}
+    drawSparkline(ctx,wp,openP,lead);
+    return;
+  }
   if(ch[id]&&cm[id]&&cm[id].lead===lead){
-    const c=ch[id];
-    c.data.labels=labels;c.data.datasets[0].data=data;
-    if(c.data.datasets[1])c.data.datasets[1].data=wp.map(()=>openP);
-    c.update('none');return;
+    try{
+      const c=ch[id];
+      c.data.labels=labels;c.data.datasets[0].data=data;
+      if(c.data.datasets[1])c.data.datasets[1].data=wp.map(()=>openP);
+      c.update('none');return;
+    }catch(e){
+      if(ch[id]){try{ch[id].destroy()}catch(e2){}delete ch[id];}
+      drawSparkline(ctx,wp,openP,lead);
+      return;
+    }
   }
   if(ch[id]){ch[id].destroy();delete ch[id];}
   cm[id]={lead};
@@ -11552,19 +11612,24 @@ function drawChart(id,pts,openP,curP,sTs,eTs,now){
     }
   }];
   if(openP>0)ds.push({data:wp.map(()=>openP),borderColor:'rgba(255,255,255,.1)',borderWidth:1,borderDash:[3,4],pointRadius:0,fill:false,tension:0});
-  ch[id]=new Chart(ctx,{type:'line',data:{labels,datasets:ds},options:{
-    animation:false,responsive:true,maintainAspectRatio:false,
-    plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,
-      backgroundColor:'rgba(9,9,14,.97)',borderColor:'#1c1c30',borderWidth:1,
-      titleColor:'#303050',bodyColor:'#d8d8f0',padding:8,
-      callbacks:{label:c=>'$'+fmt(c.raw,dec)}}},
-    scales:{
-      x:{ticks:{maxTicksLimit:4,color:'#303050',font:{size:10,family:'Plus Jakarta Sans'}},
-        grid:{color:'rgba(20,20,40,.9)'},border:{display:false}},
-      y:{position:'right',ticks:{color:'#404060',font:{size:10,family:'Plus Jakarta Sans'},callback:v=>'$'+fmt(v,dec)},
-        grid:{color:'rgba(255,255,255,.02)'},border:{display:false}}
-    }
-  }});
+  try{
+    ch[id]=new Chart(ctx,{type:'line',data:{labels,datasets:ds},options:{
+      animation:false,responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,
+        backgroundColor:'rgba(9,9,14,.97)',borderColor:'#1c1c30',borderWidth:1,
+        titleColor:'#303050',bodyColor:'#d8d8f0',padding:8,
+        callbacks:{label:c=>'$'+fmt(c.raw,dec)}}},
+      scales:{
+        x:{ticks:{maxTicksLimit:4,color:'#303050',font:{size:10,family:'Plus Jakarta Sans'}},
+          grid:{color:'rgba(20,20,40,.9)'},border:{display:false}},
+        y:{position:'right',ticks:{color:'#404060',font:{size:10,family:'Plus Jakarta Sans'},callback:v=>'$'+fmt(v,dec)},
+          grid:{color:'rgba(255,255,255,.02)'},border:{display:false}}
+      }
+    }});
+  }catch(e){
+    if(ch[id]){try{ch[id].destroy()}catch(e2){}delete ch[id];}
+    drawSparkline(ctx,wp,openP,lead);
+  }
 }
 
 function renderPositions(d){
@@ -11579,6 +11644,7 @@ function renderPositions(d){
     const cls=p.lead===null?'':p.lead?' lead':' trail';
     const sideH=p.side==='Up'?'<span class="pup">UP ▲</span>':'<span class="pdn">DOWN ▼</span>';
     const bH=p.lead===null?'<span class="bunk">?</span>':p.lead?'<span class="blead">▲ LEAD</span>':'<span class="btrail">▼ TRAIL</span>';
+    const srcH=p.src==='fallback'?'<span class="bunk">FALLBACK</span>':'';
     const scoreH=p.score!=null?`<span class="stag">${p.score}</span>`:'';
     const mc=p.move_pct>=0?'g':'r';
     const bc=p.lead===null?'#303050':(p.lead?'var(--g)':'var(--r)');
@@ -11586,7 +11652,7 @@ function renderPositions(d){
   <span class="psym">${p.asset}</span>
   <span class="pdur">${p.duration||15}m</span>
   ${sideH}</div>
-<div class="phr">${bH}${scoreH}</div></div>
+<div class="phr">${bH}${srcH}${scoreH}</div></div>
 <div class="pdata">
 <div class="di"><div class="dl">Entry</div><div class="dv">${p.entry.toFixed(3)}</div></div>
 <div class="di"><div class="dl">Stake</div><div class="dv">$${fmt(p.stake)}</div></div>
@@ -11666,12 +11732,27 @@ async function pollMid(){
   for(const [cid,tid] of Object.entries(_mt)){
     if(!tid)continue;
     try{
-      const j=await fetch('https://clob.polymarket.com/midpoint?token_id='+tid).then(r=>r.json());
+      const r=await fetch('https://clob.polymarket.com/midpoint?token_id='+tid);
       const el=document.getElementById('m'+cid);
-      if(el&&j.mid!=null){
-        const v=parseFloat(j.mid);
-        el.textContent=v.toFixed(3);
-        el.className='dv '+(v>=0.5?'g':'r');
+      if(r.status===404){
+        // Invalid or stale token id for this market side; stop polling this row.
+        if(el){el.textContent='n/a';el.className='dv dm';}
+        delete _mt[cid];
+        continue;
+      }
+      if(!r.ok)continue;
+      const j=await r.json();
+      if(el){
+        if(j&&j.mid!=null){
+          const v=parseFloat(j.mid);
+          if(Number.isFinite(v)){
+            el.textContent=v.toFixed(3);
+            el.className='dv '+(v>=0.5?'g':'r');
+          }
+        }else{
+          el.textContent='—';
+          el.className='dv d';
+        }
       }
     }catch(e){}
   }
