@@ -11094,10 +11094,13 @@ class LiveTrader:
             _ph       = self.price_history.get(asset)
             rtds_ts   = _ph[-1][0] if _ph else 0
             cur_p     = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
+            duration  = int(trade.get("duration", mkt.get("duration", 15)) or 15)
             end_ts    = float(trade.get("end_ts", mkt.get("end_ts", 0)) or 0)
             start_ts  = float(mkt.get("start_ts", 0) or 0)
+            # Round timing must follow "price to beat" lock window, not entry timestamp.
+            if end_ts > 0 and duration > 0:
+                start_ts = end_ts - duration * 60.0
             mins_left = max(0.0, (end_ts - now_ts) / 60)
-            duration  = int(trade.get("duration", mkt.get("duration", 15)) or 15)
             if open_p > 0 and cur_p > 0:
                 pred_winner = "Up" if cur_p >= open_p else "Down"
                 lead = side == pred_winner
@@ -11140,9 +11143,11 @@ class LiveTrader:
             _ph = self.price_history.get(asset)
             rtds_ts = _ph[-1][0] if _ph else 0
             cur_p = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
+            duration = int(meta.get("duration", 15) or 15)
             end_ts = float(meta.get("end_ts", 0) or 0)
             start_ts = float(meta.get("start_ts", 0) or 0)
-            duration = int(meta.get("duration", 15) or 15)
+            if end_ts > 0 and duration > 0:
+                start_ts = end_ts - duration * 60.0
             mins_left = max(0.0, (end_ts - now_ts) / 60.0) if end_ts > 0 else 0.0
             if open_p > 0 and cur_p > 0:
                 pred_winner = "Up" if cur_p >= open_p else "Down"
@@ -11528,6 +11533,24 @@ function countdown(minsLeft){
   const m=Math.floor(t/60), s=t%60;
   return {m:String(m).padStart(2,'0'),s:String(s).padStart(2,'0')};
 }
+function countdownSec(secLeft){
+  const t=Math.max(0,Math.floor(secLeft||0));
+  const m=Math.floor(t/60), s=t%60;
+  return {m:String(m).padStart(2,'0'),s:String(s).padStart(2,'0')};
+}
+function tickTime(){
+  const now=Math.floor(Date.now()/1000);
+  for(const [uid,pm] of Object.entries(_posMeta||{})){
+    const durSec=Math.max(60,Math.round((pm.duration||15)*60));
+    const secLeft=Math.max(0,Math.round((pm.end_ts||now)-now));
+    const pct=Math.min(100,Math.max(0,((durSec-secLeft)/durSec)*100));
+    const cd=countdownSec(secLeft);
+    const tEl=document.getElementById('tm'+uid);
+    const pEl=document.getElementById('pb'+uid);
+    if(tEl)tEl.innerHTML=`${cd.m}<small>m</small> ${cd.s}<small>s</small>`;
+    if(pEl)pEl.style.width=`${pct}%`;
+  }
+}
 
 function renderHeader(d){
   document.getElementById('ts').textContent=d.ts;
@@ -11708,7 +11731,9 @@ function renderPositions(d){
   el.innerHTML=d.positions.map((p,idx)=>{
     const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
     const cid='c'+uid;
-    const pct=Math.min(100,Math.max(0,(now-p.start_ts)/((p.end_ts-p.start_ts)||1)*100));
+    const durSec=Math.max(60,Math.round((p.duration||15)*60));
+    const secLeft=Math.max(0,Math.round((p.end_ts||now)-now));
+    const pct=Math.min(100,Math.max(0,((durSec-secLeft)/durSec)*100));
     const cls=p.lead===null?'':p.lead?' lead':' trail';
     const sideH=p.side==='Up'?'<span class="pup">UP ▲</span>':'<span class="pdn">DOWN ▼</span>';
     const bH=p.lead===null?'<span class="bunk">?</span>':p.lead?'<span class="blead">▲ LEAD</span>':'<span class="btrail">▼ TRAIL</span>';
@@ -11716,7 +11741,7 @@ function renderPositions(d){
     const scoreH=p.score!=null?`<span class="stag">${p.score}</span>`:'';
     const mc=p.move_pct>=0?'g':'r';
     const bc=p.lead===null?'#303050':(p.lead?'var(--g)':'var(--r)');
-    const cd=countdown(p.mins_left||0);
+    const cd=countdownSec(secLeft);
     const delta=(p.cur_p||0)-(p.open_p||0);
     const dc=delta>=0?'g':'r';
     return `<div class="pcard${cls}"><div class="ph"><div class="phl">
@@ -11727,17 +11752,17 @@ function renderPositions(d){
 <div class="pdata">
 <div class="di"><div class="dl">Price to beat</div><div class="dv">$${fmt(p.open_p,pdec(p.open_p))}</div></div>
 <div class="di"><div class="dl">Current price</div><div class="dv">$${fmt(p.cur_p,pdec(p.cur_p))} <span class="${dc}" style="font-size:.8rem">${pfx(delta)}${fmt(Math.abs(delta),pdec(Math.abs(delta)||0.01))}</span></div><div class="dv d" style="font-size:.82rem" id="m${uid}">—</div></div>
-<div class="pcount"><div class="dl">Time left</div><div class="pcv">${cd.m}<small>m</small> ${cd.s}<small>s</small></div></div>
+<div class="pcount"><div class="dl">Time left</div><div class="pcv" id="tm${uid}">${cd.m}<small>m</small> ${cd.s}<small>s</small></div></div>
 </div>
 <div class="ca"><canvas id="${cid}" height="120"></canvas></div>
 <div class="pf"><span class="lbl">Stake <b>$${fmt(p.stake)}</b> · Move <b class="${mc}">${pfx(p.move_pct)}${p.move_pct.toFixed(2)}%</b></span>
 <span class="rk">${p.rk||''}</span></div>
-<div class="tb"><div class="tbf" style="width:${pct}%;background:${bc}"></div></div>
+<div class="tb"><div class="tbf" id="pb${uid}" style="width:${pct}%;background:${bc}"></div></div>
 </div>`;
   }).join('');
   d.positions.forEach((p,idx)=>{
     const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
-    _posMeta[uid]={open_p:p.open_p,cur_p:p.cur_p,start_ts:p.start_ts,end_ts:p.end_ts};
+    _posMeta[uid]={open_p:p.open_p,cur_p:p.cur_p,start_ts:p.start_ts,end_ts:p.end_ts,duration:p.duration||15};
     const basePts=d.charts[p.asset]||[];
     drawChart('c'+uid,basePts,p.open_p,p.cur_p,p.start_ts,p.end_ts,now);
   });
@@ -11746,6 +11771,7 @@ function renderPositions(d){
     const tid=String(p.token_id||'').trim();
     if(tid && !_mid404.has(tid))_mt[uid]=tid;
   });
+  tickTime();
   pollMid();
 }
 
@@ -11843,6 +11869,7 @@ async function pollMid(){
 
 refresh();
 setInterval(refresh,5000);
+setInterval(tickTime,1000);
 setInterval(pollMid,2000);
 </script>
 </body></html>"""
