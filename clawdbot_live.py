@@ -1291,6 +1291,7 @@ class LiveTrader:
         self._load_stats()
         self._load_pnl_baseline()
         self._load_settled_outcomes()
+        self._bootstrap_resolved_samples_from_metrics()
         self._init_w3()
 
     def _build_w3(self, rpc: str, timeout: int = 6):
@@ -8403,6 +8404,54 @@ class LiveTrader:
             })
         except Exception:
             pass
+
+    def _bootstrap_resolved_samples_from_metrics(self):
+        """Warm-start resolved sample buffer from persisted on-chain metrics file.
+
+        This avoids a blind period after bot restart where 5m runtime guard has
+        no settled history and keeps trading low-quality 5m rounds.
+        """
+        try:
+            if not os.path.exists(METRICS_FILE):
+                return
+            loaded = 0
+            # Keep startup fast: scan tail window only.
+            with open(METRICS_FILE, encoding="utf-8") as f:
+                lines = f.readlines()[-5000:]
+            for ln in lines:
+                try:
+                    row = json.loads(ln)
+                except Exception:
+                    continue
+                if str(row.get("event", "")) != "RESOLVE":
+                    continue
+                dur = int(row.get("duration", 0) or 0)
+                if dur <= 0:
+                    rk = str(row.get("round_key", "") or "")
+                    if "-5m-" in rk:
+                        dur = 5
+                    elif "-15m-" in rk:
+                        dur = 15
+                if dur <= 0:
+                    continue
+                pnl = float(row.get("pnl", 0.0) or 0.0)
+                won = str(row.get("result", "")).upper() == "WIN"
+                self._resolved_samples.append({
+                    "ts": _time.time(),
+                    "asset": str(row.get("asset", "") or ""),
+                    "side": str(row.get("side", "") or ""),
+                    "duration": dur,
+                    "entry": float(row.get("entry_price", 0.0) or 0.0),
+                    "source": str(row.get("open_price_source", "?") or "?"),
+                    "cl_age_s": row.get("chainlink_age_s", None),
+                    "pnl": pnl,
+                    "won": bool(won),
+                })
+                loaded += 1
+            if loaded > 0:
+                print(f"{B}[BOOT]{RS} loaded {loaded} resolved samples from metrics for runtime guards")
+        except Exception as e:
+            print(f"{Y}[BOOT] resolved-sample bootstrap failed: {e}{RS}")
 
     def _pm_pattern_key(self, asset: str, duration: int, side: str, copy_net: float, flow: dict) -> str:
         low_share = float((flow or {}).get("low_c_share", 0.0) or 0.0)
