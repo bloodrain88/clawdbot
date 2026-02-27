@@ -10296,6 +10296,7 @@ class LiveTrader:
                             "side": side,
                             "asset": asset,
                             "entry": float(p.get("avgPrice", 0.5) or 0.5),
+                            "open_price": float(self.open_prices.get(cid, 0.0) or 0.0),
                             "stake_usdc": round(stable_stake, 6),
                             "stake_source": stake_src,
                             "shares": round(size_tok, 6),
@@ -11401,8 +11402,14 @@ body::before{
 .pcard:hover{box-shadow:0 10px 34px rgba(0,0,0,.46)}
 .pcard{animation:fadeIn .28s ease both}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
-.pcard.lead{border-color:var(--gbd)}
-.pcard.trail{border-color:var(--rbd)}
+.pcard.lead{border-color:#1f6a4f;box-shadow:inset 0 0 0 1px rgba(0,204,120,.18)}
+.pcard.trail{border-color:#7a2c38;box-shadow:inset 0 0 0 1px rgba(255,61,61,.16)}
+.pcard.lead .ca{background:linear-gradient(180deg,rgba(9,26,20,.92) 0%,rgba(8,16,13,.98) 100%)}
+.pcard.trail .ca{background:linear-gradient(180deg,rgba(30,12,16,.90) 0%,rgba(15,10,11,.98) 100%)}
+.bstate{font-size:.62rem;font-weight:800;letter-spacing:.06em;padding:2px 8px;border-radius:4px;text-transform:uppercase}
+.bstate.win{background:rgba(0,204,120,.14);border:1px solid rgba(0,204,120,.40);color:#52d69d}
+.bstate.lose{background:rgba(255,61,61,.14);border:1px solid rgba(255,61,61,.38);color:#ff7c7c}
+.bstate.na{background:rgba(95,141,255,.12);border:1px solid rgba(95,141,255,.30);color:#8eb0ff}
 .ph{padding:14px 16px 0;display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
 .phl{display:flex;align-items:flex-start;gap:6px;flex-direction:column}
 .psym{font-size:1rem;font-weight:800;letter-spacing:-.02em}
@@ -11736,22 +11743,26 @@ function renderPositions(d){
     const pct=Math.min(100,Math.max(0,((durSec-secLeft)/durSec)*100));
     const cls=p.lead===null?'':p.lead?' lead':' trail';
     const sideH=p.side==='Up'?'<span class="pup">UP ▲</span>':'<span class="pdn">DOWN ▼</span>';
-    const bH=p.lead===null?'<span class="bunk">?</span>':p.lead?'<span class="blead">▲ LEAD</span>':'<span class="btrail">▼ TRAIL</span>';
+    const bH=p.lead===null?'<span class="bstate na">Unknown</span>':p.lead?'<span class="bstate win">Winning</span>':'<span class="bstate lose">Losing</span>';
     const srcH=p.src==='fallback'?'<span class="bunk">FALLBACK</span>':'';
     const scoreH=p.score!=null?`<span class="stag">${p.score}</span>`:'';
     const mc=p.move_pct>=0?'g':'r';
     const bc=p.lead===null?'#303050':(p.lead?'var(--g)':'var(--r)');
     const cd=countdownSec(secLeft);
-    const delta=(p.cur_p||0)-(p.open_p||0);
+    const hasBeat=(p.open_p||0)>0;
+    const delta=hasBeat?((p.cur_p||0)-(p.open_p||0)):0;
     const dc=delta>=0?'g':'r';
+    const openTxt=hasBeat?('$'+fmt(p.open_p,pdec(p.open_p))):'N/A';
+    const curTxt=(p.cur_p||0)>0?('$'+fmt(p.cur_p,pdec(p.cur_p))):'N/A';
+    const deltaTxt=hasBeat?`${pfx(delta)}${fmt(Math.abs(delta),pdec(Math.abs(delta)||0.01))}`:'N/A';
     return `<div class="pcard${cls}"><div class="ph"><div class="phl">
   <span class="psym">${p.asset} Up or Down - ${p.duration||15} Minutes</span>
   <span class="pevt">${fmtETRange(p.start_ts,p.end_ts)}</span>
   <span class="pdur">${p.duration||15}m</span>${sideH}</div>
 <div class="phr">${bH}${srcH}${scoreH}</div></div>
 <div class="pdata">
-<div class="di"><div class="dl">Price to beat</div><div class="dv">$${fmt(p.open_p,pdec(p.open_p))}</div></div>
-<div class="di"><div class="dl">Current price</div><div class="dv">$${fmt(p.cur_p,pdec(p.cur_p))} <span class="${dc}" style="font-size:.8rem">${pfx(delta)}${fmt(Math.abs(delta),pdec(Math.abs(delta)||0.01))}</span></div><div class="dv d" style="font-size:.82rem" id="m${uid}">—</div></div>
+<div class="di"><div class="dl">Price to beat</div><div class="dv">${openTxt}</div></div>
+<div class="di"><div class="dl">Current price</div><div class="dv">${curTxt} <span class="${hasBeat?dc:'dm'}" style="font-size:.8rem">${deltaTxt}</span></div><div class="dv d" style="font-size:.82rem" id="m${uid}">—</div></div>
 <div class="pcount"><div class="dl">Time left</div><div class="pcv" id="tm${uid}">${cd.m}<small>m</small> ${cd.s}<small>s</small></div></div>
 </div>
 <div class="ca"><canvas id="${cid}" height="120"></canvas></div>
