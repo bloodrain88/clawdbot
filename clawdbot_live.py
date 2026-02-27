@@ -11151,6 +11151,57 @@ setInterval(pollMidpoints, 2000);
                 return web.Response(text=json.dumps({"ok": False, "error": str(e)}),
                                     content_type="application/json")
 
+        async def handle_analyze(request):
+            """Detailed breakdown by score|entry_band|asset for a given date prefix."""
+            try:
+                date = request.rel_url.query.get("date", "")[:10]
+                from collections import defaultdict as _dd
+                rows = _dd(lambda: {"wins": 0, "outcomes": 0, "pnl": 0.0,
+                                    "gross_win": 0.0, "gross_loss": 0.0})
+                with open(METRICS_FILE, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                            if r.get("event") != "RESOLVE":
+                                continue
+                            if date and not str(r.get("ts", "")).startswith(date):
+                                continue
+                            score = int(r.get("score") or 0)
+                            entry = float(r.get("entry_price") or 0)
+                            pnl   = float(r.get("pnl") or 0)
+                            won   = r.get("result") == "WIN"
+                            asset = str(r.get("asset", "?"))
+                            sc = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
+                            if entry < 0.30:   eb = "<30c"
+                            elif entry < 0.51: eb = "30-50c"
+                            elif entry < 0.61: eb = "51-60c"
+                            elif entry < 0.71: eb = "61-70c"
+                            else:              eb = ">70c"
+                            k = sc + "|" + eb
+                            rows[k]["outcomes"] += 1
+                            rows[k]["pnl"] += pnl
+                            if won:
+                                rows[k]["wins"] += 1
+                                rows[k]["gross_win"] += max(0.0, pnl)
+                            else:
+                                rows[k]["gross_loss"] += max(0.0, -pnl)
+                        except Exception:
+                            pass
+                out = []
+                for k, v in sorted(rows.items(), key=lambda x: x[1]["pnl"], reverse=True):
+                    n = v["outcomes"]
+                    wr = round(v["wins"] / n * 100, 1) if n else 0
+                    pf = round(v["gross_win"] / v["gross_loss"], 2) if v["gross_loss"] > 0 else None
+                    be = round(v["gross_loss"] / (v["gross_win"] + v["gross_loss"]) * 100, 1) if (v["gross_win"] + v["gross_loss"]) > 0 else None
+                    out.append({"bucket": k, "n": n, "wr": wr, "pf": pf,
+                                "be_wr": be, "pnl": round(v["pnl"], 2)})
+                return web.Response(text=json.dumps({"date": date, "rows": out}),
+                                    content_type="application/json",
+                                    headers={"Access-Control-Allow-Origin": "*"})
+            except Exception as e:
+                return web.Response(text=json.dumps({"error": str(e)}),
+                                    content_type="application/json")
+
         async def handle_daily(request):
             try:
                 daily = {}
@@ -11190,6 +11241,7 @@ setInterval(pollMidpoints, 2000);
         app.router.add_get("/", handle_html)
         app.router.add_get("/api", handle_api)
         app.router.add_get("/daily", handle_daily)
+        app.router.add_get("/analyze", handle_analyze)
         app.router.add_get("/reload-buckets", handle_reload_buckets)
         runner = web.AppRunner(app)
         await runner.setup()
