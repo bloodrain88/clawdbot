@@ -11303,54 +11303,65 @@ setInterval(pollMidpoints, 2000);
                                     content_type="application/json")
 
         async def handle_corr(request):
-            """Token outcome correlation across same time windows."""
+            """Token direction correlation from Polymarket historical data (~16k windows)."""
             try:
+                import urllib.request as _ur
                 from collections import defaultdict as _dd
                 from itertools import combinations
                 import math as _math
-                rounds = _dd(dict)
-                with open(METRICS_FILE, encoding="utf-8") as f:
-                    for line in f:
+                _SERIES = {"BTC": 10192, "ETH": 10191, "SOL": 10423, "XRP": 10422}
+                _HDRS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+                windows = _dd(dict)
+                for asset, sid in _SERIES.items():
+                    offset = 0
+                    while True:
+                        url = (f"https://gamma-api.polymarket.com/events"
+                               f"?series_id={sid}&closed=true&limit=200&offset={offset}")
+                        req = _ur.Request(url, headers=_HDRS)
                         try:
-                            r = json.loads(line)
-                            if r.get("event") != "RESOLVE": continue
-                            asset = r.get("asset")
-                            won = 1 if r.get("result") == "WIN" else 0
-                            dur = int(r.get("duration") or 15)
-                            ts = str(r.get("ts", ""))
-                            if len(ts) < 16: continue
-                            # round to 5-min slot: YYYY-MM-DDTHH:MM -> slot
-                            h, m = int(ts[11:13]), int(ts[14:16])
-                            slot = ts[:11] + f"{h:02d}:{(m//5)*5:02d}|{dur}m"
-                            if asset not in rounds[slot]:  # keep first trade per asset/slot
-                                rounds[slot][asset] = {"won": won, "dur": dur}
-                        except Exception: pass
-                pairs = _dd(lambda: {"bw": 0, "bl": 0, "sp": 0, "n": 0})
-                for slot, assets in rounds.items():
-                    alist = list(assets.items())
-                    for (a1, d1), (a2, d2) in combinations(alist, 2):
-                        if d1["dur"] != d2["dur"]: continue
-                        key = "|".join(sorted([a1, a2])) + "|" + str(d1["dur"]) + "m"
-                        w1, w2 = d1["won"], d2["won"]
+                            with _ur.urlopen(req, timeout=15) as resp:
+                                events = json.loads(resp.read())
+                        except Exception:
+                            break
+                        if not events:
+                            break
+                        for ev in events:
+                            for mkt in ev.get("markets", []):
+                                end = str(ev.get("endDate", ""))[:16]
+                                if not end:
+                                    continue
+                                try:
+                                    prices   = json.loads(mkt["outcomePrices"]) if isinstance(mkt.get("outcomePrices"), str) else mkt.get("outcomePrices", [])
+                                    outcomes = json.loads(mkt["outcomes"])      if isinstance(mkt.get("outcomes"), str)      else mkt.get("outcomes", [])
+                                    p0, p1 = float(prices[0]), float(prices[1])
+                                except Exception:
+                                    continue
+                                if p0 > 0.95:   winner = outcomes[0]
+                                elif p1 > 0.95: winner = outcomes[1]
+                                else:           continue
+                                if asset not in windows[end]:
+                                    windows[end][asset] = winner
+                        offset += 200
+                        if len(events) < 200:
+                            break
+                pairs = _dd(lambda: {"uu": 0, "dd": 0, "sp": 0, "n": 0})
+                for slot, assets in windows.items():
+                    for (a1, d1), (a2, d2) in combinations(list(assets.items()), 2):
+                        key = "|".join(sorted([a1, a2]))
                         pairs[key]["n"] += 1
-                        if w1 == 1 and w2 == 1:   pairs[key]["bw"] += 1
-                        elif w1 == 0 and w2 == 0: pairs[key]["bl"] += 1
-                        else:                      pairs[key]["sp"] += 1
+                        if d1 == "Up"   and d2 == "Up":   pairs[key]["uu"] += 1
+                        elif d1 == "Down" and d2 == "Down": pairs[key]["dd"] += 1
+                        else:                               pairs[key]["sp"] += 1
                 out = []
                 for k, v in sorted(pairs.items()):
                     n = v["n"]
                     if n == 0: continue
-                    agree = round((v["bw"] + v["bl"]) / n * 100, 1)
-                    phi = 0.0
-                    try:
-                        a, b, c, d = v["bw"], v["sp"]//2, v["sp"] - v["sp"]//2, v["bl"]
-                        denom = _math.sqrt((a+b)*(c+d)*(a+c)*(b+d))
-                        phi = round((a*d - b*c) / denom, 3) if denom > 0 else 0.0
-                    except Exception: pass
-                    out.append({"pair": k, "n": n, "both_win": v["bw"],
-                                "both_lose": v["bl"], "split": v["sp"],
-                                "agree_pct": agree, "phi": phi})
-                return web.Response(text=json.dumps(out),
+                    same = v["uu"] + v["dd"]
+                    same_pct = round(same / n * 100, 1)
+                    out.append({"pair": k, "n": n, "up_up": v["uu"],
+                                "down_down": v["dd"], "split": v["sp"],
+                                "same_pct": same_pct})
+                return web.Response(text=json.dumps({"source": "polymarket", "windows": len(windows), "rows": out}),
                                     content_type="application/json",
                                     headers={"Access-Control-Allow-Origin": "*"})
             except Exception as e:
