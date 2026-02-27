@@ -535,6 +535,16 @@ NEXT_MARKET_ANALYSIS_WINDOW_SEC = float(os.environ.get("NEXT_MARKET_ANALYSIS_WIN
 NEXT_MARKET_ANALYSIS_LOG_EVERY_SEC = float(os.environ.get("NEXT_MARKET_ANALYSIS_LOG_EVERY_SEC", "15"))
 NEXT_MARKET_ANALYSIS_MIN_CONF = float(os.environ.get("NEXT_MARKET_ANALYSIS_MIN_CONF", "0.54"))  # was 0.56
 ENABLE_5M = os.environ.get("ENABLE_5M", "false").lower() == "true"
+FIVE_M_RUNTIME_GUARD_ENABLED = os.environ.get("FIVE_M_RUNTIME_GUARD_ENABLED", "true").lower() == "true"
+FIVE_M_GUARD_WINDOW = int(os.environ.get("FIVE_M_GUARD_WINDOW", "20"))
+FIVE_M_GUARD_DISABLE_MIN_OUTCOMES = int(os.environ.get("FIVE_M_GUARD_DISABLE_MIN_OUTCOMES", "12"))
+FIVE_M_GUARD_DISABLE_PF = float(os.environ.get("FIVE_M_GUARD_DISABLE_PF", "1.00"))
+FIVE_M_GUARD_DISABLE_WR = float(os.environ.get("FIVE_M_GUARD_DISABLE_WR", "0.45"))
+FIVE_M_GUARD_REENABLE_MIN_OUTCOMES = int(os.environ.get("FIVE_M_GUARD_REENABLE_MIN_OUTCOMES", "16"))
+FIVE_M_GUARD_REENABLE_PF = float(os.environ.get("FIVE_M_GUARD_REENABLE_PF", "1.10"))
+FIVE_M_GUARD_REENABLE_WR = float(os.environ.get("FIVE_M_GUARD_REENABLE_WR", "0.52"))
+FIVE_M_GUARD_MIN_DISABLE_SEC = float(os.environ.get("FIVE_M_GUARD_MIN_DISABLE_SEC", "900"))
+FIVE_M_GUARD_CHECK_EVERY_SEC = float(os.environ.get("FIVE_M_GUARD_CHECK_EVERY_SEC", "20"))
 ORDER_FAST_MODE = os.environ.get("ORDER_FAST_MODE", "true").lower() == "true"
 MAKER_POLL_5M_SEC = float(os.environ.get("MAKER_POLL_5M_SEC", "0.15"))
 MAKER_POLL_15M_SEC = float(os.environ.get("MAKER_POLL_15M_SEC", "0.25"))
@@ -1241,6 +1251,10 @@ class LiveTrader:
         self._errors            = ErrorTracker()
         self._bucket_stats      = BucketStats()
         _bs_load(self._bucket_stats)
+        self._enable_5m_runtime = bool(ENABLE_5M)
+        self._five_m_disabled_until = 0.0
+        self._five_m_guard_last_eval_ts = 0.0
+        self._five_m_guard_last_state_log_ts = 0.0
         self._copyflow_map      = {}
         self._copyflow_leaders  = {}
         self._copyflow_leaders_live = {}
@@ -2562,6 +2576,10 @@ class LiveTrader:
         print(
             f"{B}[BOOT]{RS} "
             f"trade_all={TRADE_ALL_MARKETS} 5m={ENABLE_5M} assets={','.join(sorted(FIVE_MIN_ASSETS))} "
+            f"5m_guard={FIVE_M_RUNTIME_GUARD_ENABLED} "
+            f"5m_guard_window={FIVE_M_GUARD_WINDOW} "
+            f"5m_off(wr/pf)<{FIVE_M_GUARD_DISABLE_WR*100:.0f}%/{FIVE_M_GUARD_DISABLE_PF:.2f} "
+            f"5m_on(wr/pf)>={FIVE_M_GUARD_REENABLE_WR*100:.0f}%/{FIVE_M_GUARD_REENABLE_PF:.2f} "
             f"score_gate(5m/15m)={MIN_SCORE_GATE_5M}/{MIN_SCORE_GATE_15M} "
             f"max_entry={MAX_ENTRY_PRICE:.2f}+tol{MAX_ENTRY_TOL:.2f} payout>={MIN_PAYOUT_MULT:.2f}x "
             f"near_miss_tol={ENTRY_NEAR_MISS_TOL:.3f} "
@@ -8806,6 +8824,90 @@ class LiveTrader:
             "recent_wr_lb": recent_wr_lb,
         }
 
+    def _five_m_quality_snapshot(self, window: int | None = None) -> dict:
+        """Rolling settled quality snapshot for 5m only (from on-chain resolved samples)."""
+        w = int(window or FIVE_M_GUARD_WINDOW)
+        vals = []
+        for s in reversed(self._resolved_samples):
+            if int(s.get("duration", 0) or 0) > 5:
+                continue
+            vals.append(s)
+            if len(vals) >= max(1, w):
+                break
+        vals.reverse()
+        n = len(vals)
+        wins = sum(1 for x in vals if bool(x.get("won", False)))
+        wr = (wins / n) if n > 0 else 0.0
+        pnl = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals)
+        gross_win = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) > 0.0)
+        gross_loss = -sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) < 0.0)
+        pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
+        return {
+            "n": n,
+            "wins": wins,
+            "wr": wr,
+            "pnl": pnl,
+            "pf": pf,
+        }
+
+    def _update_5m_runtime_guard(self):
+        """Auto-disable/enable 5m based on rolling settled quality."""
+        if not ENABLE_5M:
+            self._enable_5m_runtime = False
+            return
+        if not FIVE_M_RUNTIME_GUARD_ENABLED:
+            self._enable_5m_runtime = True
+            return
+        now = _time.time()
+        if (now - self._five_m_guard_last_eval_ts) < max(5.0, FIVE_M_GUARD_CHECK_EVERY_SEC):
+            return
+        self._five_m_guard_last_eval_ts = now
+
+        snap = self._five_m_quality_snapshot(max(FIVE_M_GUARD_WINDOW, FIVE_M_GUARD_REENABLE_MIN_OUTCOMES))
+        n = int(snap.get("n", 0) or 0)
+        wr = float(snap.get("wr", 0.0) or 0.0)
+        pf = float(snap.get("pf", 1.0) or 1.0)
+        pnl = float(snap.get("pnl", 0.0) or 0.0)
+
+        if self._enable_5m_runtime:
+            bad_quality = (
+                n >= max(1, FIVE_M_GUARD_DISABLE_MIN_OUTCOMES)
+                and (pf < FIVE_M_GUARD_DISABLE_PF or wr < FIVE_M_GUARD_DISABLE_WR)
+            )
+            if bad_quality:
+                self._enable_5m_runtime = False
+                self._five_m_disabled_until = now + max(60.0, FIVE_M_GUARD_MIN_DISABLE_SEC)
+                self._five_m_guard_last_state_log_ts = now
+                print(
+                    f"{Y}[5M-GUARD]{RS} disabled for {max(1.0, FIVE_M_GUARD_MIN_DISABLE_SEC)/60.0:.1f}m "
+                    f"(n={n} wr={wr*100.0:.1f}% pf={pf:.2f} pnl={pnl:+.2f})"
+                )
+            return
+
+        # Currently disabled.
+        if now < float(self._five_m_disabled_until or 0.0):
+            if (now - self._five_m_guard_last_state_log_ts) >= 60.0:
+                mins_left = (float(self._five_m_disabled_until) - now) / 60.0
+                self._five_m_guard_last_state_log_ts = now
+                print(
+                    f"{Y}[5M-GUARD]{RS} cooling-down {max(0.0, mins_left):.1f}m "
+                    f"(n={n} wr={wr*100.0:.1f}% pf={pf:.2f} pnl={pnl:+.2f})"
+                )
+            return
+
+        good_quality = (
+            n >= max(1, FIVE_M_GUARD_REENABLE_MIN_OUTCOMES)
+            and pf >= FIVE_M_GUARD_REENABLE_PF
+            and wr >= FIVE_M_GUARD_REENABLE_WR
+        )
+        if good_quality:
+            self._enable_5m_runtime = True
+            self._five_m_guard_last_state_log_ts = now
+            print(
+                f"{G}[5M-GUARD]{RS} re-enabled "
+                f"(n={n} wr={wr*100.0:.1f}% pf={pf:.2f} pnl={pnl:+.2f})"
+            )
+
     def _bucket_size_scale(self, duration: int, score: int, entry: float) -> float:
         """Adaptive size control from realized EV quality by bucket."""
         k = self._bucket_key(duration, score, entry)
@@ -9411,6 +9513,7 @@ class LiveTrader:
                     self._prebid_plan.pop(pcid, None)
             # Settlement always has priority over new entries.
             await self._resolve()
+            self._update_5m_runtime_guard()
             if self.pending_redeem:
                 pending_n = len(self.pending_redeem)
                 claimable_n = int(self.onchain_redeemable_count or 0)
@@ -9670,6 +9773,14 @@ class LiveTrader:
                                 f"{late_valid[0]['asset']} {late_valid[0]['side']} score={late_valid[0]['score']}"
                             )
                             valid = late_valid
+                if ENABLE_5M and (not self._enable_5m_runtime) and valid:
+                    pre_n = len(valid)
+                    valid = [s for s in valid if int(s.get("duration", 0) or 0) > 5]
+                    if pre_n != len(valid) and self._should_log("5m-guard-filter", 20):
+                        print(
+                            f"{Y}[5M-GUARD]{RS} filtered {pre_n-len(valid)} x 5m signals "
+                            f"(runtime OFF)"
+                        )
                 if valid:
                     best = valid[0]
                     other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
@@ -9691,7 +9802,7 @@ class LiveTrader:
                     print(
                         f"{Y}[ROUND-DIAG]{RS} eligible={eligible_started} candidates={len(candidates)} "
                         f"blocked_seen={blocked_seen} pending_redeem={len(self.pending_redeem)} "
-                        f"open_onchain={self.onchain_open_count} enable_5m={ENABLE_5M}"
+                        f"open_onchain={self.onchain_open_count} enable_5m={ENABLE_5M}/{self._enable_5m_runtime}"
                     )
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
                 shadow_pending = dict(active_pending)
