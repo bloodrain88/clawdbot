@@ -11252,11 +11252,62 @@ setInterval(pollMidpoints, 2000);
                 return web.Response(text=json.dumps({"error": str(e)}),
                                     content_type="application/json")
 
+        async def handle_dur_stats(request):
+            """Duration breakdown (5m vs 15m) from metrics file."""
+            try:
+                from collections import defaultdict as _dd
+                rows = _dd(lambda: {"wins": 0, "losses": 0, "pnl": 0.0,
+                                    "gross_win": 0.0, "gross_loss": 0.0})
+                n5 = n15 = 0
+                with open(METRICS_FILE, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                            if r.get("event") != "RESOLVE":
+                                continue
+                            dur = int(r.get("duration") or 15)
+                            score = int(r.get("score") or 0)
+                            entry = float(r.get("entry_price") or 0)
+                            pnl = float(r.get("pnl") or 0)
+                            won = r.get("result") == "WIN"
+                            sc = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
+                            if entry < 0.30:   eb = "<30c"
+                            elif entry < 0.51: eb = "30-50c"
+                            elif entry < 0.61: eb = "51-60c"
+                            elif entry < 0.71: eb = "61-70c"
+                            else:              eb = ">70c"
+                            k = f"{dur}m|{sc}|{eb}"
+                            rows[k]["wins" if won else "losses"] += 1
+                            rows[k]["pnl"] += pnl
+                            if won: rows[k]["gross_win"] += max(0.0, pnl)
+                            else:   rows[k]["gross_loss"] += max(0.0, -pnl)
+                            if dur == 5: n5 += 1
+                            else: n15 += 1
+                        except Exception:
+                            pass
+                out = []
+                for k, v in sorted(rows.items(), key=lambda x: x[1]["pnl"], reverse=True):
+                    n = v["wins"] + v["losses"]
+                    wr = round(v["wins"] / n * 100, 1) if n else 0
+                    denom = v["gross_win"] + v["gross_loss"]
+                    be = round(v["gross_loss"] / denom * 100, 1) if denom > 0 else None
+                    pf = round(v["gross_win"] / v["gross_loss"], 2) if v["gross_loss"] > 0 else None
+                    out.append({"bucket": k, "n": n, "wr": wr, "pf": pf,
+                                "be_wr": be, "pnl": round(v["pnl"], 2)})
+                return web.Response(
+                    text=json.dumps({"n5m": n5, "n15m": n15, "rows": out}),
+                    content_type="application/json",
+                    headers={"Access-Control-Allow-Origin": "*"})
+            except Exception as e:
+                return web.Response(text=json.dumps({"error": str(e)}),
+                                    content_type="application/json")
+
         app = web.Application()
         app.router.add_get("/", handle_html)
         app.router.add_get("/api", handle_api)
         app.router.add_get("/daily", handle_daily)
         app.router.add_get("/analyze", handle_analyze)
+        app.router.add_get("/dur-stats", handle_dur_stats)
         app.router.add_get("/reload-buckets", handle_reload_buckets)
         runner = web.AppRunner(app)
         await runner.setup()
