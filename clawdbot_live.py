@@ -11158,6 +11158,7 @@ setInterval(pollMidpoints, 2000);
             """Detailed breakdown by score|entry_band|asset for a given date prefix."""
             try:
                 date = request.rel_url.query.get("date", "")[:10]
+                dur_filter = request.rel_url.query.get("dur", "")
                 from collections import defaultdict as _dd
                 rows = _dd(lambda: {"wins": 0, "outcomes": 0, "pnl": 0.0,
                                     "gross_win": 0.0, "gross_loss": 0.0})
@@ -11168,6 +11169,8 @@ setInterval(pollMidpoints, 2000);
                             if r.get("event") != "RESOLVE":
                                 continue
                             if date and not str(r.get("ts", "")).startswith(date):
+                                continue
+                            if dur_filter and str(r.get("duration", "15")) != dur_filter:
                                 continue
                             score = int(r.get("score") or 0)
                             entry = float(r.get("entry_price") or 0)
@@ -11213,12 +11216,15 @@ setInterval(pollMidpoints, 2000);
 
         async def handle_daily(request):
             try:
+                dur_filter = request.rel_url.query.get("dur", "")
                 daily = {}
                 with open(METRICS_FILE, encoding="utf-8") as f:
                     for line in f:
                         try:
                             r = json.loads(line)
                             if r.get("event") != "RESOLVE":
+                                continue
+                            if dur_filter and str(r.get("duration", "15")) != dur_filter:
                                 continue
                             day = str(r.get("ts", ""))[:10]
                             pnl = float(r.get("pnl") or 0)
