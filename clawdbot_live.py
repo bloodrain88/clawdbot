@@ -11682,6 +11682,9 @@ function renderPositions(d){
   const now=d.now_ts;
   document.getElementById('pos-title').textContent='Open Positions'+(d.positions.length?' · '+d.positions.length:'');
   const el=document.getElementById('positions');
+  // Rebuilding cards replaces canvas nodes: drop stale chart instances first.
+  Object.keys(ch).forEach(k=>{try{if(ch[k])ch[k].destroy()}catch(e){} delete ch[k];});
+  Object.keys(cm).forEach(k=>{delete cm[k];});
   if(!d.positions.length){el.innerHTML='';return;}
   _posMeta={};
   el.innerHTML=d.positions.map((p,idx)=>{
