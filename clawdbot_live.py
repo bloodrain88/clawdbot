@@ -11303,25 +11303,30 @@ setInterval(pollMidpoints, 2000);
                                     content_type="application/json")
 
         async def handle_corr(request):
-            """Token outcome correlation across same round_key windows."""
+            """Token outcome correlation across same time windows."""
             try:
                 from collections import defaultdict as _dd
                 from itertools import combinations
+                import math as _math
                 rounds = _dd(dict)
                 with open(METRICS_FILE, encoding="utf-8") as f:
                     for line in f:
                         try:
                             r = json.loads(line)
                             if r.get("event") != "RESOLVE": continue
-                            rk = r.get("round_key", "")
-                            if not rk: continue
                             asset = r.get("asset")
                             won = 1 if r.get("result") == "WIN" else 0
                             dur = int(r.get("duration") or 15)
-                            rounds[rk][asset] = {"won": won, "dur": dur}
+                            ts = str(r.get("ts", ""))
+                            if len(ts) < 16: continue
+                            # round to 5-min slot: YYYY-MM-DDTHH:MM -> slot
+                            h, m = int(ts[11:13]), int(ts[14:16])
+                            slot = ts[:11] + f"{h:02d}:{(m//5)*5:02d}|{dur}m"
+                            if asset not in rounds[slot]:  # keep first trade per asset/slot
+                                rounds[slot][asset] = {"won": won, "dur": dur}
                         except Exception: pass
                 pairs = _dd(lambda: {"bw": 0, "bl": 0, "sp": 0, "n": 0})
-                for rk, assets in rounds.items():
+                for slot, assets in rounds.items():
                     alist = list(assets.items())
                     for (a1, d1), (a2, d2) in combinations(alist, 2):
                         if d1["dur"] != d2["dur"]: continue
@@ -11338,9 +11343,8 @@ setInterval(pollMidpoints, 2000);
                     agree = round((v["bw"] + v["bl"]) / n * 100, 1)
                     phi = 0.0
                     try:
-                        import math
                         a, b, c, d = v["bw"], v["sp"]//2, v["sp"] - v["sp"]//2, v["bl"]
-                        denom = math.sqrt((a+b)*(c+d)*(a+c)*(b+d))
+                        denom = _math.sqrt((a+b)*(c+d)*(a+c)*(b+d))
                         phi = round((a*d - b*c) / denom, 3) if denom > 0 else 0.0
                     except Exception: pass
                     out.append({"pair": k, "n": n, "both_win": v["bw"],
