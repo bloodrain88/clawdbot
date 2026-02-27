@@ -1557,6 +1557,22 @@ class LiveTrader:
         except Exception:
             return ""
 
+    def _open_price_by_cid(self, cid: str) -> float:
+        """Best-effort open price lookup with cid normalization."""
+        c = str(cid or "").strip()
+        if not c:
+            return 0.0
+        v = float(self.open_prices.get(c, 0.0) or 0.0)
+        if v > 0:
+            return v
+        c_norm = c.lower().replace("0x", "")
+        for k, pv in self.open_prices.items():
+            if str(k or "").strip().lower().replace("0x", "") == c_norm:
+                vv = float(pv or 0.0)
+                if vv > 0:
+                    return vv
+        return 0.0
+
     def _midpoint_token_id_from_cid_side(self, cid: str, side: str, m: dict | None = None, t: dict | None = None) -> str:
         """Prefer live market token ids; fall back to stored/derived ids."""
         side_n = self._normalize_side_label(side)
@@ -10291,12 +10307,22 @@ class LiveTrader:
                             stable_stake = prev_stake
                         elif prev_stake > 0 and stable_stake > 0:
                             stable_stake = max(prev_stake, stable_stake)
+                        open_ref = float(self._open_price_by_cid(cid) or 0.0)
+                        if open_ref <= 0 and asset in ("BTC", "ETH", "SOL", "XRP") and start_ts > 0 and end_ts > start_ts:
+                            try:
+                                pm_ref = float(await self._get_polymarket_open_price(asset, start_ts, end_ts, dur_guess) or 0.0)
+                            except Exception:
+                                pm_ref = 0.0
+                            if pm_ref > 0:
+                                self.open_prices[cid] = pm_ref
+                                self.open_prices_source[cid] = "PM"
+                                open_ref = pm_ref
                         onchain_open_meta_by_cid[cid] = {
                             "title": title,
                             "side": side,
                             "asset": asset,
                             "entry": float(p.get("avgPrice", 0.5) or 0.5),
-                            "open_price": float(self.open_prices.get(cid, 0.0) or 0.0),
+                            "open_price": float(open_ref or 0.0),
                             "stake_usdc": round(stable_stake, 6),
                             "stake_source": stake_src,
                             "shares": round(size_tok, 6),
@@ -11088,7 +11114,7 @@ class LiveTrader:
             if stake <= 0:
                 continue
             entry     = float(trade.get("fill_price", trade.get("entry", 0.5)) or 0.5)
-            open_p    = float(self.open_prices.get(cid, 0.0) or 0.0)
+            open_p    = float(self._open_price_by_cid(cid) or 0.0)
             cl_p      = self.cl_prices.get(asset, 0)
             cl_ts     = self.cl_updated.get(asset, 0)
             rtds_p    = self.prices.get(asset, 0)
@@ -11135,7 +11161,7 @@ class LiveTrader:
             asset = str(meta.get("asset", "?") or "?")
             side = str(meta.get("side", "?") or "?")
             entry = float(meta.get("entry", 0.5) or 0.5)
-            open_p = float(self.open_prices.get(cid, 0.0) or 0.0)
+            open_p = float(self._open_price_by_cid(cid) or 0.0)
             if open_p <= 0:
                 open_p = float(meta.get("open_price", 0.0) or 0.0)
             cl_p = self.cl_prices.get(asset, 0)
