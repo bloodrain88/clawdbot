@@ -10749,8 +10749,21 @@ class LiveTrader:
 
         # Open positions
         positions = []
+        onchain_open_cids_norm = {
+            str(c or "").strip().lower() for c in (self.onchain_open_cids or set())
+            if str(c or "").strip()
+        }
+        seen_cids_norm = set()
         for cid, (mkt, trade) in list(self.pending.items()):
-            if self.onchain_snapshot_ts > 0 and cid not in self.onchain_open_cids:
+            cid_norm = str(cid or "").strip().lower()
+            if not cid_norm or cid_norm in seen_cids_norm:
+                continue
+            seen_cids_norm.add(cid_norm)
+            if (
+                self.onchain_snapshot_ts > 0
+                and cid not in self.onchain_open_cids
+                and cid_norm not in onchain_open_cids_norm
+            ):
                 continue
             asset = trade.get("asset", "?")
             side  = trade.get("side", "?")
@@ -10784,8 +10797,9 @@ class LiveTrader:
                 "stake": round(stake, 2), "cur_p": round(cur_p, 2),
                 "open_p": round(open_p, 6), "move_pct": round(move_pct, 3),
                 "lead": lead, "mins_left": round(mins_left, 1),
-                "cid": cid[:12], "start_ts": start_ts, "end_ts": end_ts,
+                "cid": cid_norm[:12], "start_ts": start_ts, "end_ts": end_ts,
                 "duration": duration, "token_id": token_id,
+                "rk": self._round_key(cid=cid_norm, m=mkt, t=trade),
             })
 
         # Skip top reasons (last 15m)
@@ -11048,7 +11062,7 @@ function renderPositions(d) {
     const barColor = p.lead ? '#3fb950' : (p.lead===false ? '#f85149' : '#8b949e');
     return `<div class="pos-card">
       <div class="pos-header">
-        <div class="pos-title">${p.asset} <span style="color:#8b949e">${p.side}</span> &nbsp; ${badge}</div>
+        <div class="pos-title">${p.asset} ${p.duration}m <span style="color:#8b949e">${p.side}</span> &nbsp; ${badge}</div>
         <div style="font-size:.8em;color:#6e7681">${p.mins_left.toFixed(1)}m left</div>
       </div>
       <div class="pos-stats">
@@ -11063,7 +11077,7 @@ function renderPositions(d) {
       </div>
       <div class="ptb" style="margin-top:4px">
         <span>PM token: <b id="mid-${p.cid}" style="color:#e3b341">…</b></span>
-        <span style="color:#6e7681;font-size:.68em">${p.token_id ? p.token_id.slice(0,12)+'…' : ''}</span>
+        <span style="color:#6e7681;font-size:.68em">${p.rk ? p.rk : (p.token_id ? p.token_id.slice(0,12)+'…' : '')}</span>
       </div>
       <div class="timer-bar-wrap"><div class="timer-bar" style="width:${pct}%;background:${barColor}"></div></div>
     </div>`;
