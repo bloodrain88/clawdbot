@@ -1557,6 +1557,43 @@ class LiveTrader:
         except Exception:
             return ""
 
+    def _midpoint_token_id_from_cid_side(self, cid: str, side: str, m: dict | None = None, t: dict | None = None) -> str:
+        """Prefer live market token ids; fall back to stored/derived ids."""
+        side_n = self._normalize_side_label(side)
+        cid_n = str(cid or "").strip().lower()
+        cid_n_hex = cid_n.replace("0x", "")
+
+        # 1) Active market map (authoritative for clob midpoint endpoint)
+        try:
+            for cid_a, ma in (self.active_mkts or {}).items():
+                ca = str(cid_a or "").strip().lower()
+                if not ca:
+                    continue
+                if ca == cid_n or ca.replace("0x", "") == cid_n_hex:
+                    tid = str((ma or {}).get("token_up" if side_n == "Up" else "token_down", "") or "").strip()
+                    if tid:
+                        return tid
+        except Exception:
+            pass
+
+        # 2) Explicit token ids already attached to local trade/meta.
+        for src in (t or {}, m or {}):
+            try:
+                tid = str((src or {}).get("token_id", "") or "").strip()
+                if tid:
+                    return tid
+            except Exception:
+                pass
+            try:
+                tid = str((src or {}).get("token_up" if side_n == "Up" else "token_down", "") or "").strip()
+                if tid:
+                    return tid
+            except Exception:
+                pass
+
+        # 3) Last resort deterministic derivation.
+        return self._token_id_from_cid_side(cid, side_n) or ""
+
     @staticmethod
     def _normalize_side_label(side_raw: str) -> str:
         s = str(side_raw or "").strip().lower()
@@ -11067,8 +11104,7 @@ class LiveTrader:
                 move_pct = (cur_p - open_p) / open_p * 100
             else:
                 lead, move_pct = None, 0.0
-            token_id = (trade.get("token_id") or
-                        self._token_id_from_cid_side(cid, side) or "")
+            token_id = self._midpoint_token_id_from_cid_side(cid, side, mkt, trade)
             positions.append({
                 "asset": asset, "side": side, "entry": round(entry, 3),
                 "stake": round(stake, 2), "cur_p": round(cur_p, 2),
@@ -11114,7 +11150,7 @@ class LiveTrader:
                 move_pct = (cur_p - open_p) / open_p * 100
             else:
                 lead, move_pct = None, 0.0
-            token_id = self._token_id_from_cid_side(cid, side) or ""
+            token_id = self._midpoint_token_id_from_cid_side(cid, side, meta, None)
             positions.append({
                 "asset": asset, "side": side, "entry": round(entry, 3),
                 "stake": round(stake, 2), "cur_p": round(cur_p, 2),
