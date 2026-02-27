@@ -11306,15 +11306,23 @@ setInterval(pollMidpoints, 2000);
         _corr_cache = {"source": "polymarket", "windows": 0, "rows": [], "built_at": ""}
 
         async def _build_corr_cache():
-            """Fetch Polymarket historical data and compute direction correlation."""
+            """Fetch Polymarket historical data (15m + 5m) and compute direction correlation."""
             import urllib.request as _ur
             from collections import defaultdict as _dd
             from itertools import combinations
-            _SERIES = {"BTC": 10192, "ETH": 10191, "SOL": 10423, "XRP": 10422}
+            # {asset: (series_id, duration_label)}
+            _SERIES = {
+                "BTC|15m": (10192, "15m"), "ETH|15m": (10191, "15m"),
+                "SOL|15m": (10423, "15m"), "XRP|15m": (10422, "15m"),
+                "BTC|5m":  (10684, "5m"),  "ETH|5m":  (10683, "5m"),
+            }
             _HDRS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+            # windows[slot][asset|dur] = direction
             windows = _dd(dict)
-            for asset, sid in _SERIES.items():
-                offset = 0
+            counts = {}
+            for key, (sid, dur) in _SERIES.items():
+                asset = key.split("|")[0]
+                offset = 0; total = 0
                 while True:
                     url = (f"https://gamma-api.polymarket.com/events"
                            f"?series_id={sid}&closed=true&limit=200&offset={offset}")
@@ -11340,15 +11348,23 @@ setInterval(pollMidpoints, 2000);
                             if p0 > 0.95:   winner = outcomes[0]
                             elif p1 > 0.95: winner = outcomes[1]
                             else:           continue
-                            if asset not in windows[end]:
-                                windows[end][asset] = winner
+                            slot = end + "|" + dur
+                            wkey = asset + "|" + dur
+                            if wkey not in windows[slot]:
+                                windows[slot][wkey] = winner
+                                total += 1
                     offset += 200
                     if len(events) < 200:
                         break
+                counts[key] = total
             pairs = _dd(lambda: {"uu": 0, "dd": 0, "sp": 0, "n": 0})
             for slot, assets in windows.items():
-                for (a1, d1), (a2, d2) in combinations(list(assets.items()), 2):
-                    key = "|".join(sorted([a1, a2]))
+                dur = slot.rsplit("|", 1)[-1]
+                # only pair assets within same duration
+                same_dur = [(k, v) for k, v in assets.items() if k.endswith("|" + dur)]
+                for (a1, d1), (a2, d2) in combinations(same_dur, 2):
+                    a1n = a1.split("|")[0]; a2n = a2.split("|")[0]
+                    key = "|".join(sorted([a1n, a2n])) + "|" + dur
                     pairs[key]["n"] += 1
                     if d1 == "Up"   and d2 == "Up":   pairs[key]["uu"] += 1
                     elif d1 == "Down" and d2 == "Down": pairs[key]["dd"] += 1
