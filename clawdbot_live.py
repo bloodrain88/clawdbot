@@ -281,7 +281,7 @@ HC15_FALLBACK_PCT_LEFT = float(os.environ.get("HC15_FALLBACK_PCT_LEFT", "0.35"))
 HC15_FALLBACK_MAX_ENTRY = float(os.environ.get("HC15_FALLBACK_MAX_ENTRY", "0.36"))
 MIN_PAYOUT_MULT_5M = float(os.environ.get("MIN_PAYOUT_MULT_5M", "1.75"))
 MIN_EV_NET_5M = float(os.environ.get("MIN_EV_NET_5M", "0.019"))
-ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.54"))
+ENTRY_HARD_CAP_5M = float(os.environ.get("ENTRY_HARD_CAP_5M", "0.72"))
 ENTRY_HARD_CAP_15M = float(os.environ.get("ENTRY_HARD_CAP_15M", "0.65"))
 ENTRY_NEAR_MISS_TOL = float(os.environ.get("ENTRY_NEAR_MISS_TOL", "0.030"))
 PULLBACK_LIMIT_ENABLED = os.environ.get("PULLBACK_LIMIT_ENABLED", "true").lower() == "true"
@@ -5198,6 +5198,8 @@ class LiveTrader:
             cheap_side = "Up" if up_price <= (1.0 - up_price) else "Down"
             cheap_entry_now = min(up_price, 1.0 - up_price)
             if (
+                duration >= 15
+                and
                 cheap_entry_now <= CONTRARIAN_TAIL_MAX_ENTRY
                 and mins_left >= CONTRARIAN_TAIL_MIN_MINS_LEFT
                 and move_pct >= CONTRARIAN_TAIL_MIN_MOVE_PCT
@@ -5348,8 +5350,9 @@ class LiveTrader:
         base_min_entry_allowed = 0.01
         base_max_entry_allowed = max_entry_allowed
         if duration <= 5:
-            max_entry_allowed = min(max_entry_allowed, MAX_ENTRY_PRICE_5M)
-            min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_5M)
+            # 5m entry gating is market-driven (EV/probability/real execution),
+            # not static [min,max] clamps that can block profitable rounds.
+            min_entry_allowed = max(min_entry_allowed, 0.01)
             base_min_entry_allowed = min_entry_allowed
             base_max_entry_allowed = max_entry_allowed
             if MAX_WIN_MODE:
@@ -5430,10 +5433,13 @@ class LiveTrader:
         if (ws_fresh or rest_fresh) and cl_fresh and vol_fresh and mins_left >= (FRESH_RELAX_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else FRESH_RELAX_MIN_LEFT_5M):
             max_entry_allowed = min(FRESH_RELAX_ENTRY_CAP, max_entry_allowed + FRESH_RELAX_ENTRY_ADD)
         max_entry_allowed = min(max_entry_allowed, adaptive_hard_cap)
-        # Hard entry ceiling: never take market orders above 54¢.
-        # Tokens start at ~50¢ (fair value) at window open — paying 64¢ ask is overpaying.
-        # When live_entry > 0.54, PULLBACK_LIMIT fires a resting bid at max_entry_allowed (~0.53).
-        max_entry_allowed = min(max_entry_allowed, 0.54)
+        # Hard entry ceiling:
+        # - 15m unchanged: strict 54c ceiling.
+        # - 5m: use adaptive hard cap (execution/quality aware), avoid static 54c choke.
+        if duration >= 15:
+            max_entry_allowed = min(max_entry_allowed, 0.54)
+        else:
+            max_entry_allowed = min(max_entry_allowed, max(0.60, adaptive_hard_cap))
         # Dynamic min-entry (not fixed hard floor): adapt to setup quality + microstructure.
         # High-quality setup can dip lower for super-payout entries; weaker setup is stricter.
         min_entry_dyn = float(base_min_entry_allowed)
