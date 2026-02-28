@@ -6224,6 +6224,17 @@ class LiveTrader:
             and move_pct >= LATE_PAYOUT_RELAX_MIN_MOVE
         ):
             min_payout_req = min(min_payout_req, 1.72)
+        # High-quality execution unlock:
+        # allow 1.80x floor on strong setups to avoid dead-zones around 1.82-1.98x.
+        if (
+            duration >= CORE_DURATION_MIN
+            and score >= 14
+            and true_prob >= 0.66
+            and edge >= 0.10
+            and execution_ev >= 0.018
+            and cl_agree
+        ):
+            min_payout_req = min(min_payout_req, 1.80)
         min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
         if (ws_fresh or rest_fresh) and cl_fresh and vol_fresh and mins_left >= (FRESH_RELAX_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else FRESH_RELAX_MIN_LEFT_5M):
             max_entry_allowed = min(FRESH_RELAX_ENTRY_CAP, max_entry_allowed + FRESH_RELAX_ENTRY_ADD)
