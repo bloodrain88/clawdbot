@@ -206,6 +206,16 @@ NETWORK        = os.environ.get("POLY_NETWORK", "polygon")  # polygon | amoy
 BANKROLL       = float(os.environ.get("BANKROLL", "100.0"))
 PROFIT_PUSH_MODE = os.environ.get("PROFIT_PUSH_MODE", "false").lower() == "true"
 PROFIT_PUSH_MULT = float(os.environ.get("PROFIT_PUSH_MULT", "1.0"))
+PROFIT_PUSH_ADAPTIVE_MODE = os.environ.get("PROFIT_PUSH_ADAPTIVE_MODE", "true").lower() == "true"
+PROFIT_PUSH_PROBE_MULT = float(os.environ.get("PROFIT_PUSH_PROBE_MULT", "0.62"))
+PROFIT_PUSH_BASE_MULT = float(os.environ.get("PROFIT_PUSH_BASE_MULT", "1.00"))
+PROFIT_PUSH_PUSH_MULT = float(os.environ.get("PROFIT_PUSH_PUSH_MULT", "1.35"))
+PROFIT_PUSH_PUSH_MIN_SCORE = int(os.environ.get("PROFIT_PUSH_PUSH_MIN_SCORE", "12"))
+PROFIT_PUSH_PUSH_MIN_TRUE_PROB = float(os.environ.get("PROFIT_PUSH_PUSH_MIN_TRUE_PROB", "0.64"))
+PROFIT_PUSH_PUSH_MIN_EXEC_EV = float(os.environ.get("PROFIT_PUSH_PUSH_MIN_EXEC_EV", "0.030"))
+PROFIT_PUSH_BASE_MIN_SCORE = int(os.environ.get("PROFIT_PUSH_BASE_MIN_SCORE", "9"))
+PROFIT_PUSH_BASE_MIN_EXEC_EV = float(os.environ.get("PROFIT_PUSH_BASE_MIN_EXEC_EV", "0.010"))
+PROFIT_PUSH_MAX_MULT = float(os.environ.get("PROFIT_PUSH_MAX_MULT", "1.85"))
 MIN_EDGE       = float(os.environ.get("MIN_EDGE", "0.20"))     # base edge floor — raised from 0.08 (data: edge>=0.20 → WR=52.7%)
 MIN_MOVE       = float(os.environ.get("MIN_MOVE", "0.0003"))   # flat filter threshold
 MOMENTUM_WEIGHT = float(os.environ.get("MOMENTUM_WEIGHT", "0.40"))
@@ -1281,6 +1291,7 @@ class LiveTrader:
         self._bucket_stats      = BucketStats()
         _bs_load(self._bucket_stats)
         self._enable_5m_runtime = bool(ENABLE_5M)
+        self._five_m_runtime_size_mult = 1.0
         self._five_m_disabled_until = 0.0
         self._five_m_guard_last_eval_ts = 0.0
         self._five_m_guard_last_state_log_ts = 0.0
@@ -2688,6 +2699,8 @@ class LiveTrader:
         )
         print(
             f"{B}[BOOT]{RS} profit_push_mode={PROFIT_PUSH_MODE} mult={PROFIT_PUSH_MULT:.2f} "
+            f"adaptive={PROFIT_PUSH_ADAPTIVE_MODE} "
+            f"tier_x(probe/base/push)={PROFIT_PUSH_PROBE_MULT:.2f}/{PROFIT_PUSH_BASE_MULT:.2f}/{PROFIT_PUSH_PUSH_MULT:.2f} "
             f"max_abs_bet={MAX_ABS_BET:.2f} bankroll_cap={MAX_BANKROLL_PCT:.0%} "
             f"high_ev_boost={HIGH_EV_SIZE_BOOST:.2f}/{HIGH_EV_SIZE_BOOST_MAX:.2f} "
             f"booster(ev/payout/max_entry)>={MID_BOOSTER_MIN_EV_NET:.3f}/{MID_BOOSTER_MIN_PAYOUT:.2f}/{MID_BOOSTER_MAX_ENTRY:.2f}"
@@ -6238,6 +6251,42 @@ class LiveTrader:
                     )
 
         # Final superbet/tail normalization after all decays.
+        profit_push_tier = "off"
+        profit_push_size_mult = 1.0
+        if PROFIT_PUSH_MODE and PROFIT_PUSH_ADAPTIVE_MODE:
+            is_push = (
+                score >= PROFIT_PUSH_PUSH_MIN_SCORE
+                and true_prob >= PROFIT_PUSH_PUSH_MIN_TRUE_PROB
+                and execution_ev >= PROFIT_PUSH_PUSH_MIN_EXEC_EV
+                and cl_agree
+                and entry <= max(0.50, WINMODE_MAX_ENTRY_15M if duration > 5 else WINMODE_MAX_ENTRY_5M)
+            )
+            is_base = (
+                score >= PROFIT_PUSH_BASE_MIN_SCORE
+                and execution_ev >= PROFIT_PUSH_BASE_MIN_EXEC_EV
+            )
+            if is_push:
+                profit_push_tier = "push"
+                profit_push_size_mult = PROFIT_PUSH_PUSH_MULT
+            elif is_base:
+                profit_push_tier = "base"
+                profit_push_size_mult = PROFIT_PUSH_BASE_MULT
+            else:
+                profit_push_tier = "probe"
+                profit_push_size_mult = PROFIT_PUSH_PROBE_MULT
+            if duration <= 5:
+                profit_push_size_mult *= max(0.20, min(1.25, float(self._five_m_runtime_size_mult or 1.0)))
+            profit_push_size_mult = max(0.20, min(PROFIT_PUSH_MAX_MULT, float(profit_push_size_mult)))
+            if abs(profit_push_size_mult - 1.0) > 1e-9:
+                old_size = float(size)
+                size = max(float(MIN_EXEC_NOTIONAL_USDC), round(min(hard_cap, old_size * profit_push_size_mult), 2))
+                if self._noisy_log_enabled(f"profit-push-size:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{B}[SIZE-TUNE]{RS} {asset} {duration}m {side} "
+                        f"profit-push {profit_push_tier} x{profit_push_size_mult:.2f} "
+                        f"${old_size:.2f}->${size:.2f}"
+                    )
+
         payout_mult = (1.0 / max(entry, 1e-9))
         if SUPER_BET_MIN_SIZE_ENABLED:
             can_superbet = (
@@ -6354,6 +6403,9 @@ class LiveTrader:
             "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
             "prebid_arm": arm_active,
             "must_fire": bool(late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15),
+            "profit_push_tier": profit_push_tier,
+            "profit_push_size_mult": profit_push_size_mult,
+            "runtime_5m_size_mult": float(self._five_m_runtime_size_mult or 1.0),
         }
 
     async def _execute_trade(self, sig: dict):
@@ -9037,9 +9089,11 @@ class LiveTrader:
         """Auto-disable/enable 5m based on rolling settled quality."""
         if not ENABLE_5M:
             self._enable_5m_runtime = False
+            self._five_m_runtime_size_mult = 0.0
             return
         if not FIVE_M_RUNTIME_GUARD_ENABLED:
             self._enable_5m_runtime = True
+            self._five_m_runtime_size_mult = 1.0
             return
         now = _time.time()
         if (now - self._five_m_guard_last_eval_ts) < max(5.0, FIVE_M_GUARD_CHECK_EVERY_SEC):
@@ -9052,6 +9106,34 @@ class LiveTrader:
         pf = float(snap.get("pf", 1.0) or 1.0)
         pnl = float(snap.get("pnl", 0.0) or 0.0)
 
+        # Profit-push adaptive path:
+        # keep 5m active but resize exposure by rolling realized quality.
+        if PROFIT_PUSH_MODE and PROFIT_PUSH_ADAPTIVE_MODE:
+            self._enable_5m_runtime = True
+            prev_mult = float(self._five_m_runtime_size_mult or 1.0)
+            mult = 1.0
+            if n < max(1, FIVE_M_DYNAMIC_SCORE_MIN_OUTCOMES):
+                mult = 1.0
+            elif pf < 0.85 or wr < 0.40:
+                mult = 0.22
+            elif pf < 1.00 or wr < 0.45:
+                mult = 0.35
+            elif pf < 1.05 or wr < 0.50:
+                mult = 0.60
+            elif pf >= 1.15 and wr >= 0.55:
+                mult = 1.15
+            self._five_m_runtime_size_mult = max(0.20, min(1.25, mult))
+            if (
+                abs(self._five_m_runtime_size_mult - prev_mult) >= 0.05
+                or (now - self._five_m_guard_last_state_log_ts) >= 60.0
+            ):
+                self._five_m_guard_last_state_log_ts = now
+                print(
+                    f"{B}[5M-ADAPT]{RS} size_x={self._five_m_runtime_size_mult:.2f} "
+                    f"(n={n} wr={wr*100.0:.1f}% pf={pf:.2f} pnl={pnl:+.2f})"
+                )
+            return
+
         if self._enable_5m_runtime:
             bad_quality = (
                 n >= max(1, FIVE_M_GUARD_DISABLE_MIN_OUTCOMES)
@@ -9059,6 +9141,7 @@ class LiveTrader:
             )
             if bad_quality:
                 self._enable_5m_runtime = False
+                self._five_m_runtime_size_mult = 0.0
                 self._five_m_disabled_until = now + max(60.0, FIVE_M_GUARD_MIN_DISABLE_SEC)
                 self._five_m_guard_last_state_log_ts = now
                 print(
@@ -9085,6 +9168,7 @@ class LiveTrader:
         )
         if good_quality:
             self._enable_5m_runtime = True
+            self._five_m_runtime_size_mult = 1.0
             self._five_m_guard_last_state_log_ts = now
             print(
                 f"{G}[5M-GUARD]{RS} re-enabled "
@@ -10005,7 +10089,7 @@ class LiveTrader:
                                 f"{late_valid[0]['asset']} {late_valid[0]['side']} score={late_valid[0]['score']}"
                             )
                             valid = late_valid
-                if ENABLE_5M and (not self._enable_5m_runtime) and valid:
+                if ENABLE_5M and (not self._enable_5m_runtime) and valid and not (PROFIT_PUSH_MODE and PROFIT_PUSH_ADAPTIVE_MODE):
                     pre_n = len(valid)
                     valid = [s for s in valid if int(s.get("duration", 0) or 0) > 5]
                     if pre_n != len(valid) and self._should_log("5m-guard-filter", 20):
