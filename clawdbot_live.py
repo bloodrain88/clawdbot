@@ -272,6 +272,8 @@ ROUND_CONSENSUS_15M_ENABLED = os.environ.get("ROUND_CONSENSUS_15M_ENABLED", "tru
 ROUND_CONSENSUS_MIN_NET = int(os.environ.get("ROUND_CONSENSUS_MIN_NET", "2"))
 ROUND_CONSENSUS_OVERRIDE_SCORE = int(os.environ.get("ROUND_CONSENSUS_OVERRIDE_SCORE", "19"))
 ROUND_CONSENSUS_OVERRIDE_EDGE = float(os.environ.get("ROUND_CONSENSUS_OVERRIDE_EDGE", "0.16"))
+ROUND_CONSENSUS_STRICT_15M = os.environ.get("ROUND_CONSENSUS_STRICT_15M", "true").lower() == "true"
+ROUND_CONSENSUS_MOVE_BPS = float(os.environ.get("ROUND_CONSENSUS_MOVE_BPS", "1.5"))
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "0"))
 MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "0"))
@@ -11067,6 +11069,7 @@ class LiveTrader:
                 if ROUND_CONSENSUS_15M_ENABLED:
                     up_votes = 0
                     dn_votes = 0
+                    move_sum = 0.0
                     for m in candidates:
                         if int(m.get("duration", 0) or 0) < 15:
                             continue
@@ -11074,6 +11077,8 @@ class LiveTrader:
                         cur = float(m.get("current", 0.0) or 0.0)
                         if op <= 0 or cur <= 0:
                             continue
+                        rel = (cur - op) / max(op, 1e-9)
+                        move_sum += rel
                         if cur >= op:
                             up_votes += 1
                         else:
@@ -11081,11 +11086,15 @@ class LiveTrader:
                     net = abs(up_votes - dn_votes)
                     if net >= max(1, ROUND_CONSENSUS_MIN_NET):
                         consensus_side_15m = "Up" if up_votes > dn_votes else "Down"
-                        if self._should_log("round-consensus-15m", LOG_ROUND_SIGNAL_EVERY_SEC):
-                            print(
-                                f"{B}[CONSENSUS]{RS} 15m side={consensus_side_15m} "
-                                f"(up={up_votes} down={dn_votes} net={net})"
-                            )
+                    else:
+                        move_thr = max(0.0, float(ROUND_CONSENSUS_MOVE_BPS or 0.0)) / 10000.0
+                        if abs(move_sum) >= move_thr and (up_votes + dn_votes) >= 2:
+                            consensus_side_15m = "Up" if move_sum > 0 else "Down"
+                    if consensus_side_15m and self._should_log("round-consensus-15m", LOG_ROUND_SIGNAL_EVERY_SEC):
+                        print(
+                            f"{B}[CONSENSUS]{RS} 15m side={consensus_side_15m} "
+                            f"(up={up_votes} down={dn_votes} net={net} move={(move_sum*100):+.3f}%)"
+                        )
                 blackout_ev = self._macro_blackout_active()
                 if blackout_ev:
                     if self._should_log("macro-blackout", 120):
@@ -11100,6 +11109,9 @@ class LiveTrader:
                         and int(sig.get("duration", 0) or 0) >= 15
                         and str(sig.get("side", "") or "") != consensus_side_15m
                     ):
+                        if ROUND_CONSENSUS_STRICT_15M:
+                            self._skip_tick("consensus_contra")
+                            continue
                         over = (
                             int(sig.get("score", 0) or 0) >= ROUND_CONSENSUS_OVERRIDE_SCORE
                             and float(sig.get("edge", 0.0) or 0.0) >= ROUND_CONSENSUS_OVERRIDE_EDGE
