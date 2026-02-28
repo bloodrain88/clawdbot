@@ -7554,13 +7554,13 @@ class LiveTrader:
                         print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
                 elif self._should_log("round-empty", LOG_ROUND_EMPTY_EVERY_SEC):
                     print(f"{Y}[ROUND]{RS} no executable signal")
-                    top_sk = self._skip_top(window_sec=300, top_n=3)
-                    top_sk_s = ", ".join([f"{x['reason']}={x['count']}" for x in top_sk]) if top_sk else "none"
+                    sk_total, top_sk = self._skip_top(window_sec=300, top_n=3)
+                    top_sk_s = ", ".join([f"{reason}={count}" for reason, count in top_sk]) if top_sk else "none"
                     print(
                         f"{Y}[ROUND-DIAG]{RS} eligible={eligible_started} candidates={len(candidates)} "
                         f"blocked_seen={blocked_seen} pending_redeem={len(self.pending_redeem)} "
                         f"open_onchain={self.onchain_open_count} enable_5m={ENABLE_5M}/{self._enable_5m_runtime} "
-                        f"top_skip[{top_sk_s}]"
+                        f"skip_total={sk_total} top_skip[{top_sk_s}]"
                     )
                 active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
                 shadow_pending = dict(active_pending)
