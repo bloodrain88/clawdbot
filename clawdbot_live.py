@@ -1262,6 +1262,8 @@ class LiveTrader:
         self._clob_market_ws = None
         self._clob_ws_books  = {}     # token_id -> {"ts_ms": float, "best_bid": float, "best_ask": float, "tick": float, "asks": [(p,s)]}
         self._clob_ws_assets_subscribed = set()
+        # Token ids queued for immediate market-WS subscribe (e.g. newly discovered rounds).
+        self._clob_ws_pending_subs = set()
         self._heartbeat_last_ok = 0.0
         self._heartbeat_id   = ""
         self._order_event_cache = {}  # order_id -> {"status": str, "filled_size": float, "ts": float}
@@ -4714,7 +4716,7 @@ class LiveTrader:
                     hb_task = asyncio.create_task(_app_heartbeat())
                     try:
                         while True:
-                            desired = self._trade_focus_token_ids() or self._active_token_ids()
+                            desired = (self._trade_focus_token_ids() or self._active_token_ids()) | set(self._clob_ws_pending_subs)
                             add = desired - self._clob_ws_assets_subscribed
                             if add:
                                 await ws.send(
@@ -4727,8 +4729,11 @@ class LiveTrader:
                                     )
                                 )
                                 self._clob_ws_assets_subscribed |= set(add)
+                                self._clob_ws_pending_subs -= set(add)
                             try:
-                                raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, CLOB_MARKET_WS_SYNC_SEC))
+                                # Keep a short poll interval so new-token subscriptions are flushed
+                                # quickly at round rollover (prevents ws_age=9e9 gaps).
+                                raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
                             except asyncio.TimeoutError:
                                 continue
                             try:
@@ -4762,6 +4767,7 @@ class LiveTrader:
             finally:
                 self._clob_market_ws = None
                 self._clob_ws_assets_subscribed = set()
+                self._clob_ws_pending_subs = set()
 
     # ── SCORE + EXECUTE ───────────────────────────────────────────────────────
     async def _fetch_pm_book_safe(self, token_id: str):
@@ -10809,7 +10815,8 @@ class LiveTrader:
                                 f"— continuing with per-market freshness checks"
                             )
 
-            # Subscribe new markets to RTDS token price stream
+            # Subscribe new markets to RTDS token price stream.
+            # Also queue token ids for immediate CLOB market-WS subscription.
             if self._rtds_ws:
                 for cid, m in markets.items():
                     if cid not in self.active_mkts:
@@ -10820,6 +10827,10 @@ class LiveTrader:
                                         "action": "subscribe",
                                         "subscriptions": [{"asset_id": tid, "type": "market"}]
                                     }))
+                                except Exception:
+                                    pass
+                                try:
+                                    self._clob_ws_pending_subs.add(str(tid))
                                 except Exception:
                                     pass
 
