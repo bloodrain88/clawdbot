@@ -261,7 +261,7 @@ LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 FORCE_TRADE_EVERY_ROUND = os.environ.get("FORCE_TRADE_EVERY_ROUND", "true").lower() == "true"
-NO_TRADE_RECOVERY_ENABLED = os.environ.get("NO_TRADE_RECOVERY_ENABLED", "true").lower() == "true"
+NO_TRADE_RECOVERY_ENABLED = True
 NO_TRADE_RECOVERY_ROUNDS = int(os.environ.get("NO_TRADE_RECOVERY_ROUNDS", "2"))
 FORCE_COVERAGE_MIN_PAYOUT_15M = float(os.environ.get("FORCE_COVERAGE_MIN_PAYOUT_15M", "1.40"))
 FORCE_COVERAGE_MIN_EV_15M = float(os.environ.get("FORCE_COVERAGE_MIN_EV_15M", "0.000"))
@@ -7612,7 +7612,7 @@ class LiveTrader:
                                 f"{late_valid[0]['asset']} {late_valid[0]['side']} score={late_valid[0]['score']}"
                             )
                             valid = late_valid
-                if not valid and FORCE_TRADE_EVERY_ROUND and candidates:
+                if not valid and candidates:
                     relaxed_all = list(await asyncio.gather(*[self._score_market(c, late_relax=True) for c in candidates]))
                     relaxed_valid = sorted([s for s in relaxed_all if s is not None], key=self._signal_growth_score, reverse=True)
                     if relaxed_valid:
@@ -7755,29 +7755,45 @@ class LiveTrader:
                 if blackout_ev:
                     if self._should_log("macro-blackout", 120):
                         print(f"{Y}[MACRO-BLACKOUT]{RS} skipping trades — {blackout_ev} event window active")
+                force_round_now = bool(
+                    FORCE_TRADE_EVERY_ROUND
+                    and slots > 0
+                    and selected
+                    and not blackout_ev
+                )
+                force_picked = False
                 for sig in selected:
                     if len(to_exec) >= slots:
                         break
                     if blackout_ev:
                         continue
+                    bypass_gates = bool(force_round_now and not force_picked)
                     if (
                         consensus_side_15m
                         and int(sig.get("duration", 0) or 0) >= 15
                         and str(sig.get("side", "") or "") != consensus_side_15m
                     ):
-                        if ROUND_CONSENSUS_STRICT_15M:
+                        if bypass_gates:
+                            if self._should_log("round-force-bypass-consensus", 10):
+                                print(
+                                    f"{Y}[ROUND-FORCE-BYPASS]{RS} consensus "
+                                    f"{sig.get('asset','?')} {sig.get('duration','?')}m "
+                                    f"{sig.get('side','?')} != {consensus_side_15m}"
+                                )
+                        elif ROUND_CONSENSUS_STRICT_15M:
                             self._skip_tick("consensus_contra")
                             continue
-                        over = (
-                            int(sig.get("score", 0) or 0) >= ROUND_CONSENSUS_OVERRIDE_SCORE
-                            and float(sig.get("edge", 0.0) or 0.0) >= ROUND_CONSENSUS_OVERRIDE_EDGE
-                        )
-                        if not over:
-                            self._skip_tick("consensus_contra")
-                            continue
-                    if not self._exposure_ok(sig, shadow_pending):
+                        else:
+                            over = (
+                                int(sig.get("score", 0) or 0) >= ROUND_CONSENSUS_OVERRIDE_SCORE
+                                and float(sig.get("edge", 0.0) or 0.0) >= ROUND_CONSENSUS_OVERRIDE_EDGE
+                            )
+                            if not over:
+                                self._skip_tick("consensus_contra")
+                                continue
+                    if (not bypass_gates) and (not self._exposure_ok(sig, shadow_pending)):
                         continue
-                    if not TRADE_ALL_MARKETS:
+                    if (not bypass_gates) and (not TRADE_ALL_MARKETS):
                         pending_up = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Up")
                         pending_dn = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Down")
                         if sig["side"] == "Up" and pending_up >= MAX_SAME_DIR:
@@ -7789,20 +7805,24 @@ class LiveTrader:
                         if pending_up > 0 and sig["side"] == "Down":  continue
                     # NOTE: correlated Kelly sizing is handled by ROUND_CORR_SAME_SIDE_DECAY in execution path.
                     # Removed scan_loop 1/sqrt(N) division to avoid double-applying the same reduction.
-                    to_exec.append(sig)
+                    picked_sig = dict(sig) if bypass_gates else sig
+                    if bypass_gates:
+                        picked_sig["round_force_coverage"] = True
+                        picked_sig["round_force_execute"] = True
+                        force_picked = True
+                    to_exec.append(picked_sig)
                     m_sig = sig.get("m", {}) if isinstance(sig.get("m", {}), dict) else {}
                     t_sig = {
-                        "side": sig.get("side", ""),
-                        "size": float(sig.get("size", 0.0) or 0.0),
-                        "asset": sig.get("asset", ""),
-                        "duration": int(sig.get("duration", 0) or 0),
+                        "side": picked_sig.get("side", ""),
+                        "size": float(picked_sig.get("size", 0.0) or 0.0),
+                        "asset": picked_sig.get("asset", ""),
+                        "duration": int(picked_sig.get("duration", 0) or 0),
                         "end_ts": float(m_sig.get("end_ts", now + 60) or (now + 60)),
                     }
                     shadow_pending[f"__pick__{len(to_exec)}"] = (m_sig, t_sig)
                 counted_no_trade = False
                 if (
                     NO_TRADE_RECOVERY_ENABLED
-                    and FORCE_TRADE_EVERY_ROUND
                     and (not to_exec)
                     and selected
                     and slots > 0
