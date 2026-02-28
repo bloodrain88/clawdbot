@@ -1275,6 +1275,7 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                     )
     if score < min_score_local:
         return None
+    force_coverage_mode = bool(FORCE_TRADE_EVERY_ROUND and late_relax)
     # Per-asset blocking for 15m
     if duration >= 15:
         asset = m.get("asset", "")
@@ -1291,8 +1292,18 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                     self._skip_tick("asset_soft_blocked_low_score")
                     return None
             else:
-                self._skip_tick("asset_blocked_sol" if asset == "SOL" else "asset_blocked_xrp")
-                return None
+                if force_coverage_mode:
+                    score -= max(2, ASSET_BLOCK_SOFT_SCORE_PEN + 1)
+                    edge -= max(0.010, ASSET_BLOCK_SOFT_EDGE_PEN + 0.004)
+                    if self._noisy_log_enabled(f"asset-force-soft:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[ASSET-GATE-FORCE]{RS} {asset} {duration}m soften hard block "
+                            f"(score-={max(2, ASSET_BLOCK_SOFT_SCORE_PEN + 1)} "
+                            f"edge-={max(0.010, ASSET_BLOCK_SOFT_EDGE_PEN + 0.004):.3f})"
+                        )
+                else:
+                    self._skip_tick("asset_blocked_sol" if asset == "SOL" else "asset_blocked_xrp")
+                    return None
     # Per-tier blocking via env vars (default all off)
     if duration >= 15:
         score_tier = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
@@ -1309,14 +1320,22 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                     self._skip_tick(f"score_tier_soft_blocked_{score_tier}")
                     return None
             else:
-                self._skip_tick(
-                    "score_tier_blocked_s0_8" if score_tier == "s0-8"
-                    else ("score_tier_blocked_s9_11" if score_tier == "s9-11" else "score_tier_blocked_s12p")
-                )
-                return None
+                if force_coverage_mode:
+                    score -= 2
+                    edge -= max(0.006, SCORE_BLOCK_SOFT_EDGE_PEN)
+                else:
+                    self._skip_tick(
+                        "score_tier_blocked_s0_8" if score_tier == "s0-8"
+                        else ("score_tier_blocked_s9_11" if score_tier == "s9-11" else "score_tier_blocked_s12p")
+                    )
+                    return None
         if score_tier == "s0-8" and MIN_ENTRY_PRICE_S0_8_15M > 0 and entry < MIN_ENTRY_PRICE_S0_8_15M:
-            self._skip_tick("score_s0_8_entry_too_low")
-            return None
+            if force_coverage_mode:
+                score -= 1
+                edge -= 0.004
+            else:
+                self._skip_tick("score_s0_8_entry_too_low")
+                return None
 
     token_id = m["token_up"] if side == "Up" else m["token_down"]
     if not token_id:
