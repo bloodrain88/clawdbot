@@ -1562,7 +1562,7 @@ class LiveTrader:
 
     def _ws_strict_age_cap_ms(self) -> float:
         """Adaptive strict WS freshness cap tuned to live network conditions."""
-        base = float(CLOB_MARKET_WS_MAX_AGE_MS)
+        base = max(float(CLOB_MARKET_WS_MAX_AGE_MS), 5000.0)
         if not WS_STRICT_ADAPTIVE_ENABLED:
             return base
         try:
@@ -1571,8 +1571,11 @@ class LiveTrader:
             if ws_med >= 9e8:
                 return base
             dyn = max(base, ws_med * max(1.0, float(WS_STRICT_ADAPTIVE_MULT)))
-            dyn = max(float(WS_STRICT_ADAPTIVE_MIN_MS), dyn)
-            dyn = min(float(WS_STRICT_ADAPTIVE_MAX_MS), dyn, float(WS_HEALTH_MAX_MED_AGE_MS))
+            hard_min = max(5000.0, float(WS_STRICT_ADAPTIVE_MIN_MS))
+            hard_max = max(hard_min, float(WS_STRICT_ADAPTIVE_MAX_MS))
+            health_cap = max(5000.0, float(WS_HEALTH_MAX_MED_AGE_MS))
+            dyn = max(hard_min, dyn)
+            dyn = min(hard_max, dyn, health_cap)
             return float(max(base, dyn))
         except Exception:
             return base
