@@ -268,6 +268,8 @@ ROUND_SECOND_TRADE_MAX_ENTRY = float(os.environ.get("ROUND_SECOND_TRADE_MAX_ENTR
 ROUND_SECOND_TRADE_MAX_GSCORE_GAP = float(os.environ.get("ROUND_SECOND_TRADE_MAX_GSCORE_GAP", "0.030"))
 ROUND_FORCE_MAX_BANK_FRAC = float(os.environ.get("ROUND_FORCE_MAX_BANK_FRAC", "0.08"))
 ROUND_FORCE_MIN_NOTIONAL_MULT = float(os.environ.get("ROUND_FORCE_MIN_NOTIONAL_MULT", "1.00"))
+ROUND_FORCE_PAYOUT_CAP_15M = float(os.environ.get("ROUND_FORCE_PAYOUT_CAP_15M", "1.82"))
+ROUND_FORCE_PAYOUT_CAP_5M = float(os.environ.get("ROUND_FORCE_PAYOUT_CAP_5M", "1.68"))
 ROUND_CONSENSUS_15M_ENABLED = os.environ.get("ROUND_CONSENSUS_15M_ENABLED", "true").lower() == "true"
 ROUND_CONSENSUS_MIN_NET = int(os.environ.get("ROUND_CONSENSUS_MIN_NET", "2"))
 ROUND_CONSENSUS_OVERRIDE_SCORE = int(os.environ.get("ROUND_CONSENSUS_OVERRIDE_SCORE", "19"))
@@ -6273,6 +6275,11 @@ class LiveTrader:
             and cl_agree
         ):
             min_payout_req = min(min_payout_req, 1.80)
+        # Round-force anti-freeze: keep payout floor bounded so adaptive tightening
+        # cannot fully block executable markets for long stretches.
+        if FORCE_TRADE_EVERY_ROUND:
+            force_cap = ROUND_FORCE_PAYOUT_CAP_5M if duration <= 5 else ROUND_FORCE_PAYOUT_CAP_15M
+            min_payout_req = min(min_payout_req, max(1.30, force_cap))
         min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
         if (ws_fresh or rest_fresh) and cl_fresh and vol_fresh and mins_left >= (FRESH_RELAX_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else FRESH_RELAX_MIN_LEFT_5M):
             max_entry_allowed = min(FRESH_RELAX_ENTRY_CAP, max_entry_allowed + FRESH_RELAX_ENTRY_ADD)
@@ -10180,11 +10187,11 @@ class LiveTrader:
         # Conservative confidence guard: if the lower confidence bound of recent WR drops below 50%,
         # tighten aggressively to protect EV under uncertainty.
         if snap["recent_n"] >= 10 and snap["recent_wr_lb"] < 0.50:
-            tightness += min(1.0, (0.50 - snap["recent_wr_lb"]) * 4.0)
+            tightness += min(0.45, (0.50 - snap["recent_wr_lb"]) * 2.0)
         if snap["avg_slip"] > 220:
             tightness += min(0.6, (snap["avg_slip"] - 220.0) / 600.0)
         if self.consec_losses >= 2:
-            tightness += min(1.0, (self.consec_losses - 1) * 0.25)
+            tightness += min(0.45, (self.consec_losses - 1) * 0.15)
         if snap["outcomes"] >= 12 and snap["pf"] > 1.35 and snap["expectancy"] > 0.30 and snap["avg_slip"] < 120:
             tightness -= 0.35
         # Momentum regime relaxation: require both observed WR and confidence.
@@ -10205,7 +10212,7 @@ class LiveTrader:
         min_payout_raw = base_payout + (0.20 * tightness)
         if duration >= 15:
             # Keep 15m payout floor strict: adapt upward only, never below base.
-            min_payout = max(base_payout, min(base_payout + payout_upshift_cap, min_payout_raw))
+            min_payout = max(base_payout, min(base_payout + min(payout_upshift_cap, 0.18), min_payout_raw))
         else:
             min_payout = max(1.55, min(base_payout + payout_upshift_cap, min_payout_raw))
         min_ev = max(0.005, base_ev + (0.015 * tightness))
