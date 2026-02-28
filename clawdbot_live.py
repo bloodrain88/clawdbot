@@ -3166,6 +3166,8 @@ class LiveTrader:
         try:
             conn = sqlite3.connect(METRICS_DB_FILE, timeout=5.0)
             try:
+                conn.execute("PRAGMA journal_mode=WAL")  # non-blocking concurrent reads
+                conn.execute("PRAGMA synchronous=NORMAL")  # safe + faster than FULL
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS resolve_metrics (
