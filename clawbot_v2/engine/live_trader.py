@@ -4964,6 +4964,98 @@ class LiveTrader:
         }
         return sig
 
+    def _build_forced_round_signal(self, m: dict) -> dict | None:
+        """Build a minimally-complete executable signal when score path yields no candidates.
+        This is used only for force-coverage recovery to avoid prolonged zero-trade stalls.
+        """
+        try:
+            cid = str(m.get("conditionId", "") or "")
+            if not cid:
+                return None
+            asset = str(m.get("asset", "") or "")
+            duration = int(m.get("duration", 0) or 0)
+            mins_left = float(m.get("mins_left", 0.0) or 0.0)
+            if mins_left <= 0.5:
+                return None
+            open_price = float(self.open_prices.get(cid, 0.0) or 0.0)
+            if open_price <= 0:
+                return None
+            current = float(self._current_price(asset) or 0.0)
+            if current <= 0:
+                return None
+            side = "Up" if current >= open_price else "Down"
+            up_price = float(m.get("up_price", 0.5) or 0.5)
+            up_price = max(0.01, min(0.99, up_price))
+            entry = up_price if side == "Up" else (1.0 - up_price)
+            max_entry_allowed = min(0.95, MAX_ENTRY_PRICE + MAX_ENTRY_TOL)
+            entry = max(0.01, min(max_entry_allowed, entry))
+            if entry <= 0.0 or entry >= 1.0:
+                return None
+            token_id = str(m.get("token_up", "") if side == "Up" else m.get("token_down", "")).strip()
+            if not token_id:
+                return None
+            src_tag = f"[{self.open_prices_source.get(cid, '?')}]"
+            total_life = float((m.get("end_ts", 0.0) or 0.0) - (m.get("start_ts", 0.0) or 0.0))
+            pct_remaining = ((mins_left * 60.0) / total_life) if total_life > 0 else 0.0
+            move_rel = (current - open_price) / max(open_price, 1e-9)
+            move_str = f"{move_rel:+.3%}"
+            true_prob = max(0.50, min(0.62, 0.50 + min(0.12, abs(move_rel) * 3.0)))
+            edge = true_prob - entry
+            size = float(self._kelly_size(true_prob=true_prob, entry=entry, kelly_frac=KELLY_FRACTION))
+            size = max(max(MIN_BET_ABS, MIN_EXEC_NOTIONAL_USDC), round(size, 2))
+            if size > self.bankroll * MAX_BANKROLL_PCT:
+                size = round(self.bankroll * MAX_BANKROLL_PCT, 2)
+            if size <= 0:
+                return None
+            cl_now = float(self.cl_prices.get(asset, 0.0) or 0.0)
+            cl_agree = True
+            if cl_now > 0:
+                cl_agree = (cl_now >= open_price) if side == "Up" else (cl_now < open_price)
+            return {
+                "cid": cid,
+                "m": m,
+                "asset": asset,
+                "duration": duration,
+                "mins_left": mins_left,
+                "side": side,
+                "score": max(MIN_SCORE_GATE, 9),
+                "label": f"{asset} {duration}m | forced-coverage",
+                "open_price": open_price,
+                "src_tag": src_tag,
+                "current": current,
+                "move_str": move_str,
+                "pct_remaining": pct_remaining,
+                "bs_prob": true_prob,
+                "mom_prob": true_prob,
+                "true_prob": true_prob,
+                "up_price": up_price,
+                "edge": edge,
+                "entry": entry,
+                "size": size,
+                "token_id": token_id,
+                "cl_agree": cl_agree,
+                "ob_imbalance": 0.0,
+                "imbalance_confirms": False,
+                "tf_votes": 0,
+                "very_strong_mom": False,
+                "perp_basis": 0.0,
+                "vwap_dev": 0.0,
+                "cross_count": 0,
+                "chainlink_age_s": float((_time.time() - float(self.cl_updated.get(asset, 0.0) or 0.0)) if self.cl_updated.get(asset, 0.0) else -1.0),
+                "open_price_source": self.open_prices_source.get(cid, "?"),
+                "min_edge": float(self._adaptive_min_edge()),
+                "force_taker": False,
+                "pm_book_data": None,
+                "use_limit": False,
+                "max_entry_allowed": max_entry_allowed,
+                "analysis_quality": 0.50,
+                "analysis_conviction": 0.50,
+                "round_force_coverage": True,
+                "round_force_execute": True,
+            }
+        except Exception:
+            return None
+
     async def _execute_trade(self, sig: dict):
         from clawbot_v2.execution.core import _execute_trade
         return await _execute_trade(self, sig)
@@ -7531,6 +7623,24 @@ class LiveTrader:
                                 f"{top['asset']} {top['duration']}m {top['side']} score={top['score']} "
                                 f"g={self._signal_growth_score(top):+.3f}"
                             )
+                    else:
+                        forced_sigs = [self._build_forced_round_signal(c) for c in candidates]
+                        forced_valid = [s for s in forced_sigs if s is not None]
+                        forced_valid = sorted(
+                            forced_valid,
+                            key=lambda s: abs(float(s.get("edge", 0.0) or 0.0)),
+                            reverse=True,
+                        )
+                        if forced_valid:
+                            valid = forced_valid
+                            if self._should_log("round-force-synth", 10):
+                                top = forced_valid[0]
+                                print(
+                                    f"{Y}[ROUND-FORCE-SYNTH]{RS} "
+                                    f"{top.get('asset','?')} {top.get('duration','?')}m "
+                                    f"{top.get('side','?')} entry={float(top.get('entry',0.0) or 0.0):.3f} "
+                                    f"edge={float(top.get('edge',0.0) or 0.0):+.3f}"
+                                )
                 if ENABLE_5M and (not self._enable_5m_runtime) and valid and not (PROFIT_PUSH_MODE and PROFIT_PUSH_ADAPTIVE_MODE):
                     pre_n = len(valid)
                     valid = [s for s in valid if int(s.get("duration", 0) or 0) > 5]
