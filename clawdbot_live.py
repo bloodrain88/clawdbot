@@ -1726,11 +1726,25 @@ class LiveTrader:
         except Exception:
             return 0.0, 0.0
 
+    def _duration_from_question(self, question: str) -> int:
+        """Infer round duration (minutes) from explicit ET window in title."""
+        q_st, q_et = self._round_bounds_from_question(question or "")
+        if q_st <= 0 or q_et <= q_st:
+            return 0
+        try:
+            d = int(round((q_et - q_st) / 60.0))
+        except Exception:
+            return 0
+        return d if d in (5, 15) else 0
+
     def _apply_exact_window_from_question(self, m: dict, t: dict | None = None) -> bool:
         """Normalize start/end timestamps from explicit ET window in title when possible."""
         if not isinstance(m, dict):
             return False
         dur = int((t or {}).get("duration") or m.get("duration") or 0)
+        q_dur = self._duration_from_question(m.get("question", ""))
+        if q_dur in (5, 15):
+            dur = q_dur
         if dur <= 0:
             return False
         q_start, q_end = self._round_bounds_from_question(m.get("question", ""))
@@ -1738,6 +1752,7 @@ class LiveTrader:
             return False
         m["start_ts"] = q_start
         m["end_ts"] = q_end
+        m["duration"] = dur
         if t is not None:
             t["end_ts"] = q_end
             t["duration"] = dur
@@ -1748,6 +1763,9 @@ class LiveTrader:
         if not isinstance(m, dict):
             return False
         dur = int((t or {}).get("duration") or m.get("duration") or 0)
+        q_dur = self._duration_from_question(m.get("question", ""))
+        if q_dur in (5, 15):
+            dur = q_dur
         if dur <= 0:
             return False
         q_start, q_end = self._round_bounds_from_question(m.get("question", ""))
@@ -1772,10 +1790,9 @@ class LiveTrader:
         end_ts = float(t.get("end_ts") or m.get("end_ts") or 0)
         if not self._is_exact_round_bounds(start_ts, end_ts, dur):
             q_st, q_et = self._round_bounds_from_question(m.get("question", ""))
-            if dur <= 0 and q_st > 0 and q_et > q_st:
-                q_dur = int(round((q_et - q_st) / 60.0))
-                if q_dur in (5, 15):
-                    dur = q_dur
+            q_dur = self._duration_from_question(m.get("question", ""))
+            if q_dur in (5, 15):
+                dur = q_dur
             if self._is_exact_round_bounds(q_st, q_et, dur):
                 start_ts, end_ts = q_st, q_et
         if self._is_exact_round_bounds(start_ts, end_ts, dur):
@@ -1794,10 +1811,9 @@ class LiveTrader:
         end_ts = float(t.get("end_ts") or m.get("end_ts") or 0)
         if not self._is_exact_round_bounds(start_ts, end_ts, dur):
             q_st, q_et = self._round_bounds_from_question(m.get("question", ""))
-            if dur <= 0 and q_st > 0 and q_et > q_st:
-                q_dur = int(round((q_et - q_st) / 60.0))
-                if q_dur in (5, 15):
-                    dur = q_dur
+            q_dur = self._duration_from_question(m.get("question", ""))
+            if q_dur in (5, 15):
+                dur = q_dur
             if self._is_exact_round_bounds(q_st, q_et, dur):
                 start_ts, end_ts = q_st, q_et
         if self._is_exact_round_bounds(start_ts, end_ts, dur):
