@@ -11228,6 +11228,39 @@ class LiveTrader:
                     ),
                 })
 
+        # If a row has cid-fallback rk (missing exact round bounds), align it to
+        # the nearest exact round for the same asset+duration.
+        if positions:
+            exact_ref = {}
+            for p in positions:
+                rk = str(p.get("rk", "") or "")
+                if "-cid" in rk:
+                    continue
+                k = (str(p.get("asset", "?")), int(p.get("duration", 0) or 0))
+                prev = exact_ref.get(k)
+                cand = (float(p.get("start_ts", 0.0) or 0.0), float(p.get("end_ts", 0.0) or 0.0))
+                if cand[1] <= 0:
+                    continue
+                if prev is None:
+                    exact_ref[k] = cand
+                    continue
+                # keep the round whose end_ts is closest to "now"
+                if abs(cand[1] - now_ts) < abs(prev[1] - now_ts):
+                    exact_ref[k] = cand
+            for p in positions:
+                rk = str(p.get("rk", "") or "")
+                if "-cid" not in rk:
+                    continue
+                k = (str(p.get("asset", "?")), int(p.get("duration", 0) or 0))
+                ref = exact_ref.get(k)
+                if not ref:
+                    continue
+                st_ref, et_ref = ref
+                if et_ref > 0:
+                    p["start_ts"] = float(st_ref)
+                    p["end_ts"] = float(et_ref)
+                    p["mins_left"] = round(max(0.0, (et_ref - now_ts) / 60.0), 1)
+
         # Avoid contradictory duplicate cards for the same asset and round slot.
         # Keep the strongest row (higher stake, valid open price preferred).
         if positions:
