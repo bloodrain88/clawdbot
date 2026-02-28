@@ -380,6 +380,7 @@ RUNTIME_JSON_LOG_ENABLED = os.environ.get("RUNTIME_JSON_LOG_ENABLED", "true").lo
 RUNTIME_JSON_LOG_ROTATE_DAILY = os.environ.get("RUNTIME_JSON_LOG_ROTATE_DAILY", "true").lower() == "true"
 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
+SHOW_DASHBOARD_FALLBACK = os.environ.get("SHOW_DASHBOARD_FALLBACK", "false").lower() == "true"
 STRICT_ONCHAIN_STATE = os.environ.get("STRICT_ONCHAIN_STATE", "true").lower() == "true"
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "true").lower() == "true"
 LOG_STATS_LOCAL = os.environ.get("LOG_STATS_LOCAL", "false").lower() == "true"
@@ -11147,57 +11148,58 @@ class LiveTrader:
                 "rk": self._round_key(cid=cid_norm, m=mkt, t=trade),
             })
 
-        # On-chain fallback rows (for positions not present in local pending state).
-        for cid, meta in list((self.onchain_open_meta_by_cid or {}).items()):
-            cid_norm = str(cid or "").strip().lower()
-            if not cid_norm or cid_norm in seen_cids_norm:
-                continue
-            seen_cids_norm.add(cid_norm)
-            stake = float((self.onchain_open_stake_by_cid or {}).get(cid, 0.0) or 0.0)
-            if stake <= 0:
-                stake = float((self.onchain_open_usdc_by_cid or {}).get(cid, 0.0) or 0.0)
-            if stake <= 0:
-                continue
-            asset = str(meta.get("asset", "?") or "?")
-            side = str(meta.get("side", "?") or "?")
-            entry = float(meta.get("entry", 0.5) or 0.5)
-            open_p = float(self._open_price_by_cid(cid) or 0.0)
-            if open_p <= 0:
-                open_p = float(meta.get("open_price", 0.0) or 0.0)
-            cl_p = self.cl_prices.get(asset, 0)
-            cl_ts = self.cl_updated.get(asset, 0)
-            rtds_p = self.prices.get(asset, 0)
-            _ph = self.price_history.get(asset)
-            rtds_ts = _ph[-1][0] if _ph else 0
-            cur_p = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
-            duration = int(meta.get("duration", 15) or 15)
-            end_ts = float(meta.get("end_ts", 0) or 0)
-            start_ts = float(meta.get("start_ts", 0) or 0)
-            if end_ts > 0 and duration > 0:
-                start_ts = end_ts - duration * 60.0
-            mins_left = max(0.0, (end_ts - now_ts) / 60.0) if end_ts > 0 else 0.0
-            if open_p > 0 and cur_p > 0:
-                pred_winner = "Up" if cur_p >= open_p else "Down"
-                lead = side == pred_winner
-                move_pct = (cur_p - open_p) / open_p * 100
-            else:
-                lead, move_pct = None, 0.0
-            token_id = self._midpoint_token_id_from_cid_side(cid, side, meta, None)
-            positions.append({
-                "asset": asset, "side": side, "entry": round(entry, 3),
-                "stake": round(stake, 2), "cur_p": round(cur_p, 2),
-                "open_p": round(open_p, 6), "move_pct": round(move_pct, 3),
-                "lead": lead, "mins_left": round(mins_left, 1),
-                "src": "fallback",
-                "cid_full": cid_norm,
-                "cid": cid_norm[:12], "start_ts": start_ts, "end_ts": end_ts,
-                "duration": duration, "token_id": token_id,
-                "rk": self._round_key(
-                    cid=cid_norm,
-                    m={"asset": asset, "duration": duration, "start_ts": start_ts, "end_ts": end_ts},
-                    t={"asset": asset, "side": side, "duration": duration, "end_ts": end_ts},
-                ),
-            })
+        # Optional fallback rows for on-chain positions not present in local pending state.
+        if SHOW_DASHBOARD_FALLBACK:
+            for cid, meta in list((self.onchain_open_meta_by_cid or {}).items()):
+                cid_norm = str(cid or "").strip().lower()
+                if not cid_norm or cid_norm in seen_cids_norm:
+                    continue
+                seen_cids_norm.add(cid_norm)
+                stake = float((self.onchain_open_stake_by_cid or {}).get(cid, 0.0) or 0.0)
+                if stake <= 0:
+                    stake = float((self.onchain_open_usdc_by_cid or {}).get(cid, 0.0) or 0.0)
+                if stake <= 0:
+                    continue
+                asset = str(meta.get("asset", "?") or "?")
+                side = str(meta.get("side", "?") or "?")
+                entry = float(meta.get("entry", 0.5) or 0.5)
+                open_p = float(self._open_price_by_cid(cid) or 0.0)
+                if open_p <= 0:
+                    open_p = float(meta.get("open_price", 0.0) or 0.0)
+                cl_p = self.cl_prices.get(asset, 0)
+                cl_ts = self.cl_updated.get(asset, 0)
+                rtds_p = self.prices.get(asset, 0)
+                _ph = self.price_history.get(asset)
+                rtds_ts = _ph[-1][0] if _ph else 0
+                cur_p = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
+                duration = int(meta.get("duration", 15) or 15)
+                end_ts = float(meta.get("end_ts", 0) or 0)
+                start_ts = float(meta.get("start_ts", 0) or 0)
+                if end_ts > 0 and duration > 0:
+                    start_ts = end_ts - duration * 60.0
+                mins_left = max(0.0, (end_ts - now_ts) / 60.0) if end_ts > 0 else 0.0
+                if open_p > 0 and cur_p > 0:
+                    pred_winner = "Up" if cur_p >= open_p else "Down"
+                    lead = side == pred_winner
+                    move_pct = (cur_p - open_p) / open_p * 100
+                else:
+                    lead, move_pct = None, 0.0
+                token_id = self._midpoint_token_id_from_cid_side(cid, side, meta, None)
+                positions.append({
+                    "asset": asset, "side": side, "entry": round(entry, 3),
+                    "stake": round(stake, 2), "cur_p": round(cur_p, 2),
+                    "open_p": round(open_p, 6), "move_pct": round(move_pct, 3),
+                    "lead": lead, "mins_left": round(mins_left, 1),
+                    "src": "fallback",
+                    "cid_full": cid_norm,
+                    "cid": cid_norm[:12], "start_ts": start_ts, "end_ts": end_ts,
+                    "duration": duration, "token_id": token_id,
+                    "rk": self._round_key(
+                        cid=cid_norm,
+                        m={"asset": asset, "duration": duration, "start_ts": start_ts, "end_ts": end_ts},
+                        t={"asset": asset, "side": side, "duration": duration, "end_ts": end_ts},
+                    ),
+                })
 
         # Keep one row per CID (already ensured by seen_cids_norm above).
         # Do not collapse by asset/duration/side: multiple real opens can share
@@ -11311,7 +11313,7 @@ class LiveTrader:
             "pnl": round(pnl, 2), "roi": round(roi, 1),
             "usdc": round(self.onchain_usdc_balance, 2),
             "open_stake": round(self.onchain_open_stake_total, 2),
-            "open_count": self.onchain_open_count,
+            "open_count": len(positions),
             "open_mark": round(self.onchain_open_mark_value, 2),
             "total_equity": round(display_bank, 2),
             "prices": {a: round(p, 2) for a, p in self.prices.items() if p > 0},
