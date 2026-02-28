@@ -272,10 +272,15 @@ MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "0"))
 BLOCK_SCORE_S0_8_15M  = os.environ.get("BLOCK_SCORE_S0_8_15M",  "false").lower() == "true"
 BLOCK_SCORE_S9_11_15M = os.environ.get("BLOCK_SCORE_S9_11_15M", "false").lower() == "true"
 BLOCK_SCORE_S12P_15M  = os.environ.get("BLOCK_SCORE_S12P_15M",  "false").lower() == "true"
+SCORE_BLOCK_SOFT_MODE = os.environ.get("SCORE_BLOCK_SOFT_MODE", "true").lower() == "true"
+SCORE_BLOCK_SOFT_EDGE_PEN = float(os.environ.get("SCORE_BLOCK_SOFT_EDGE_PEN", "0.010"))
 # Profit guard: low-score 15m performs poorly in 30-50c band; keep only >50c by default.
 MIN_ENTRY_PRICE_S0_8_15M = float(os.environ.get("MIN_ENTRY_PRICE_S0_8_15M", "0.50"))  # 0=disabled
 BLOCK_ASSET_SOL_15M = os.environ.get("BLOCK_ASSET_SOL_15M", "false").lower() == "true"
 BLOCK_ASSET_XRP_15M = os.environ.get("BLOCK_ASSET_XRP_15M", "false").lower() == "true"
+ASSET_BLOCK_SOFT_MODE = os.environ.get("ASSET_BLOCK_SOFT_MODE", "true").lower() == "true"
+ASSET_BLOCK_SOFT_SCORE_PEN = int(os.environ.get("ASSET_BLOCK_SOFT_SCORE_PEN", "2"))
+ASSET_BLOCK_SOFT_EDGE_PEN = float(os.environ.get("ASSET_BLOCK_SOFT_EDGE_PEN", "0.008"))
 MIN_TRUE_PROB_GATE_15M = float(os.environ.get("MIN_TRUE_PROB_GATE_15M", "0.50"))
 MIN_TRUE_PROB_GATE_5M  = float(os.environ.get("MIN_TRUE_PROB_GATE_5M",  "0.50"))
 ROLLING3_WIN_SCORE_PEN = int(os.environ.get("ROLLING3_WIN_SCORE_PEN", "0"))
@@ -5470,9 +5475,9 @@ class LiveTrader:
             and current > 0
             and duration in (5, 15)
         ):
-            lock_mins = LATE_DIR_LOCK_MIN_LEFT_5M if duration <= 5 else LATE_DIR_LOCK_MIN_LEFT_15M
+            lock_mins, lock_move_min = self._late_lock_thresholds(duration)
             move_abs = abs((current - open_price) / max(open_price, 1e-9))
-            if mins_left <= lock_mins and move_abs >= LATE_DIR_LOCK_MIN_MOVE_PCT:
+            if mins_left <= lock_mins and move_abs >= lock_move_min:
                 beat_dir = "Up" if current >= open_price else "Down"
                 if side != beat_dir:
                     if self._noisy_log_enabled(f"late-lock-score:{asset}:{side}", LOG_SKIP_EVERY_SEC):
@@ -5966,24 +5971,42 @@ class LiveTrader:
         # Per-asset blocking for 15m
         if duration >= 15:
             asset = m.get("asset", "")
-            if BLOCK_ASSET_SOL_15M and asset == "SOL":
-                self._skip_tick("asset_blocked_sol")
-                return None
-            if BLOCK_ASSET_XRP_15M and asset == "XRP":
-                self._skip_tick("asset_blocked_xrp")
-                return None
+            if (BLOCK_ASSET_SOL_15M and asset == "SOL") or (BLOCK_ASSET_XRP_15M and asset == "XRP"):
+                if ASSET_BLOCK_SOFT_MODE:
+                    score -= max(0, ASSET_BLOCK_SOFT_SCORE_PEN)
+                    edge -= max(0.0, ASSET_BLOCK_SOFT_EDGE_PEN)
+                    if self._noisy_log_enabled(f"asset-softgate:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[ASSET-GATE]{RS} {asset} {duration}m soft "
+                            f"(score-={ASSET_BLOCK_SOFT_SCORE_PEN} edge-={ASSET_BLOCK_SOFT_EDGE_PEN:.3f})"
+                        )
+                    if score < max(3, min_score_local - 1):
+                        self._skip_tick("asset_soft_blocked_low_score")
+                        return None
+                else:
+                    self._skip_tick("asset_blocked_sol" if asset == "SOL" else "asset_blocked_xrp")
+                    return None
         # Per-tier blocking via env vars (default all off)
         if duration >= 15:
             score_tier = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
-            if score_tier == "s0-8"  and BLOCK_SCORE_S0_8_15M:
-                self._skip_tick("score_tier_blocked_s0_8")
-                return None
-            if score_tier == "s9-11" and BLOCK_SCORE_S9_11_15M:
-                self._skip_tick("score_tier_blocked_s9_11")
-                return None
-            if score_tier == "s12+"  and BLOCK_SCORE_S12P_15M:
-                self._skip_tick("score_tier_blocked_s12p")
-                return None
+            tier_blocked = (
+                (score_tier == "s0-8" and BLOCK_SCORE_S0_8_15M)
+                or (score_tier == "s9-11" and BLOCK_SCORE_S9_11_15M)
+                or (score_tier == "s12+" and BLOCK_SCORE_S12P_15M)
+            )
+            if tier_blocked:
+                if SCORE_BLOCK_SOFT_MODE:
+                    score -= 2
+                    edge -= max(0.0, SCORE_BLOCK_SOFT_EDGE_PEN)
+                    if score < max(3, min_score_local - 1):
+                        self._skip_tick(f"score_tier_soft_blocked_{score_tier}")
+                        return None
+                else:
+                    self._skip_tick(
+                        "score_tier_blocked_s0_8" if score_tier == "s0-8"
+                        else ("score_tier_blocked_s9_11" if score_tier == "s9-11" else "score_tier_blocked_s12p")
+                    )
+                    return None
             if score_tier == "s0-8" and MIN_ENTRY_PRICE_S0_8_15M > 0 and entry < MIN_ENTRY_PRICE_S0_8_15M:
                 self._skip_tick("score_s0_8_entry_too_low")
                 return None
@@ -7045,13 +7068,13 @@ class LiveTrader:
                 and duration in (5, 15)
                 and sig.get("open_price", 0) > 0
             ):
-                lock_mins = LATE_DIR_LOCK_MIN_LEFT_5M if duration <= 5 else LATE_DIR_LOCK_MIN_LEFT_15M
+                lock_mins, lock_move_min = self._late_lock_thresholds(duration)
                 if mins_left <= lock_mins:
                     cur_now = self._current_price(sig["asset"]) or sig.get("current", 0)
                     open_p = float(sig.get("open_price", 0) or 0)
                     if cur_now > 0 and open_p > 0:
                         move_abs = abs((cur_now - open_p) / max(open_p, 1e-9))
-                        if move_abs >= LATE_DIR_LOCK_MIN_MOVE_PCT:
+                        if move_abs >= lock_move_min:
                             beat_dir = "Up" if cur_now >= open_p else "Down"
                             if sig.get("side") != beat_dir:
                                 if self._noisy_log_enabled(f"late-lock-exec:{sig['asset']}:{sig.get('side','')}", LOG_SKIP_EVERY_SEC):
@@ -9712,10 +9735,17 @@ class LiveTrader:
         recent_wr_lb = float(snap.get("recent_wr_lb", 0.5) or 0.5)
 
         target = float(pol.get("target_daily_profit_usdc", 100.0) or 100.0)
-        soft_loss = abs(float(pol.get("soft_daily_loss_usdc", 25.0) or 25.0))
-        hard_loss = abs(float(pol.get("hard_daily_loss_usdc", 45.0) or 45.0))
-        soft_dd = abs(float(pol.get("soft_intraday_drawdown_usdc", 20.0) or 20.0))
-        hard_dd = abs(float(pol.get("hard_intraday_drawdown_usdc", 35.0) or 35.0))
+        base_soft_loss = abs(float(pol.get("soft_daily_loss_usdc", 25.0) or 25.0))
+        base_hard_loss = abs(float(pol.get("hard_daily_loss_usdc", 45.0) or 45.0))
+        base_soft_dd = abs(float(pol.get("soft_intraday_drawdown_usdc", 20.0) or 20.0))
+        base_hard_dd = abs(float(pol.get("hard_intraday_drawdown_usdc", 35.0) or 35.0))
+        # Dynamic thresholds from realized PnL volatility (agentic, regime-aware).
+        rp = [abs(float(x or 0.0)) for x in list(self.recent_pnl)[-30:]]
+        avg_abs = (sum(rp) / len(rp)) if rp else 2.5
+        soft_loss = max(base_soft_loss, avg_abs * 5.0)
+        hard_loss = max(base_hard_loss, avg_abs * 8.0)
+        soft_dd = max(base_soft_dd, avg_abs * 4.0)
+        hard_dd = max(base_hard_dd, avg_abs * 7.0)
         m_boost = float(pol.get("size_mult_boost", 1.12) or 1.12)
         m_norm = float(pol.get("size_mult_normal", 1.0) or 1.0)
         m_soft = float(pol.get("size_mult_soft", 0.82) or 0.82)
@@ -9748,6 +9778,26 @@ class LiveTrader:
                 f"day_pnl={day_pnl:+.2f} day_dd={day_dd:.2f} "
                 f"pf20={recent_pf:.2f} wr_lb20={recent_wr_lb:.2f}"
             )
+
+    def _late_lock_thresholds(self, duration: int) -> tuple[float, float]:
+        """Adaptive late-lock thresholds; avoids rigid hardcoded behavior."""
+        lock_mins = LATE_DIR_LOCK_MIN_LEFT_5M if int(duration or 0) <= 5 else LATE_DIR_LOCK_MIN_LEFT_15M
+        move_min = float(LATE_DIR_LOCK_MIN_MOVE_PCT)
+        snap = self._growth_snapshot()
+        pf = float(snap.get("recent_pf", 1.0) or 1.0)
+        wr_lb = float(snap.get("recent_wr_lb", 0.5) or 0.5)
+        mode = str(self._autopilot_mode or "normal")
+
+        if mode == "boost" and pf >= 1.10 and wr_lb >= 0.50:
+            lock_mins = max(0.8, lock_mins - (0.5 if int(duration or 0) <= 5 else 1.0))
+            move_min = min(0.0030, move_min + 0.00008)
+        elif mode in ("soft-protect", "hard-protect"):
+            lock_mins = min(lock_mins + (0.4 if mode == "soft-protect" else 0.8), 3.5 if int(duration or 0) <= 5 else 8.5)
+            move_min = max(0.00012, move_min - (0.00003 if mode == "soft-protect" else 0.00006))
+        # Global clamps to prevent pathological no-trade behavior.
+        lock_mins = max(0.8, min(3.5 if int(duration or 0) <= 5 else 8.5, lock_mins))
+        move_min = max(0.00010, min(0.0035, move_min))
+        return lock_mins, move_min
 
     def _five_m_quality_snapshot(self, window: int | None = None) -> dict:
         """Rolling settled quality snapshot for 5m only (from on-chain resolved samples)."""
@@ -12349,11 +12399,11 @@ class LiveTrader:
             return True
         execq_all = [e for e in execq_all if _buck_active(e["bucket"])]
         active_gates: list = []
-        if BLOCK_SCORE_S9_11_15M: active_gates.append("no s9-11")
-        if BLOCK_SCORE_S0_8_15M:  active_gates.append("no s0-8")
-        if BLOCK_SCORE_S12P_15M:  active_gates.append("no s12+")
-        if BLOCK_ASSET_SOL_15M:   active_gates.append("no SOL")
-        if BLOCK_ASSET_XRP_15M:   active_gates.append("no XRP")
+        if BLOCK_SCORE_S9_11_15M: active_gates.append("soft s9-11" if SCORE_BLOCK_SOFT_MODE else "no s9-11")
+        if BLOCK_SCORE_S0_8_15M:  active_gates.append("soft s0-8" if SCORE_BLOCK_SOFT_MODE else "no s0-8")
+        if BLOCK_SCORE_S12P_15M:  active_gates.append("soft s12+" if SCORE_BLOCK_SOFT_MODE else "no s12+")
+        if BLOCK_ASSET_SOL_15M:   active_gates.append("soft SOL" if ASSET_BLOCK_SOFT_MODE else "no SOL")
+        if BLOCK_ASSET_XRP_15M:   active_gates.append("soft XRP" if ASSET_BLOCK_SOFT_MODE else "no XRP")
         if not ENABLE_5M:         active_gates.append("5m off")
         if MIN_ENTRY_PRICE_S0_8_15M > 0:
             active_gates.append(f"s0-8\u2265{MIN_ENTRY_PRICE_S0_8_15M:.2f}")
