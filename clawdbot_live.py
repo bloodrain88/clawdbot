@@ -9329,23 +9329,28 @@ class LiveTrader:
         """Count how many OTHER assets are trending in the same direction right now.
         Uses Binance RTDS price vs window open_price as primary signal; falls back to
         Kalman velocity when the price move is too small (<0.03%) to be directionally
-        reliable (first ~60s of a new window). Returns 0-3."""
+        reliable (first ~60s of a new window). Returns 0-3.
+        Each distinct asset is counted at most once (uses freshest window open_price)."""
         is_up = (direction == "Up")
         count = 0
         now_ts = _time.time()
+        seen_assets: set[str] = set()
         for cid, m in self.active_mkts.items():
             a = m.get("asset", "")
-            if a == asset:
+            if a == asset or a in seen_assets:
                 continue
             op  = self.open_prices.get(cid, 0)
+            if op <= 0:
+                continue
             # Prefer RTDS price; skip if stale (> 30s) to avoid false consensus from stale feed
             cur = self.prices.get(a, 0)
             ph = self.price_history.get(a)
             ts_cur = ph[-1][0] if ph else 0.0
             if cur <= 0 or (ts_cur > 0 and now_ts - ts_cur > 30.0):
                 cur = self.cl_prices.get(a, 0)
-            if op <= 0 or cur <= 0:
+            if cur <= 0:
                 continue
+            seen_assets.add(a)
             move_pct = abs(cur - op) / max(op, 1e-8)
             if move_pct >= 0.0003:
                 # Price has moved enough from open → trust direct price direction
@@ -11242,11 +11247,15 @@ class LiveTrader:
                     up_votes = 0
                     dn_votes = 0
                     move_sum = 0.0
-                    for m in candidates:
+                    # Use all active 15m markets (not just untraded candidates) for a fuller macro picture.
+                    _cons_mkts = list(self.active_mkts.values()) if self.active_mkts else candidates
+                    for m in _cons_mkts:
                         if int(m.get("duration", 0) or 0) < 15:
                             continue
-                        op = float(m.get("open_price", 0.0) or 0.0)
-                        cur = float(m.get("current", 0.0) or 0.0)
+                        _cid_c  = m.get("conditionId", "")
+                        _asset_c = m.get("asset", "")
+                        op = float(self.open_prices.get(_cid_c, 0.0) or 0.0)
+                        cur = float(self.prices.get(_asset_c, 0) or 0.0) or float(self.cl_prices.get(_asset_c, 0) or 0.0)
                         if op <= 0 or cur <= 0:
                             continue
                         rel = (cur - op) / max(op, 1e-9)
