@@ -391,6 +391,12 @@ SETTLED_FILE   = os.path.join(_DATA_DIR, "clawdbot_settled_cids.json")
 PRICE_CACHE_FILE = os.path.join(_DATA_DIR, "clawdbot_price_cache.json")
 PRICE_CACHE_SAVE_SEC = float(os.environ.get("PRICE_CACHE_SAVE_SEC", "20"))
 PRICE_CACHE_POINTS = int(os.environ.get("PRICE_CACHE_POINTS", "300"))
+OPEN_STATE_CACHE_FILE = os.path.join(_DATA_DIR, "clawdbot_open_state_cache.json")
+OPEN_STATE_CACHE_SAVE_SEC = float(os.environ.get("OPEN_STATE_CACHE_SAVE_SEC", "15"))
+DASHBOARD_STRICT_CANONICAL = os.environ.get("DASHBOARD_STRICT_CANONICAL", "true").lower() == "true"
+DASHBOARD_FALLBACK_DEBUG = os.environ.get("DASHBOARD_FALLBACK_DEBUG", "false").lower() == "true"
+CID_MARKET_CACHE_MAX = int(os.environ.get("CID_MARKET_CACHE_MAX", "1200"))
+CID_MARKET_CACHE_TTL_SEC = float(os.environ.get("CID_MARKET_CACHE_TTL_SEC", str(7 * 86400)))
 PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false").lower() == "true"
 LOSS_STREAK_PAUSE_ENABLED = os.environ.get("LOSS_STREAK_PAUSE_ENABLED", "false").lower() == "true"
 LOSS_STREAK_PAUSE_N = int(os.environ.get("LOSS_STREAK_PAUSE_N", "3"))     # tightened 4→3
@@ -1251,6 +1257,7 @@ class LiveTrader:
         self.onchain_open_shares_by_cid = {}
         self.onchain_open_meta_by_cid = {}
         self.onchain_settling_usdc_by_cid = {}
+        self._open_state_cache_last_persist_ts = 0.0
         self.onchain_total_equity = BANKROLL
         self.onchain_snapshot_ts = 0.0
         self.daily_pnl       = 0.0
@@ -1261,7 +1268,7 @@ class LiveTrader:
             "outcomes": 0,
             "wins": 0,
         }
-        self._metrics_resolve_cache = {"ts": 0.0, "sig": None, "rows": []}
+        self._metrics_resolve_cache = {"ts": 0.0, "sig": None, "rows": [], "offset": 0}
         self.total           = 0
         self.wins            = 0
         self.start_time      = datetime.now(timezone.utc)
@@ -1322,6 +1329,7 @@ class LiveTrader:
         self._ws_last_heal_ts = 0.0
         self._skip_events = deque(maxlen=8000)  # (ts, reason)
         self._cid_family_cache  = {}
+        self._cid_market_cache  = {}
         self._prebid_plan       = {}
         self._copyflow_mtime    = 0.0
         self._copyflow_last_try = 0.0
@@ -1342,6 +1350,7 @@ class LiveTrader:
                         for a in ["BTC","ETH","SOL","XRP"]}
         self._init_log()
         self._load_price_cache()
+        self._load_open_state_cache()
         self._load_pending()
         self._load_stats()
         self._load_pnl_baseline()
@@ -2130,6 +2139,12 @@ class LiveTrader:
         cached = self._cid_family_cache.get(cid)
         if cached:
             return cached
+        m = await self._cid_market_cached(cid)
+        if m:
+            asset = str(m.get("asset", "?") or "?")
+            dur = int(m.get("duration", 0) or 0)
+            self._cid_family_cache[cid] = (asset, dur)
+            return asset, dur
         asset, dur = "?", 0
         try:
             rows = await self._http_get_json(
@@ -2160,6 +2175,76 @@ class LiveTrader:
             pass
         self._cid_family_cache[cid] = (asset, dur)
         return asset, dur
+
+    async def _cid_market_cached(self, cid: str) -> dict:
+        """ConditionId market metadata cache (persistent) to avoid repeated Gamma calls."""
+        cid = str(cid or "").strip()
+        if not cid:
+            return {}
+        cached = self._cid_market_cache.get(cid) or {}
+        now_ts = _time.time()
+        if cached:
+            cts = float(cached.get("_ts", 0.0) or 0.0)
+            if cts > 0 and (now_ts - cts) <= max(3600.0, CID_MARKET_CACHE_TTL_SEC):
+                return dict(cached)
+            if int(cached.get("duration", 0) or 0) in (5, 15) and float(cached.get("end_ts", 0.0) or 0.0) > 0:
+                # Round metadata is effectively immutable once known.
+                cached["_ts"] = now_ts
+                self._cid_market_cache[cid] = dict(cached)
+                return dict(cached)
+        if cached and cached.get("asset") and cached.get("duration"):
+            return dict(cached)
+        out = {
+            "asset": "?",
+            "duration": 0,
+            "start_ts": 0.0,
+            "end_ts": 0.0,
+            "token_up": "",
+            "token_down": "",
+            "question": "",
+            "series_slug": "",
+            "_ts": now_ts,
+        }
+        try:
+            rows = await self._http_get_json(
+                f"{GAMMA}/markets",
+                params={"conditionId": cid},
+                timeout=8,
+            )
+            m = rows[0] if isinstance(rows, list) and rows else (rows if isinstance(rows, dict) else {})
+            out["question"] = str(m.get("question", "") or "")
+            slug = str(m.get("seriesSlug") or m.get("series_slug", "") or "")
+            out["series_slug"] = slug
+            if slug in SERIES:
+                out["asset"] = str(SERIES[slug]["asset"])
+                out["duration"] = int(SERIES[slug]["duration"])
+            else:
+                q = out["question"].lower()
+                if "bitcoin" in q:
+                    out["asset"] = "BTC"
+                elif "ethereum" in q:
+                    out["asset"] = "ETH"
+                elif "solana" in q:
+                    out["asset"] = "SOL"
+                elif "xrp" in q:
+                    out["asset"] = "XRP"
+                out["duration"] = 5 if "5m" in q else (15 if "15m" in q else 0)
+            es = m.get("endDate") or m.get("end_date", "")
+            ss = m.get("eventStartTime") or m.get("startDate") or m.get("start_date", "")
+            if isinstance(es, str) and es:
+                out["end_ts"] = datetime.fromisoformat(es.replace("Z", "+00:00")).timestamp()
+            if isinstance(ss, str) and ss:
+                out["start_ts"] = datetime.fromisoformat(ss.replace("Z", "+00:00")).timestamp()
+            _, token_up, token_down = self._map_updown_market_fields(m)
+            out["token_up"] = str(token_up or "")
+            out["token_down"] = str(token_down or "")
+        except Exception:
+            pass
+        out["_ts"] = _time.time()
+        self._cid_market_cache[cid] = dict(out)
+        if int(out.get("duration", 0) or 0) > 0:
+            self._cid_family_cache[cid] = (str(out.get("asset", "?") or "?"), int(out.get("duration", 0) or 0))
+        return dict(out)
 
     def _wallet_family_metrics(
         self,
@@ -3045,6 +3130,102 @@ class LiveTrader:
         except Exception:
             pass
 
+    def _save_open_state_cache(self, force: bool = False):
+        try:
+            now_ts = _time.time()
+            if not force and (now_ts - float(self._open_state_cache_last_persist_ts or 0.0)) < max(5.0, OPEN_STATE_CACHE_SAVE_SEC):
+                return
+            self._prune_cid_market_cache(now_ts=now_ts)
+            payload = {
+                "ts": now_ts,
+                "onchain_snapshot_ts": float(self.onchain_snapshot_ts or 0.0),
+                "onchain_open_cids": sorted(list(self.onchain_open_cids or set())),
+                "onchain_open_usdc_by_cid": dict(self.onchain_open_usdc_by_cid or {}),
+                "onchain_open_stake_by_cid": dict(self.onchain_open_stake_by_cid or {}),
+                "onchain_open_shares_by_cid": dict(self.onchain_open_shares_by_cid or {}),
+                "onchain_open_meta_by_cid": dict(self.onchain_open_meta_by_cid or {}),
+                "onchain_settling_usdc_by_cid": dict(self.onchain_settling_usdc_by_cid or {}),
+                "cid_family_cache": {
+                    str(k): [str(v[0]), int(v[1])] for k, v in (self._cid_family_cache or {}).items()
+                    if isinstance(v, (list, tuple)) and len(v) >= 2
+                },
+                "cid_market_cache": dict(self._cid_market_cache or {}),
+            }
+            with open(OPEN_STATE_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            self._open_state_cache_last_persist_ts = now_ts
+        except Exception:
+            pass
+
+    def _prune_cid_market_cache(self, now_ts: float | None = None):
+        try:
+            now_ts = float(now_ts or _time.time())
+            keep_keys = set(self.onchain_open_cids or set()) | set(self.pending.keys()) | set(self.pending_redeem.keys())
+            pruned = {}
+            rows = []
+            for cid, meta in (self._cid_market_cache or {}).items():
+                if not isinstance(meta, dict):
+                    continue
+                ts = float(meta.get("_ts", 0.0) or 0.0)
+                if ts <= 0:
+                    ts = now_ts
+                    meta["_ts"] = ts
+                fresh = (now_ts - ts) <= max(3600.0, CID_MARKET_CACHE_TTL_SEC)
+                if fresh or cid in keep_keys:
+                    rows.append((cid, meta, ts))
+            rows.sort(key=lambda x: x[2], reverse=True)
+            max_keep = max(200, int(CID_MARKET_CACHE_MAX))
+            for cid, meta, _ in rows[:max_keep]:
+                pruned[cid] = meta
+            self._cid_market_cache = pruned
+        except Exception:
+            pass
+
+    def _load_open_state_cache(self):
+        if not os.path.exists(OPEN_STATE_CACHE_FILE):
+            return
+        try:
+            with open(OPEN_STATE_CACHE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            self.onchain_snapshot_ts = float(data.get("onchain_snapshot_ts", 0.0) or 0.0)
+            if self.onchain_snapshot_ts > 0 and (_time.time() - self.onchain_snapshot_ts) > 1800:
+                self.onchain_snapshot_ts = 0.0
+            self.onchain_open_cids = set(str(x) for x in (data.get("onchain_open_cids") or []) if str(x))
+            self.onchain_open_usdc_by_cid = {
+                str(k): float(v or 0.0) for k, v in (data.get("onchain_open_usdc_by_cid") or {}).items()
+            }
+            self.onchain_open_stake_by_cid = {
+                str(k): float(v or 0.0) for k, v in (data.get("onchain_open_stake_by_cid") or {}).items()
+            }
+            self.onchain_open_shares_by_cid = {
+                str(k): float(v or 0.0) for k, v in (data.get("onchain_open_shares_by_cid") or {}).items()
+            }
+            self.onchain_open_meta_by_cid = dict(data.get("onchain_open_meta_by_cid") or {})
+            self.onchain_settling_usdc_by_cid = {
+                str(k): float(v or 0.0) for k, v in (data.get("onchain_settling_usdc_by_cid") or {}).items()
+            }
+            fam = data.get("cid_family_cache") or {}
+            if isinstance(fam, dict):
+                for cid, val in fam.items():
+                    if isinstance(val, (list, tuple)) and len(val) >= 2:
+                        self._cid_family_cache[str(cid)] = (str(val[0]), int(val[1]))
+            mk = data.get("cid_market_cache") or {}
+            if isinstance(mk, dict):
+                self._cid_market_cache = dict(mk)
+            self._prune_cid_market_cache(now_ts=_time.time())
+            self.onchain_open_count = len(self.onchain_open_cids)
+            self.onchain_redeemable_count = len(self.onchain_settling_usdc_by_cid)
+            self._open_state_cache_last_persist_ts = _time.time()
+            if self.onchain_open_count or self.onchain_redeemable_count:
+                print(
+                    f"{B}[BOOT]{RS} loaded open-state cache "
+                    f"(open={self.onchain_open_count} settling={self.onchain_redeemable_count})"
+                )
+        except Exception:
+            pass
+
     def _save_seen(self):
         try:
             with open(SEEN_FILE, "w") as f:
@@ -3277,6 +3458,7 @@ class LiveTrader:
 
     def status(self):
         self._save_price_cache(force=False)
+        self._save_open_state_cache(force=False)
         el   = datetime.now(timezone.utc) - self.start_time
         h, m = int(el.total_seconds()//3600), int(el.total_seconds()%3600//60)
         wr   = f"{self.wins/self.total*100:.1f}%" if self.total else "–"
@@ -10610,6 +10792,7 @@ class LiveTrader:
                 self.onchain_settling_usdc_by_cid = dict(onchain_settling_usdc_by_cid)
                 self.onchain_total_equity = total
                 self.onchain_snapshot_ts = _time.time()
+                self._save_open_state_cache(force=False)
                 bank_state = (
                     round(usdc, 2),
                     round(open_stake_total, 2),
@@ -10739,26 +10922,19 @@ class LiveTrader:
                     # Position exists on-chain but bot has no record — recover it
                     asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
                              else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
-                    # Fetch real end_ts from Gamma API
-                    end_ts = 0; start_ts = now_ts - 60; duration = 15
+                    # Resolve round bounds and tokens from cache (Gamma only on first miss).
+                    end_ts = 0
+                    start_ts = now_ts - 60
+                    duration = 15
                     token_up = token_down = ""
-                    try:
-                        mkt_data = await self._http_get_json(
-                            f"{GAMMA}/markets", params={"conditionId": cid}, timeout=8
-                        )
-                        mkt = mkt_data[0] if isinstance(mkt_data, list) and mkt_data else (
-                              mkt_data if isinstance(mkt_data, dict) else {})
-                        es = mkt.get("endDate") or mkt.get("end_date", "")
-                        ss = mkt.get("eventStartTime") or mkt.get("startDate", "")
-                        if es: end_ts   = datetime.fromisoformat(es.replace("Z","+00:00")).timestamp()
-                        if ss: start_ts = datetime.fromisoformat(ss.replace("Z","+00:00")).timestamp()
-                        slug = mkt.get("seriesSlug") or mkt.get("series_slug", "")
-                        if slug in SERIES:
-                            duration = SERIES[slug]["duration"]
-                            asset    = SERIES[slug]["asset"]
-                        _, token_up, token_down = self._map_updown_market_fields(mkt)
-                    except Exception:
-                        pass
+                    meta_c = await self._cid_market_cached(cid)
+                    if meta_c:
+                        duration = int(meta_c.get("duration", duration) or duration)
+                        asset = str(meta_c.get("asset", asset) or asset)
+                        start_ts = float(meta_c.get("start_ts", start_ts) or start_ts)
+                        end_ts = float(meta_c.get("end_ts", end_ts) or end_ts)
+                        token_up = str(meta_c.get("token_up", "") or "")
+                        token_down = str(meta_c.get("token_down", "") or "")
                     q_st, q_et = self._round_bounds_from_question(title)
                     if self._is_exact_round_bounds(q_st, q_et, duration):
                         start_ts, end_ts = q_st, q_et
@@ -11079,26 +11255,19 @@ class LiveTrader:
                     title = pos.get("title", "")
                     asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
                              else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
-                    # Fetch real end_ts from Gamma API — never use fake timestamps
-                    end_ts = 0; start_ts = now - 60; duration = 15
+                    # Resolve round bounds/tokens from persistent CID cache.
+                    end_ts = 0
+                    start_ts = now - 60
+                    duration = 15
                     token_up = token_down = ""
-                    try:
-                        mkt_data = await loop.run_in_executor(None, lambda c=cid: _req.get(
-                            f"{GAMMA}/markets", params={"conditionId": c}, timeout=8
-                        ).json())
-                        mkt = mkt_data[0] if isinstance(mkt_data, list) and mkt_data else (
-                              mkt_data if isinstance(mkt_data, dict) else {})
-                        es = mkt.get("endDate") or mkt.get("end_date", "")
-                        ss = mkt.get("eventStartTime") or mkt.get("startDate") or mkt.get("start_date", "")
-                        if es: end_ts   = datetime.fromisoformat(es.replace("Z","+00:00")).timestamp()
-                        if ss: start_ts = datetime.fromisoformat(ss.replace("Z","+00:00")).timestamp()
-                        slug = mkt.get("seriesSlug") or mkt.get("series_slug", "")
-                        if slug in SERIES:
-                            duration = SERIES[slug]["duration"]
-                            asset    = SERIES[slug]["asset"]
-                        _, token_up, token_down = self._map_updown_market_fields(mkt)
-                    except Exception:
-                        pass
+                    meta_c = await self._cid_market_cached(cid)
+                    if meta_c:
+                        duration = int(meta_c.get("duration", duration) or duration)
+                        asset = str(meta_c.get("asset", asset) or asset)
+                        start_ts = float(meta_c.get("start_ts", start_ts) or start_ts)
+                        end_ts = float(meta_c.get("end_ts", end_ts) or end_ts)
+                        token_up = str(meta_c.get("token_up", "") or "")
+                        token_down = str(meta_c.get("token_down", "") or "")
                     q_st, q_et = self._round_bounds_from_question(title)
                     if self._is_exact_round_bounds(q_st, q_et, duration):
                         start_ts, end_ts = q_st, q_et
@@ -11311,7 +11480,7 @@ class LiveTrader:
 
     # ── WEB DASHBOARD ─────────────────────────────────────────────────────────
     def _metrics_resolve_rows_cached(self, ttl_sec: float = 20.0) -> list[dict]:
-        """Cache RESOLVE rows from metrics file to avoid repeated full-file scans."""
+        """Incremental RESOLVE parser (append-only) to avoid repeated full-file scans."""
         import os as _os
         import time as _time
 
@@ -11324,13 +11493,27 @@ class LiveTrader:
             sig = None
         if cache.get("rows") and cache.get("sig") == sig and (now - float(cache.get("ts", 0.0) or 0.0)) < max(1.0, float(ttl_sec)):
             return cache.get("rows", [])
-        if cache.get("rows") and cache.get("sig") == sig:
-            cache["ts"] = now
-            return cache.get("rows", [])
-
-        rows: list[dict] = []
+        rows: list[dict] = list(cache.get("rows", []) or [])
+        prev_sig = cache.get("sig")
+        prev_off = int(cache.get("offset", 0) or 0)
+        full_reload = True
+        if prev_sig and sig and isinstance(prev_sig, tuple) and len(prev_sig) >= 3:
+            same_inode = int(prev_sig[0]) == int(sig[0])
+            size_grew = int(sig[1]) >= int(prev_sig[1])
+            if same_inode and size_grew:
+                full_reload = False
+        if prev_off < 0:
+            prev_off = 0
+        if full_reload:
+            rows = []
+            prev_off = 0
         try:
             with open(METRICS_FILE, encoding="utf-8") as f:
+                try:
+                    f.seek(prev_off)
+                except Exception:
+                    prev_off = 0
+                    f.seek(0)
                 for line in f:
                     try:
                         r = json.loads(line)
@@ -11349,9 +11532,11 @@ class LiveTrader:
                             "asset": str(r.get("asset", "?") or "?"),
                         }
                     )
+                end_off = int(f.tell())
         except Exception:
-            rows = cache.get("rows", [])
-        self._metrics_resolve_cache = {"ts": now, "sig": sig, "rows": rows}
+            rows = list(cache.get("rows", []) or [])
+            end_off = int(cache.get("offset", 0) or 0)
+        self._metrics_resolve_cache = {"ts": now, "sig": sig, "rows": rows, "offset": end_off}
         return rows
 
     def _dashboard_data(self) -> dict:
@@ -11458,7 +11643,7 @@ class LiveTrader:
             })
 
         # Optional fallback rows for on-chain positions not present in local pending state.
-        if SHOW_DASHBOARD_FALLBACK:
+        if SHOW_DASHBOARD_FALLBACK and DASHBOARD_FALLBACK_DEBUG:
             for cid, meta in list((self.onchain_open_meta_by_cid or {}).items()):
                 cid_norm = str(cid or "").strip().lower()
                 if not cid_norm or cid_norm in seen_cids_norm:
@@ -11610,6 +11795,23 @@ class LiveTrader:
                 )
                 filtered.append(rows_k[0])
             positions = filtered
+
+        # Strict source-of-truth mode for dashboard: keep only canonical round windows.
+        if DASHBOARD_STRICT_CANONICAL and positions:
+            strict_rows = []
+            for p in positions:
+                d = int(p.get("duration", 0) or 0)
+                st = float(p.get("start_ts", 0.0) or 0.0)
+                et = float(p.get("end_ts", 0.0) or 0.0)
+                if d in (5, 15):
+                    step = float(d * 60)
+                    if st <= 0 or et <= st:
+                        continue
+                    w = et - st
+                    if abs(w - step) > max(2.0, step * 0.25):
+                        continue
+                strict_rows.append(p)
+            positions = strict_rows
 
         # Keep one row per CID (already ensured by seen_cids_norm above).
         # Do not collapse by asset/duration/side: multiple real opens can share
