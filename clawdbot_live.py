@@ -278,7 +278,7 @@ ROUND_CONSENSUS_STRICT_15M = os.environ.get("ROUND_CONSENSUS_STRICT_15M", "true"
 ROUND_CONSENSUS_MOVE_BPS = float(os.environ.get("ROUND_CONSENSUS_MOVE_BPS", "1.5"))
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "0"))
-MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "0"))
+MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "4"))
 BLOCK_SCORE_S0_8_15M  = os.environ.get("BLOCK_SCORE_S0_8_15M",  "false").lower() == "true"
 BLOCK_SCORE_S9_11_15M = os.environ.get("BLOCK_SCORE_S9_11_15M", "false").lower() == "true"
 BLOCK_SCORE_S12P_15M  = os.environ.get("BLOCK_SCORE_S12P_15M",  "false").lower() == "true"
@@ -929,6 +929,12 @@ CL_AGE_WARN_SCORE_PEN = int(os.environ.get("CL_AGE_WARN_SCORE_PEN", "2"))
 WS_FALLBACK_SCORE_PEN = int(os.environ.get("WS_FALLBACK_SCORE_PEN", "0"))  # was 1; CLOB REST at age=0ms is real-time — no penalty
 WS_SOFT_SCORE_PEN = int(os.environ.get("WS_SOFT_SCORE_PEN", "2"))
 CACHE_MIN_KLINES = int(os.environ.get("CACHE_MIN_KLINES", "10"))
+RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
+RSI_OB     = float(os.environ.get("RSI_OB",    "65"))   # > RSI_OB → strong upward momentum confirmation
+RSI_OS     = float(os.environ.get("RSI_OS",    "35"))   # < RSI_OS → strong downward momentum confirmation
+WR_PERIOD  = int(os.environ.get("WR_PERIOD",  "14"))
+WR_OB      = float(os.environ.get("WR_OB",    "-20"))   # > WR_OB  → overbought / Up momentum confirmed
+WR_OS      = float(os.environ.get("WR_OS",    "-80"))   # < WR_OS  → oversold   / Down momentum confirmed
 JUMP_CONFIRM_SCORE = int(os.environ.get("JUMP_CONFIRM_SCORE", "2"))
 OB_HARD_BLOCK = float(os.environ.get("OB_HARD_BLOCK", "-0.40"))
 OB_SCORE_T3 = float(os.environ.get("OB_SCORE_T3", "0.25"))
@@ -3127,6 +3133,43 @@ class LiveTrader:
         varq   = sum((r - q * mu) ** 2 for r in q_rets) / ((len(q_rets) - 1) * q)
         return varq / var1
 
+    def _rsi(self, asset: str) -> float:
+        """RSI from 1m klines closes. Returns neutral 50.0 if insufficient data."""
+        n = RSI_PERIOD
+        klines = self.binance_cache.get(asset, {}).get("klines", [])
+        closes = [float(k[4]) for k in klines[-(n + 2):] if float(k[4]) > 0]
+        if len(closes) < n + 1:
+            return 50.0
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            d = closes[i] - closes[i - 1]
+            gains.append(max(d, 0.0))
+            losses.append(max(-d, 0.0))
+        ag = sum(gains) / len(gains)
+        al = sum(losses) / len(losses)
+        if al == 0:
+            return 100.0 if ag > 0 else 50.0
+        rs = ag / al
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def _williams_r(self, asset: str) -> float:
+        """Williams %R from 1m klines. Range -100 to 0. Returns -50 if insufficient."""
+        n = WR_PERIOD
+        klines = self.binance_cache.get(asset, {}).get("klines", [])
+        if len(klines) < n:
+            return -50.0
+        recent = klines[-n:]
+        highs = [float(k[2]) for k in recent if float(k[2]) > 0]
+        lows  = [float(k[3]) for k in recent if float(k[3]) > 0]
+        close = float(klines[-1][4]) if klines else 0.0
+        if not highs or not lows or close <= 0:
+            return -50.0
+        hh = max(highs)
+        ll = min(lows)
+        if hh <= ll:
+            return -50.0
+        return -100.0 * (hh - close) / (hh - ll)
+
     def _jump_detect(self, asset: str) -> tuple:
         """Z-score of last 10s move vs baseline tick vol.
         Returns (is_jump: bool, direction: str|None, z_score: float)."""
@@ -5293,6 +5336,17 @@ class LiveTrader:
             regime_mult = REGIME_MULT_MR
         else:
             regime_mult = 1.0
+
+        # RSI + Williams %R momentum oscillators (−1 to +2 pts)
+        # Both agree on strong momentum = +2; one only = +1; contra = -1
+        _rsi_val = self._rsi(asset)
+        _wr_val  = self._williams_r(asset)
+        if   (is_up  and _rsi_val >= RSI_OB       and _wr_val >= WR_OB):        score += 2
+        elif (not is_up and _rsi_val <= RSI_OS     and _wr_val <= WR_OS):        score += 2
+        elif (is_up  and (_rsi_val >= RSI_OB - 5  or  _wr_val >= WR_OB + 5)):   score += 1
+        elif (not is_up and (_rsi_val <= RSI_OS + 5 or _wr_val <= WR_OS - 5)):  score += 1
+        elif (is_up  and _rsi_val <= RSI_OS        and _wr_val <= WR_OS):        score -= 1
+        elif (not is_up and _rsi_val >= RSI_OB     and _wr_val >= WR_OB):        score -= 1
 
         # Log-likelihood true_prob — Bayesian combination of independent signals
         sigma_15m = self.vols.get(asset, 0.70) * (15 / (252 * 390)) ** 0.5
@@ -10334,7 +10388,7 @@ class LiveTrader:
             ev_net
             + edge * 0.38
             + payout * 0.03
-            + score * 0.003
+            + score * 0.005
             + cl_bonus
             + core_bonus
             + wallet_alpha
