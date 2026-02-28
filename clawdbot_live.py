@@ -7477,7 +7477,9 @@ class LiveTrader:
 
         # Execution backstop: never allow micro-notional orders even if upstream scoring/sync
         # accidentally emits a tiny size. This is the final safety net before on-chain send.
-        hard_min_notional = max(float(MIN_EXEC_NOTIONAL_USDC), float(MIN_BET_ABS), 1.0)
+        # Keep execution floor aligned with adaptive sizing logic.
+        # Using MIN_BET_ABS here can reject valid autopilot-sized trades.
+        hard_min_notional = max(float(MIN_EXEC_NOTIONAL_USDC), 1.0)
         if float(size_usdc or 0.0) < hard_min_notional:
             allow_bump = bool(core_position) and (bool(round_force) or FORCE_TRADE_EVERY_ROUND)
             target_min = hard_min_notional * max(1.0, float(ROUND_FORCE_MIN_NOTIONAL_MULT))
