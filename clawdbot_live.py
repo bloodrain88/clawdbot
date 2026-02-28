@@ -42,6 +42,10 @@ from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 from eth_account import Account
 try:
+    from prediction_agent import PredictionAgent
+except ModuleNotFoundError:
+    PredictionAgent = None
+try:
     from runtime_utils import NonceManager, ErrorTracker, BucketStats
 except ModuleNotFoundError:
     from collections import defaultdict
@@ -400,6 +404,11 @@ DASHBOARD_STRICT_CANONICAL = os.environ.get("DASHBOARD_STRICT_CANONICAL", "true"
 DASHBOARD_FALLBACK_DEBUG = os.environ.get("DASHBOARD_FALLBACK_DEBUG", "false").lower() == "true"
 CID_MARKET_CACHE_MAX = int(os.environ.get("CID_MARKET_CACHE_MAX", "1200"))
 CID_MARKET_CACHE_TTL_SEC = float(os.environ.get("CID_MARKET_CACHE_TTL_SEC", str(7 * 86400)))
+AUTOPILOT_ENABLED = os.environ.get("AUTOPILOT_ENABLED", "true").lower() == "true"
+AUTOPILOT_CHECK_SEC = float(os.environ.get("AUTOPILOT_CHECK_SEC", "12"))
+AUTOPILOT_POLICY_FILE = os.environ.get("AUTOPILOT_POLICY_FILE", os.path.join(_DATA_DIR, "clawdbot_autopilot_policy.json"))
+PRED_AGENT_ENABLED = os.environ.get("PRED_AGENT_ENABLED", "true").lower() == "true"
+PRED_AGENT_MIN_SAMPLES = int(os.environ.get("PRED_AGENT_MIN_SAMPLES", "24"))
 PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false").lower() == "true"
 LOSS_STREAK_PAUSE_ENABLED = os.environ.get("LOSS_STREAK_PAUSE_ENABLED", "false").lower() == "true"
 LOSS_STREAK_PAUSE_N = int(os.environ.get("LOSS_STREAK_PAUSE_N", "3"))     # tightened 4→3
@@ -1345,6 +1354,12 @@ class LiveTrader:
         self._last_round_pick   = ""
         self._last_round_best_ts = 0.0
         self._last_round_pick_ts = 0.0
+        self._pred_agent = None
+        if PRED_AGENT_ENABLED and PredictionAgent is not None:
+            try:
+                self._pred_agent = PredictionAgent(min_samples=PRED_AGENT_MIN_SAMPLES)
+            except Exception:
+                self._pred_agent = None
         # ── Mathematical signal state (EMA + Kalman) ──────────────────────────
         _EMA_HLS = (5, 15, 30, 60, 120)
         self.emas    = {a: {hl: 0.0 for hl in _EMA_HLS} for a in ["BTC","ETH","SOL","XRP"]}
@@ -5825,6 +5840,42 @@ class LiveTrader:
         # Always take the best estimate: preserves aq/prior adjustments over plain base_prob
         true_prob = max(true_prob, base_prob)
         edge      = max(edge, base_edge)
+        if self._pred_agent is not None:
+            try:
+                _entry_hint = up_price if side == "Up" else (1.0 - up_price)
+                _buck_key = self._bucket_key(duration, score, _entry_hint)
+                pred_ctx = {
+                    "asset": asset,
+                    "duration": duration,
+                    "side": side,
+                    "current": current,
+                    "open_price": open_price,
+                    "mins_left": mins_left,
+                    "base_prob": true_prob,
+                    "base_edge": edge,
+                    "score": score,
+                    "bucket_key": _buck_key,
+                }
+                pred = self._pred_agent.predict(
+                    pred_ctx,
+                    list(self._resolved_samples),
+                    self._bucket_stats.rows,
+                )
+                p_new = float(pred.get("prob", true_prob) or true_prob)
+                e_adj = float(pred.get("edge_adj", 0.0) or 0.0)
+                s_adj = int(pred.get("score_adj", 0) or 0)
+                true_prob = max(PROB_CLAMP_MIN, min(PROB_CLAMP_MAX, p_new))
+                edge = edge + e_adj
+                score = score + s_adj
+                if self._noisy_log_enabled(f"pred-agent:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{B}[PRED-AGENT]{RS} {asset} {duration}m {side} "
+                        f"p={true_prob:.3f} ({pred.get('prob_adj',0.0):+.3f}) "
+                        f"edge_adj={e_adj:+.3f} score_adj={s_adj:+d} "
+                        f"samples={int(pred.get('samples_side',0) or 0)}"
+                    )
+            except Exception:
+                pass
         if duration <= 5 and px_align_conflict and data_div_pen_applied:
             if self._noisy_log_enabled(f"skip-5m-pxalign-div:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
