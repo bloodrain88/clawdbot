@@ -278,7 +278,7 @@ ROUND_CONSENSUS_STRICT_15M = os.environ.get("ROUND_CONSENSUS_STRICT_15M", "true"
 ROUND_CONSENSUS_MOVE_BPS = float(os.environ.get("ROUND_CONSENSUS_MOVE_BPS", "1.5"))
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "0"))
-MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "4"))
+MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "0"))
 BLOCK_SCORE_S0_8_15M  = os.environ.get("BLOCK_SCORE_S0_8_15M",  "false").lower() == "true"
 BLOCK_SCORE_S9_11_15M = os.environ.get("BLOCK_SCORE_S9_11_15M", "false").lower() == "true"
 BLOCK_SCORE_S12P_15M  = os.environ.get("BLOCK_SCORE_S12P_15M",  "false").lower() == "true"
@@ -5337,16 +5337,14 @@ class LiveTrader:
         else:
             regime_mult = 1.0
 
-        # RSI + Williams %R momentum oscillators (−1 to +2 pts)
-        # Both agree on strong momentum = +2; one only = +1; contra = -1
+        # RSI + Williams %R momentum oscillators (0 to +2 pts, purely additive)
+        # Both confirm strong momentum = +2; one only = +1; neutral or contra = 0
         _rsi_val = self._rsi(asset)
         _wr_val  = self._williams_r(asset)
         if   (is_up  and _rsi_val >= RSI_OB       and _wr_val >= WR_OB):        score += 2
         elif (not is_up and _rsi_val <= RSI_OS     and _wr_val <= WR_OS):        score += 2
         elif (is_up  and (_rsi_val >= RSI_OB - 5  or  _wr_val >= WR_OB + 5)):   score += 1
         elif (not is_up and (_rsi_val <= RSI_OS + 5 or _wr_val <= WR_OS - 5)):  score += 1
-        elif (is_up  and _rsi_val <= RSI_OS        and _wr_val <= WR_OS):        score -= 1
-        elif (not is_up and _rsi_val >= RSI_OB     and _wr_val >= WR_OB):        score -= 1
 
         # Log-likelihood true_prob — Bayesian combination of independent signals
         sigma_15m = self.vols.get(asset, 0.70) * (15 / (252 * 390)) ** 0.5
