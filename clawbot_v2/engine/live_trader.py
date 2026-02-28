@@ -41,6 +41,7 @@ from dotenv import load_dotenv
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 from eth_account import Account
+from clawbot_v2.data import HttpService
 try:
     from prediction_agent import PredictionAgent
 except ModuleNotFoundError:
@@ -1282,10 +1283,28 @@ class LiveTrader:
         self._pending_absent_counts = {}  # cid -> consecutive sync cycles absent from on-chain/API
         self.seen            = set()
         self._session        = None   # persistent aiohttp session
-        self._http_429_backoff: dict = {}  # host -> backoff_until timestamp
-        self._http_cache: dict = {}  # (url+params key) -> {"ts": float, "data": any}
-        self._http_host_last_ts: dict = {}  # host -> last request timestamp
-        self._http_host_locks: dict = {}  # host -> asyncio.Lock
+        self._http_429_backoff: dict = {}  # legacy field kept for compatibility
+        self._http_cache: dict = {}  # legacy field kept for compatibility
+        self._http_host_last_ts: dict = {}  # legacy field kept for compatibility
+        self._http_host_locks: dict = {}  # legacy field kept for compatibility
+        self._http_service = HttpService(
+            conn_limit=HTTP_CONN_LIMIT,
+            conn_per_host=HTTP_CONN_PER_HOST,
+            dns_ttl_sec=HTTP_DNS_TTL_SEC,
+            keepalive_sec=HTTP_KEEPALIVE_SEC,
+            min_gap_ms=HTTP_MIN_GAP_MS,
+            retries_429=HTTP_429_RETRIES,
+            retries_5xx=HTTP_5XX_RETRIES,
+            default_cache_ttl=HTTP_CACHE_DEFAULT_TTL_SEC,
+            default_stale_ttl=HTTP_CACHE_STALE_TTL_SEC,
+            should_log=self._should_log,
+            error_tick=lambda key, log_fn, err=None, every=20: (
+                getattr(self, "_errors", None).tick(key, log_fn, err=err, every=every)
+                if getattr(self, "_errors", None) is not None
+                else None
+            ),
+            log_warn=print,
+        )
         self._book_cache     = {}     # token_id -> {"ts_ms": float, "book": OrderBook}
         self._book_sem       = asyncio.Semaphore(max(1, BOOK_FETCH_CONCURRENCY))
         self._clob_market_ws = None
@@ -1980,107 +1999,17 @@ class LiveTrader:
         cache_ttl: float = HTTP_CACHE_DEFAULT_TTL_SEC,
         stale_ttl: float = HTTP_CACHE_STALE_TTL_SEC,
     ):
-        import json as _json
-        import random as _rnd
-        import urllib.parse as _up
-
-        now = _time.time()
-        _host = _up.urlparse(url).netloc
-        _pk = _json.dumps(params or {}, sort_keys=True, separators=(",", ":"))
-        _ck = f"{url}?{_pk}"
-        cached = self._http_cache.get(_ck)
-        if cached is not None and (now - float(cached.get("ts", 0.0) or 0.0)) <= max(0.0, cache_ttl):
-            return cached.get("data")
-
-        if self._session is None or self._session.closed:
-            connector = aiohttp.TCPConnector(
-                limit=max(1, HTTP_CONN_LIMIT),
-                limit_per_host=max(1, HTTP_CONN_PER_HOST),
-                ttl_dns_cache=max(0, HTTP_DNS_TTL_SEC),
-                enable_cleanup_closed=True,
-                keepalive_timeout=max(5.0, HTTP_KEEPALIVE_SEC),
-            )
-            self._session = aiohttp.ClientSession(
-                connector=connector,
-                headers={"User-Agent": "clawdbot-live/1.0"},
-            )
-
-        host_lock = self._http_host_locks.get(_host)
-        if host_lock is None:
-            host_lock = asyncio.Lock()
-            self._http_host_locks[_host] = host_lock
-
-        async with host_lock:
-            now = _time.time()
-            last_ts = float(self._http_host_last_ts.get(_host, 0.0) or 0.0)
-            min_gap = max(0.0, float(HTTP_MIN_GAP_MS) / 1000.0)
-            if last_ts > 0 and (now - last_ts) < min_gap:
-                await asyncio.sleep(min_gap - (now - last_ts))
-            self._http_host_last_ts[_host] = _time.time()
-
-            _bt = float(self._http_429_backoff.get(_host, 0.0) or 0.0)
-            if _bt > _time.time():
-                if cached is not None and (_time.time() - float(cached.get("ts", 0.0) or 0.0)) <= max(1.0, stale_ttl):
-                    return cached.get("data")
-                raise RuntimeError(f"http 429 backoff active for {_host} ({_bt - _time.time():.0f}s left)")
-
-            last_err = None
-            attempts = max(1, int(HTTP_429_RETRIES) + 1)
-            for i in range(attempts):
-                try:
-                    async with self._session.get(
-                        url,
-                        params=params,
-                        timeout=aiohttp.ClientTimeout(total=timeout),
-                    ) as r:
-                        if r.status == 429:
-                            retry_after = float(r.headers.get("Retry-After", "2") or 2.0)
-                            retry_after = max(1.0, retry_after)
-                            backoff_s = min(90.0, retry_after + (0.35 * i) + _rnd.uniform(0.05, 0.35))
-                            self._http_429_backoff[_host] = max(
-                                float(self._http_429_backoff.get(_host, 0.0) or 0.0),
-                                _time.time() + backoff_s,
-                            )
-                            if i < (attempts - 1):
-                                await asyncio.sleep(backoff_s)
-                                continue
-                            if cached is not None and (_time.time() - float(cached.get("ts", 0.0) or 0.0)) <= max(1.0, stale_ttl):
-                                if self._should_log(f"429-stale:{_host}", 45):
-                                    print(f"{Y}[HTTP]{RS} 429 {_host} -> using stale cache")
-                                return cached.get("data")
-                            raise RuntimeError(f"http 429 {url}")
-                        if r.status >= 500 and i < max(0, int(HTTP_5XX_RETRIES)):
-                            await asyncio.sleep(0.25 + (0.25 * i))
-                            continue
-                        if r.status >= 400:
-                            if cached is not None and (_time.time() - float(cached.get("ts", 0.0) or 0.0)) <= max(1.0, stale_ttl):
-                                return cached.get("data")
-                            raise RuntimeError(f"http {r.status} {url}")
-                        payload = await r.json()
-                        self._http_cache[_ck] = {"ts": _time.time(), "data": payload}
-                        return payload
-                except RuntimeError as e:
-                    last_err = e
-                except Exception as e:
-                    last_err = e
-                    if i < (attempts - 1):
-                        await asyncio.sleep(0.20 + (0.15 * i))
-                        continue
-
-            if cached is not None and (_time.time() - float(cached.get("ts", 0.0) or 0.0)) <= max(1.0, stale_ttl):
-                return cached.get("data")
-            self._errors.tick("http_get_json", print, err=last_err, every=20)
-            raise RuntimeError(f"http get failed: {url} err={last_err}")
+        return await self._http_service.get_json(
+            url,
+            params=params,
+            timeout=timeout,
+            cache_ttl=cache_ttl,
+            stale_ttl=stale_ttl,
+        )
 
     async def _gather_bounded(self, coros, limit: int):
         """Run awaitables with bounded concurrency to avoid network bursts."""
-        sem = asyncio.Semaphore(max(1, int(limit)))
-
-        async def _run(coro):
-            async with sem:
-                return await coro
-
-        return await asyncio.gather(*[_run(c) for c in coros], return_exceptions=True)
+        return await self._http_service.gather_bounded(list(coros), limit=limit)
 
     def _prune_order_event_cache(self):
         cutoff = _time.time() - max(10.0, USER_EVENTS_CACHE_TTL_SEC)
