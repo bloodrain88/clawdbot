@@ -6231,7 +6231,7 @@ class LiveTrader:
             and score >= 14
             and true_prob >= 0.66
             and edge >= 0.10
-            and execution_ev >= 0.018
+            and setup_q >= 0.60
             and cl_agree
         ):
             min_payout_req = min(min_payout_req, 1.80)
