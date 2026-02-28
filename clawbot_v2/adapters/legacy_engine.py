@@ -25,7 +25,7 @@ class LegacyEngine:
         self.log.warning(
             "running legacy engine through v2 adapter; migration in progress"
         )
-        from clawdbot_live import LiveTrader
+        from clawbot_v2.engine.live_trader import LiveTrader
 
         trader = LiveTrader()
         if self.settings.dashboard_mode == "external":
