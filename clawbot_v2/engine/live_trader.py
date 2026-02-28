@@ -261,6 +261,8 @@ LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 FORCE_TRADE_EVERY_ROUND = os.environ.get("FORCE_TRADE_EVERY_ROUND", "true").lower() == "true"
+NO_TRADE_RECOVERY_ENABLED = os.environ.get("NO_TRADE_RECOVERY_ENABLED", "true").lower() == "true"
+NO_TRADE_RECOVERY_ROUNDS = int(os.environ.get("NO_TRADE_RECOVERY_ROUNDS", "2"))
 ROUND_MAX_TRADES = int(os.environ.get("ROUND_MAX_TRADES", "2"))
 ROUND_SECOND_TRADE_PUSH_ONLY = os.environ.get("ROUND_SECOND_TRADE_PUSH_ONLY", "true").lower() == "true"
 ROUND_SECOND_TRADE_MIN_SCORE = int(os.environ.get("ROUND_SECOND_TRADE_MIN_SCORE", "12"))
@@ -1269,6 +1271,7 @@ class LiveTrader:
         self._live_rk_repair_ts = 0.0
         self._log_ts            = {}   # throttle map for repetitive logs
         self._scan_state_last   = None
+        self._no_trade_rounds = 0
         self._bank_state_last   = None
         self._open_ref_fetch_ts = {}
         self._markets_cache_ts  = 0.0  # last time Gamma API was actually fetched
@@ -7683,8 +7686,37 @@ class LiveTrader:
                         "end_ts": float(m_sig.get("end_ts", now + 60) or (now + 60)),
                     }
                     shadow_pending[f"__pick__{len(to_exec)}"] = (m_sig, t_sig)
+                counted_no_trade = False
+                if (
+                    NO_TRADE_RECOVERY_ENABLED
+                    and FORCE_TRADE_EVERY_ROUND
+                    and (not to_exec)
+                    and selected
+                    and slots > 0
+                    and not blackout_ev
+                ):
+                    self._no_trade_rounds += 1
+                    counted_no_trade = True
+                    if self._no_trade_rounds >= max(1, NO_TRADE_RECOVERY_ROUNDS):
+                        forced = dict(selected[0])
+                        forced["round_force_coverage"] = True
+                        forced["round_force_execute"] = True
+                        to_exec.append(forced)
+                        if self._should_log("round-no-trade-recovery", 10):
+                            print(
+                                f"{Y}[ROUND-RECOVERY]{RS} forcing execution after "
+                                f"{self._no_trade_rounds} empty rounds -> "
+                                f"{forced.get('asset','?')} {forced.get('duration','?')}m "
+                                f"{forced.get('side','?')} score={forced.get('score','?')}"
+                            )
                 if to_exec:
+                    self._no_trade_rounds = 0
                     await asyncio.gather(*[self._execute_trade(sig) for sig in to_exec])
+                elif selected:
+                    if not counted_no_trade:
+                        self._no_trade_rounds += 1
+                else:
+                    self._no_trade_rounds = max(0, self._no_trade_rounds - 1)
 
             await asyncio.sleep(SCAN_INTERVAL)
           except Exception as e:
