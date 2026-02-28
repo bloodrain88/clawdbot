@@ -554,6 +554,9 @@ async def _place_order(self, token_id, side, price, size_usdc, asset, duration, 
             edge_floor = min_edge_req if min_edge_req is not None else EXEC_EDGE_FLOOR_DEFAULT
             if not cl_agree:
                 edge_floor += EXEC_EDGE_FLOOR_NO_CL
+            if round_force:
+                # Forced round coverage: allow execution even with weak edge.
+                edge_floor = min(edge_floor, -0.03)
             strong_exec = (
                 (score >= 12)
                 and cl_agree
@@ -574,19 +577,21 @@ async def _place_order(self, token_id, side, price, size_usdc, asset, duration, 
                 print(f"{B}[LIMIT]{RS} {asset} {side} target={price:.3f} limit_edge={limit_edge:.3f} ask={best_ask:.3f}")
             elif score >= 10:
                 # High conviction: gate on maker edge (mid price), not taker (ask)
-                if maker_edge_est < 0:
+                if maker_edge_est < 0 and not round_force:
                     print(f"{Y}[SKIP] {asset} {side} [high-conv]: maker_edge={maker_edge_est:.3f} < 0 "
                           f"(mid={mid_est:.3f} model={true_prob:.3f}){RS}")
                     return None
                 print(f"{B}[EXEC-CHECK]{RS} {asset} {side} score={score} maker_edge={maker_edge_est:.3f} taker_edge={taker_edge:.3f}")
             else:
                 # Normal conviction: taker edge gate applies
-                if taker_edge < edge_floor:
+                if taker_edge < edge_floor and not round_force:
                     kind = "disagree" if not cl_agree else "directional"
                     print(f"{Y}[SKIP] {asset} {side} [{kind}]: taker_edge={taker_edge:.3f} < {edge_floor:.2f} "
                           f"(ask={best_ask:.3f} model={true_prob:.3f}){RS}")
                     return None
                 print(f"{B}[EXEC-CHECK]{RS} {asset} {side} edge={taker_edge:.3f} floor={edge_floor:.2f}")
+            if round_force and not use_limit and not force_taker:
+                force_taker = True
 
             # High conviction: skip maker, go straight to FOK taker for instant fill
             # FOK = Fill-or-Kill: fills completely at price or cancels instantly — no waiting
