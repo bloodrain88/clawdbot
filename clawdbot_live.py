@@ -5214,10 +5214,13 @@ class LiveTrader:
             elif net_disp < -sigma_15m * DISP_SIGMA_STRONG: score -= 2
             elif net_disp < -sigma_15m * DISP_SIGMA_MID: score -= 1
 
-        # Cross-asset confirmation: how many other assets trending same direction? (0-2 pts)
+        # Cross-asset confirmation: bonus for agreement, penalty for disagreement
         cross_count = self._cross_asset_direction(asset, direction)
+        cross_contra = self._cross_asset_direction(asset, "Down" if direction == "Up" else "Up")
         if   cross_count == 3: score += 2   # all other assets confirm → strong macro signal
         elif cross_count >= 2: score += 1   # majority confirm
+        elif cross_contra == 3: score -= 2  # all 3 other assets going opposite → macro headwind
+        elif cross_contra >= 2: score -= 1  # majority going opposite → mild headwind
 
         # Window-open OFI surge: fresh round + extreme aggTrade burst → strong directional signal
         # Enter at price ~0.50 (2x payout) with 62-68% win probability when all assets moving together
@@ -9190,8 +9193,9 @@ class LiveTrader:
 
     def _cross_asset_direction(self, asset: str, direction: str) -> int:
         """Count how many OTHER assets are trending in the same direction right now.
-        Uses current Binance RTDS price (preferred) vs each market's Chainlink open_price.
-        Only counts an asset when RTDS price is fresh (< 30s stale). Returns 0-3."""
+        Uses Binance RTDS price vs window open_price as primary signal; falls back to
+        Kalman velocity when the price move is too small (<0.03%) to be directionally
+        reliable (first ~60s of a new window). Returns 0-3."""
         is_up = (direction == "Up")
         count = 0
         now_ts = _time.time()
@@ -9208,7 +9212,18 @@ class LiveTrader:
                 cur = self.cl_prices.get(a, 0)
             if op <= 0 or cur <= 0:
                 continue
-            if (cur > op) == is_up:
+            move_pct = abs(cur - op) / max(op, 1e-8)
+            if move_pct >= 0.0003:
+                # Price has moved enough from open → trust direct price direction
+                dir_up = (cur > op)
+            else:
+                # Near window open: use Kalman velocity for instantaneous direction
+                kp = self._kalman_vel_prob(a)
+                if kp < 0.45 or kp > 0.55:
+                    dir_up = (kp > 0.50)
+                else:
+                    continue  # Kalman also undecided → skip this asset
+            if dir_up == is_up:
                 count += 1
         return count
 
