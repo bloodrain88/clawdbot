@@ -10,9 +10,14 @@ class PredictionAgent:
         self.min_samples = int(min_samples)
         self._pred_hist = deque(maxlen=max_hist)
         self._variant_stats = {
-            "balanced": {"n": 0, "wins": 0, "pnl": 0.0, "brier": 0.0},
-            "momentum": {"n": 0, "wins": 0, "pnl": 0.0, "brier": 0.0},
-            "empirical": {"n": 0, "wins": 0, "pnl": 0.0, "brier": 0.0},
+            "balanced": {"n": 0, "wins": 0, "pnl": 0.0, "brier": 0.0, "cal_err_ema": 0.25},
+            "momentum": {"n": 0, "wins": 0, "pnl": 0.0, "brier": 0.0, "cal_err_ema": 0.25},
+            "empirical": {"n": 0, "wins": 0, "pnl": 0.0, "brier": 0.0, "cal_err_ema": 0.25},
+        }
+        self._variant_reliability = {
+            "balanced": 1.0,
+            "momentum": 1.0,
+            "empirical": 1.0,
         }
         self._active_variant = "balanced"
         self._last_switch_ts = 0.0
@@ -107,6 +112,37 @@ class PredictionAgent:
         # Maximize realized quality: pnl per trade + conservative wr - calibration penalty.
         return (pnl_per * 0.18) + ((wr_lb - 0.5) * 0.65) - (brier * 0.10)
 
+    def _variant_weights(self, scores: dict):
+        keys = list(self._variant_stats.keys())
+        total_n = sum(int((self._variant_stats.get(k, {}) or {}).get("n", 0) or 0) for k in keys)
+        if total_n < max(6, self.min_samples // 2):
+            w = 1.0 / max(1, len(keys))
+            return {k: w for k in keys}
+        raw = {}
+        for k in keys:
+            st = self._variant_stats.get(k, {}) or {}
+            n = int(st.get("n", 0) or 0)
+            rel = float(self._variant_reliability.get(k, 1.0) or 1.0)
+            s = float(scores.get(k, 0.0) or 0.0)
+            warmup_pen = max(0.0, float(8 - n)) * 0.03
+            raw[k] = max(0.02, (rel * 0.7) + (s * 2.2) + 0.45 - warmup_pen)
+        z = sum(raw.values())
+        if z <= 1e-9:
+            w = 1.0 / max(1, len(keys))
+            return {k: w for k in keys}
+        return {k: float(v) / z for k, v in raw.items()}
+
+    def _calibrate_prob(self, p: float, active: str):
+        st = self._variant_stats.get(active, {}) or {}
+        n = int(st.get("n", 0) or 0)
+        if n < self.min_samples:
+            return self._clamp_prob(p)
+        cal_err_ema = float(st.get("cal_err_ema", 0.25) or 0.25)
+        # When recent calibration error rises, softly shrink confidence toward 0.5.
+        shrink = max(0.0, min(0.45, (cal_err_ema - 0.20) * 1.10))
+        out = 0.5 + (float(p) - 0.5) * (1.0 - shrink)
+        return self._clamp_prob(out)
+
     def _pick_active_variant(self):
         scores = {k: self._variant_score(k) for k in self._variant_stats.keys()}
         best = max(scores.items(), key=lambda kv: kv[1])[0]
@@ -128,6 +164,8 @@ class PredictionAgent:
         _ = float(context.get("base_edge", 0.0) or 0.0)
         score = int(context.get("score", 0) or 0)
         bucket_key = str(context.get("bucket_key", "") or "")
+        quote_age_ms = float(context.get("quote_age_ms", 9e9) or 9e9)
+        analysis_quality = float(context.get("analysis_quality", 0.5) or 0.5)
 
         wr, wr_lb, exp, n_side = self._sample_prior(resolved_samples, asset, duration, side)
         b_wr_lb, b_exp, b_n = self._bucket_prior(bucket_rows, bucket_key)
@@ -171,7 +209,24 @@ class PredictionAgent:
             duration=duration,
         )
         active, scores = self._pick_active_variant()
-        prob = float(probs.get(active, base_prob))
+        weights = self._variant_weights(scores)
+        blend_prob = 0.0
+        for name, w in weights.items():
+            blend_prob += float(probs.get(name, 0.5) or 0.5) * float(w)
+        active_prob = float(probs.get(active, base_prob))
+        prob = (blend_prob * 0.70) + (active_prob * 0.30)
+        prob = self._calibrate_prob(prob, active)
+
+        if quote_age_ms > 2200:
+            prob = 0.5 + (prob - 0.5) * 0.80
+        elif quote_age_ms > 1400:
+            prob = 0.5 + (prob - 0.5) * 0.90
+        elif quote_age_ms <= 700:
+            prob = 0.5 + (prob - 0.5) * 1.03
+
+        if analysis_quality < 0.45:
+            prob = 0.5 + (prob - 0.5) * 0.92
+        prob = self._clamp_prob(prob)
         prob_adj = prob - base_prob
 
         edge_adj = prob_adj * 0.65
@@ -186,6 +241,10 @@ class PredictionAgent:
             score_adj -= 1
         if score >= 14 and prob_adj > 0:
             score_adj += 1
+        if quote_age_ms > 2200:
+            score_adj -= 1
+        elif quote_age_ms <= 700 and analysis_quality >= 0.60 and prob_adj > 0:
+            score_adj += 1
 
         out = {
             "prob": prob,
@@ -198,7 +257,9 @@ class PredictionAgent:
             "exp_side": exp,
             "variant": active,
             "variant_probs": probs,
+            "variant_weights": weights,
             "variant_scores": scores,
+            "quote_age_ms": quote_age_ms,
         }
         self._pred_hist.append({"ts": time.time(), "ctx": context, "out": out})
         return out
@@ -216,7 +277,14 @@ class PredictionAgent:
                 st["n"] = int(st.get("n", 0) or 0) + 1
                 st["wins"] = int(st.get("wins", 0) or 0) + (1 if won else 0)
                 st["pnl"] = float(st.get("pnl", 0.0) or 0.0) + float(pnl or 0.0)
-                st["brier"] = float(st.get("brier", 0.0) or 0.0) + ((p - y) ** 2)
+                err = (p - y) ** 2
+                st["brier"] = float(st.get("brier", 0.0) or 0.0) + err
+                prev_cal = float(st.get("cal_err_ema", 0.25) or 0.25)
+                st["cal_err_ema"] = (prev_cal * 0.96) + (err * 0.04)
+                hit = 1.0 if ((p >= 0.5) == bool(won)) else 0.0
+                rel_prev = float(self._variant_reliability.get(name, 1.0) or 1.0)
+                rel_new = (rel_prev * 0.97) + ((0.60 + 0.80 * hit) * 0.03)
+                self._variant_reliability[name] = max(0.35, min(1.65, rel_new))
             # Re-pick best variant after each settled trade.
             self._pick_active_variant()
         except Exception:

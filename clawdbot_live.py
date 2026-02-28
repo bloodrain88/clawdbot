@@ -631,6 +631,13 @@ FAST_TAKER_EDGE_DIFF_MAX = float(os.environ.get("FAST_TAKER_EDGE_DIFF_MAX", "0.0
 FAST_TAKER_EARLY_WINDOW_SEC_5M = float(os.environ.get("FAST_TAKER_EARLY_WINDOW_SEC_5M", "45"))
 FAST_TAKER_EARLY_WINDOW_SEC_15M = float(os.environ.get("FAST_TAKER_EARLY_WINDOW_SEC_15M", "75"))
 FAST_FOK_MIN_DEPTH_RATIO = float(os.environ.get("FAST_FOK_MIN_DEPTH_RATIO", "1.00"))
+EXEC_SPEED_PRIORITY_ENABLED = os.environ.get("EXEC_SPEED_PRIORITY_ENABLED", "true").lower() == "true"
+FAST_TAKER_SPEED_SCORE_5M = int(os.environ.get("FAST_TAKER_SPEED_SCORE_5M", "9"))
+FAST_TAKER_SPEED_SCORE_15M = int(os.environ.get("FAST_TAKER_SPEED_SCORE_15M", "10"))
+FAST_PATH_MAX_BOOK_AGE_MS = float(os.environ.get("FAST_PATH_MAX_BOOK_AGE_MS", "1300"))
+MAX_MAKER_HOLD_5M_SEC = float(os.environ.get("MAX_MAKER_HOLD_5M_SEC", "0.28"))
+MAX_MAKER_HOLD_15M_SEC = float(os.environ.get("MAX_MAKER_HOLD_15M_SEC", "0.42"))
+ORDER_LATENCY_LOG_ENABLED = os.environ.get("ORDER_LATENCY_LOG_ENABLED", "true").lower() == "true"
 MAX_TAKER_SLIP_BPS_5M = float(os.environ.get("MAX_TAKER_SLIP_BPS_5M", "80"))
 MAX_TAKER_SLIP_BPS_15M = float(os.environ.get("MAX_TAKER_SLIP_BPS_15M", "70"))
 MAX_BOOK_SPREAD_5M = float(os.environ.get("MAX_BOOK_SPREAD_5M", "0.060"))
@@ -5926,6 +5933,8 @@ class LiveTrader:
                     "base_edge": edge,
                     "score": score,
                     "bucket_key": _buck_key,
+                    "quote_age_ms": quote_age_ms,
+                    "analysis_quality": analysis_quality,
                 }
                 pred = self._pred_agent.predict(
                     pred_ctx,
@@ -7539,9 +7548,13 @@ class LiveTrader:
                         price=float(px_order),
                         order_type=OrderType.FOK,
                     )
+                    t_sign0 = _time.perf_counter()
                     signed = await loop.run_in_executor(None, lambda: self.clob.create_market_order(order_args))
+                    t_sign_ms = (_time.perf_counter() - t_sign0) * 1000.0
                     try:
+                        t_post0 = _time.perf_counter()
                         resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
+                        t_post_ms = (_time.perf_counter() - t_post0) * 1000.0
                     except Exception as e:
                         # FOK semantics: if not fully matched immediately, exchange returns a kill error.
                         # Treat this as unfilled (not a hard order failure).
@@ -7553,6 +7566,11 @@ class LiveTrader:
                         ):
                             return {"status": "killed", "orderID": "", "id": ""}, float(px_order)
                         raise
+                    if ORDER_LATENCY_LOG_ENABLED:
+                        print(
+                            f"{B}[ORDER-LAT]{RS} {asset} {side} {duration}m "
+                            f"fok sign={t_sign_ms:.0f}ms post={t_post_ms:.0f}ms"
+                        )
                     return resp, float(px_order)
 
                 # Use pre-fetched book from scoring phase (free — ran in parallel with Binance signals)
@@ -7599,6 +7617,11 @@ class LiveTrader:
                     best_ask = float(asks[0].price)
                     best_bid = float(bids[0].price) if bids else best_ask - 0.10
                     spread   = best_ask - best_bid
+                book_age_exec_ms = 9e9
+                if isinstance(pm_book_data, dict):
+                    bts = float(pm_book_data.get("ts", 0.0) or 0.0)
+                    if bts > 0:
+                        book_age_exec_ms = max(0.0, (_time.time() - bts) * 1000.0)
 
                 taker_edge     = true_prob - best_ask
                 mid_est        = (best_bid + best_ask) / 2
@@ -7661,6 +7684,7 @@ class LiveTrader:
                     eff_max_entry = max_entry_allowed if max_entry_allowed is not None else 0.99
                     fast_spread_cap = FAST_TAKER_SPREAD_MAX_5M if duration <= 5 else FAST_TAKER_SPREAD_MAX_15M
                     score_cap = FAST_TAKER_SCORE_5M if duration <= 5 else FAST_TAKER_SCORE_15M
+                    speed_score_cap = FAST_TAKER_SPEED_SCORE_5M if duration <= 5 else FAST_TAKER_SPEED_SCORE_15M
                     secs_elapsed = max(0.0, duration * 60.0 - max(0.0, mins_left * 60.0))
                     early_cut = FAST_TAKER_EARLY_WINDOW_SEC_5M if duration <= 5 else FAST_TAKER_EARLY_WINDOW_SEC_15M
                     # Execution-first path: when signal is strong and book is tradable, prefer instant fill.
@@ -7689,6 +7713,15 @@ class LiveTrader:
                         best_ask <= eff_max_entry
                         and taker_edge >= edge_floor
                         and (maker_edge_est - taker_edge) <= FAST_TAKER_EDGE_DIFF_MAX
+                    ):
+                        force_taker = True
+                    if (
+                        EXEC_SPEED_PRIORITY_ENABLED
+                        and (book_age_exec_ms <= FAST_PATH_MAX_BOOK_AGE_MS)
+                        and score >= speed_score_cap
+                        and spread <= (fast_spread_cap + 0.002)
+                        and best_ask <= eff_max_entry
+                        and taker_edge >= edge_floor
                     ):
                         force_taker = True
 
@@ -7854,8 +7887,17 @@ class LiveTrader:
                     size=float(round(size_tok_m, 2)),
                     side="BUY",
                 )
+                t_sign0 = _time.perf_counter()
                 signed  = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
+                t_sign_ms = (_time.perf_counter() - t_sign0) * 1000.0
+                t_post0 = _time.perf_counter()
                 resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.GTC))
+                t_post_ms = (_time.perf_counter() - t_post0) * 1000.0
+                if ORDER_LATENCY_LOG_ENABLED:
+                    print(
+                        f"{B}[ORDER-LAT]{RS} {asset} {side} {duration}m "
+                        f"maker sign={t_sign_ms:.0f}ms post={t_post_ms:.0f}ms"
+                    )
                 order_id = resp.get("orderID") or resp.get("id", "")
                 status   = resp.get("status", "")
 
@@ -7881,6 +7923,10 @@ class LiveTrader:
                 elif strong_exec and not use_limit:
                     # For strong setups, do not spend too long in maker limbo.
                     max_wait = min(max_wait, 0.25 if duration <= 5 else 0.30)
+                if EXEC_SPEED_PRIORITY_ENABLED and not use_limit:
+                    # Speed-first: keep maker exposure extremely short, then re-price via FOK.
+                    speed_cap = MAX_MAKER_HOLD_5M_SEC if duration <= 5 else MAX_MAKER_HOLD_15M_SEC
+                    max_wait = min(max_wait, speed_cap)
                 polls     = max(1, int(max_wait / poll_interval))
                 print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
                       f"waiting up to {polls*poll_interval}s for fill...{RS}")
