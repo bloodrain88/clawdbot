@@ -1354,6 +1354,12 @@ class LiveTrader:
         self._last_round_pick   = ""
         self._last_round_best_ts = 0.0
         self._last_round_pick_ts = 0.0
+        self._autopilot_size_mult = 1.0
+        self._autopilot_mode = "normal"
+        self._autopilot_last_eval_ts = 0.0
+        self._autopilot_day_key = ""
+        self._autopilot_day_peak = float(BANKROLL)
+        self._autopilot_policy = {}
         self._pred_agent = None
         if PRED_AGENT_ENABLED and PredictionAgent is not None:
             try:
@@ -1369,6 +1375,7 @@ class LiveTrader:
                         for a in ["BTC","ETH","SOL","XRP"]}
         self._init_log()
         self._init_metrics_db()
+        self._load_autopilot_policy()
         self._load_price_cache()
         self._load_open_state_cache()
         self._load_pending()
@@ -5840,6 +5847,8 @@ class LiveTrader:
         # Always take the best estimate: preserves aq/prior adjustments over plain base_prob
         true_prob = max(true_prob, base_prob)
         edge      = max(edge, base_edge)
+        pred_variant = ""
+        pred_variant_probs = {}
         if self._pred_agent is not None:
             try:
                 _entry_hint = up_price if side == "Up" else (1.0 - up_price)
@@ -5867,11 +5876,13 @@ class LiveTrader:
                 true_prob = max(PROB_CLAMP_MIN, min(PROB_CLAMP_MAX, p_new))
                 edge = edge + e_adj
                 score = score + s_adj
+                pred_variant = str(pred.get("variant", "") or "")
+                pred_variant_probs = dict(pred.get("variant_probs", {}) or {})
                 if self._noisy_log_enabled(f"pred-agent:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                     print(
                         f"{B}[PRED-AGENT]{RS} {asset} {duration}m {side} "
                         f"p={true_prob:.3f} ({pred.get('prob_adj',0.0):+.3f}) "
-                        f"edge_adj={e_adj:+.3f} score_adj={s_adj:+d} "
+                        f"edge_adj={e_adj:+.3f} score_adj={s_adj:+d} variant={pred_variant or 'na'} "
                         f"samples={int(pred.get('samples_side',0) or 0)}"
                     )
             except Exception:
@@ -6827,6 +6838,16 @@ class LiveTrader:
                             f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet cap(final) "
                             f"x={payout_mult:.2f} ${old_size:.2f}->${size:.2f}"
                         )
+        # Global autonomous policy multiplier (never zeroed by policy).
+        ap_mult = max(0.25, min(1.35, float(self._autopilot_size_mult or 1.0)))
+        if abs(ap_mult - 1.0) > 1e-9:
+            old_size = float(size)
+            size = max(float(MIN_EXEC_NOTIONAL_USDC), round(min(hard_cap, old_size * ap_mult), 2))
+            if self._noisy_log_enabled(f"autopilot-size:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{B}[SIZE-TUNE]{RS} {asset} {duration}m {side} autopilot "
+                    f"{self._autopilot_mode} x{ap_mult:.2f} ${old_size:.2f}->${size:.2f}"
+                )
         # Immediate fills: FOK on strong signal, GTC limit otherwise
         # Limit orders (use_limit=True) are always GTC — force_taker stays False
         force_taker = (not use_limit) and (
@@ -6887,12 +6908,16 @@ class LiveTrader:
             "recent_side_score_adj": recent_side_score_adj,
             "recent_side_edge_adj": recent_side_edge_adj,
             "recent_side_prob_adj": recent_side_prob_adj,
+            "pred_variant": pred_variant,
+            "pred_variant_probs": pred_variant_probs,
             "rolling_n": int(rolling_profile.get("n", 0) or 0),
             "rolling_exp": float(rolling_profile.get("exp", 0.0) or 0.0),
             "rolling_wr_lb": float(rolling_profile.get("wr_lb", 0.5) or 0.5),
             "rolling_prob_add": float(rolling_profile.get("prob_add", 0.0) or 0.0),
             "rolling_ev_add": float(rolling_profile.get("ev_add", 0.0) or 0.0),
             "rolling_size_mult": float(rolling_profile.get("size_mult", 1.0) or 1.0),
+            "autopilot_mode": self._autopilot_mode,
+            "autopilot_size_mult": float(self._autopilot_size_mult or 1.0),
             "min_payout_req": min_payout_req,
             "min_ev_req": min_ev_req,
             "analysis_quality": analysis_quality,
@@ -7141,6 +7166,10 @@ class LiveTrader:
                 "recent_side_score_adj": sig.get("recent_side_score_adj", 0),
                 "recent_side_edge_adj": sig.get("recent_side_edge_adj", 0.0),
                 "recent_side_prob_adj": sig.get("recent_side_prob_adj", 0.0),
+                "pred_variant": sig.get("pred_variant", ""),
+                "pred_variant_probs": sig.get("pred_variant_probs", {}),
+                "autopilot_mode": sig.get("autopilot_mode", ""),
+                "autopilot_size_mult": sig.get("autopilot_size_mult", 1.0),
                 "rolling_n": sig.get("rolling_n", 0),
                 "rolling_exp": sig.get("rolling_exp", 0.0),
                 "rolling_wr_lb": sig.get("rolling_wr_lb", 0.5),
@@ -7187,6 +7216,9 @@ class LiveTrader:
                 "quote_age_ms": round(sig.get("quote_age_ms", 0.0), 2),
                 "bucket": stat_bucket,
                 "round_key": round_key,
+                "pred_variant": sig.get("pred_variant", ""),
+                "autopilot_mode": sig.get("autopilot_mode", ""),
+                "autopilot_size_mult": sig.get("autopilot_size_mult", 1.0),
                 "booster_mode": bool(is_booster),
                 "booster_note": sig.get("booster_note", ""),
                 "duration": sig.get("duration", 15),
@@ -8264,6 +8296,8 @@ class LiveTrader:
                             self._record_result(asset, side, True, trade.get("structural", False), pnl=pnl)
                             self._record_resolved_sample(trade, pnl, True)
                             self._record_pm_pattern_outcome(trade, pnl, True)
+                            if self._pred_agent is not None:
+                                self._pred_agent.observe_outcome(trade, True, pnl)
                         self._log(m, trade, "WIN", pnl)
                         self._log_onchain_event("RESOLVE", cid, {
                             "asset": asset,
@@ -8354,6 +8388,8 @@ class LiveTrader:
                                 self._record_result(asset, side, False, trade.get("structural", False), pnl=pnl)
                                 self._record_resolved_sample(trade, pnl, False)
                                 self._record_pm_pattern_outcome(trade, pnl, False)
+                                if self._pred_agent is not None:
+                                    self._pred_agent.observe_outcome(trade, False, pnl)
                             self._log(m, trade, "LOSS", pnl)
                             self._log_onchain_event("RESOLVE", cid, {
                                 "asset": asset,
@@ -9605,6 +9641,114 @@ class LiveTrader:
             "recent_wr_lb": recent_wr_lb,
         }
 
+    def _load_autopilot_policy(self):
+        # Profit-oriented defaults with safety rails; never hard-stop trading by default.
+        self._autopilot_policy = {
+            "enabled": True,
+            "target_daily_profit_usdc": 100.0,
+            "soft_daily_loss_usdc": 25.0,
+            "hard_daily_loss_usdc": 45.0,
+            "soft_intraday_drawdown_usdc": 20.0,
+            "hard_intraday_drawdown_usdc": 35.0,
+            "size_mult_boost": 1.12,
+            "size_mult_normal": 1.00,
+            "size_mult_soft": 0.82,
+            "size_mult_hard": 0.62,
+            "size_mult_floor": 0.55,   # never 0: avoids false no-trade days
+            "disable_5m_on_hard": False,  # keep trading unless explicitly enabled
+        }
+        try:
+            if os.path.exists(AUTOPILOT_POLICY_FILE):
+                with open(AUTOPILOT_POLICY_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self._autopilot_policy.update(data)
+        except Exception:
+            pass
+
+    def _safe_daily_pnl(self) -> float:
+        # Use cached UTC-day reconciliation, not historical start-bank deltas.
+        try:
+            now_ts = _time.time()
+            day_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            dc = self._dash_daily_cache or {}
+            if dc.get("day") == day_utc and (now_ts - float(dc.get("ts", 0.0) or 0.0)) <= 60.0:
+                return float(dc.get("pnl", 0.0) or 0.0)
+            pnl = 0.0
+            for r in self._metrics_resolve_rows_cached(ttl_sec=15.0):
+                if str(r.get("ts", "")).startswith(day_utc):
+                    pnl += float(r.get("pnl", 0.0) or 0.0)
+            return float(pnl)
+        except Exception:
+            return float(self.daily_pnl or 0.0)
+
+    def _apply_autopilot_policy(self):
+        if not AUTOPILOT_ENABLED:
+            self._autopilot_size_mult = 1.0
+            self._autopilot_mode = "off"
+            return
+        now_ts = _time.time()
+        if (now_ts - float(self._autopilot_last_eval_ts or 0.0)) < max(3.0, AUTOPILOT_CHECK_SEC):
+            return
+        self._autopilot_last_eval_ts = now_ts
+
+        pol = dict(self._autopilot_policy or {})
+        if not bool(pol.get("enabled", True)):
+            self._autopilot_size_mult = 1.0
+            self._autopilot_mode = "disabled"
+            return
+
+        day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        eq_now = float(self.onchain_total_equity if self.onchain_snapshot_ts > 0 else self.bankroll)
+        if self._autopilot_day_key != day_key:
+            self._autopilot_day_key = day_key
+            self._autopilot_day_peak = eq_now
+        self._autopilot_day_peak = max(float(self._autopilot_day_peak or eq_now), eq_now)
+
+        day_pnl = self._safe_daily_pnl()
+        day_dd = max(0.0, float(self._autopilot_day_peak) - eq_now)
+        snap = self._growth_snapshot()
+        recent_pf = float(snap.get("recent_pf", 1.0) or 1.0)
+        recent_wr_lb = float(snap.get("recent_wr_lb", 0.5) or 0.5)
+
+        target = float(pol.get("target_daily_profit_usdc", 100.0) or 100.0)
+        soft_loss = abs(float(pol.get("soft_daily_loss_usdc", 25.0) or 25.0))
+        hard_loss = abs(float(pol.get("hard_daily_loss_usdc", 45.0) or 45.0))
+        soft_dd = abs(float(pol.get("soft_intraday_drawdown_usdc", 20.0) or 20.0))
+        hard_dd = abs(float(pol.get("hard_intraday_drawdown_usdc", 35.0) or 35.0))
+        m_boost = float(pol.get("size_mult_boost", 1.12) or 1.12)
+        m_norm = float(pol.get("size_mult_normal", 1.0) or 1.0)
+        m_soft = float(pol.get("size_mult_soft", 0.82) or 0.82)
+        m_hard = float(pol.get("size_mult_hard", 0.62) or 0.62)
+        m_floor = max(0.25, float(pol.get("size_mult_floor", 0.55) or 0.55))
+        disable_5m_on_hard = bool(pol.get("disable_5m_on_hard", False))
+
+        mode = "normal"
+        mult = m_norm
+        if (day_pnl <= -hard_loss) or (day_dd >= hard_dd):
+            mode = "hard-protect"
+            mult = m_hard
+            if disable_5m_on_hard:
+                self._enable_5m_runtime = False
+        elif (day_pnl <= -soft_loss) or (day_dd >= soft_dd):
+            mode = "soft-protect"
+            mult = m_soft
+        elif (day_pnl >= target) and (recent_pf >= 1.10) and (recent_wr_lb >= 0.50):
+            mode = "boost"
+            mult = m_boost
+
+        # Never drop to no-trade due to policy noise/mismeasurement.
+        mult = max(m_floor, min(1.35, mult))
+        changed = (abs(mult - float(self._autopilot_size_mult or 1.0)) >= 0.03) or (mode != self._autopilot_mode)
+        self._autopilot_size_mult = mult
+        self._autopilot_mode = mode
+        if changed and self._should_log("autopilot-mode", 30):
+            print(
+                f"{B}[AUTOPILOT]{RS} mode={mode} size_x={mult:.2f} "
+                f"day_pnl={day_pnl:+.2f} day_dd={day_dd:.2f} "
+                f"pf20={recent_pf:.2f} wr_lb20={recent_wr_lb:.2f}"
+            )
+
     def _five_m_quality_snapshot(self, window: int | None = None) -> dict:
         """Rolling settled quality snapshot for 5m only (from on-chain resolved samples)."""
         w = int(window or FIVE_M_GUARD_WINDOW)
@@ -10397,6 +10541,7 @@ class LiveTrader:
             # Settlement always has priority over new entries.
             await self._resolve()
             self._update_5m_runtime_guard()
+            self._apply_autopilot_policy()
             if self.pending_redeem:
                 pending_n = len(self.pending_redeem)
                 claimable_n = int(self.onchain_redeemable_count or 0)
