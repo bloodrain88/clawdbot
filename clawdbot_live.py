@@ -29,6 +29,7 @@ import math
 import csv
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time as _time
@@ -385,6 +386,8 @@ PENDING_FILE   = os.path.join(_DATA_DIR, "clawdbot_pending.json")
 SEEN_FILE      = os.path.join(_DATA_DIR, "clawdbot_seen.json")
 STATS_FILE     = os.path.join(_DATA_DIR, "clawdbot_stats.json")
 METRICS_FILE   = os.path.join(_DATA_DIR, "clawdbot_onchain_metrics.jsonl")
+METRICS_DB_FILE = os.path.join(_DATA_DIR, "clawdbot_metrics.db")
+METRICS_DB_IMPORT_MAX_LINES = int(os.environ.get("METRICS_DB_IMPORT_MAX_LINES", "200000"))
 RUNTIME_JSON_LOG_FILE = os.path.join(_DATA_DIR, "clawdbot_runtime_logs.jsonl")
 PNL_BASELINE_FILE = os.path.join(_DATA_DIR, "clawdbot_pnl_baseline.json")
 SETTLED_FILE   = os.path.join(_DATA_DIR, "clawdbot_settled_cids.json")
@@ -1268,7 +1271,8 @@ class LiveTrader:
             "outcomes": 0,
             "wins": 0,
         }
-        self._metrics_resolve_cache = {"ts": 0.0, "sig": None, "rows": [], "offset": 0}
+        self._metrics_resolve_cache = {"ts": 0.0, "sig": None, "rows": [], "offset": 0, "db_rowid": 0}
+        self._metrics_db_ready = False
         self.total           = 0
         self.wins            = 0
         self.start_time      = datetime.now(timezone.utc)
@@ -1349,6 +1353,7 @@ class LiveTrader:
         self.kalman  = {a: {"pos":0.0,"vel":0.0,"p00":1.0,"p01":0.0,"p11":1.0,"rdy":False}
                         for a in ["BTC","ETH","SOL","XRP"]}
         self._init_log()
+        self._init_metrics_db()
         self._load_price_cache()
         self._load_open_state_cache()
         self._load_pending()
@@ -2246,6 +2251,51 @@ class LiveTrader:
             self._cid_family_cache[cid] = (str(out.get("asset", "?") or "?"), int(out.get("duration", 0) or 0))
         return dict(out)
 
+    async def _warmup_active_cid_cache(self):
+        """Warmup market metadata cache only for currently active CIDs."""
+        try:
+            open_rows, red_rows = await asyncio.gather(
+                self._http_get_json(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "false"},
+                    timeout=10,
+                ),
+                self._http_get_json(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "true"},
+                    timeout=10,
+                ),
+            )
+            rows = []
+            if isinstance(open_rows, list):
+                rows.extend(open_rows)
+            if isinstance(red_rows, list):
+                rows.extend(red_rows)
+            cids = []
+            seen = set()
+            for p in rows:
+                cid = str(p.get("conditionId", "") or "").strip()
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                cids.append(cid)
+            if not cids:
+                return
+            sem = asyncio.Semaphore(8)
+
+            async def _one(cid: str):
+                async with sem:
+                    try:
+                        await self._cid_market_cached(cid)
+                    except Exception:
+                        pass
+
+            await asyncio.gather(*[_one(c) for c in cids[:120]])
+            self._save_open_state_cache(force=True)
+            print(f"{B}[BOOT]{RS} warmed CID market cache for {min(len(cids), 120)} active positions")
+        except Exception as e:
+            print(f"{Y}[BOOT] cid warmup skipped: {e}{RS}")
+
     def _wallet_family_metrics(
         self,
         rows: list[dict],
@@ -3049,6 +3099,137 @@ class LiveTrader:
         corr = 0.75   # empirical BTC→altcoin lag correlation
         return float(norm.cdf(btc_lag_move / vol_t * corr))
 
+    def _init_metrics_db(self):
+        try:
+            conn = sqlite3.connect(METRICS_DB_FILE, timeout=5.0)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS resolve_metrics (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts TEXT NOT NULL,
+                        event TEXT NOT NULL,
+                        condition_id TEXT NOT NULL,
+                        asset TEXT,
+                        side TEXT,
+                        duration INTEGER,
+                        score INTEGER,
+                        entry_price REAL,
+                        pnl REAL,
+                        result TEXT,
+                        round_key TEXT,
+                        open_price_source TEXT,
+                        chainlink_age_s REAL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_resolve_ts ON resolve_metrics(ts)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_resolve_cid ON resolve_metrics(condition_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_resolve_event ON resolve_metrics(event)"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self._metrics_db_ready = True
+            self._metrics_db_backfill_from_jsonl()
+        except Exception:
+            self._metrics_db_ready = False
+
+    def _metrics_db_backfill_from_jsonl(self):
+        if not self._metrics_db_ready or not os.path.exists(METRICS_FILE):
+            return
+        try:
+            conn = sqlite3.connect(METRICS_DB_FILE, timeout=8.0)
+            try:
+                cur = conn.cursor()
+                n_existing = int(cur.execute("SELECT COUNT(*) FROM resolve_metrics").fetchone()[0] or 0)
+                if n_existing > 0:
+                    return
+                max_lines = max(1000, int(METRICS_DB_IMPORT_MAX_LINES))
+                with open(METRICS_FILE, encoding="utf-8") as f:
+                    lines = f.readlines()[-max_lines:]
+                ins = 0
+                for ln in lines:
+                    try:
+                        row = json.loads(ln)
+                    except Exception:
+                        continue
+                    ev = str(row.get("event", "") or "")
+                    if not ev.startswith("RESOLVE"):
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO resolve_metrics
+                        (ts,event,condition_id,asset,side,duration,score,entry_price,pnl,result,round_key,open_price_source,chainlink_age_s)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            str(row.get("ts", "") or datetime.now(timezone.utc).isoformat()),
+                            ev,
+                            str(row.get("condition_id", "") or ""),
+                            str(row.get("asset", "") or ""),
+                            str(row.get("side", "") or ""),
+                            int(row.get("duration", 0) or 0),
+                            int(row.get("score", 0) or 0),
+                            float(row.get("entry_price", 0.0) or 0.0),
+                            float(row.get("pnl", 0.0) or 0.0),
+                            str(row.get("result", "") or ""),
+                            str(row.get("round_key", "") or ""),
+                            str(row.get("open_price_source", "") or ""),
+                            float(row.get("chainlink_age_s", 0.0) or 0.0),
+                        ),
+                    )
+                    ins += 1
+                conn.commit()
+                if ins > 0:
+                    print(f"{B}[BOOT]{RS} imported {ins} RESOLVE rows into metrics sqlite")
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+    def _metrics_db_insert_resolve(self, rec: dict):
+        if not self._metrics_db_ready:
+            return
+        try:
+            ev = str(rec.get("event", "") or "")
+            if not ev.startswith("RESOLVE"):
+                return
+            conn = sqlite3.connect(METRICS_DB_FILE, timeout=3.0)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO resolve_metrics
+                    (ts,event,condition_id,asset,side,duration,score,entry_price,pnl,result,round_key,open_price_source,chainlink_age_s)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        str(rec.get("ts", "") or datetime.now(timezone.utc).isoformat()),
+                        ev,
+                        str(rec.get("condition_id", "") or ""),
+                        str(rec.get("asset", "") or ""),
+                        str(rec.get("side", "") or ""),
+                        int(rec.get("duration", 0) or 0),
+                        int(rec.get("score", 0) or 0),
+                        float(rec.get("entry_price", 0.0) or 0.0),
+                        float(rec.get("pnl", 0.0) or 0.0),
+                        str(rec.get("result", "") or ""),
+                        str(rec.get("round_key", "") or ""),
+                        str(rec.get("open_price_source", "") or ""),
+                        float(rec.get("chainlink_age_s", 0.0) or 0.0),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
     def _save_pending(self):
         try:
             with open(PENDING_FILE, "w") as f:
@@ -3440,6 +3621,7 @@ class LiveTrader:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
         except Exception:
             pass
+        self._metrics_db_insert_resolve(rec)
 
     # ── STATUS ────────────────────────────────────────────────────────────────
     def _local_position_counts(self):
@@ -8872,42 +9054,81 @@ class LiveTrader:
         no settled history and keeps trading low-quality 5m rounds.
         """
         try:
-            if not os.path.exists(METRICS_FILE):
-                return
             loaded = 0
-            # Keep startup fast: scan tail window only.
-            with open(METRICS_FILE, encoding="utf-8") as f:
-                lines = f.readlines()[-5000:]
-            for ln in lines:
+            rows = []
+            if self._metrics_db_ready:
                 try:
-                    row = json.loads(ln)
+                    conn = sqlite3.connect(METRICS_DB_FILE, timeout=3.0)
+                    try:
+                        cur = conn.cursor()
+                        rows = cur.execute(
+                            """
+                            SELECT asset, side, duration, entry_price, open_price_source, chainlink_age_s, pnl, result, round_key
+                            FROM resolve_metrics
+                            WHERE event='RESOLVE'
+                            ORDER BY id DESC
+                            LIMIT 5000
+                            """
+                        ).fetchall()
+                    finally:
+                        conn.close()
+                    rows = list(reversed(rows))
                 except Exception:
-                    continue
-                if str(row.get("event", "")) != "RESOLVE":
-                    continue
-                dur = int(row.get("duration", 0) or 0)
-                if dur <= 0:
-                    rk = str(row.get("round_key", "") or "")
-                    if "-5m-" in rk:
-                        dur = 5
-                    elif "-15m-" in rk:
-                        dur = 15
-                if dur <= 0:
-                    continue
-                pnl = float(row.get("pnl", 0.0) or 0.0)
-                won = str(row.get("result", "")).upper() == "WIN"
-                self._resolved_samples.append({
-                    "ts": _time.time(),
-                    "asset": str(row.get("asset", "") or ""),
-                    "side": str(row.get("side", "") or ""),
-                    "duration": dur,
-                    "entry": float(row.get("entry_price", 0.0) or 0.0),
-                    "source": str(row.get("open_price_source", "?") or "?"),
-                    "cl_age_s": row.get("chainlink_age_s", None),
-                    "pnl": pnl,
-                    "won": bool(won),
-                })
-                loaded += 1
+                    rows = []
+            if rows:
+                for asset, side, dur, entry_price, open_src, cl_age_s, pnl, result, rk in rows:
+                    d = int(dur or 0)
+                    if d <= 0:
+                        rks = str(rk or "")
+                        d = 5 if "-5m-" in rks else (15 if "-15m-" in rks else 0)
+                    if d <= 0:
+                        continue
+                    self._resolved_samples.append({
+                        "ts": _time.time(),
+                        "asset": str(asset or ""),
+                        "side": str(side or ""),
+                        "duration": d,
+                        "entry": float(entry_price or 0.0),
+                        "source": str(open_src or "?"),
+                        "cl_age_s": cl_age_s,
+                        "pnl": float(pnl or 0.0),
+                        "won": str(result or "").upper() == "WIN",
+                    })
+                    loaded += 1
+            elif os.path.exists(METRICS_FILE):
+                # Fallback path for first migration / db unavailable.
+                with open(METRICS_FILE, encoding="utf-8") as f:
+                    lines = f.readlines()[-5000:]
+                for ln in lines:
+                    try:
+                        row = json.loads(ln)
+                    except Exception:
+                        continue
+                    if str(row.get("event", "")) != "RESOLVE":
+                        continue
+                    dur = int(row.get("duration", 0) or 0)
+                    if dur <= 0:
+                        rk = str(row.get("round_key", "") or "")
+                        if "-5m-" in rk:
+                            dur = 5
+                        elif "-15m-" in rk:
+                            dur = 15
+                    if dur <= 0:
+                        continue
+                    pnl = float(row.get("pnl", 0.0) or 0.0)
+                    won = str(row.get("result", "")).upper() == "WIN"
+                    self._resolved_samples.append({
+                        "ts": _time.time(),
+                        "asset": str(row.get("asset", "") or ""),
+                        "side": str(row.get("side", "") or ""),
+                        "duration": dur,
+                        "entry": float(row.get("entry_price", 0.0) or 0.0),
+                        "source": str(row.get("open_price_source", "?") or "?"),
+                        "cl_age_s": row.get("chainlink_age_s", None),
+                        "pnl": pnl,
+                        "won": bool(won),
+                    })
+                    loaded += 1
             if loaded > 0:
                 print(f"{B}[BOOT]{RS} loaded {loaded} resolved samples from metrics for runtime guards")
         except Exception as e:
@@ -11480,12 +11701,79 @@ class LiveTrader:
 
     # ── WEB DASHBOARD ─────────────────────────────────────────────────────────
     def _metrics_resolve_rows_cached(self, ttl_sec: float = 20.0) -> list[dict]:
-        """Incremental RESOLVE parser (append-only) to avoid repeated full-file scans."""
+        """SQLite-first incremental RESOLVE cache with JSONL fallback."""
         import os as _os
         import time as _time
 
         now = _time.time()
         cache = self._metrics_resolve_cache
+        db_rowid = int(cache.get("db_rowid", 0) or 0)
+
+        if self._metrics_db_ready:
+            try:
+                conn = sqlite3.connect(METRICS_DB_FILE, timeout=3.0)
+                try:
+                    cur = conn.cursor()
+                    max_id_row = cur.execute("SELECT COALESCE(MAX(id),0) FROM resolve_metrics").fetchone()
+                    max_id = int((max_id_row[0] if max_id_row else 0) or 0)
+                    if max_id == db_rowid and cache.get("rows") and (now - float(cache.get("ts", 0.0) or 0.0)) < max(1.0, float(ttl_sec)):
+                        return cache.get("rows", [])
+                    if max_id > db_rowid and cache.get("rows"):
+                        q = cur.execute(
+                            """
+                            SELECT ts,duration,score,entry_price,pnl,result,asset,id
+                            FROM resolve_metrics
+                            WHERE id > ?
+                            ORDER BY id ASC
+                            """,
+                            (db_rowid,),
+                        ).fetchall()
+                        rows = list(cache.get("rows", []) or [])
+                        for ts, duration, score, entry_price, pnl, result, asset, rid in q:
+                            rows.append(
+                                {
+                                    "ts": str(ts or ""),
+                                    "duration": int(duration or 15),
+                                    "score": int(score or 0),
+                                    "entry_price": float(entry_price or 0.0),
+                                    "pnl": float(pnl or 0.0),
+                                    "result": str(result or ""),
+                                    "asset": str(asset or "?"),
+                                }
+                            )
+                            db_rowid = int(rid or db_rowid)
+                        self._metrics_resolve_cache = {"ts": now, "sig": "sqlite", "rows": rows, "offset": 0, "db_rowid": max_id}
+                        return rows
+                    # cold path from sqlite
+                    q = cur.execute(
+                        """
+                        SELECT ts,duration,score,entry_price,pnl,result,asset,id
+                        FROM resolve_metrics
+                        ORDER BY id ASC
+                        """
+                    ).fetchall()
+                    rows: list[dict] = []
+                    for ts, duration, score, entry_price, pnl, result, asset, rid in q:
+                        rows.append(
+                            {
+                                "ts": str(ts or ""),
+                                "duration": int(duration or 15),
+                                "score": int(score or 0),
+                                "entry_price": float(entry_price or 0.0),
+                                "pnl": float(pnl or 0.0),
+                                "result": str(result or ""),
+                                "asset": str(asset or "?"),
+                            }
+                        )
+                        db_rowid = int(rid or db_rowid)
+                    self._metrics_resolve_cache = {"ts": now, "sig": "sqlite", "rows": rows, "offset": 0, "db_rowid": max_id}
+                    return rows
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        # JSONL fallback (legacy path)
         try:
             st = _os.stat(METRICS_FILE)
             sig = (int(getattr(st, "st_ino", 0)), int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
@@ -11536,7 +11824,7 @@ class LiveTrader:
         except Exception:
             rows = list(cache.get("rows", []) or [])
             end_off = int(cache.get("offset", 0) or 0)
-        self._metrics_resolve_cache = {"ts": now, "sig": sig, "rows": rows, "offset": end_off}
+        self._metrics_resolve_cache = {"ts": now, "sig": sig, "rows": rows, "offset": end_off, "db_rowid": db_rowid}
         return rows
 
     def _dashboard_data(self) -> dict:
@@ -12834,6 +13122,7 @@ setInterval(pollMid,2000);
         self._sync_redeemable()   # redeem any wins from previous runs
         # Sync stats from API immediately so first status print shows real data
         await self._sync_stats_from_api()
+        await self._warmup_active_cid_cache()
         await self._seed_binance_cache()   # populate Binance cache before WS streams start
         async def _guard(name, method):
             """Restart a loop if it crashes — one failure can't kill all loops."""
