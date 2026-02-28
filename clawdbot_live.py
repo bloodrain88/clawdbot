@@ -10247,9 +10247,10 @@ class LiveTrader:
                             f"(sig_exact={sig_exact} pending_exact={p_exact}){RS}"
                         )
                     return False
-        # 5m same-side duplicate safeguard:
-        # do not stack same asset/side in the same 5m round due to cid/fallback drift.
-        if sig_dur <= 5 and sig_end > 0:
+        # Same-side duplicate safeguard across Polymarket short rounds:
+        # do not stack same asset/side in the same 5m/15m round due to cid/fallback drift.
+        if sig_dur in (5, 15) and sig_end > 0:
+            end_tol = 60.0 if sig_dur <= 5 else 120.0
             for c, (m, t) in active_pending.items():
                 p_asset = str((t or {}).get("asset", (m or {}).get("asset", "") or "")).upper()
                 p_dur = int((t or {}).get("duration", (m or {}).get("duration", 0) or 0))
@@ -10257,11 +10258,11 @@ class LiveTrader:
                 if p_asset != sig_asset or p_dur != sig_dur or p_side != side:
                     continue
                 p_end = float((t or {}).get("end_ts", (m or {}).get("end_ts", 0)) or 0)
-                if p_end > 0 and abs(p_end - sig_end) <= 60.0:
+                if p_end > 0 and abs(p_end - sig_end) <= end_tol:
                     if LOG_VERBOSE:
                         print(
                             f"{Y}[RISK] skip {sig_asset} {sig_dur}m {side} duplicate same-side round "
-                            f"(sig_end={sig_end:.0f} pending_end={p_end:.0f}){RS}"
+                            f"(sig_end={sig_end:.0f} pending_end={p_end:.0f} tol={end_tol:.0f}s){RS}"
                         )
                     return False
         total_cap, side_cap = self._regime_caps()
