@@ -490,6 +490,10 @@ CLOB_MARKET_WS_ENABLED = os.environ.get("CLOB_MARKET_WS_ENABLED", "true").lower(
 CLOB_MARKET_WS_SYNC_SEC = float(os.environ.get("CLOB_MARKET_WS_SYNC_SEC", "2.0"))
 CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "2000"))
 CLOB_MARKET_WS_SOFT_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_SOFT_AGE_MS", "6000"))
+WS_STRICT_ADAPTIVE_ENABLED = os.environ.get("WS_STRICT_ADAPTIVE_ENABLED", "true").lower() == "true"
+WS_STRICT_ADAPTIVE_MULT = float(os.environ.get("WS_STRICT_ADAPTIVE_MULT", "1.35"))
+WS_STRICT_ADAPTIVE_MIN_MS = float(os.environ.get("WS_STRICT_ADAPTIVE_MIN_MS", "2200"))
+WS_STRICT_ADAPTIVE_MAX_MS = float(os.environ.get("WS_STRICT_ADAPTIVE_MAX_MS", "6500"))
 CLOB_REST_FALLBACK_ENABLED = os.environ.get("CLOB_REST_FALLBACK_ENABLED", "true").lower() == "true"
 CLOB_REST_FRESH_MAX_AGE_MS = float(os.environ.get("CLOB_REST_FRESH_MAX_AGE_MS", "4000"))  # was 1500; REST scan cycle can be 2-3s
 CLOB_WS_STALE_HEAL_HITS = int(os.environ.get("CLOB_WS_STALE_HEAL_HITS", "1"))         # was 3; detect in 0.5s not 1.5s
@@ -1549,6 +1553,23 @@ class LiveTrader:
         ws_med = float(hs.get("ws_market_med_ms", 9e9) or 9e9)
         ok = (ratio >= WS_HEALTH_MIN_FRESH_RATIO) and (ws_med <= WS_HEALTH_MAX_MED_AGE_MS)
         return ok, hs
+
+    def _ws_strict_age_cap_ms(self) -> float:
+        """Adaptive strict WS freshness cap tuned to live network conditions."""
+        base = float(CLOB_MARKET_WS_MAX_AGE_MS)
+        if not WS_STRICT_ADAPTIVE_ENABLED:
+            return base
+        try:
+            hs = self._feed_health_snapshot()
+            ws_med = float(hs.get("ws_market_med_ms", 9e9) or 9e9)
+            if ws_med >= 9e8:
+                return base
+            dyn = max(base, ws_med * max(1.0, float(WS_STRICT_ADAPTIVE_MULT)))
+            dyn = max(float(WS_STRICT_ADAPTIVE_MIN_MS), dyn)
+            dyn = min(float(WS_STRICT_ADAPTIVE_MAX_MS), dyn, float(WS_HEALTH_MAX_MED_AGE_MS))
+            return float(max(base, dyn))
+        except Exception:
+            return base
 
     def _booster_locked(self) -> bool:
         return _time.time() < float(self._booster_lock_until or 0.0)
@@ -4686,7 +4707,6 @@ class LiveTrader:
                         while True:
                             desired = self._trade_focus_token_ids() or self._active_token_ids()
                             add = desired - self._clob_ws_assets_subscribed
-                            rem = self._clob_ws_assets_subscribed - desired
                             if add:
                                 await ws.send(
                                     json.dumps(
@@ -4698,17 +4718,6 @@ class LiveTrader:
                                     )
                                 )
                                 self._clob_ws_assets_subscribed |= set(add)
-                            if rem:
-                                await ws.send(
-                                    json.dumps(
-                                        {
-                                            "assets_ids": sorted(rem),
-                                            "type": "market",
-                                            "operation": "unsubscribe",
-                                        }
-                                    )
-                                )
-                                self._clob_ws_assets_subscribed -= set(rem)
                             try:
                                 raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, CLOB_MARKET_WS_SYNC_SEC))
                             except asyncio.TimeoutError:
@@ -5005,8 +5014,9 @@ class LiveTrader:
         (taker_ratio, vol_ratio)   = self._binance_taker_flow(asset)
         (perp_basis, funding_rate) = self._binance_perp_signals(asset)
         (vwap_dev, vol_mult)       = self._binance_window_stats(asset, m["start_ts"])
+        ws_strict_age_cap = self._ws_strict_age_cap_ms()
         _pm_book = await self._fetch_pm_book_safe(prefetch_token)
-        ws_book_now = self._get_clob_ws_book(prefetch_token, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+        ws_book_now = self._get_clob_ws_book(prefetch_token, max_age_ms=ws_strict_age_cap)
         ws_book_soft = self._get_clob_ws_book(prefetch_token, max_age_ms=WS_BOOK_SOFT_MAX_AGE_MS)
         ws_book_strict = ws_book_now
         if ws_book_now is None:
@@ -5015,7 +5025,7 @@ class LiveTrader:
             tok_d = str(m.get("token_down", "") or "")
             alt = tok_d if prefetch_token == tok_u else tok_u
             if alt:
-                ws_book_now = self._get_clob_ws_book(alt, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+                ws_book_now = self._get_clob_ws_book(alt, max_age_ms=ws_strict_age_cap)
                 ws_book_strict = ws_book_now
                 if ws_book_soft is None:
                     ws_book_soft = self._get_clob_ws_book(alt, max_age_ms=WS_BOOK_SOFT_MAX_AGE_MS)
@@ -11981,7 +11991,8 @@ class LiveTrader:
         if CLOB_MARKET_WS_ENABLED and self.active_mkts:
             tids = list(self._trade_focus_token_ids() or self._active_token_ids())
             if tids:
-                stale = [tid for tid in tids if self._clob_ws_book_age_ms(tid) > CLOB_MARKET_WS_MAX_AGE_MS]
+                ws_age_cap = self._ws_strict_age_cap_ms()
+                stale = [tid for tid in tids if self._clob_ws_book_age_ms(tid) > ws_age_cap]
                 if len(stale) == len(tids):
                     self._ws_stale_hits += 1
                     if self._should_log("health-ws-stale", LOG_HEALTH_EVERY_SEC):
@@ -11989,7 +12000,7 @@ class LiveTrader:
                         age_s = ", ".join(f"{a:.0f}ms" for a in age_samples)
                         print(
                             f"{Y}[HEALTH]{RS} CLOB-WS stale {len(stale)}/{len(tids)} tokens "
-                            f"(samples={age_s}) hits={self._ws_stale_hits}"
+                            f"(samples={age_s} cap={ws_age_cap:.0f}ms) hits={self._ws_stale_hits}"
                         )
                     if (
                         self._ws_stale_hits >= max(1, CLOB_WS_STALE_HEAL_HITS)
