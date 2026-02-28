@@ -5080,12 +5080,22 @@ class LiveTrader:
                 and ((_time.time() - float(ws_book_now.get("ts", 0.0) or 0.0)) * 1000.0) <= CLOB_REST_FRESH_MAX_AGE_MS
             )
             if not allow_strict_rest:
-                if self._noisy_log_enabled(f"skip-strict-ws:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    print(
-                        f"{Y}[SKIP] {asset} {duration}m strict WS required (no fresh strict book){RS}"
-                    )
-                self._skip_tick("book_ws_strict_required")
-                return None
+                strict_bypass = bool(FORCE_TRADE_EVERY_ROUND and late_relax and isinstance(ws_book_now, dict))
+                if strict_bypass:
+                    score -= max(1, int(round(WS_FALLBACK_SCORE_PEN)))
+                    edge -= 0.003
+                    if self._noisy_log_enabled(f"ws-strict-bypass:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[WS-STRICT-BYPASS]{RS} {asset} {duration}m using degraded book "
+                            f"(round-force late-relax)"
+                        )
+                else:
+                    if self._noisy_log_enabled(f"skip-strict-ws:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[SKIP] {asset} {duration}m strict WS required (no fresh strict book){RS}"
+                        )
+                    self._skip_tick("book_ws_strict_required")
+                    return None
 
         # Additional instant signals from Binance cache (zero latency)
         dw_ob     = self._ob_depth_weighted(asset)
