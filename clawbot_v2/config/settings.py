@@ -53,7 +53,7 @@ class Settings:
 
 def load_settings() -> Settings:
     return Settings(
-        bot_engine=os.environ.get("BOT_ENGINE", "modular").strip().lower(),
+        bot_engine="modular",
         network=os.environ.get("POLY_NETWORK", "polygon").strip().lower(),
         dry_run=_env_bool("DRY_RUN", True),
         data_dir=os.environ.get("DATA_DIR", "/data"),
