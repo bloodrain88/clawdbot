@@ -5531,26 +5531,18 @@ class LiveTrader:
             if mins_left <= lock_mins and move_abs >= lock_move_min:
                 beat_dir = "Up" if current >= open_price else "Down"
                 if side != beat_dir:
-                    if late_relax and FORCE_TRADE_EVERY_ROUND:
-                        prev_side = side
-                        side = beat_dir
-                        # Keep a conservative haircut after forced alignment.
-                        score -= 1
-                        edge -= 0.004
-                        true_prob = max(0.05, min(0.95, 0.5 + (true_prob - 0.5) * 0.92))
-                        if self._noisy_log_enabled(f"late-lock-align:{asset}:{prev_side}", LOG_FLOW_EVERY_SEC):
-                            print(
-                                f"{Y}[LATE-ALIGN]{RS} {asset} {duration}m {prev_side}->{beat_dir} "
-                                f"mins_left={mins_left:.1f} move={move_abs*100:.2f}%"
-                            )
-                    else:
-                        if self._noisy_log_enabled(f"late-lock-score:{asset}:{side}", LOG_SKIP_EVERY_SEC):
-                            print(
-                                f"{Y}[SKIP]{RS} {asset} {duration}m {side} late-lock: "
-                                f"beat_dir={beat_dir} mins_left={mins_left:.1f} move={move_abs*100:.2f}%"
-                            )
-                        self._skip_tick("late_lock")
-                        return None
+                    prev_side = side
+                    side = beat_dir
+                    # Soft alignment by default: keep trading flow but reduce confidence.
+                    # This avoids no-trade stalls while preserving direction discipline near expiry.
+                    score -= 1
+                    edge -= 0.004
+                    true_prob = max(0.05, min(0.95, 0.5 + (true_prob - 0.5) * 0.92))
+                    if self._noisy_log_enabled(f"late-lock-align:{asset}:{prev_side}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[LATE-ALIGN]{RS} {asset} {duration}m {prev_side}->{beat_dir} "
+                            f"mins_left={mins_left:.1f} move={move_abs*100:.2f}%"
+                        )
 
         # Late-window locked-direction prob boost:
         # When in the last LATE_PAYOUT_RELAX_PCT_LEFT of the window AND price has already moved
