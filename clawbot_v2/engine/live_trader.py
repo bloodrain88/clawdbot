@@ -33,6 +33,7 @@ import sqlite3
 import sys
 import threading
 import random
+import traceback
 import time as _time
 from collections import deque, defaultdict
 from datetime import datetime, timezone
@@ -1516,11 +1517,25 @@ class LiveTrader:
 
     def _skip_top(self, window_sec: int = SKIP_STATS_WINDOW_SEC, top_n: int = SKIP_STATS_TOP_N):
         now = _time.time()
-        while self._skip_events and (now - float(self._skip_events[0][0] or 0.0)) > max(60, int(window_sec)):
-            self._skip_events.popleft()
+        while self._skip_events:
+            head = self._skip_events[0]
+            if isinstance(head, (tuple, list)):
+                ts = float(head[0] or 0.0) if len(head) >= 1 else 0.0
+            elif isinstance(head, (int, float)):
+                ts = float(head)
+            else:
+                ts = 0.0
+            if (now - ts) > max(60, int(window_sec)):
+                self._skip_events.popleft()
+                continue
+            break
         counts = defaultdict(int)
-        for _, r in self._skip_events:
-            counts[r] += 1
+        for ev in self._skip_events:
+            if isinstance(ev, (tuple, list)) and len(ev) >= 2:
+                reason = str(ev[1] or "unknown")
+            else:
+                reason = "unknown"
+            counts[reason] += 1
         total = sum(counts.values())
         top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[: max(1, int(top_n))]
         return total, top
@@ -1635,9 +1650,12 @@ class LiveTrader:
         return _time.time() < float(self._booster_lock_until or 0.0)
 
     def _short_cid(self, cid: str) -> str:
-        if not cid:
+        if cid is None:
             return "n/a"
-        return f"{cid[:10]}..."
+        s = str(cid)
+        if not s:
+            return "n/a"
+        return f"{s[:10]}..."
 
     def _as_float(self, v, default: float = 0.0) -> float:
         try:
@@ -2572,7 +2590,7 @@ class LiveTrader:
                     self._copyflow_leaders_live = live_scores
                     if self._should_log("copyflow-intel", 120):
                         top = sorted(live_scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
-                        top_s = ", ".join(f"{w[:6]}..={s:.2f}" for w, s in top)
+                        top_s = ", ".join(f"{str(w)[:6]}..={s:.2f}" for w, s in top)
                         print(f"{B}[COPY-INTEL]{RS} leaders24h={len(live_scores)} top={top_s}")
                 self._copyflow_leaders_family = family_scores
                 if self._should_log("copyflow-intel-family", 150):
@@ -2581,7 +2599,9 @@ class LiveTrader:
                         if not mp:
                             continue
                         topf = sorted(mp.items(), key=lambda kv: kv[1], reverse=True)[:1]
-                        fam_parts.append(f"{fam_key}:{topf[0][0][:6]}..={topf[0][1]:.2f}")
+                        fam_wallet = str(topf[0][0]) if topf else "n/a"
+                        fam_score = float(topf[0][1]) if topf else 0.0
+                        fam_parts.append(f"{fam_key}:{fam_wallet[:6]}..={fam_score:.2f}")
                     if fam_parts:
                         print(f"{B}[COPY-FAMILY]{RS} " + " | ".join(fam_parts))
             except Exception as e:
@@ -4325,7 +4345,7 @@ class LiveTrader:
                 self._rtds_fails = fails
                 if "429" in err_s or "too many requests" in err_s:
                     # Upstream throttling: back off harder to recover stable freshness.
-                    wait_s = min(180.0, 12.0 * (1.8 ** min(8, fails - 1)))
+                    wait_s = min(300.0, 20.0 * (2.0 ** min(8, fails - 1)))
                 else:
                     wait_s = min(30.0, 2.0 * (2 ** min(5, fails - 1)))
                 wait_s = wait_s * random.uniform(0.90, 1.25)
@@ -7628,6 +7648,8 @@ class LiveTrader:
             await asyncio.sleep(SCAN_INTERVAL)
           except Exception as e:
             print(f"{R}[SCAN] Error (continuing): {e}{RS}")
+            if self._noisy_log_enabled("scan-traceback", 5.0):
+                print(f"{R}[SCAN-TRACE]{RS} {traceback.format_exc(limit=4).strip()}")
             await asyncio.sleep(SCAN_INTERVAL)
 
     async def _refresh_balance(self):
