@@ -254,6 +254,13 @@ TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 FORCE_TRADE_EVERY_ROUND = os.environ.get("FORCE_TRADE_EVERY_ROUND", "false").lower() == "true"
 ROUND_MAX_TRADES = int(os.environ.get("ROUND_MAX_TRADES", "2"))
+ROUND_SECOND_TRADE_PUSH_ONLY = os.environ.get("ROUND_SECOND_TRADE_PUSH_ONLY", "true").lower() == "true"
+ROUND_SECOND_TRADE_MIN_SCORE = int(os.environ.get("ROUND_SECOND_TRADE_MIN_SCORE", "12"))
+ROUND_SECOND_TRADE_MIN_EXEC_EV = float(os.environ.get("ROUND_SECOND_TRADE_MIN_EXEC_EV", "0.035"))
+ROUND_SECOND_TRADE_MIN_TRUE_PROB = float(os.environ.get("ROUND_SECOND_TRADE_MIN_TRUE_PROB", "0.64"))
+ROUND_SECOND_TRADE_REQUIRE_CL_AGREE = os.environ.get("ROUND_SECOND_TRADE_REQUIRE_CL_AGREE", "true").lower() == "true"
+ROUND_SECOND_TRADE_MAX_ENTRY = float(os.environ.get("ROUND_SECOND_TRADE_MAX_ENTRY", "0.52"))
+ROUND_SECOND_TRADE_MAX_GSCORE_GAP = float(os.environ.get("ROUND_SECOND_TRADE_MAX_GSCORE_GAP", "0.030"))
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "0"))
 MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "0"))
@@ -2698,7 +2705,8 @@ class LiveTrader:
             f"ev_net>={MIN_EV_NET:.3f} fee={FEE_RATE_EST:.4f} "
             f"risk(max_open/same_dir/cid)={MAX_OPEN}/{MAX_SAME_DIR}/{MAX_CID_EXPOSURE_PCT:.0%} "
             f"block_opp(cid/round)={BLOCK_OPPOSITE_SIDE_SAME_CID}/{BLOCK_OPPOSITE_SIDE_SAME_ROUND} "
-            f"round_coverage={FORCE_TRADE_EVERY_ROUND} round_max_trades={max(1, ROUND_MAX_TRADES)}"
+            f"round_coverage={FORCE_TRADE_EVERY_ROUND} round_max_trades={max(1, ROUND_MAX_TRADES)} "
+            f"2nd_push_only={ROUND_SECOND_TRADE_PUSH_ONLY}"
         )
         print(
             f"{B}[BOOT]{RS} profit_push_mode={PROFIT_PUSH_MODE} mult={PROFIT_PUSH_MULT:.2f} "
@@ -9355,6 +9363,27 @@ class LiveTrader:
             + lag_penalty
         )
 
+    def _allow_second_round_trade(self, sig: dict, first_sig: dict | None = None) -> bool:
+        """Permit second trade in same round only for high-quality push setups."""
+        if not ROUND_SECOND_TRADE_PUSH_ONLY:
+            return True
+        if int(sig.get("score", 0) or 0) < ROUND_SECOND_TRADE_MIN_SCORE:
+            return False
+        if float(sig.get("execution_ev", 0.0) or 0.0) < ROUND_SECOND_TRADE_MIN_EXEC_EV:
+            return False
+        if float(sig.get("true_prob", 0.0) or 0.0) < ROUND_SECOND_TRADE_MIN_TRUE_PROB:
+            return False
+        if ROUND_SECOND_TRADE_REQUIRE_CL_AGREE and (not bool(sig.get("cl_agree", False))):
+            return False
+        if float(sig.get("entry", 1.0) or 1.0) > ROUND_SECOND_TRADE_MAX_ENTRY:
+            return False
+        if first_sig is not None:
+            g = float(self._signal_growth_score(sig))
+            g0 = float(self._signal_growth_score(first_sig))
+            if g < (g0 - ROUND_SECOND_TRADE_MAX_GSCORE_GAP):
+                return False
+        return True
+
     def _regime_caps(self) -> tuple[float, float]:
         vals = []
         for a in BNB_SYM:
@@ -10141,7 +10170,18 @@ class LiveTrader:
                 to_exec = []
                 selected = sorted(valid, key=self._signal_growth_score, reverse=True)
                 if FORCE_TRADE_EVERY_ROUND and selected:
-                    selected = selected[:max(1, min(6, ROUND_MAX_TRADES))]
+                    cap = max(1, min(6, ROUND_MAX_TRADES))
+                    if cap <= 1:
+                        selected = selected[:1]
+                    else:
+                        first = selected[0]
+                        filtered = [first]
+                        for cand in selected[1:]:
+                            if len(filtered) >= cap:
+                                break
+                            if self._allow_second_round_trade(cand, first):
+                                filtered.append(cand)
+                        selected = filtered
                 if ROUND_BEST_ONLY and valid:
                     best_5m = max((s for s in valid if s.get("duration", 0) <= 5), key=self._signal_growth_score, default=None)
                     best_15m = max((s for s in valid if s.get("duration", 0) > 5), key=self._signal_growth_score, default=None)
