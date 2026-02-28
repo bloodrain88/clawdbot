@@ -6186,7 +6186,12 @@ class LiveTrader:
         # - 15m unchanged: strict 54c ceiling.
         # - 5m: use adaptive hard cap (execution/quality aware), avoid static 54c choke.
         if duration >= 15:
-            max_entry_allowed = min(max_entry_allowed, 0.54)
+            strong_relax = 0.0
+            if true_prob >= 0.72 and score >= 14 and edge >= 0.14:
+                strong_relax = 0.02
+            if FORCE_TRADE_EVERY_ROUND and late_relax and true_prob >= 0.66 and score >= 10 and edge >= 0.10:
+                strong_relax = max(strong_relax, 0.03)
+            max_entry_allowed = min(max_entry_allowed, 0.54 + strong_relax)
         else:
             max_entry_allowed = min(max_entry_allowed, max(0.60, adaptive_hard_cap))
         # Dynamic min-entry (not fixed hard floor): adapt to setup quality + microstructure.
@@ -7768,6 +7773,10 @@ class LiveTrader:
                     if tick > 0:
                         gap_ticks = max(0.0, (best_bid - maker_price) / tick)
                     max_gap_ticks = MAKER_PULLBACK_MAX_GAP_TICKS_5M if duration <= 5 else MAKER_PULLBACK_MAX_GAP_TICKS_15M
+                    if strong_exec:
+                        max_gap_ticks += (1 if duration <= 5 else 2)
+                    if round_force:
+                        max_gap_ticks += (2 if duration <= 5 else 3)
                     if gap_ticks > float(max_gap_ticks):
                         eff_max_entry = max_entry_allowed if max_entry_allowed is not None else 0.99
                         if best_ask <= eff_max_entry and taker_edge >= edge_floor:
@@ -7786,14 +7795,24 @@ class LiveTrader:
                                     self.bankroll -= size_usdc
                                     print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
                                     return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_maker_bypass", "notional_usdc": size_usdc}
-                                print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=maker_bypass_fok_unfilled")
-                                return None
-                        print(
-                            f"{Y}[SKIP]{RS} {asset} {side} maker pullback too far "
-                            f"(gap={gap_ticks:.1f} ticks>{max_gap_ticks})"
-                        )
-                        self._skip_tick("maker_pullback_too_far")
-                        return None
+                                bypass_filled = False
+                                if not (strong_exec or round_force):
+                                    print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=maker_bypass_fok_unfilled")
+                                    return None
+                        if strong_exec or round_force:
+                            maker_price = round(min(max(tick, best_bid), eff_max_entry, 0.97), 4)
+                            if self._noisy_log_enabled(f"maker-reprice-gap:{asset}:{side}", LOG_EXEC_EVERY_SEC):
+                                print(
+                                    f"{Y}[MAKER-REPRICE]{RS} {asset} {side} gap={gap_ticks:.1f} ticks>{max_gap_ticks} "
+                                    f"-> maker_price={maker_price:.3f}"
+                                )
+                        else:
+                            print(
+                                f"{Y}[SKIP]{RS} {asset} {side} maker pullback too far "
+                                f"(gap={gap_ticks:.1f} ticks>{max_gap_ticks})"
+                            )
+                            self._skip_tick("maker_pullback_too_far")
+                            return None
                 size_tok_m, maker_notional = _normalize_order_size(maker_price_order, size_usdc)
                 size_usdc = maker_notional
                 if size_usdc < hard_min_notional:
@@ -7945,7 +7964,7 @@ class LiveTrader:
                             return None
                     fresh_payout = 1.0 / max(fresh_ask, 1e-9)
                     min_payout_fb, min_ev_fb, _ = self._adaptive_thresholds(duration)
-                    _must_fire_exec = bool(sig.get("must_fire", False))
+                    _must_fire_exec = bool(round_force)
                     if _must_fire_exec:
                         # Must-fire: accept any EV-positive payout (>= 1.30x minimum)
                         min_payout_fb = max(1.30, min_payout_fb - 0.35)
