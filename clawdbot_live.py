@@ -11080,6 +11080,31 @@ class LiveTrader:
         roi = pnl / self.start_bank * 100 if self.start_bank > 0 else 0
         wr = round(self.wins / self.total * 100, 1) if self.total else 0
 
+        def _norm_round_bounds(start_ts: float, end_ts: float, duration: int) -> tuple[float, float]:
+            """Normalize dashboard round bounds to canonical 5m/15m windows."""
+            d = int(duration or 0)
+            if d not in (5, 15):
+                return float(start_ts or 0.0), float(end_ts or 0.0)
+            step = float(d * 60)
+            st = float(start_ts or 0.0)
+            et = float(end_ts or 0.0)
+            exact = (
+                et > 0
+                and abs((et / step) - round(et / step)) < 1e-6
+                and abs(((et - st) if st > 0 else step) - step) <= 2.0
+            )
+            if exact:
+                return st if st > 0 else (et - step), et
+            # Bad/non-canonical timestamps (e.g., 7:06-7:21): snap to nearest valid boundary.
+            if et > 0:
+                et_n = round(et / step) * step
+            else:
+                et_n = math.ceil(now_ts / step) * step
+            if et_n <= now_ts:
+                et_n = math.ceil(now_ts / step) * step
+            st_n = et_n - step
+            return st_n, et_n
+
         # Price history for charts (last 20 min, ~4 pts/s max → cap at 600 pts)
         charts = {}
         for asset, ph in self.price_history.items():
@@ -11128,6 +11153,7 @@ class LiveTrader:
             # Round timing must follow "price to beat" lock window, not entry timestamp.
             if end_ts > 0 and duration > 0:
                 start_ts = end_ts - duration * 60.0
+            start_ts, end_ts = _norm_round_bounds(start_ts, end_ts, duration)
             mins_left = max(0.0, (end_ts - now_ts) / 60)
             if open_p > 0 and cur_p > 0:
                 pred_winner = "Up" if cur_p >= open_p else "Down"
@@ -11177,6 +11203,7 @@ class LiveTrader:
                 start_ts = float(meta.get("start_ts", 0) or 0)
                 if end_ts > 0 and duration > 0:
                     start_ts = end_ts - duration * 60.0
+                start_ts, end_ts = _norm_round_bounds(start_ts, end_ts, duration)
                 mins_left = max(0.0, (end_ts - now_ts) / 60.0) if end_ts > 0 else 0.0
                 if open_p > 0 and cur_p > 0:
                     pred_winner = "Up" if cur_p >= open_p else "Down"
@@ -11200,6 +11227,32 @@ class LiveTrader:
                         t={"asset": asset, "side": side, "duration": duration, "end_ts": end_ts},
                     ),
                 })
+
+        # Avoid contradictory duplicate cards for the same asset and round slot.
+        # Keep the strongest row (higher stake, valid open price preferred).
+        if positions:
+            by_slot = {}
+            for p in positions:
+                d = int(p.get("duration", 0) or 0)
+                et = float(p.get("end_ts", 0.0) or 0.0)
+                if d in (5, 15) and et > 0:
+                    slot = round(et / (d * 60.0))
+                else:
+                    slot = int(et)
+                k = (str(p.get("asset", "?")), d, slot)
+                by_slot.setdefault(k, []).append(p)
+            filtered = []
+            for _, rows_k in by_slot.items():
+                rows_k.sort(
+                    key=lambda r: (
+                        1 if float(r.get("open_p", 0.0) or 0.0) > 0 else 0,
+                        float(r.get("stake", 0.0) or 0.0),
+                        float(r.get("end_ts", 0.0) or 0.0),
+                    ),
+                    reverse=True,
+                )
+                filtered.append(rows_k[0])
+            positions = filtered
 
         # Keep one row per CID (already ensured by seen_cids_norm above).
         # Do not collapse by asset/duration/side: multiple real opens can share
