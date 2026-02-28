@@ -30,4 +30,4 @@ COPY clawbot_v2 ./clawbot_v2
 COPY clawdbot_copyflow.json .
 COPY macro_events.json /data/macro_events.json
 COPY scripts ./scripts
-CMD ["python", "-u", "clawbot_v2/main.py"]
+CMD ["python", "-u", "-m", "clawbot_v2.main"]
