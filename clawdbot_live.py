@@ -257,7 +257,7 @@ LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE = int(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_K
 LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB", "0.80"))
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
-FORCE_TRADE_EVERY_ROUND = os.environ.get("FORCE_TRADE_EVERY_ROUND", "false").lower() == "true"
+FORCE_TRADE_EVERY_ROUND = os.environ.get("FORCE_TRADE_EVERY_ROUND", "true").lower() == "true"
 ROUND_MAX_TRADES = int(os.environ.get("ROUND_MAX_TRADES", "2"))
 ROUND_SECOND_TRADE_PUSH_ONLY = os.environ.get("ROUND_SECOND_TRADE_PUSH_ONLY", "true").lower() == "true"
 ROUND_SECOND_TRADE_MIN_SCORE = int(os.environ.get("ROUND_SECOND_TRADE_MIN_SCORE", "12"))
