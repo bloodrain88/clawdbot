@@ -3075,6 +3075,18 @@ class LiveTrader:
         k["p01"] = (1.0 - k0) * p01_p
         k["p11"] = p11_p - k1 * p01_p
 
+    def _price_hist_last_ts(self, asset: str) -> float:
+        """Safe last timestamp from price_history across legacy/new entry formats."""
+        ph = self.price_history.get(asset)
+        if not ph:
+            return 0.0
+        last = ph[-1]
+        if isinstance(last, (tuple, list)):
+            return float(last[0] or 0.0) if len(last) >= 1 else 0.0
+        if isinstance(last, (int, float)):
+            return float(last)
+        return 0.0
+
     def _kalman_vel_prob(self, asset: str) -> float:
         """P(Up) from Kalman-estimated velocity; 0.5 if filter not yet ready."""
         import math as _m
@@ -3888,8 +3900,7 @@ class LiveTrader:
             cl_p   = self.cl_prices.get(asset, 0)
             cl_ts  = self.cl_updated.get(asset, 0)
             rtds_p = self.prices.get(asset, 0)
-            _ph    = self.price_history.get(asset)
-            rtds_ts = _ph[-1][0] if _ph else 0
+            rtds_ts = self._price_hist_last_ts(asset)
             if rtds_ts > cl_ts and rtds_p > 0:
                 cur_p = rtds_p
                 cur_p_src = "RTDS"
@@ -3995,8 +4006,7 @@ class LiveTrader:
             cl_p   = float(self.cl_prices.get(asset, 0.0) or 0.0)
             cl_ts  = self.cl_updated.get(asset, 0)
             rtds_p = float(self.prices.get(asset, 0.0) or 0.0)
-            _ph2   = self.price_history.get(asset)
-            rtds_ts2 = _ph2[-1][0] if _ph2 else 0
+            rtds_ts2 = self._price_hist_last_ts(asset)
             if rtds_ts2 > cl_ts and rtds_p > 0:
                 cur_p = rtds_p
                 cur_p_src = "RTDS"
@@ -5630,8 +5640,7 @@ class LiveTrader:
                 continue
             # Prefer RTDS price; skip if stale (> 30s) to avoid false consensus from stale feed
             cur = self.prices.get(a, 0)
-            ph = self.price_history.get(a)
-            ts_cur = ph[-1][0] if ph else 0.0
+            ts_cur = self._price_hist_last_ts(a)
             if cur <= 0 or (ts_cur > 0 and now_ts - ts_cur > 30.0):
                 cur = self.cl_prices.get(a, 0)
             if cur <= 0:
@@ -8794,8 +8803,7 @@ class LiveTrader:
             cl_p      = self.cl_prices.get(asset, 0)
             cl_ts     = self.cl_updated.get(asset, 0)
             rtds_p    = self.prices.get(asset, 0)
-            _ph       = self.price_history.get(asset)
-            rtds_ts   = _ph[-1][0] if _ph else 0
+            rtds_ts   = self._price_hist_last_ts(asset)
             cur_p     = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
             duration  = int(trade.get("duration", mkt.get("duration", 15)) or 15)
             end_ts    = float(trade.get("end_ts", mkt.get("end_ts", 0)) or 0)
@@ -8845,8 +8853,7 @@ class LiveTrader:
                 cl_p = self.cl_prices.get(asset, 0)
                 cl_ts = self.cl_updated.get(asset, 0)
                 rtds_p = self.prices.get(asset, 0)
-                _ph = self.price_history.get(asset)
-                rtds_ts = _ph[-1][0] if _ph else 0
+                rtds_ts = self._price_hist_last_ts(asset)
                 cur_p = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
                 duration = int(meta.get("duration", 15) or 15)
                 end_ts = float(meta.get("end_ts", 0) or 0)
