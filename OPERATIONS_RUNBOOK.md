@@ -120,8 +120,32 @@ Quando c'e' un problema, rispondere sempre con:
 4. Fix applicato.
 5. Verifica post-fix.
 
-## 9) Deploy manuale stabile (senza webhook VCS)
-Quando l'integrazione VCS e' instabile/non disponibile, usare sempre questo metodo.
+## 9) Deploy: ordine obbligatorio (sempre)
+Usare sempre questo ordine operativo:
+
+1. `Webhook Git` (prima scelta, no API Northflank locale)
+2. `Manual deploy script` (fallback quando webhook non parte)
+
+### 9.1 Webhook Git (prima scelta)
+Comandi:
+```bash
+cd /Users/alessandro/clawdbot
+git push origin main
+```
+
+Se serve forzare il deploy senza cambiare codice:
+```bash
+cd /Users/alessandro/clawdbot
+git commit --allow-empty -m "trigger deploy"
+git push origin main
+```
+
+Verifica obbligatoria post-deploy:
+- cercare nuovo `[BOOT]` del container recente;
+- confermare i flag critici runtime (esempio: `trade_all=True 5m=False` quando 5m deve restare spento).
+
+### 9.2 Deploy manuale stabile (fallback senza webhook)
+Quando webhook VCS e' instabile/non disponibile, usare questo metodo.
 
 Script versionato:
 - `scripts/nf_manual_deploy.sh`
@@ -140,4 +164,4 @@ Cosa fa:
 5. verifica finale `deployedSHA == git rev-parse HEAD`
 
 Regola operativa:
-- Se il deploy automatico non parte, non usare fix ad-hoc: rilanciare solo questo script.
+- Se il deploy automatico (webhook) non parte, non usare fix ad-hoc: usare solo questo script.

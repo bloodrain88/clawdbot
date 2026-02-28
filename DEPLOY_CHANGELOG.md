@@ -12,6 +12,21 @@ Ogni modifica che impatta trading/runtime deve aggiungere una nuova entry con:
 
 ## 2026-02-22
 
+## 2026-02-28
+
+### Commit `deploy-webhook-priority-runbook`
+- Scope: `OPERATIONS_RUNBOOK.md`
+- Summary:
+  - Definito ordine deploy obbligatorio:
+    1) push Git/webhook (prima scelta, senza API Northflank locale),
+    2) `scripts/nf_manual_deploy.sh` come fallback.
+  - Aggiunta procedura di trigger deploy con commit vuota (`git commit --allow-empty`) per forzare webhook.
+  - Aggiunta verifica post-deploy obbligatoria su riga `[BOOT]` con flag runtime critici (es. `5m=False`).
+- Feed/infra status intent:
+  - Nessun cambio logica trading/feed runtime; solo standardizzazione processo rilascio.
+- Rollback:
+  - `git revert <sha-commit>`
+
 ### Commit `freshness-first-rest-quality-fix`
 - Scope: `clawdbot_live.py`
 - Summary:
