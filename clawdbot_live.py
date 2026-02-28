@@ -1258,6 +1258,7 @@ class LiveTrader:
             "outcomes": 0,
             "wins": 0,
         }
+        self._metrics_resolve_cache = {"ts": 0.0, "sig": None, "rows": []}
         self.total           = 0
         self.wins            = 0
         self.start_time      = datetime.now(timezone.utc)
@@ -11229,6 +11230,50 @@ class LiveTrader:
             self.status()
 
     # ── WEB DASHBOARD ─────────────────────────────────────────────────────────
+    def _metrics_resolve_rows_cached(self, ttl_sec: float = 20.0) -> list[dict]:
+        """Cache RESOLVE rows from metrics file to avoid repeated full-file scans."""
+        import os as _os
+        import time as _time
+
+        now = _time.time()
+        cache = self._metrics_resolve_cache
+        try:
+            st = _os.stat(METRICS_FILE)
+            sig = (int(getattr(st, "st_ino", 0)), int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
+        except Exception:
+            sig = None
+        if cache.get("rows") and cache.get("sig") == sig and (now - float(cache.get("ts", 0.0) or 0.0)) < max(1.0, float(ttl_sec)):
+            return cache.get("rows", [])
+        if cache.get("rows") and cache.get("sig") == sig:
+            cache["ts"] = now
+            return cache.get("rows", [])
+
+        rows: list[dict] = []
+        try:
+            with open(METRICS_FILE, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if r.get("event") != "RESOLVE":
+                        continue
+                    rows.append(
+                        {
+                            "ts": str(r.get("ts", "") or ""),
+                            "duration": int(r.get("duration") or 15),
+                            "score": int(r.get("score") or 0),
+                            "entry_price": float(r.get("entry_price") or 0.0),
+                            "pnl": float(r.get("pnl") or 0.0),
+                            "result": str(r.get("result", "") or ""),
+                            "asset": str(r.get("asset", "?") or "?"),
+                        }
+                    )
+        except Exception:
+            rows = cache.get("rows", [])
+        self._metrics_resolve_cache = {"ts": now, "sig": sig, "rows": rows}
+        return rows
+
     def _dashboard_data(self) -> dict:
         """Collect current bot state as a JSON-serialisable dict for the web dashboard."""
         import time as _t
@@ -11515,24 +11560,13 @@ class LiveTrader:
             d_pnl = 0.0
             d_outcomes = 0
             d_wins = 0
-            try:
-                with open(METRICS_FILE, encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            r = json.loads(line)
-                            if r.get("event") != "RESOLVE":
-                                continue
-                            if not str(r.get("ts", "")).startswith(day_utc):
-                                continue
-                            pnl_r = float(r.get("pnl") or 0.0)
-                            d_pnl += pnl_r
-                            d_outcomes += 1
-                            if r.get("result") == "WIN":
-                                d_wins += 1
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            for r in self._metrics_resolve_rows_cached(ttl_sec=20.0):
+                if not str(r.get("ts", "")).startswith(day_utc):
+                    continue
+                d_pnl += float(r.get("pnl") or 0.0)
+                d_outcomes += 1
+                if r.get("result") == "WIN":
+                    d_wins += 1
             self._dash_daily_cache = {
                 "ts": now_ts,
                 "day": day_utc,
@@ -12209,43 +12243,36 @@ setInterval(pollMid,2000);
                 from collections import defaultdict as _dd
                 rows = _dd(lambda: {"wins": 0, "outcomes": 0, "pnl": 0.0,
                                     "gross_win": 0.0, "gross_loss": 0.0})
-                with open(METRICS_FILE, encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            r = json.loads(line)
-                            if r.get("event") != "RESOLVE":
-                                continue
-                            if date and not str(r.get("ts", "")).startswith(date):
-                                continue
-                            if dur_filter and str(r.get("duration", "15")) != dur_filter:
-                                continue
-                            score = int(r.get("score") or 0)
-                            entry = float(r.get("entry_price") or 0)
-                            pnl   = float(r.get("pnl") or 0)
-                            won   = r.get("result") == "WIN"
-                            asset = str(r.get("asset", "?"))
-                            sc = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
-                            if entry < 0.30:   eb = "<30c"
-                            elif entry < 0.51: eb = "30-50c"
-                            elif entry < 0.61: eb = "51-60c"
-                            elif entry < 0.71: eb = "61-70c"
-                            else:              eb = ">70c"
-                            by = request.rel_url.query.get("by", "bucket")
-                            if by == "asset":
-                                k = asset
-                            elif by == "asset-score":
-                                k = asset + "|" + sc
-                            else:
-                                k = sc + "|" + eb
-                            rows[k]["outcomes"] += 1
-                            rows[k]["pnl"] += pnl
-                            if won:
-                                rows[k]["wins"] += 1
-                                rows[k]["gross_win"] += max(0.0, pnl)
-                            else:
-                                rows[k]["gross_loss"] += max(0.0, -pnl)
-                        except Exception:
-                            pass
+                for r in self._metrics_resolve_rows_cached(ttl_sec=15.0):
+                    if date and not str(r.get("ts", "")).startswith(date):
+                        continue
+                    if dur_filter and str(r.get("duration", "15")) != dur_filter:
+                        continue
+                    score = int(r.get("score") or 0)
+                    entry = float(r.get("entry_price") or 0)
+                    pnl   = float(r.get("pnl") or 0)
+                    won   = r.get("result") == "WIN"
+                    asset = str(r.get("asset", "?"))
+                    sc = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
+                    if entry < 0.30:   eb = "<30c"
+                    elif entry < 0.51: eb = "30-50c"
+                    elif entry < 0.61: eb = "51-60c"
+                    elif entry < 0.71: eb = "61-70c"
+                    else:              eb = ">70c"
+                    by = request.rel_url.query.get("by", "bucket")
+                    if by == "asset":
+                        k = asset
+                    elif by == "asset-score":
+                        k = asset + "|" + sc
+                    else:
+                        k = sc + "|" + eb
+                    rows[k]["outcomes"] += 1
+                    rows[k]["pnl"] += pnl
+                    if won:
+                        rows[k]["wins"] += 1
+                        rows[k]["gross_win"] += max(0.0, pnl)
+                    else:
+                        rows[k]["gross_loss"] += max(0.0, -pnl)
                 out = []
                 for k, v in sorted(rows.items(), key=lambda x: x[1]["pnl"], reverse=True):
                     n = v["outcomes"]
@@ -12265,25 +12292,18 @@ setInterval(pollMid,2000);
             try:
                 dur_filter = request.rel_url.query.get("dur", "")
                 daily = {}
-                with open(METRICS_FILE, encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            r = json.loads(line)
-                            if r.get("event") != "RESOLVE":
-                                continue
-                            if dur_filter and str(r.get("duration", "15")) != dur_filter:
-                                continue
-                            day = str(r.get("ts", ""))[:10]
-                            pnl = float(r.get("pnl") or 0)
-                            won = r.get("result") == "WIN"
-                            if day not in daily:
-                                daily[day] = {"wins": 0, "outcomes": 0, "pnl": 0.0}
-                            daily[day]["outcomes"] += 1
-                            daily[day]["pnl"] += pnl
-                            if won:
-                                daily[day]["wins"] += 1
-                        except Exception:
-                            pass
+                for r in self._metrics_resolve_rows_cached(ttl_sec=15.0):
+                    if dur_filter and str(r.get("duration", "15")) != dur_filter:
+                        continue
+                    day = str(r.get("ts", ""))[:10]
+                    pnl = float(r.get("pnl") or 0)
+                    won = r.get("result") == "WIN"
+                    if day not in daily:
+                        daily[day] = {"wins": 0, "outcomes": 0, "pnl": 0.0}
+                    daily[day]["outcomes"] += 1
+                    daily[day]["pnl"] += pnl
+                    if won:
+                        daily[day]["wins"] += 1
                 out = []
                 cumul = 0.0
                 for day in sorted(daily):
@@ -12306,32 +12326,25 @@ setInterval(pollMid,2000);
                 rows = _dd(lambda: {"wins": 0, "losses": 0, "pnl": 0.0,
                                     "gross_win": 0.0, "gross_loss": 0.0})
                 n5 = n15 = 0
-                with open(METRICS_FILE, encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            r = json.loads(line)
-                            if r.get("event") != "RESOLVE":
-                                continue
-                            dur = int(r.get("duration") or 15)
-                            score = int(r.get("score") or 0)
-                            entry = float(r.get("entry_price") or 0)
-                            pnl = float(r.get("pnl") or 0)
-                            won = r.get("result") == "WIN"
-                            sc = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
-                            if entry < 0.30:   eb = "<30c"
-                            elif entry < 0.51: eb = "30-50c"
-                            elif entry < 0.61: eb = "51-60c"
-                            elif entry < 0.71: eb = "61-70c"
-                            else:              eb = ">70c"
-                            k = f"{dur}m|{sc}|{eb}"
-                            rows[k]["wins" if won else "losses"] += 1
-                            rows[k]["pnl"] += pnl
-                            if won: rows[k]["gross_win"] += max(0.0, pnl)
-                            else:   rows[k]["gross_loss"] += max(0.0, -pnl)
-                            if dur == 5: n5 += 1
-                            else: n15 += 1
-                        except Exception:
-                            pass
+                for r in self._metrics_resolve_rows_cached(ttl_sec=15.0):
+                    dur = int(r.get("duration") or 15)
+                    score = int(r.get("score") or 0)
+                    entry = float(r.get("entry_price") or 0)
+                    pnl = float(r.get("pnl") or 0)
+                    won = r.get("result") == "WIN"
+                    sc = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
+                    if entry < 0.30:   eb = "<30c"
+                    elif entry < 0.51: eb = "30-50c"
+                    elif entry < 0.61: eb = "51-60c"
+                    elif entry < 0.71: eb = "61-70c"
+                    else:              eb = ">70c"
+                    k = f"{dur}m|{sc}|{eb}"
+                    rows[k]["wins" if won else "losses"] += 1
+                    rows[k]["pnl"] += pnl
+                    if won: rows[k]["gross_win"] += max(0.0, pnl)
+                    else:   rows[k]["gross_loss"] += max(0.0, -pnl)
+                    if dur == 5: n5 += 1
+                    else: n15 += 1
                 out = []
                 for k, v in sorted(rows.items(), key=lambda x: x[1]["pnl"], reverse=True):
                     n = v["wins"] + v["losses"]
