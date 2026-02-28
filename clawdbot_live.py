@@ -4881,17 +4881,8900 @@ class LiveTrader:
             return None
 
     async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
-        from clawbot_v2.legacy_core.score import score_market
-        return await score_market(self, m, late_relax)
+        """Score a market opportunity. Returns signal dict or None if hard-blocked.
+        Pure analysis — no side effects, no order placement.
+        late_relax=True: relax score gate by LATE_MUST_FIRE_SCORE_RELAX (must-fire last N min)."""
+        score_started = _time.perf_counter()
+        cid       = m["conditionId"]
+        booster_eval = False
+        booster_side_locked = ""
+        if cid in self.seen:
+            if MID_BOOSTER_ENABLED and cid in self.pending:
+                _pm, _pt = self.pending.get(cid, ({}, {}))
+                _pside = str((_pt or {}).get("side", "") or "")
+                _is_core = bool((_pt or {}).get("core_position", True))
+                _stake_onchain = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
+                if _pside in ("Up", "Down") and _is_core and _stake_onchain > 0:
+                    booster_eval = True
+                    booster_side_locked = _pside
+                else:
+                    return None
+            else:
+                return None
+        asset     = m["asset"]
+        duration  = m["duration"]
+        mins_left = m["mins_left"]
+        up_price  = m["up_price"]
+        label     = f"{asset} {duration}m | {m.get('question','')[:45]}"
+        # Pre-fetch likely token book (cheap-side = token_up iff up_price≤0.50)
+        prefetch_token = m.get("token_up", "") if up_price <= PREFETCH_UP_PRICE_MAX else m.get("token_down", "")
+
+        # Decision price selection: use freshest reliable source (prefer CL when fresh),
+        # then apply soft penalties for source divergence instead of hard blocking.
+        rtds_now = float(self.prices.get(asset, 0) or 0.0)
+        cl_now = float(self.cl_prices.get(asset, 0) or 0.0)
+        last_tick_ts = self.price_history.get(asset, deque(maxlen=1))[-1][0] if self.price_history.get(asset) else 0
+        quote_age_ms = (_time.time() - last_tick_ts) * 1000.0 if last_tick_ts else 9e9
+        cl_updated = self.cl_updated.get(asset, 0)
+        cl_age_s = (_time.time() - cl_updated) if cl_updated else None
+        if cl_now > 0 and cl_age_s is not None and cl_age_s <= CL_FRESH_PRICE_AGE_SEC:
+            current = cl_now
+            px_src = "CL"
+            quote_age_ms = 0.0   # CL is the resolution oracle; Binance WS freshness irrelevant
+        elif rtds_now > 0 and quote_age_ms <= MAX_QUOTE_STALENESS_MS:
+            current = rtds_now
+            px_src = "RTDS"
+        elif cl_now > 0:
+            current = cl_now
+            px_src = "CL-stale"
+        elif rtds_now > 0:
+            current = rtds_now
+            px_src = "RTDS-stale"
+        else:
+            return None
+
+        open_price = self.open_prices.get(cid)
+        if not open_price:
+            if LOG_VERBOSE or self._should_log(f"wait-open:{cid}", LOG_OPEN_WAIT_EVERY_SEC):
+                print(f"{Y}[WAIT] {label} → waiting for first CL round{RS}")
+            return None
+
+        src = self.open_prices_source.get(cid, "?")
+        src_tag = f"[{src}]"
+
+        # Timing gate
+        total_life    = m["end_ts"] - m["start_ts"]
+        pct_remaining = (mins_left * 60) / total_life if total_life > 0 else 0
+        if pct_remaining < PCT_REMAINING_MIN:
+            return None   # too close to close
+
+        # Oracle latency mode: only enter when Chainlink JUST updated in the final window.
+        # Also allows contrarian tail entries early in the window (cheap tokens, mean-reversion).
+        if ORACLE_LATENCY_ONLY_MODE:
+            move_now = abs(current - open_price) / max(open_price, 1e-9)
+            oracle_window = (
+                cl_age_s is not None
+                and cl_age_s <= ORACLE_FRESH_AGE_S
+                and mins_left <= ORACLE_MAX_MINS_LEFT
+                and move_now >= ORACLE_MIN_MOVE_PCT
+            )
+            tail_window = (
+                CONTRARIAN_TAIL_ENABLED
+                and min(up_price, 1.0 - up_price) <= CONTRARIAN_TAIL_MAX_ENTRY
+                and mins_left >= CONTRARIAN_TAIL_MIN_MINS_LEFT
+                and move_now >= CONTRARIAN_TAIL_MIN_MOVE_PCT
+            )
+            if not oracle_window and not tail_window:
+                return None
+
+        # Previous window direction from CL prices (used as one signal among others).
+        prev_open     = self.asset_prev_open.get(asset, 0)
+        prev_win_move = abs((open_price - prev_open) / prev_open) if prev_open > 0 and open_price > 0 else 0.0
+        prev_win_dir  = None
+        if prev_open > 0 and open_price > 0:
+            diff = (open_price - prev_open) / prev_open
+            if   diff >  PREV_WIN_DIR_MOVE_MIN: prev_win_dir = "Up"
+            elif diff < -PREV_WIN_DIR_MOVE_MIN: prev_win_dir = "Down"
+
+        move_pct = abs(current - open_price) / open_price if open_price > 0 else 0
+        move_str = f"{(current-open_price)/open_price:+.3%}"
+
+        # ── Multi-signal Score ────────────────────────────────────────────────
+        # Resolution rule: ANY price above open = Up wins (even $0.001).
+        # Direction from price if moved; from momentum consensus if flat.
+        # Max possible: 2+3+4+1+3+3+2+1 = 19 pts
+        score = 0
+        # Keep initialized for any early quality penalties before final side selection.
+        edge = 0.0
+        px_align_conflict = False
+        data_div_pen_applied = False
+
+        # Compute momentum — EMA-based (O(1) from cache) + Kalman velocity signal
+        mom_5s   = self._momentum_prob(asset, seconds=5)
+        mom_30s  = self._momentum_prob(asset, seconds=30)
+        mom_180s = self._momentum_prob(asset, seconds=180)
+        mom_kal  = self._kalman_vel_prob(asset)
+        th_up, th_dn = MOM_THRESH_UP, MOM_THRESH_DN
+        tf_up_votes = sum([mom_5s > th_up, mom_30s > th_up, mom_180s > th_up, mom_kal > th_up])
+        tf_dn_votes = sum([mom_5s < th_dn, mom_30s < th_dn, mom_180s < th_dn, mom_kal < th_dn])
+
+        # Chainlink current — the resolution oracle
+        cl_move_pct = abs(cl_now - open_price) / open_price if cl_now > 0 and open_price > 0 else 0
+        cl_direction = ("Up" if cl_now > open_price else "Down") if cl_move_pct >= CL_DIRECTION_MOVE_MIN else None
+
+        # Direction: Chainlink is authoritative (it resolves the market)
+        # Use Binance RTDS only when it's clearly moving; fall back to CL then momentum
+        if move_pct >= DIR_MOVE_MIN:
+            direction = "Up" if current > open_price else "Down"
+            # Small move + opposite CL direction: keep trading, but align to oracle and penalize.
+            if cl_direction and cl_direction != direction and move_pct < DIR_CONFLICT_MOVE_MAX:
+                score -= DIR_CONFLICT_SCORE_PEN
+                edge -= DIR_CONFLICT_EDGE_PEN
+                px_align_conflict = True
+                if cl_age_s is not None and cl_age_s <= DIR_CONFLICT_CL_AGE_MAX:
+                    direction = cl_direction
+                if self._noisy_log_enabled(f"px-align:{asset}:{duration}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[PX-ALIGN]{RS} {asset} {duration}m conflict rtds={rtds_now:.4f} "
+                        f"cl={cl_now:.4f} open={open_price:.4f} src={px_src} -> dir={direction}"
+                    )
+        elif cl_direction:
+            direction = cl_direction   # Binance flat → trust Chainlink direction
+        elif tf_up_votes > tf_dn_votes:
+            direction = "Up"
+        elif tf_dn_votes > tf_up_votes:
+            direction = "Down"
+        else:
+            direction = "Up" if cl_now >= open_price else "Down"  # always bet — binary resolves either way
+
+        is_up    = (direction == "Up")
+        tf_votes = tf_up_votes if is_up else tf_dn_votes
+        very_strong_mom = (tf_votes >= TF_VOTES_STRONG)
+
+        is_early_continuation = (prev_win_dir == direction and pct_remaining > EARLY_CONT_PCT_MIN)
+
+        # Entry timing (0-2 pts) — earlier = AMM hasn't repriced yet = better odds
+        if   pct_remaining >= TIMING_SCORE_PCT_2: score += 2
+        elif pct_remaining >= TIMING_SCORE_PCT_1: score += 1
+
+        # Move size (0-3 pts) — price confirmation bonus; not a gate
+        if   move_pct >= MOVE_SCORE_T3: score += 3
+        elif move_pct >= MOVE_SCORE_T2: score += 2
+        elif move_pct >= MOVE_SCORE_T1: score += 1
+        # flat/tiny move → +0 pts (still tradeable if momentum/taker confirm)
+
+        # Multi-TF momentum + Kalman (0-5 pts; signals: 5s/30s/180s EMA + Kalman velocity)
+        if   tf_votes == TF_VOTES_MAX: score += TF_SCORE_MAX
+        elif tf_votes == TF_VOTES_STRONG: score += TF_SCORE_STRONG
+        elif tf_votes == TF_VOTES_MID: score += TF_SCORE_MID
+
+        # Chainlink direction agreement (+1 agree / −3 disagree)
+        # CL is the resolution oracle — disagreement is a major red flag
+        cl_agree = True
+        if cl_now > 0 and open_price > 0:
+            if (is_up) != (cl_now >= open_price):   # >= matches resolution rule (tie → Up wins)
+                cl_agree = False
+        if cl_agree:  score += CL_AGREE_SCORE_BONUS
+        else:         score -= CL_DISAGREE_SCORE_PEN
+
+        # Soft source-divergence penalty (no hard skip): discourages entries on feed mismatch.
+        if open_price > 0 and cl_now > 0 and rtds_now > 0:
+            div = abs(cl_now - rtds_now) / open_price
+            if div >= DIV_PEN_START:
+                div_pen = min(DIV_PEN_MAX_SCORE, max(1, int(div / DIV_PEN_START)))
+                score -= div_pen
+                edge -= min(DIV_PEN_EDGE_CAP, div * DIV_PEN_EDGE_MULT)
+                data_div_pen_applied = True
+                if self._noisy_log_enabled(f"data-div:{asset}:{duration}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[DATA-DIV]{RS} {asset} {duration}m cl={cl_now:.4f} rtds={rtds_now:.4f} "
+                        f"open={open_price:.4f} div={div*100:.3f}% (-{div_pen} score)"
+                    )
+
+        # On-chain-first confidence: prefer authoritative open-price source + fresh oracle.
+        open_src = self.open_prices_source.get(cid, "?")
+        if STRICT_PM_SOURCE and open_src != "PM":
+            return None
+        src_conf = 1.0 if open_src == "PM" else (0.9 if open_src == "CL-exact" else 0.6)
+        onchain_adj = 0
+        if open_src == "PM":
+            onchain_adj += 1
+        elif open_src not in ("CL-exact", "PM"):
+            onchain_adj -= 1
+        if cl_age_s is None:
+            onchain_adj -= 1
+        elif cl_age_s > CL_AGE_MAX_SKIP:
+            return None
+        elif cl_age_s > CL_AGE_WARN:
+            onchain_adj -= CL_AGE_WARN_SCORE_PEN
+        # Empirical guard from live outcomes: core 15m trades with missing CL age
+        # are materially worse. Keep block for missing age, allow mildly stale.
+        if duration >= 15 and (not booster_eval):
+            if cl_age_s is None:
+                if self._noisy_log_enabled(f"skip-core-source-age:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    a = -1.0 if cl_age_s is None else float(cl_age_s)
+                    print(f"{Y}[SKIP] {asset} {duration}m core source-age invalid (cl_age={a:.1f}s){RS}")
+                self._skip_tick("core_source_age_invalid")
+                return None
+        score += onchain_adj
+
+        # ── Binance signals from WS cache (instant) + PM book fetch (async ~36ms) ─
+        ob_imbalance               = self._binance_imbalance(asset)
+        (taker_ratio, vol_ratio)   = self._binance_taker_flow(asset)
+        (perp_basis, funding_rate) = self._binance_perp_signals(asset)
+        (vwap_dev, vol_mult)       = self._binance_window_stats(asset, m["start_ts"])
+        ws_strict_age_cap = self._ws_strict_age_cap_ms()
+        _pm_book = await self._fetch_pm_book_safe(prefetch_token)
+        ws_book_now = self._get_clob_ws_book(prefetch_token, max_age_ms=ws_strict_age_cap)
+        ws_book_soft = self._get_clob_ws_book(prefetch_token, max_age_ms=WS_BOOK_SOFT_MAX_AGE_MS)
+        ws_book_strict = ws_book_now
+        if ws_book_now is None:
+            # Try alternate side token before declaring WS missing.
+            tok_u = str(m.get("token_up", "") or "")
+            tok_d = str(m.get("token_down", "") or "")
+            alt = tok_d if prefetch_token == tok_u else tok_u
+            if alt:
+                ws_book_now = self._get_clob_ws_book(alt, max_age_ms=ws_strict_age_cap)
+                ws_book_strict = ws_book_now
+                if ws_book_soft is None:
+                    ws_book_soft = self._get_clob_ws_book(alt, max_age_ms=WS_BOOK_SOFT_MAX_AGE_MS)
+        # Never trade on soft-stale WS books: keep strict-fresh only for entries.
+        # Older books can still be observed by health checker, but not used in scoring/execution.
+
+        # Realtime triad gating: orderbook + leader + volume signals.
+        if REQUIRE_ORDERBOOK_WS and ws_book_now is None:
+            # Soft fallback: if REST/PM book is fresh enough, continue with a small quality penalty.
+            pm_ok = False
+            clob_rest_ok = False
+            pm_age_ms = 9e9
+            if isinstance(_pm_book, dict):
+                pm_ts = float(_pm_book.get("ts", 0.0) or 0.0)
+                pm_age_ms = ((_time.time() - pm_ts) * 1000.0) if pm_ts > 0 else 9e9
+                pm_best_ask = float(_pm_book.get("best_ask", 0.0) or 0.0)
+                pm_src = str(_pm_book.get("source", "") or "")
+                pm_ok = pm_best_ask > 0 and pm_age_ms <= WS_BOOK_FALLBACK_MAX_AGE_MS
+                clob_rest_ok = (
+                    pm_src == "clob-rest"
+                    and pm_best_ask > 0
+                    and pm_age_ms <= CLOB_REST_FRESH_MAX_AGE_MS
+                )
+            if clob_rest_ok or (WS_BOOK_FALLBACK_ENABLED and PM_BOOK_FALLBACK_ENABLED and pm_ok):
+                score -= WS_FALLBACK_SCORE_PEN
+                ws_book_now = _pm_book
+                if self._noisy_log_enabled(f"ws-fallback:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
+                    if clob_rest_ok:
+                        print(
+                            f"{B}[CLOB-REST]{RS} {asset} {duration}m using fresh CLOB REST book "
+                            f"(age={pm_age_ms:.0f}ms) — WS stale"
+                        )
+                    else:
+                        print(
+                            f"{Y}[WS-FALLBACK]{RS} {asset} {duration}m using PM book "
+                            f"(age={pm_age_ms:.0f}ms) — no fresh CLOB WS"
+                        )
+            else:
+                # Last-resort soft WS fallback (short stale window) to avoid hard stalls.
+                if isinstance(ws_book_soft, dict):
+                    ws_book_now = ws_book_soft
+                    score -= WS_SOFT_SCORE_PEN
+                    if self._noisy_log_enabled(f"ws-soft:{asset}:{duration}", LOG_SKIP_EVERY_SEC):
+                        ws_age_pref = self._clob_ws_book_age_ms(prefetch_token)
+                        print(
+                            f"{Y}[WS-SOFT]{RS} {asset} {duration}m using older CLOB WS book "
+                            f"(age={ws_age_pref:.0f}ms) — strict/REST unavailable"
+                        )
+                else:
+                    if self._noisy_log_enabled(f"skip-no-ws-book:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                        ws_age_pref = self._clob_ws_book_age_ms(prefetch_token)
+                        print(
+                            f"{Y}[SKIP] {asset} {duration}m missing fresh CLOB WS book "
+                            f"(ws_age={ws_age_pref:.0f}ms pm_age={pm_age_ms:.0f}ms){RS}"
+                        )
+                    self._skip_tick("book_ws_missing")
+                    return None
+        if REQUIRE_ORDERBOOK_WS and STRICT_REQUIRE_FRESH_BOOK_WS and ws_book_strict is None:
+            allow_strict_rest = (
+                isinstance(ws_book_now, dict)
+                and str(ws_book_now.get("source", "") or "") == "clob-rest"
+                and ((_time.time() - float(ws_book_now.get("ts", 0.0) or 0.0)) * 1000.0) <= CLOB_REST_FRESH_MAX_AGE_MS
+            )
+            if not allow_strict_rest:
+                strict_bypass = bool(FORCE_TRADE_EVERY_ROUND and late_relax and isinstance(ws_book_now, dict))
+                if strict_bypass:
+                    score -= max(1, int(round(WS_FALLBACK_SCORE_PEN)))
+                    edge -= 0.003
+                    if self._noisy_log_enabled(f"ws-strict-bypass:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[WS-STRICT-BYPASS]{RS} {asset} {duration}m using degraded book "
+                            f"(round-force late-relax)"
+                        )
+                else:
+                    if self._noisy_log_enabled(f"skip-strict-ws:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[SKIP] {asset} {duration}m strict WS required (no fresh strict book){RS}"
+                        )
+                    self._skip_tick("book_ws_strict_required")
+                    return None
+
+        # Additional instant signals from Binance cache (zero latency)
+        dw_ob     = self._ob_depth_weighted(asset)
+        autocorr  = self._autocorr_regime(asset)
+        vr_ratio  = self._variance_ratio(asset)
+        is_jump, jump_dir, jump_z = self._jump_detect(asset)
+        btc_lead_p = self._btc_lead_signal(asset)
+        cache_a = self.binance_cache.get(asset, {})
+        volume_ready = bool(cache_a.get("depth_bids")) and bool(cache_a.get("depth_asks")) and (len(cache_a.get("klines", [])) >= CACHE_MIN_KLINES)
+        if REQUIRE_VOLUME_SIGNAL and not volume_ready:
+            if self._noisy_log_enabled(f"skip-no-vol:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(f"{Y}[SKIP] {asset} {duration}m missing live Binance depth/volume cache{RS}")
+            self._skip_tick("volume_missing")
+            return None
+
+        # Jump detection: sudden move against our direction = hard abort
+        if is_jump and jump_dir is not None and jump_dir != direction:
+            return None
+        if is_jump and jump_dir == direction:
+            score += JUMP_CONFIRM_SCORE
+
+        # Order book imbalance — depth-weighted 1/rank (more reliable than flat sum)
+        ob_sig = dw_ob if is_up else -dw_ob    # positive = OB confirms direction
+        if ob_sig < OB_HARD_BLOCK:
+            return None    # extreme contra OB — hard block
+        if   ob_sig > OB_SCORE_T3: score += 3
+        elif ob_sig > OB_SCORE_T2: score += 2
+        elif ob_sig > OB_SCORE_T1: score += 1
+        else:               score -= 1
+        imbalance_confirms = ob_sig > IMBALANCE_CONFIRM_MIN
+
+        # Taker buy/sell flow + volume vs 30-min avg (−1 to +5 pts)
+        if   (is_up and taker_ratio > TAKER_T3_UP) or (not is_up and taker_ratio < TAKER_T3_DN): score += 3
+        elif (is_up and taker_ratio > TAKER_T2_UP) or (not is_up and taker_ratio < TAKER_T2_DN): score += 2
+        elif abs(taker_ratio - 0.50) < TAKER_NEUTRAL: score += 1
+        else:                                score -= 1
+        if   vol_ratio > VOL_SCORE_T2: score += 2
+        elif vol_ratio > VOL_SCORE_T1: score += 1
+
+        # Perp futures basis: premium = leveraged longs crowding in = bullish (−1 to +2 pts)
+        perp_confirms = (is_up and perp_basis > PERP_CONFIRM) or (not is_up and perp_basis < -PERP_CONFIRM)
+        perp_strong   = (is_up and perp_basis > PERP_STRONG) or (not is_up and perp_basis < -PERP_STRONG)
+        perp_contra   = (is_up and perp_basis < -PERP_CONFIRM) or (not is_up and perp_basis > PERP_CONFIRM)
+        if   perp_strong:   score += 2
+        elif perp_confirms: score += 1
+        elif perp_contra:   score -= 1
+
+        # Funding rate: extreme = crowded = contrarian (−1 to +1 pts)
+        # High positive funding + Down bet = contrarian confirms shorts
+        # Very high positive funding + Up bet = overcrowded longs = risky
+        if   (not is_up and funding_rate >  FUNDING_POS_STRONG): score += 1
+        elif (is_up     and funding_rate <  FUNDING_NEG_CONFIRM): score += 1
+        elif (is_up     and funding_rate >  FUNDING_POS_EXTREME): score -= 1
+        elif (not is_up and funding_rate <  FUNDING_NEG_STRONG): score -= 1
+
+        # Liquidation signal: opposing-side liq confirms direction (0 to +2 pts)
+        score += self._liq_signal(asset, direction)
+
+        # Open Interest delta: growing OI confirms momentum (−1 to +1 pt)
+        oi_data = self._oi.get(asset, {})
+        if oi_data.get("prev", 0) > 0 and oi_data.get("cur", 0) > 0:
+            oi_delta = (oi_data["cur"] - oi_data["prev"]) / oi_data["prev"]
+            if   (is_up     and oi_delta >  OI_DELTA_UP):  score += 1
+            elif (not is_up and oi_delta <  OI_DELTA_DN):  score += 1
+            elif (is_up     and oi_delta <  OI_DELTA_DN):  score -= 1
+            elif (not is_up and oi_delta >  OI_DELTA_UP):  score -= 1
+
+        # L/S ratio: extreme crowding = contrarian (0 to −1 pt)
+        ls_long = self._ls_ratio.get(asset, 1.0)
+        if   (is_up     and ls_long > LS_LONG_EXT):  score -= 1   # too crowded long → risky Up
+        elif (not is_up and ls_long < LS_SHORT_EXT): score -= 1   # too crowded short → risky Down
+
+        # VWAP: momentum signal (−2 to +2 pts)
+        # Price ABOVE window VWAP in our direction = momentum confirms = good
+        # Price BELOW window VWAP in our direction = momentum weak = bad
+        vwap_net = vwap_dev if is_up else -vwap_dev   # positive = price above VWAP in bet direction
+        if   vwap_net >  VWAP_SCORE_T2: score += 2
+        elif vwap_net >  VWAP_SCORE_T1: score += 1
+        elif vwap_net < -VWAP_SCORE_T2: score -= 2
+        elif vwap_net < -VWAP_SCORE_T1: score -= 1
+
+        # Vol-normalized displacement signal (−2 to +2 pts)
+        sigma_15m = self.vols.get(asset, 0.70) * (15 / (252 * 390)) ** 0.5
+        open_price_disp = open_price
+        if open_price_disp and sigma_15m > 0:
+            net_disp = (current - open_price_disp) / open_price_disp * (1 if is_up else -1)
+            if   net_disp > sigma_15m * DISP_SIGMA_STRONG: score += 2
+            elif net_disp > sigma_15m * DISP_SIGMA_MID: score += 1
+            elif net_disp < -sigma_15m * DISP_SIGMA_STRONG: score -= 2
+            elif net_disp < -sigma_15m * DISP_SIGMA_MID: score -= 1
+
+        # Cross-asset confirmation: bonus for agreement, penalty for disagreement
+        cross_count = self._cross_asset_direction(asset, direction)
+        cross_contra = self._cross_asset_direction(asset, "Down" if direction == "Up" else "Up")
+        if   cross_count == 3: score += 2   # all other assets confirm → strong macro signal
+        elif cross_count >= 2: score += 1   # majority confirm
+        elif cross_contra == 3: score -= 2  # all 3 other assets going opposite → macro headwind
+        elif cross_contra >= 2: score -= 1  # majority going opposite → mild headwind
+
+        # Window-open OFI surge: fresh round + extreme aggTrade burst → strong directional signal
+        # Enter at price ~0.50 (2x payout) with 62-68% win probability when all assets moving together
+        ofi_surge_active = False
+        if (
+            OFI_SURGE_ENABLED
+            and pct_remaining >= OFI_SURGE_PCT_MIN
+            and duration >= 15
+        ):
+            surge_ofi = self._binance_agg_ofi(asset, window_sec=OFI_SURGE_WINDOW_SEC)
+            surge_confirms = (is_up and surge_ofi >= OFI_SURGE_THRESH_UP) or (not is_up and surge_ofi <= OFI_SURGE_THRESH_DN)
+            if surge_confirms:
+                score += OFI_SURGE_SCORE_BONUS
+                ofi_surge_active = True
+
+        # BTC lead signal for non-BTC assets — BTC lagged move predicts altcoins (0–2 pts)
+        if asset != "BTC":
+            if   (is_up and btc_lead_p > BTC_LEAD_T2_UP) or (not is_up and btc_lead_p < BTC_LEAD_T2_DN): score += 2
+            elif (is_up and btc_lead_p > BTC_LEAD_T1_UP) or (not is_up and btc_lead_p < BTC_LEAD_T1_DN): score += 1
+            elif (is_up and btc_lead_p < BTC_LEAD_NEG_UP) or (not is_up and btc_lead_p > BTC_LEAD_NEG_DN): score -= 1
+
+        # Previous-window continuation (data-driven, low weight).
+        # Never use a fixed global continuation prior; require realtime corroboration.
+        if prev_win_dir is not None:
+            if prev_win_dir == direction:
+                conf_hits = 0
+                conf_hits += 1 if tf_votes >= 3 else 0
+                conf_hits += 1 if ((is_up and taker_ratio > CONT_HIT_TAKER_UP) or ((not is_up) and taker_ratio < CONT_HIT_TAKER_DN)) else 0
+                conf_hits += 1 if ((is_up and ob_sig > CONT_HIT_OB) or ((not is_up) and ob_sig < -CONT_HIT_OB)) else 0
+                if conf_hits >= 2:
+                    score += 2 if pct_remaining > CONT_BONUS_EARLY_PCT else 1
+            else:
+                score -= 1
+
+        # Autocorr + Variance Ratio regime: trending boosts momentum confidence
+        if vr_ratio > REGIME_VR_TREND and autocorr > REGIME_AC_TREND:
+            score += 1       # trending regime — momentum more reliable
+            regime_mult = REGIME_MULT_TREND
+        elif vr_ratio < REGIME_VR_MR and autocorr < REGIME_AC_MR:
+            score -= 1       # mean-reverting — momentum less reliable
+            regime_mult = REGIME_MULT_MR
+        else:
+            regime_mult = 1.0
+
+        # RSI + Williams %R momentum oscillators (0 to +2 pts, purely additive)
+        # Both confirm strong momentum = +2; one only = +1; neutral or contra = 0
+        _rsi_val = self._rsi(asset)
+        _wr_val  = self._williams_r(asset)
+        if   (is_up  and _rsi_val >= RSI_OB       and _wr_val >= WR_OB):        score += 2
+        elif (not is_up and _rsi_val <= RSI_OS     and _wr_val <= WR_OS):        score += 2
+        elif (is_up  and (_rsi_val >= RSI_OB - 5  or  _wr_val >= WR_OB + 5)):   score += 1
+        elif (not is_up and (_rsi_val <= RSI_OS + 5 or _wr_val <= WR_OS - 5)):  score += 1
+
+        # Log-likelihood true_prob — Bayesian combination of independent signals
+        sigma_15m = self.vols.get(asset, 0.70) * (15 / (252 * 390)) ** 0.5
+        llr = 0.0
+        # 1. Price displacement z-score
+        if open_price > 0 and sigma_15m > 0:
+            llr += (current - open_price) / open_price / sigma_15m * LLR_PRICE_MULT
+        # 2. Short vs long EMA cross
+        ema5  = self.emas.get(asset, {}).get(5, current)
+        ema60 = self.emas.get(asset, {}).get(60, current)
+        if ema60 > 0:
+            llr += (ema5 / ema60 - 1.0) * LLR_EMA_MULT
+        # 3. Kalman velocity
+        k = self.kalman.get(asset, {})
+        if k.get("rdy"):
+            per_sec_vol = max(self.vols.get(asset, 0.7) / math.sqrt(252 * 24 * 3600), 1e-8)
+            llr += k["vel"] / per_sec_vol * LLR_KALMAN_MULT
+        # 4. Depth-weighted OB imbalance
+        llr += dw_ob * LLR_OB_MULT
+        # 5. Taker buy/sell flow
+        llr += (taker_ratio - 0.5) * LLR_TAKER_MULT
+        # 6. Perp basis
+        if abs(perp_basis) > 1e-7:
+            llr += math.copysign(min(abs(perp_basis) * LLR_PERP_MULT, LLR_PERP_CAP), perp_basis)
+        # 7. Chainlink oracle agreement
+        if cl_agree:  llr += LLR_CL_AGREE
+        else:         llr -= LLR_CL_DISAGREE
+        # 8. BTC lead for altcoins
+        if asset != "BTC":
+            llr += (btc_lead_p - 0.5) * LLR_BTC_LEAD_MULT
+        # 9. Regime scale
+        llr *= regime_mult
+        # Sigmoid → prob_up
+        p_up_ll   = 1.0 / (1.0 + math.exp(-max(-LLR_CLAMP, min(LLR_CLAMP, llr))))
+        # Structural tie bias: resolution uses >= so exact CL tie resolves as Up
+        p_up_ll   = min(1.0, p_up_ll + TIE_BIAS_UP)
+        bias_up   = self._direction_bias(asset, "Up", duration)
+        bias_down = self._direction_bias(asset, "Down", duration)
+        # Net bias: bias_up raises P(Up), bias_down lowers P(Up) — normalize so sum=1
+        prob_up   = max(0.05, min(0.95, p_up_ll + bias_up - bias_down))
+        prob_down = 1.0 - prob_up
+
+        # Early continuation prior boost (bounded, realtime-confirmed).
+        if prev_win_dir == direction and pct_remaining > CONT_BONUS_EARLY_PCT:
+            prior_boost = 0.0
+            if tf_votes >= 3:
+                prior_boost += PRIOR_BOOST_TF
+            if ((is_up and taker_ratio > PRIOR_BOOST_TAKER_UP) or ((not is_up) and taker_ratio < PRIOR_BOOST_TAKER_DN)):
+                prior_boost += PRIOR_BOOST_TAKER
+            if ((is_up and ob_sig > PRIOR_BOOST_OB_MIN) or ((not is_up) and ob_sig < -PRIOR_BOOST_OB_MIN)):
+                prior_boost += PRIOR_BOOST_OB
+            if cl_agree:
+                prior_boost += PRIOR_BOOST_CL
+            prior_boost = max(0.0, min(CONTINUATION_PRIOR_MAX_BOOST, prior_boost))
+            if direction == "Up":
+                prob_up = max(prob_up, min(0.95, prob_up + prior_boost))
+                prob_down = 1 - prob_up
+            else:
+                prob_down = max(prob_down, min(0.95, prob_down + prior_boost))
+                prob_up   = 1 - prob_down
+
+        # Online calibration: shrink overconfident probabilities toward 50% when live WR degrades.
+        shrink = self._prob_shrink_factor()
+        prob_up = 0.5 + (prob_up - 0.5) * shrink
+        prob_up = max(0.05, min(0.95, prob_up))
+        prob_down = 1.0 - prob_up
+
+        # Recent on-chain side prior (asset+duration+side), non-blocking directional calibration.
+        up_recent = self._recent_side_profile(asset, duration, "Up")
+        dn_recent = self._recent_side_profile(asset, duration, "Down")
+        up_adj = float(up_recent.get("prob_adj", 0.0) or 0.0)
+        dn_adj = float(dn_recent.get("prob_adj", 0.0) or 0.0)
+        if abs(up_adj) > DEFAULT_EPS or abs(dn_adj) > DEFAULT_EPS:
+            pu = max(PROB_REBALANCE_MIN, min(PROB_REBALANCE_MAX, prob_up + up_adj))
+            pd = max(PROB_REBALANCE_MIN, min(PROB_REBALANCE_MAX, prob_down + dn_adj))
+            z = pu + pd
+            if z > 0:
+                prob_up = max(PROB_CLAMP_MIN, min(PROB_CLAMP_MAX, pu / z))
+                prob_down = 1.0 - prob_up
+
+        edge_up   = prob_up   - up_price
+        edge_down = prob_down - (1 - up_price)
+        min_edge   = self._adaptive_min_edge()
+        pre_filter = max(PREFILTER_MIN, min_edge * PREFILTER_EDGE_MULT)
+
+        # Lock side to price direction when move is clear.
+        # AMM edge comparison only used when price is flat (no clear directional signal)
+        if move_pct >= FORCE_DIR_MOVE_MIN:
+            forced_side = "Up" if current > open_price else "Down"
+            forced_edge = edge_up if forced_side == "Up" else edge_down
+            forced_prob = prob_up if forced_side == "Up" else prob_down
+            if forced_edge >= 0:
+                side, edge, true_prob = forced_side, forced_edge, forced_prob
+            elif forced_edge < FORCE_DIR_EDGE_HARD_BLOCK:
+                return None   # AMM has massively overpriced this direction — no edge at all
+            else:
+                side, edge, true_prob = forced_side, max(FORCE_DIR_EDGE_FLOOR, forced_edge), forced_prob
+        else:
+            # Flat price: side MUST match direction (CL/momentum consensus).
+            # AMM edge only used to reject extreme mispricing (< -15%).
+            # Momentum/CL direction wins over weak market-pricing noise.
+            dir_edge = edge_up if direction == "Up" else edge_down
+            dir_prob = prob_up if direction == "Up" else prob_down
+            if dir_edge < FORCE_DIR_EDGE_HARD_BLOCK:
+                return None   # AMM massively overpriced our direction — no edge
+            side, edge, true_prob = direction, max(FORCE_DIR_EDGE_FLOOR, dir_edge), dir_prob
+
+        # Max-win profile (source fix):
+        # choose side by EV utility (not raw probability), with soft event-context prior.
+        if MAX_WIN_MODE:
+            payout_up = 1.0 / max(up_price, 1e-9)
+            payout_dn = 1.0 / max(1.0 - up_price, 1e-9)
+            ev_up = (prob_up * payout_up) - 1.0 - max(0.001, up_price * (1.0 - up_price) * 0.0624)
+            ev_dn = (prob_down * payout_dn) - 1.0 - max(0.001, (1.0 - up_price) * up_price * 0.0624)
+            util_up = ev_up + edge_up * UTIL_EDGE_MULT
+            util_dn = ev_dn + edge_down * UTIL_EDGE_MULT
+            # Soft contextual prior from current event state (non-blocking).
+            if duration >= CORE_DURATION_MIN and open_price > 0 and current > 0 and mins_left <= EVENT_ALIGN_MIN_LEFT_15M:
+                mv = (current - open_price) / max(open_price, 1e-9)
+                if abs(mv) >= EVENT_ALIGN_MIN_MOVE_PCT:
+                    # bounded utility shift: follow clear event drift unless EV is decisively opposite
+                    u_shift = min(SETUP_Q_HARD_RELAX_MAX, max(EVENT_ALIGN_WITH_EDGE_BONUS, abs(mv) * LLR_PERP_MULT / 125.0))
+                    if mv >= 0:
+                        util_up += u_shift
+                        util_dn -= u_shift
+                    else:
+                        util_dn += u_shift
+                        util_up -= u_shift
+            if util_up >= util_dn:
+                side, edge, true_prob = "Up", edge_up, prob_up
+            else:
+                side, edge, true_prob = "Down", edge_down, prob_down
+
+        # Keep signal components aligned to the effective side.
+        asset_entry_size_mult = 1.0
+        side_up = side == "Up"
+        event_align_size_mult = 1.0
+        recent_side = up_recent if side_up else dn_recent
+        recent_side_n = int(recent_side.get("n", 0) or 0)
+        recent_side_exp = float(recent_side.get("exp", 0.0) or 0.0)
+        recent_side_wr_lb = float(recent_side.get("wr_lb", 0.5) or 0.5)
+        recent_side_score_adj = int(recent_side.get("score_adj", 0) or 0)
+        recent_side_edge_adj = float(recent_side.get("edge_adj", 0.0) or 0.0)
+        recent_side_prob_adj = float(recent_side.get("prob_adj", 0.0) or 0.0)
+        if recent_side_score_adj != 0 or abs(recent_side_edge_adj) > DEFAULT_EPS:
+            score += recent_side_score_adj
+            edge += recent_side_edge_adj
+            if self._noisy_log_enabled(f"recent-side:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{B}[RECENT-SIDE]{RS} {asset} {duration}m {side} "
+                    f"adj(score={recent_side_score_adj:+d},edge={recent_side_edge_adj:+.3f},prob={recent_side_prob_adj:+.3f}) "
+                    f"n={recent_side_n} exp={recent_side_exp:+.2f} wr_lb={recent_side_wr_lb:.2f}"
+                )
+        # Asset+entry-band profile from settled on-chain outcomes.
+        aq_entry = up_price if side_up else (1.0 - up_price)
+        aq = self._asset_entry_profile(asset, duration, side, aq_entry, open_src, cl_age_s)
+        aq_score = int(aq.get("score_adj", 0) or 0)
+        aq_edge = float(aq.get("edge_adj", 0.0) or 0.0)
+        aq_prob = float(aq.get("prob_adj", 0.0) or 0.0)
+        asset_entry_size_mult = float(aq.get("size_mult", 1.0) or 1.0)
+        if aq_score != 0 or abs(aq_edge) > DEFAULT_EPS or abs(aq_prob) > DEFAULT_EPS:
+            score += aq_score
+            edge += aq_edge
+            true_prob = max(0.05, min(0.95, true_prob + aq_prob))
+            if self._noisy_log_enabled(f"onchain-q:{asset}:{duration}:{side}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{B}[ONCHAIN-Q]{RS} {asset} {duration}m {side} "
+                    f"band={aq.get('band','?')} n={int(aq.get('n',0) or 0)} "
+                    f"wr_lb={float(aq.get('wr_lb',0.5) or 0.5):.2f} pf={float(aq.get('pf',1.0) or 1.0):.2f} "
+                    f"exp={float(aq.get('exp',0.0) or 0.0):+.2f} "
+                    f"adj(score={aq_score:+d},edge={aq_edge:+.3f},prob={aq_prob:+.3f},size_x={asset_entry_size_mult:.2f})"
+                )
+        tf_votes = tf_up_votes if side_up else tf_dn_votes
+        ob_sig = dw_ob if side_up else -dw_ob
+        cl_agree = True
+        if cl_now > 0 and open_price > 0:
+            cl_agree = (cl_now > open_price) == side_up
+
+        # Soft event-alignment penalty (non-blocking):
+        # if signal is contrarian while move is already clear in 15m mid/late window,
+        # reduce score/edge and shrink size rather than hard-skipping.
+        if (
+            EVENT_ALIGN_GUARD_ENABLED
+            and duration >= 15
+            and mins_left <= EVENT_ALIGN_MIN_LEFT_15M
+            and open_price > 0
+            and current > 0
+        ):
+            move_now = (current - open_price) / max(open_price, 1e-9)
+            if abs(move_now) >= EVENT_ALIGN_MIN_MOVE_PCT:
+                event_dir = "Up" if move_now >= 0 else "Down"
+                if side != event_dir:
+                    strong_exception = (
+                        score >= EVENT_ALIGN_ALLOW_SCORE
+                        and true_prob >= EVENT_ALIGN_ALLOW_TRUE_PROB
+                    )
+                    if not strong_exception:
+                        pen_scale = max(0.6, min(1.4, abs(move_now) / max(EVENT_ALIGN_MIN_MOVE_PCT, 1e-9)))
+                        sc_pen = max(1, int(round(EVENT_ALIGN_CONTRA_SCORE_PEN * pen_scale)))
+                        ed_pen = max(0.004, EVENT_ALIGN_CONTRA_EDGE_PEN * pen_scale)
+                        score -= sc_pen
+                        edge -= ed_pen
+                        true_prob = 0.5 + (true_prob - 0.5) * 0.88
+                        event_align_size_mult = max(0.20, min(1.0, EVENT_ALIGN_CONTRA_SIZE_MULT))
+                        if self._noisy_log_enabled(f"event-align-pen:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                            print(
+                                f"{Y}[EVENT-ALIGN]{RS} {asset} {duration}m contra {side}!={event_dir} "
+                                f"move={move_now*100:+.3f}% sc_pen={sc_pen} ed_pen={ed_pen:+.3f} "
+                                f"size_x={event_align_size_mult:.2f}"
+                            )
+                else:
+                    score += max(0, EVENT_ALIGN_WITH_SCORE_BONUS)
+                    edge += max(0.0, EVENT_ALIGN_WITH_EDGE_BONUS)
+        if ASSET_QUALITY_FILTER_ENABLED:
+            q_n, q_pf, q_exp = self._asset_side_quality(asset, side)
+            if q_n >= max(1, ASSET_QUALITY_MIN_TRADES):
+                if q_pf <= ASSET_QUALITY_BLOCK_PF and q_exp <= ASSET_QUALITY_BLOCK_EXP:
+                    if ASSET_QUALITY_HARD_BLOCK_ENABLED:
+                        if self._noisy_log_enabled(f"skip-asset-quality-block:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                            print(
+                                f"{Y}[SKIP] {asset} {duration}m quality-block {side} "
+                                f"(n={q_n} pf={q_pf:.2f} exp={q_exp:+.2f}){RS}"
+                            )
+                        self._skip_tick("asset_quality_block")
+                        return None
+                    # Default: don't freeze execution; apply a stronger penalty only.
+                    score -= max(3, ASSET_QUALITY_SCORE_PENALTY + 1)
+                    edge -= max(0.015, ASSET_QUALITY_EDGE_PENALTY + 0.005)
+                    if self._noisy_log_enabled(f"asset-quality-softblock:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[ASSET-QUALITY]{RS} {asset} {duration}m {side} soft-block "
+                            f"(n={q_n} pf={q_pf:.2f} exp={q_exp:+.2f})"
+                        )
+                if q_pf < ASSET_QUALITY_MIN_PF or q_exp < ASSET_QUALITY_MIN_EXP:
+                    score -= ASSET_QUALITY_SCORE_PENALTY
+                    edge -= ASSET_QUALITY_EDGE_PENALTY
+                    if self._noisy_log_enabled(f"asset-quality-pen:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[ASSET-QUALITY]{RS} {asset} {duration}m {side} "
+                            f"penalty n={q_n} pf={q_pf:.2f} exp={q_exp:+.2f} "
+                            f"(-{ASSET_QUALITY_SCORE_PENALTY} score)"
+                        )
+        imbalance_confirms = ob_sig > 0.10
+
+
+        # Late-window direction lock: avoid betting against the beat direction
+        # when the move is already clear near expiry.
+        if (
+            LATE_DIR_LOCK_ENABLED
+            and open_price > 0
+            and current > 0
+            and duration in (5, 15)
+        ):
+            lock_mins, lock_move_min = self._late_lock_thresholds(duration)
+            move_abs = abs((current - open_price) / max(open_price, 1e-9))
+            if mins_left <= lock_mins and move_abs >= lock_move_min:
+                beat_dir = "Up" if current >= open_price else "Down"
+                if side != beat_dir:
+                    prev_side = side
+                    side = beat_dir
+                    # Soft alignment by default: keep trading flow but reduce confidence.
+                    # This avoids no-trade stalls while preserving direction discipline near expiry.
+                    score -= 1
+                    edge -= 0.004
+                    true_prob = max(0.05, min(0.95, 0.5 + (true_prob - 0.5) * 0.92))
+                    if self._noisy_log_enabled(f"late-lock-align:{asset}:{prev_side}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[LATE-ALIGN]{RS} {asset} {duration}m {prev_side}->{beat_dir} "
+                            f"mins_left={mins_left:.1f} move={move_abs*100:.2f}%"
+                        )
+
+        # Late-window locked-direction prob boost:
+        # When in the last LATE_PAYOUT_RELAX_PCT_LEFT of the window AND price has already moved
+        # LATE_PAYOUT_RELAX_MIN_MOVE in our direction AND taker flow confirms → boost true_prob.
+        # This captures high-certainty entries where win rate is 72-78% but payout only 1.65-1.80x.
+        late_locked = (
+            LATE_PAYOUT_RELAX_ENABLED
+            and pct_remaining <= LATE_PAYOUT_RELAX_PCT_LEFT
+            and duration >= 15
+            and open_price > 0
+            and move_pct >= LATE_PAYOUT_RELAX_MIN_MOVE
+            and ((side_up and current >= open_price) or (not side_up and current < open_price))
+            and ((side_up and taker_ratio >= 0.52) or (not side_up and taker_ratio <= 0.48))
+        )
+        if late_locked:
+            true_prob = max(0.05, min(0.95, true_prob + LATE_PAYOUT_PROB_BOOST))
+
+        # OFI surge prob boost (already added score bonus above; now also boost probability)
+        if ofi_surge_active:
+            true_prob = max(0.05, min(0.95, true_prob + OFI_SURGE_PROB_BOOST))
+
+        # Optional copyflow signal from externally ranked leader wallets on same market.
+        copy_adj = 0
+        copy_net = 0.0
+        leader_ready = False
+        leader_soft_ready = False
+        signal_tier = "TIER-C"
+        signal_source = "synthetic"
+        leader_size_scale = LEADER_SYNTH_SIZE_SCALE
+        flow_n = 0
+        flow_age_s = 9e9
+        up_conf = 0.0
+        dn_conf = 0.0
+        flow = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
+        pm_pattern_key = ""
+        pm_pattern_score_adj = 0
+        pm_pattern_edge_adj = 0.0
+        pm_pattern_n = 0
+        pm_pattern_exp = 0.0
+        pm_pattern_wr_lb = 0.5
+        pm_public_pattern_score_adj = 0
+        pm_public_pattern_edge_adj = 0.0
+        pm_public_pattern_n = 0
+        pm_public_pattern_dom = 0.0
+        pm_public_pattern_avg_c = 0.0
+        recent_side_n = 0
+        recent_side_exp = 0.0
+        recent_side_wr_lb = 0.5
+        recent_side_score_adj = 0
+        recent_side_edge_adj = 0.0
+        recent_side_prob_adj = 0.0
+        if isinstance(flow, dict):
+            up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
+            dn_conf = float(flow.get("Down", flow.get("down", 0.0)) or 0.0)
+            flow_n = int(flow.get("n", 0) or 0)
+            flow_ts = float(flow.get("ts", 0.0) or 0.0)
+            flow_age_s = (_time.time() - flow_ts) if flow_ts > 0 else 9e9
+            flow_fresh = flow_age_s <= COPYFLOW_LIVE_MAX_AGE_SEC
+            leader_net = up_conf - dn_conf
+            # "Leader-flow present" should reflect data availability, not strict sample quality.
+            # Keep MARKET_LEADER_MIN_N only for force-follow logic below.
+            leader_ready = flow_fresh and (flow_n >= 1)
+            leader_soft_ready = (flow_n >= MARKET_LEADER_MIN_N) and (
+                flow_age_s <= LEADER_FLOW_FALLBACK_MAX_AGE_SEC
+            )
+            # Strong per-market leader consensus: follow the market leaders on this CID.
+            if (
+                MARKET_LEADER_FOLLOW_ENABLED
+                and flow_fresh
+                and flow_n >= MARKET_LEADER_MIN_N
+                and abs(leader_net) >= MARKET_LEADER_MIN_NET
+            ):
+                leader_side = "Up" if leader_net > 0 else "Down"
+                leader_entry = up_price if leader_side == "Up" else (1 - up_price)
+                leader_entry_cap = min(
+                    LEADER_ENTRY_CAP_HARD_MAX,
+                    MAX_ENTRY_PRICE + MAX_ENTRY_TOL + LEADER_ENTRY_CAP_EXTRA,
+                )
+                leader_quality_ok = True
+                if LEADER_FORCE_QUALITY_GUARD_ENABLED:
+                    try:
+                        q = self._asset_entry_profile(
+                            asset, duration, leader_side, leader_entry, open_src, cl_age_s
+                        )
+                        q_n = int(q.get("n", 0) or 0)
+                        q_wr = float(q.get("wr_lb", 0.5) or 0.5)
+                        q_pf = float(q.get("pf", 1.0) or 1.0)
+                        q_exp = float(q.get("exp", 0.0) or 0.0)
+                        rs = self._recent_side_profile(asset, duration, leader_side)
+                        rs_n = int(rs.get("n", 0) or 0)
+                        rs_wr = float(rs.get("wr_lb", 0.5) or 0.5)
+                        rs_exp = float(rs.get("exp", 0.0) or 0.0)
+                        bad_band = (
+                            q_n >= LEADER_FORCE_MIN_N
+                            and (q_wr < LEADER_FORCE_MIN_WR_LB or q_pf < LEADER_FORCE_MIN_PF or q_exp < LEADER_FORCE_MIN_EXP)
+                        )
+                        bad_recent = (
+                            rs_n >= LEADER_FORCE_MIN_N
+                            and rs_wr < LEADER_FORCE_MIN_WR_LB
+                            and rs_exp < LEADER_FORCE_MIN_EXP
+                        )
+                        if bad_band or bad_recent:
+                            leader_quality_ok = False
+                            if self._noisy_log_enabled(f"leader-block:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                                print(
+                                    f"{Y}[LEADER-BLOCK]{RS} {asset} {duration}m side={leader_side} "
+                                    f"band(n={q_n} wr_lb={q_wr:.2f} pf={q_pf:.2f} exp={q_exp:+.2f}) "
+                                    f"recent(n={rs_n} wr_lb={rs_wr:.2f} exp={rs_exp:+.2f})"
+                                )
+                    except Exception:
+                        pass
+                if leader_entry <= leader_entry_cap and leader_quality_ok:
+                    if side != leader_side:
+                        if self._noisy_log_enabled(f"leader-follow:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                            print(
+                                f"{B}[LEADER-FOLLOW]{RS} {asset} {duration}m force {side}->{leader_side} "
+                                f"(up={up_conf:.2f} down={dn_conf:.2f} n={flow_n} entry={leader_entry:.3f})"
+                            )
+                        side = leader_side
+                    score += MARKET_LEADER_SCORE_BONUS
+                    edge += MARKET_LEADER_EDGE_BONUS
+                    signal_tier = "TIER-A"
+                    signal_source = "leader-fresh"
+                    leader_size_scale = LEADER_FRESH_SIZE_SCALE
+                elif self._noisy_log_enabled(f"leader-follow-bypass:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[LEADER-BYPASS]{RS} {asset} {duration}m leader={leader_side} "
+                        f"entry={leader_entry:.3f} > cap={leader_entry_cap:.3f}"
+                    )
+            elif MARKET_LEADER_FOLLOW_ENABLED and (not flow_fresh) and flow_n > 0:
+                # Leader-flow stale is informational only: never block/penalize execution.
+                pass
+            pref = up_conf if side == "Up" else dn_conf
+            opp = dn_conf if side == "Up" else up_conf
+            copy_net = pref - opp
+            copy_adj = int(round(max(-COPYFLOW_BONUS_MAX, min(COPYFLOW_BONUS_MAX, copy_net * COPYFLOW_BONUS_MAX))))
+            score += copy_adj
+            edge += copy_net * COPY_NET_EDGE_MULT
+            # Leader behavior style signal: are winners buying cheap or paying high cents?
+            avg_c = float(flow.get("avg_entry_c", 0.0) or 0.0)
+            low_share = float(flow.get("low_c_share", 0.0) or 0.0)
+            high_share = float(flow.get("high_c_share", 0.0) or 0.0)
+            multibet_ratio = float(flow.get("multibet_ratio", 0.0) or 0.0)
+            if avg_c > 0 and high_share >= LEADER_STYLE_HIGH_SHARE_MIN and multibet_ratio >= LEADER_STYLE_MULTIBET_MIN:
+                score += LEADER_STYLE_SCORE_BONUS
+                edge += LEADER_STYLE_EDGE_BONUS
+            elif avg_c > 0 and low_share >= LEADER_STYLE_LOW_SHARE_MIN and (up_price if side == "Up" else (1 - up_price)) > LEADER_STYLE_EXPENSIVE_ENTRY_MIN:
+                # Winners buying low-cents but market now expensive: fade confidence.
+                score -= LEADER_STYLE_SCORE_PENALTY
+                edge -= LEADER_STYLE_EDGE_PENALTY
+            if PM_PATTERN_ENABLED:
+                pm_pattern_key = self._pm_pattern_key(asset, duration, side, copy_net, flow)
+                patt = self._pm_pattern_profile(pm_pattern_key)
+                pm_pattern_score_adj = int(patt.get("score_adj", 0) or 0)
+                pm_pattern_edge_adj = float(patt.get("edge_adj", 0.0) or 0.0)
+                pm_pattern_n = int(patt.get("n", 0) or 0)
+                pm_pattern_exp = float(patt.get("exp", 0.0) or 0.0)
+                pm_pattern_wr_lb = float(patt.get("wr_lb", 0.5) or 0.5)
+                if pm_pattern_score_adj != 0 or abs(pm_pattern_edge_adj) > 1e-9:
+                    score += pm_pattern_score_adj
+                    edge += pm_pattern_edge_adj
+                    if self._noisy_log_enabled(f"pm-pattern:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{B}[PM-PATTERN]{RS} {asset} {duration}m {side} "
+                            f"adj(score={pm_pattern_score_adj:+d},edge={pm_pattern_edge_adj:+.3f}) "
+                            f"n={int(patt.get('n',0) or 0)} exp={float(patt.get('exp',0.0) or 0.0):+.2f} "
+                            f"wr_lb={float(patt.get('wr_lb',0.5) or 0.5):.2f}"
+                        )
+                elif (
+                    int(patt.get("n", 0) or 0) > 0
+                    and int(patt.get("n", 0) or 0) < int(patt.get("min_n", PM_PATTERN_MIN_N) or PM_PATTERN_MIN_N)
+                    and self._noisy_log_enabled(f"pm-pattern-warmup:{asset}:{cid}", LOG_FLOW_EVERY_SEC)
+                ):
+                    print(
+                        f"{Y}[PM-PATTERN-WARMUP]{RS} {asset} {duration}m {side} "
+                        f"n={int(patt.get('n',0) or 0)}/{int(patt.get('min_n', PM_PATTERN_MIN_N) or PM_PATTERN_MIN_N)} "
+                        f"exp={float(patt.get('exp',0.0) or 0.0):+.2f} "
+                        f"wr_lb={float(patt.get('wr_lb',0.5) or 0.5):.2f}"
+                    )
+            if PM_PUBLIC_PATTERN_ENABLED:
+                pub = self._pm_public_pattern_profile(side, flow, (up_price if side == "Up" else (1.0 - up_price)))
+                pub_score_adj = int(pub.get("score_adj", 0) or 0)
+                pub_edge_adj = float(pub.get("edge_adj", 0.0) or 0.0)
+                pm_public_pattern_score_adj = pub_score_adj
+                pm_public_pattern_edge_adj = pub_edge_adj
+                pm_public_pattern_n = int(pub.get("n", 0) or 0)
+                pm_public_pattern_dom = float(pub.get("dom", 0.0) or 0.0)
+                pm_public_pattern_avg_c = float(pub.get("avg_c", 0.0) or 0.0)
+                if pub_score_adj != 0 or abs(pub_edge_adj) > 1e-9:
+                    score += pub_score_adj
+                    edge += pub_edge_adj
+                    if self._noisy_log_enabled(f"pm-public-pattern:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        if float(pub.get("avg_c", 0.0) or 0.0) >= PM_PUBLIC_OCROWD_AVG_C_MIN and abs(float(pub.get("dom", 0.0) or 0.0)) >= PM_PUBLIC_PATTERN_DOM_MED:
+                            print(
+                                f"{Y}[PM-PUBLIC-OCROWD]{RS} {asset} {duration}m {side} "
+                                f"high-cent crowd mode avg={float(pub.get('avg_c',0.0) or 0.0):.1f}c "
+                                f"dom={float(pub.get('dom',0.0) or 0.0):+.2f}"
+                            )
+                        print(
+                            f"{B}[PM-PUBLIC-PATTERN]{RS} {asset} {duration}m {side} "
+                            f"adj(score={pub_score_adj:+d},edge={pub_edge_adj:+.3f}) "
+                            f"n={int(pub.get('n',0) or 0)} dom={float(pub.get('dom',0.0) or 0.0):+.2f} "
+                            f"avg={float(pub.get('avg_c',0.0) or 0.0):.1f}c src={str(flow.get('src','?') or '?')}"
+                        )
+                elif (
+                    int(pub.get("n", 0) or 0) > 0
+                    and int(pub.get("n", 0) or 0) < int(pub.get("min_n", PM_PUBLIC_PATTERN_MIN_N) or PM_PUBLIC_PATTERN_MIN_N)
+                    and self._noisy_log_enabled(f"pm-public-pattern-warmup:{asset}:{cid}", LOG_FLOW_EVERY_SEC)
+                ):
+                    print(
+                        f"{Y}[PM-PUBLIC-WARMUP]{RS} {asset} {duration}m {side} "
+                        f"n={int(pub.get('n',0) or 0)}/{int(pub.get('min_n', PM_PUBLIC_PATTERN_MIN_N) or PM_PUBLIC_PATTERN_MIN_N)} "
+                        f"dom={float(pub.get('dom',0.0) or 0.0):+.2f} avg={float(pub.get('avg_c',0.0) or 0.0):.1f}c"
+                    )
+
+        # Real-time CID refresh on missing/stale leader-flow before any gating decision.
+        if COPYFLOW_CID_ONDEMAND_ENABLED and (
+            flow_n <= 0 or flow_age_s > COPYFLOW_LIVE_MAX_AGE_SEC
+        ):
+            now_ts = _time.time()
+            last_ts = float(self._copyflow_cid_on_demand_ts.get(cid, 0.0) or 0.0)
+            if (now_ts - last_ts) >= COPYFLOW_CID_ONDEMAND_COOLDOWN_SEC:
+                self._copyflow_cid_on_demand_ts[cid] = now_ts
+                try:
+                    await self._copyflow_refresh_cid_once(cid, reason="score-miss")
+                except Exception:
+                    pass
+                flow = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
+                if isinstance(flow, dict):
+                    up_conf = float(flow.get("Up", flow.get("up", 0.0)) or 0.0)
+                    dn_conf = float(flow.get("Down", flow.get("down", 0.0)) or 0.0)
+                    flow_n = int(flow.get("n", 0) or 0)
+                    flow_ts = float(flow.get("ts", 0.0) or 0.0)
+                    flow_age_s = (_time.time() - flow_ts) if flow_ts > 0 else 9e9
+                    leader_net = up_conf - dn_conf
+                    leader_ready = flow_age_s <= COPYFLOW_LIVE_MAX_AGE_SEC and flow_n >= 1
+                    leader_soft_ready = (flow_n >= MARKET_LEADER_MIN_N) and (
+                        flow_age_s <= LEADER_FLOW_FALLBACK_MAX_AGE_SEC
+                    )
+                    pref = up_conf if side == "Up" else dn_conf
+                    opp = dn_conf if side == "Up" else up_conf
+                    copy_net = pref - opp
+        if leader_ready and signal_source != "leader-fresh":
+            signal_tier = "TIER-A"
+            signal_source = "leader-live"
+            leader_size_scale = LEADER_FRESH_SIZE_SCALE
+        if REQUIRE_LEADER_FLOW and (not leader_ready):
+            # Leader wallets are optional alpha, never a hard gate.
+            # We continue with strict realtime technical stack.
+            signal_tier = "TIER-B"
+            signal_source = "tech-realtime-no-leader"
+            leader_size_scale = min(leader_size_scale, LEADER_NOFLOW_SIZE_SCALE)
+
+        # Leader/prebid can change side: refresh side-aligned metrics.
+        side_up = side == "Up"
+        tf_votes = tf_up_votes if side_up else tf_dn_votes
+        ob_sig = dw_ob if side_up else -dw_ob
+        cl_agree = True
+        if cl_now > 0 and open_price > 0:
+            cl_agree = (cl_now > open_price) == side_up
+        imbalance_confirms = ob_sig > IMBALANCE_CONFIRM_MIN
+
+        # Source-quality + signal-conviction analysis (real data only).
+        # This is the primary anti-random layer: trade only when data is both fresh and coherent.
+        cl_fresh = (cl_age_s is not None) and (cl_age_s <= ANALYSIS_CL_FRESH_MAX_AGE_SEC)
+        quote_fresh = quote_age_ms <= min(MAX_QUOTE_STALENESS_MS, ANALYSIS_QUOTE_FRESH_MAX_MS)
+        ws_fresh = ws_book_strict is not None
+        rest_fresh = (
+            isinstance(ws_book_now, dict)
+            and str(ws_book_now.get("source", "") or "") in ("clob-rest", "pm")
+            and ((_time.time() - float(ws_book_now.get("ts", 0.0) or 0.0)) * 1000.0)
+            <= max(CLOB_REST_FRESH_MAX_AGE_MS, WS_BOOK_FALLBACK_MAX_AGE_MS)
+        )
+        book_fresh = ws_fresh or rest_fresh
+        vol_fresh = bool(volume_ready)
+        leader_fresh = bool(leader_ready)
+        analysis_quality = (
+            ((ANALYSIS_QUALITY_WS_WEIGHT if ws_fresh else (ANALYSIS_QUALITY_REST_WEIGHT if rest_fresh else 0.0)))
+            + (ANALYSIS_QUALITY_LEADER_WEIGHT if leader_fresh else 0.0)
+            + (ANALYSIS_QUALITY_CL_WEIGHT if cl_fresh else 0.0)
+            + (ANALYSIS_QUALITY_QUOTE_WEIGHT if quote_fresh else 0.0)
+            + (ANALYSIS_QUALITY_VOL_WEIGHT if vol_fresh else 0.0)
+        )
+
+        dir_sign = 1.0 if side == "Up" else -1.0
+        ob_c = max(0.0, min(1.0, (ob_sig + ANALYSIS_OB_OFFSET) / ANALYSIS_OB_SCALE))
+        tk_signed = (taker_ratio - 0.5) * dir_sign
+        tk_c = max(0.0, min(1.0, (tk_signed + ANALYSIS_TAKER_OFFSET) / ANALYSIS_TAKER_SCALE))
+        tf_c = max(0.0, min(1.0, (float(tf_votes) - ANALYSIS_TF_BASE) / ANALYSIS_TF_SCALE))
+        basis_c = max(0.0, min(1.0, ((dir_sign * perp_basis) + ANALYSIS_BASIS_OFFSET) / ANALYSIS_BASIS_SCALE))
+        vwap_c = max(0.0, min(1.0, ((dir_sign * vwap_dev) + ANALYSIS_VWAP_OFFSET) / ANALYSIS_VWAP_SCALE))
+        cl_c = 1.0 if cl_agree else 0.0
+        leader_c = ANALYSIS_LEADER_BASE
+        if leader_fresh:
+            leader_c = max(0.0, min(1.0, ((copy_net) + ANALYSIS_LEADER_OFFSET) / ANALYSIS_LEADER_SCALE))
+        # Binary-option time-lock signal: N(d2) from Black-Scholes, probability
+        # that current price ends on our side at window close. Always computable
+        # from (current vs open_price, time remaining, realized vol). Strong
+        # near end of window when price has clearly moved; neutral (0.5) in flat markets.
+        _sigma_ann = self.vols.get(asset, 0.70)
+        _T_years   = max(mins_left / 525600.0, 1e-9)   # 365*24*60 = 525600 min/year
+        if open_price and open_price > 0 and current > 0 and _sigma_ann > 0:
+            _d2  = (math.log(current / open_price) - 0.5 * _sigma_ann ** 2 * _T_years) / (_sigma_ann * math.sqrt(_T_years))
+            bin_c = float(norm.cdf(_d2 if side_up else -_d2))
+        else:
+            bin_c = 0.5
+        analysis_conviction = (
+            ANALYSIS_CONV_W_OB     * ob_c
+            + ANALYSIS_CONV_W_TK     * tk_c
+            + ANALYSIS_CONV_W_TF     * tf_c
+            + ANALYSIS_CONV_W_BASIS  * basis_c
+            + ANALYSIS_CONV_W_VWAP   * vwap_c
+            + ANALYSIS_CONV_W_CL     * cl_c
+            + ANALYSIS_CONV_W_LEADER * leader_c
+            + ANALYSIS_CONV_W_BINARY * bin_c
+        )
+
+
+        # Recalibrate posterior using measured analysis quality.
+        # Higher quality allows stronger posterior; weaker quality shrinks toward 50%.
+        quality_scale = ANALYSIS_PROB_SCALE_MIN + (
+            (ANALYSIS_PROB_SCALE_MAX - ANALYSIS_PROB_SCALE_MIN) * max(0.0, min(1.0, analysis_quality))
+        )
+        prob_up = 0.5 + (prob_up - 0.5) * quality_scale
+        prob_up = max(PROB_CLAMP_MIN, min(PROB_CLAMP_MAX, prob_up))
+        prob_down = 1.0 - prob_up
+        # Apply recent side prior again after quality rescale (keeps final posterior aligned to live outcomes).
+        up_recent = self._recent_side_profile(asset, duration, "Up")
+        dn_recent = self._recent_side_profile(asset, duration, "Down")
+        up_adj = float(up_recent.get("prob_adj", 0.0) or 0.0)
+        dn_adj = float(dn_recent.get("prob_adj", 0.0) or 0.0)
+        if abs(up_adj) > DEFAULT_EPS or abs(dn_adj) > DEFAULT_EPS:
+            pu = max(PROB_REBALANCE_MIN, min(PROB_REBALANCE_MAX, prob_up + up_adj))
+            pd = max(PROB_REBALANCE_MIN, min(PROB_REBALANCE_MAX, prob_down + dn_adj))
+            z = pu + pd
+            if z > 0:
+                prob_up = max(PROB_CLAMP_MIN, min(PROB_CLAMP_MAX, pu / z))
+                prob_down = 1.0 - prob_up
+        edge_up = prob_up - up_price
+        edge_down = prob_down - (1 - up_price)
+
+        # Pre-bid arm: for first seconds after open, bias side/execution to pre-planned signal.
+        arm = self._prebid_plan.get(cid, {})
+        arm_active = False
+        if isinstance(arm, dict) and PREBID_ARM_ENABLED:
+            now_ts = _time.time()
+            start_ts = float(arm.get("start_ts", 0) or 0)
+            conf = float(arm.get("conf", 0.0) or 0.0)
+            arm_side = arm.get("side", "")
+            if start_ts > 0 and now_ts >= start_ts and (now_ts - start_ts) <= PREBID_ARM_WINDOW_SEC and conf >= PREBID_MIN_CONF:
+                arm_active = True
+                if arm_side in ("Up", "Down") and arm_side != side:
+                    side = arm_side
+                    entry = up_price if side == "Up" else (1 - up_price)
+                score += PREBID_SCORE_BONUS
+                edge += max(0.0, conf - 0.5) * PREBID_EDGE_MULT
+
+        # Pre-bid may override side: refresh aligned metrics for downstream gates/sizing.
+        side_up = side == "Up"
+        tf_votes = tf_up_votes if side_up else tf_dn_votes
+        ob_sig = dw_ob if side_up else -dw_ob
+        cl_agree = True
+        if cl_now > 0 and open_price > 0:
+            cl_agree = (cl_now > open_price) == side_up
+        imbalance_confirms = ob_sig > IMBALANCE_CONFIRM_MIN
+
+
+        # Contrarian tail: buy the cheap/trailing side when market overreacts early in window.
+        # Mean-reversion edge: cheap side at 25-40¢ with 7+ min left → EV strongly positive.
+        contrarian_tail_active = False
+        if CONTRARIAN_TAIL_ENABLED:
+            cheap_side = "Up" if up_price <= (1.0 - up_price) else "Down"
+            cheap_entry_now = min(up_price, 1.0 - up_price)
+            if (
+                duration >= 15
+                and
+                cheap_entry_now <= CONTRARIAN_TAIL_MAX_ENTRY
+                and mins_left >= CONTRARIAN_TAIL_MIN_MINS_LEFT
+                and move_pct >= CONTRARIAN_TAIL_MIN_MOVE_PCT
+                and cheap_side != direction   # contrarian to the current move
+            ):
+                side = cheap_side
+                side_up = (side == "Up")
+                contrarian_tail_active = True
+                if self._noisy_log_enabled(f"tail-contra:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{B}[TAIL]{RS} {asset} {duration}m contrarian {side} "
+                        f"entry={cheap_entry_now:.2f} move={move_pct*100:.2f}% mins_left={mins_left:.1f}"
+                    )
+
+        # Bet the signal direction — EV_net and execution quality drive growth.
+        entry = up_price if side == "Up" else (1 - up_price)
+        # Keep edge/prob aligned with final side after pre-bid/copyflow adjustments.
+        base_prob = prob_up if side == "Up" else prob_down
+        base_edge = edge_up if side == "Up" else edge_down
+        # Always take the best estimate: preserves aq/prior adjustments over plain base_prob
+        true_prob = max(true_prob, base_prob)
+        edge      = max(edge, base_edge)
+        pred_variant = ""
+        pred_variant_probs = {}
+        if self._pred_agent is not None:
+            try:
+                _entry_hint = up_price if side == "Up" else (1.0 - up_price)
+                _buck_key = self._bucket_key(duration, score, _entry_hint)
+                pred_ctx = {
+                    "asset": asset,
+                    "duration": duration,
+                    "side": side,
+                    "current": current,
+                    "open_price": open_price,
+                    "mins_left": mins_left,
+                    "base_prob": true_prob,
+                    "base_edge": edge,
+                    "score": score,
+                    "bucket_key": _buck_key,
+                    "quote_age_ms": quote_age_ms,
+                    "analysis_quality": analysis_quality,
+                }
+                pred = self._pred_agent.predict(
+                    pred_ctx,
+                    list(self._resolved_samples),
+                    self._bucket_stats.rows,
+                )
+                p_new = float(pred.get("prob", true_prob) or true_prob)
+                e_adj = float(pred.get("edge_adj", 0.0) or 0.0)
+                s_adj = int(pred.get("score_adj", 0) or 0)
+                true_prob = max(PROB_CLAMP_MIN, min(PROB_CLAMP_MAX, p_new))
+                edge = edge + e_adj
+                score = score + s_adj
+                pred_variant = str(pred.get("variant", "") or "")
+                pred_variant_probs = dict(pred.get("variant_probs", {}) or {})
+                if self._noisy_log_enabled(f"pred-agent:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{B}[PRED-AGENT]{RS} {asset} {duration}m {side} "
+                        f"p={true_prob:.3f} ({pred.get('prob_adj',0.0):+.3f}) "
+                        f"edge_adj={e_adj:+.3f} score_adj={s_adj:+d} variant={pred_variant or 'na'} "
+                        f"samples={int(pred.get('samples_side',0) or 0)}"
+                    )
+            except Exception:
+                pass
+        if duration <= 5 and px_align_conflict and data_div_pen_applied:
+            if self._noisy_log_enabled(f"skip-5m-pxalign-div:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP]{RS} {asset} 5m hard conflict px-align+data-div "
+                    f"(src={px_src} cl_age={(-1.0 if cl_age_s is None else cl_age_s):.1f}s)"
+                )
+            self._skip_tick("5m_pxalign_datadiv_conflict")
+            return None
+
+        if MAX_WIN_MODE:
+            if WINMODE_REQUIRE_CL_AGREE and not cl_agree:
+                return None
+            min_prob_req = WINMODE_MIN_TRUE_PROB_5M if duration <= 5 else WINMODE_MIN_TRUE_PROB_15M
+            if true_prob < min_prob_req:
+                return None
+            if edge < WINMODE_MIN_EDGE:
+                return None
+
+        # ── Minimum true_prob gate (2/3-rule: need ≥60% confidence) ─────────
+        min_tp = MIN_TRUE_PROB_GATE_5M if duration <= 5 else MIN_TRUE_PROB_GATE_15M
+        if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
+            min_tp = max(0.50, min_tp - LATE_MUST_FIRE_PROB_RELAX)   # 0.60 → 0.55 in must-fire window
+        _payout_mult_local = 1.0 / max(entry, 1e-9)
+        _highpayout_bypass = (   # 10x+ entries get a lower prob floor — still profitable at 45% win rate
+            _payout_mult_local >= HIGHPAYOUT_MIN_PAYOUT
+            and score >= HIGHPAYOUT_MIN_SCORE
+            and edge >= HIGHPAYOUT_MIN_EDGE
+            and true_prob >= HIGHPAYOUT_MIN_PROB
+        )
+        if true_prob < min_tp and not _highpayout_bypass:
+            self._skip_tick("prob_below_gate")
+            return None
+
+        # ── Score gate (duration-aware) ─────────────────────────────────────
+        min_score_local = MIN_SCORE_GATE
+        if duration <= 5:
+            min_score_local = max(min_score_local, MIN_SCORE_GATE_5M)
+        else:
+            min_score_local = max(min_score_local, MIN_SCORE_GATE_15M)
+        # Rolling 3-trade gate: if last 3 trades had <2 wins, require higher score
+        _r3 = list(self.recent_trades)[-3:]
+        if len(_r3) >= 3 and sum(_r3) < 2:
+            min_score_local += ROLLING3_WIN_SCORE_PEN
+        if arm_active:
+            min_score_local = max(0, min_score_local - 2)
+        # Cross-asset 3/4 consensus override: all other assets confirm same direction.
+        # Macro move confirmed by all assets → relax min_score (but never below 4).
+        if (
+            CROSS_CONSENSUS_ENABLED
+            and cross_count >= CROSS_CONSENSUS_MIN_COUNT
+            and duration >= 15
+        ):
+            min_score_local = max(4, min_score_local - CROSS_CONSENSUS_SCORE_RELAX)
+        # Must-fire late-window relaxation: lower gate in last N minutes to guarantee entry
+        if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
+            min_score_local = max(LATE_MUST_FIRE_MIN_SCORE, min_score_local - LATE_MUST_FIRE_SCORE_RELAX)
+        if duration <= 5 and FIVE_M_DYNAMIC_SCORE_ENABLED:
+            snap5 = self._five_m_quality_snapshot(max(FIVE_M_GUARD_WINDOW, FIVE_M_DYNAMIC_SCORE_MIN_OUTCOMES))
+            n5 = int(snap5.get("n", 0) or 0)
+            wr5 = float(snap5.get("wr", 0.0) or 0.0)
+            pf5 = float(snap5.get("pf", 1.0) or 1.0)
+            if n5 >= max(1, FIVE_M_DYNAMIC_SCORE_MIN_OUTCOMES):
+                add_gate = 0
+                if (wr5 < FIVE_M_DYNAMIC_SCORE_BAD_WR) or (pf5 < FIVE_M_DYNAMIC_SCORE_BAD_PF):
+                    add_gate = max(add_gate, FIVE_M_DYNAMIC_SCORE_ADD_BAD)
+                if (wr5 < FIVE_M_DYNAMIC_SCORE_WORSE_WR) or (pf5 < FIVE_M_DYNAMIC_SCORE_WORSE_PF):
+                    add_gate = max(add_gate, FIVE_M_DYNAMIC_SCORE_ADD_WORSE)
+                if add_gate > 0:
+                    min_score_local += add_gate
+                    if self._noisy_log_enabled(f"5m-adapt:{asset}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{B}[5M-ADAPT]{RS} gate+{add_gate} => min_score={min_score_local} "
+                            f"(n={n5} wr={wr5*100:.1f}% pf={pf5:.2f})"
+                        )
+        if score < min_score_local:
+            return None
+        # Per-asset blocking for 15m
+        if duration >= 15:
+            asset = m.get("asset", "")
+            if (BLOCK_ASSET_SOL_15M and asset == "SOL") or (BLOCK_ASSET_XRP_15M and asset == "XRP"):
+                if ASSET_BLOCK_SOFT_MODE:
+                    score -= max(0, ASSET_BLOCK_SOFT_SCORE_PEN)
+                    edge -= max(0.0, ASSET_BLOCK_SOFT_EDGE_PEN)
+                    if self._noisy_log_enabled(f"asset-softgate:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[ASSET-GATE]{RS} {asset} {duration}m soft "
+                            f"(score-={ASSET_BLOCK_SOFT_SCORE_PEN} edge-={ASSET_BLOCK_SOFT_EDGE_PEN:.3f})"
+                        )
+                    if score < max(3, min_score_local - 1):
+                        self._skip_tick("asset_soft_blocked_low_score")
+                        return None
+                else:
+                    self._skip_tick("asset_blocked_sol" if asset == "SOL" else "asset_blocked_xrp")
+                    return None
+        # Per-tier blocking via env vars (default all off)
+        if duration >= 15:
+            score_tier = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
+            tier_blocked = (
+                (score_tier == "s0-8" and BLOCK_SCORE_S0_8_15M)
+                or (score_tier == "s9-11" and BLOCK_SCORE_S9_11_15M)
+                or (score_tier == "s12+" and BLOCK_SCORE_S12P_15M)
+            )
+            if tier_blocked:
+                if SCORE_BLOCK_SOFT_MODE:
+                    score -= 2
+                    edge -= max(0.0, SCORE_BLOCK_SOFT_EDGE_PEN)
+                    if score < max(3, min_score_local - 1):
+                        self._skip_tick(f"score_tier_soft_blocked_{score_tier}")
+                        return None
+                else:
+                    self._skip_tick(
+                        "score_tier_blocked_s0_8" if score_tier == "s0-8"
+                        else ("score_tier_blocked_s9_11" if score_tier == "s9-11" else "score_tier_blocked_s12p")
+                    )
+                    return None
+            if score_tier == "s0-8" and MIN_ENTRY_PRICE_S0_8_15M > 0 and entry < MIN_ENTRY_PRICE_S0_8_15M:
+                self._skip_tick("score_s0_8_entry_too_low")
+                return None
+
+        token_id = m["token_up"] if side == "Up" else m["token_down"]
+        if not token_id:
+            return None
+        opp_token_id = m["token_down"] if side == "Up" else m["token_up"]
+        pm_book_data = _pm_book if token_id == prefetch_token else None
+        if pm_book_data is None:
+            # Ensure entry/payout gates use the actual traded side book, not synthetic 1-up_price.
+            ws_side = self._get_clob_ws_book(token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+            if ws_side is not None:
+                pm_book_data = ws_side
+            else:
+                pm_book_data = await self._fetch_pm_book_safe(token_id)
+        # Side/book sanity check: if chosen token ask is far from expected side price
+        # and opposite token aligns much better, swap to prevent inverted side execution.
+        def _best_ask_from(book):
+            if not book:
+                return 0.0
+            if isinstance(book, dict):
+                return float(book.get("best_ask", 0.0) or 0.0)
+            try:
+                _b, _a, _t = book
+                return float(_a or 0.0)
+            except Exception:
+                return 0.0
+
+        fair_side_entry = up_price if side == "Up" else (1.0 - up_price)
+        chosen_ask = _best_ask_from(pm_book_data)
+        if opp_token_id:
+            opp_book = self._get_clob_ws_book(opp_token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+            if opp_book is None:
+                opp_book = await self._fetch_pm_book_safe(opp_token_id)
+            opp_ask = _best_ask_from(opp_book)
+            # Token-map drift guard:
+            # if selected token ask is far from expected side entry while opposite token is close,
+            # remap token ids for this decision to avoid inverted execution.
+            if chosen_ask > 0 and opp_ask > 0:
+                err_keep = abs(chosen_ask - fair_side_entry)
+                err_swap = abs(opp_ask - fair_side_entry)
+                if err_keep >= 0.18 and (err_swap + 0.05) < err_keep:
+                    if self._noisy_log_enabled(f"side-remap:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[SIDE-REMAP]{RS} {asset} {duration}m {side} "
+                            f"token {self._short_cid(token_id)}->{self._short_cid(opp_token_id)} "
+                            f"ask={chosen_ask:.3f} opp_ask={opp_ask:.3f} fair={fair_side_entry:.3f}"
+                        )
+                    token_id = opp_token_id
+                    pm_book_data = opp_book
+                    chosen_ask = opp_ask
+
+        # ── Live CLOB price (more accurate than Gamma up_price) ──────────────
+        live_entry = entry
+        book_age_ms = 0.0
+        if pm_book_data is not None:
+            if isinstance(pm_book_data, dict):
+                book_ts = float(pm_book_data.get("ts", 0.0) or 0.0)
+                book_age_ms = ((_time.time() - book_ts) * 1000.0) if book_ts > 0 else 9e9
+                if book_age_ms > MAX_ORDERBOOK_AGE_MS:
+                    pm_book_data = None
+                else:
+                    clob_ask = float(pm_book_data.get("best_ask", 0.0) or 0.0)
+                    live_entry = clob_ask
+            else:
+                # Backward compatibility with old tuple format.
+                _, clob_ask, _ = pm_book_data
+                live_entry = clob_ask
+
+        # ── Entry strategy ────────────────────────────────────────────────────
+        # Defensive initialization: keeps evaluate loop alive even if future
+        # branches reference execution_ev before the final EV computation.
+        execution_ev = -9.0
+        # Trade every eligible market while still preferring higher-payout entries.
+        use_limit = False
+        # Dynamic max entry: base + tolerance + small conviction slack.
+        score_slack = SETUP_SLACK_HIGH if score >= SETUP_SCORE_SLACK_HIGH else (SETUP_SLACK_MID if score >= SETUP_SCORE_SLACK_MID else 0.0)
+        max_entry_allowed = min(0.97, MAX_ENTRY_PRICE + MAX_ENTRY_TOL + score_slack)
+        min_entry_allowed = 0.01
+        base_min_entry_allowed = 0.01
+        base_max_entry_allowed = max_entry_allowed
+        if duration <= 5:
+            # 5m entry gating is market-driven (EV/probability/real execution),
+            # not static [min,max] clamps that can block profitable rounds.
+            min_entry_allowed = max(min_entry_allowed, 0.01)
+            base_min_entry_allowed = min_entry_allowed
+            base_max_entry_allowed = max_entry_allowed
+            if MAX_WIN_MODE:
+                max_entry_allowed = min(max_entry_allowed, WINMODE_MAX_ENTRY_5M)
+        else:
+            min_entry_allowed = max(min_entry_allowed, MIN_ENTRY_PRICE_15M)
+            base_min_entry_allowed = min_entry_allowed
+            base_max_entry_allowed = max_entry_allowed
+            if MAX_WIN_MODE:
+                max_entry_allowed = min(max_entry_allowed, WINMODE_MAX_ENTRY_15M)
+        # Adaptive model-consistent cap: if conviction is high, allow higher entry as long
+        # expected value after fees remains positive.
+        min_ev_base = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
+        base_min_ev_req = float(min_ev_base)
+        base_min_payout_req = float(MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT)
+        model_cap = true_prob / max(1.0 + FEE_RATE_EST + max(0.003, min_ev_base), 1e-9)
+        model_cap = min(model_cap, MAX_ENTRY_PRICE + MAX_ENTRY_TOL)  # never override hard entry cap
+        if score >= 9:
+            max_entry_allowed = max(max_entry_allowed, min(0.85, model_cap))
+        # Adaptive protection against poor payout fills from realized outcomes.
+        min_payout_req, min_ev_req, adaptive_hard_cap = self._adaptive_thresholds(duration)
+        rolling_profile = self._rolling_15m_profile(duration, live_entry, open_src, cl_age_s)
+        if duration >= 15 and (not booster_eval):
+            min_ev_req = max(0.005, min_ev_req + float(rolling_profile.get("ev_add", 0.0) or 0.0))
+        # Dynamic flow constraints by current setup quality (avoid static hardcoded behavior).
+        setup_q = max(0.0, min(1.0, (analysis_quality * 0.55) + (analysis_conviction * 0.45)))
+        q_relax = max(0.0, setup_q - 0.55)
+        min_payout_req = max(1.55, min_payout_req - (0.20 * q_relax))
+        # Additional payout relaxation only for strong, side-aligned 15m setups.
+        # This reduces "no-trade" dead-zones without opening weak entries.
+        if (
+            duration >= CORE_DURATION_MIN
+            and score >= SETUP_Q_HARD_RELAX_SCORE
+            and true_prob >= SETUP_Q_HARD_RELAX_PROB
+            and setup_q >= SETUP_Q_HARD_RELAX_MIN
+            and cl_agree
+        ):
+            extra_relax = min(SETUP_Q_HARD_RELAX_MAX, max(0.0, setup_q - SETUP_Q_HARD_RELAX_MIN) * SETUP_Q_HARD_RELAX_MULT)
+            min_payout_req = max(1.70, min_payout_req - extra_relax)
+        # Core 15m payout floor is data-driven from rolling on-chain profile.
+        if duration >= CORE_DURATION_MIN and (not booster_eval):
+            roll_n = int(rolling_profile.get("n", 0) or 0)
+            roll_exp = float(rolling_profile.get("exp", 0.0) or 0.0)
+            roll_wr_lb = float(rolling_profile.get("wr_lb", 0.5) or 0.5)
+            if roll_n >= max(8, int(ROLLING_15M_CALIB_MIN_N)):
+                if roll_exp >= ROLL_EXP_GOOD and roll_wr_lb >= ROLL_WR_GOOD:
+                    dyn_floor = 1.50
+                elif roll_exp <= ROLL_EXP_BAD or roll_wr_lb < ROLL_WR_BAD:
+                    dyn_floor = 1.78
+                else:
+                    dyn_floor = 1.62
+            else:
+                dyn_floor = 1.62
+            min_payout_req = max(min_payout_req, dyn_floor)
+        # Late-window locked-direction payout relax:
+        # Win rate is ~72-78% in last LATE_PAYOUT_RELAX_PCT_LEFT of window → 1.65x payout is +EV.
+        # This recovers the 33% skip rate from payout_below on late-window aligned entries.
+        if (
+            LATE_PAYOUT_RELAX_ENABLED
+            and duration >= 15
+            and pct_remaining <= LATE_PAYOUT_RELAX_PCT_LEFT
+            and move_pct >= LATE_PAYOUT_RELAX_MIN_MOVE
+            and open_price > 0 and current > 0
+            and ((side == "Up" and current >= open_price) or (side == "Down" and current < open_price))
+        ):
+            min_payout_req = min(min_payout_req, LATE_PAYOUT_RELAX_FLOOR)
+        # Trend-confirmed payout relax: when Chainlink + binary model both confirm direction,
+        # cap min_payout_req at 1.72x throughout the window (not just last 45%).
+        # Prevents paralysis in trending markets where trend-side tokens cost 55-58¢.
+        if (
+            duration >= CORE_DURATION_MIN
+            and cl_agree
+            and bin_c >= 0.54
+            and move_pct >= LATE_PAYOUT_RELAX_MIN_MOVE
+        ):
+            min_payout_req = min(min_payout_req, 1.72)
+        # High-quality execution unlock:
+        # allow 1.80x floor on strong setups to avoid dead-zones around 1.82-1.98x.
+        if (
+            duration >= CORE_DURATION_MIN
+            and score >= 14
+            and true_prob >= 0.66
+            and edge >= 0.10
+            and setup_q >= 0.60
+            and cl_agree
+        ):
+            min_payout_req = min(min_payout_req, 1.80)
+        # Round-force anti-freeze: keep payout floor bounded so adaptive tightening
+        # cannot fully block executable markets for long stretches.
+        if FORCE_TRADE_EVERY_ROUND:
+            force_cap = ROUND_FORCE_PAYOUT_CAP_5M if duration <= 5 else ROUND_FORCE_PAYOUT_CAP_15M
+            if duration >= 15:
+                force_cap = min(force_cap, 1.72)
+            min_payout_req = min(min_payout_req, max(1.30, force_cap))
+        min_ev_req = max(0.005, min_ev_req - (0.012 * q_relax))
+        if (ws_fresh or rest_fresh) and cl_fresh and vol_fresh and mins_left >= (FRESH_RELAX_MIN_LEFT_15M if duration >= CORE_DURATION_MIN else FRESH_RELAX_MIN_LEFT_5M):
+            max_entry_allowed = min(FRESH_RELAX_ENTRY_CAP, max_entry_allowed + FRESH_RELAX_ENTRY_ADD)
+        max_entry_allowed = min(max_entry_allowed, adaptive_hard_cap)
+        # Hard entry ceiling:
+        # - 15m unchanged: strict 54c ceiling.
+        # - 5m: use adaptive hard cap (execution/quality aware), avoid static 54c choke.
+        if duration >= 15:
+            strong_relax = 0.0
+            if true_prob >= 0.72 and score >= 14 and edge >= 0.14:
+                strong_relax = 0.02
+            if FORCE_TRADE_EVERY_ROUND and late_relax and true_prob >= 0.66 and score >= 10 and edge >= 0.10:
+                strong_relax = max(strong_relax, 0.03)
+            max_entry_allowed = min(max_entry_allowed, min(0.90, ENTRY_HARD_CAP_15M + strong_relax))
+        else:
+            max_entry_allowed = min(max_entry_allowed, max(0.60, adaptive_hard_cap))
+        # Dynamic min-entry (not fixed hard floor): adapt to setup quality + microstructure.
+        # High-quality setup can dip lower for super-payout entries; weaker setup is stricter.
+        min_entry_dyn = float(base_min_entry_allowed)
+        if setup_q >= SETUP_Q_RELAX_MIN and vol_ratio >= SETUP_VOL_RELAX_MIN and tf_votes >= TF_VOTES_MID:
+            relax = min(SETUP_Q_RELAX_MAX, (setup_q - SETUP_Q_RELAX_MIN) * SETUP_Q_RELAX_MULT)
+            min_entry_dyn = max(0.01, min_entry_dyn - relax)
+        elif setup_q <= SETUP_Q_TIGHTEN_MIN:
+            tighten = min(SETUP_Q_TIGHTEN_MAX, (SETUP_Q_TIGHTEN_MIN - setup_q) * SETUP_Q_TIGHTEN_MULT)
+            min_entry_dyn = min(0.45, min_entry_dyn + tighten)
+        if mins_left <= (3.5 if duration >= CORE_DURATION_MIN else 1.8):
+            # Near expiry, avoid ultra-low entries that are mostly noise/fill artifacts.
+            min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + ENTRY_TIGHTEN_ADD)
+        if not (ws_fresh or rest_fresh):   # only tighten when both WS and REST are stale
+            min_entry_dyn = max(min_entry_dyn, base_min_entry_allowed + ENTRY_TIGHTEN_ADD)
+        min_entry_allowed = max(0.01, min(min_entry_dyn, max_entry_allowed - 0.01))
+        # High-conviction 15m mode: target lower cents early for better payout.
+        hc15 = (
+            HC15_ENABLED and duration == 15 and
+            score >= HC15_MIN_SCORE and
+            true_prob >= HC15_MIN_TRUE_PROB and
+            edge >= HC15_MIN_EDGE
+        )
+        if hc15 and pct_remaining > HC15_FALLBACK_PCT_LEFT and live_entry > HC15_TARGET_ENTRY:
+            use_limit = True
+            entry = min(HC15_TARGET_ENTRY, max_entry_allowed)
+        else:
+            if min_entry_allowed <= live_entry <= max_entry_allowed:
+                entry = live_entry
+            elif PULLBACK_LIMIT_ENABLED and pct_remaining >= (
+                PULLBACK_LIMIT_MIN_PCT_LEFT if duration <= 5 else max(PULLBACK_LIMIT_MIN_PCT_LEFT, PULLBACK_MIN_ENTRY_FLOOR)
+            ):
+                # Don't miss good-payout setups: park a pullback limit at max acceptable entry.
+                use_limit = True
+                entry = max_entry_allowed
+            else:
+                if self._noisy_log_enabled(f"skip-score-entry:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                    print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} outside [{min_entry_allowed:.2f},{max_entry_allowed:.2f}]{RS}")
+                self._skip_tick("entry_outside")
+                return None
+
+        payout_mult = 1.0 / max(entry, 1e-9)
+        if payout_mult < min_payout_req:
+            if payout_mult >= max(1.0, (min_payout_req - PAYOUT_NEAR_MISS_TOL)):
+                if self._noisy_log_enabled(f"payout-near-miss:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[PAYOUT-TOL]{RS} {asset} {side} payout={payout_mult:.2f}x "
+                        f"near min={min_payout_req:.2f}x (tol={PAYOUT_NEAR_MISS_TOL:.2f}x)"
+                    )
+            else:
+                if self._noisy_log_enabled(f"skip-score-payout:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {side} payout={payout_mult:.3f}x "
+                        f"< min={min_payout_req:.3f}x{RS}"
+                    )
+                self._skip_tick("payout_below")
+                return None
+        # Polymarket fee is price-dependent: p*(1-p)*6.24% (parabolic, peaks at p=0.5).
+        # FEE_RATE_EST (flat 1.56%) overcounts fees on high-payout entries (e.g. p=0.20 → actual=1.0%).
+        _fee_dyn = max(0.001, entry * (1.0 - entry) * 0.0624)
+        ev_net = (true_prob / max(entry, 1e-9)) - 1.0 - _fee_dyn
+        exec_slip_cost, exec_nofill_penalty, exec_fill_ratio = self._execution_penalties(duration, score, entry)
+        execution_ev = ev_net - exec_slip_cost - exec_nofill_penalty
+        if execution_ev < min_ev_req:
+            if self._noisy_log_enabled(f"skip-score-ev:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP] {asset} {side} exec_ev={execution_ev:.3f} "
+                    f"(ev={ev_net:.3f} slip={exec_slip_cost:.3f} nofill={exec_nofill_penalty:.3f}) "
+                    f"< min={min_ev_req:.3f}{RS}"
+                )
+            self._skip_tick("ev_below")
+            return None
+        if duration >= 15 and (not booster_eval) and CONSISTENCY_CORE_ENABLED:
+            must_fire_active = late_relax and LATE_MUST_FIRE_ENABLED
+            core_payout = 1.0 / max(entry, 1e-9)
+            dyn_prob_floor = max(
+                0.50,
+                min(
+                    0.90,
+                    CONSISTENCY_MIN_TRUE_PROB_15M + float(rolling_profile.get("prob_add", 0.0) or 0.0),
+                ),
+            )
+            dyn_ev_floor = max(
+                0.005,
+                min(
+                    0.060,
+                    CONSISTENCY_MIN_EXEC_EV_15M + float(rolling_profile.get("ev_add", 0.0) or 0.0),
+                ),
+            )
+            # Must-fire: relax all consistency floors so at least one trade fires per 15m round
+            if must_fire_active:
+                dyn_prob_floor = max(0.48, dyn_prob_floor - LATE_MUST_FIRE_PROB_RELAX)
+                dyn_ev_floor   = max(0.001, dyn_ev_floor - 0.010)
+            if EV_FRONTIER_ENABLED and (not must_fire_active):
+                # Entry-aware minimum probability: allow sub-2x only when posterior is strong enough.
+                # required_prob = breakeven(entry+fees) + safety margin increasing with expensive entries.
+                req_prob = (
+                    (entry * (1.0 + _fee_dyn))
+                    + EV_FRONTIER_MARGIN_BASE
+                    + max(0.0, entry - 0.50) * EV_FRONTIER_MARGIN_HIGH_ENTRY
+                )
+                if true_prob + 1e-9 < req_prob:
+                    if self._noisy_log_enabled(f"skip-ev-frontier:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[SKIP] {asset} {duration}m ev-frontier prob "
+                            f"{true_prob:.3f}<{req_prob:.3f} (entry={entry:.3f}){RS}"
+                        )
+                    self._skip_tick("ev_frontier_prob_low")
+                    return None
+            core_lead_now = (
+                (side == "Up" and current >= open_price) or
+                (side == "Down" and current < open_price)   # strict: tie resolves as Up
+            )
+            core_strong = (
+                score >= CONSISTENCY_STRONG_MIN_SCORE_15M
+                and true_prob >= CONSISTENCY_STRONG_MIN_TRUE_PROB_15M
+                and execution_ev >= CONSISTENCY_STRONG_MIN_EXEC_EV_15M
+                and tf_votes >= 3
+                and cl_agree
+            )
+            _min_payout_consistency = max(1.30, CONSISTENCY_MIN_PAYOUT_15M) if not must_fire_active else 1.30
+            if core_payout + 1e-9 < _min_payout_consistency:
+                if self._noisy_log_enabled(f"skip-consistency-payout:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m consistency payout="
+                        f"{core_payout:.3f}x<{_min_payout_consistency:.3f}x{RS}"
+                    )
+                self._skip_tick("consistency_payout_low")
+                return None
+            if CONSISTENCY_REQUIRE_CL_AGREE_15M and (not cl_agree) and (not must_fire_active):
+                if self._noisy_log_enabled(f"skip-consistency-cl:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(f"{Y}[SKIP] {asset} {duration}m consistency: CL disagree on core trade{RS}")
+                self._skip_tick("consistency_cl_disagree")
+                return None
+            if true_prob + 1e-9 < dyn_prob_floor:
+                if self._noisy_log_enabled(f"skip-consistency-prob:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m consistency prob "
+                        f"{true_prob:.3f}<{dyn_prob_floor:.3f}{RS}"
+                    )
+                self._skip_tick("consistency_prob_low")
+                return None
+            if execution_ev + 1e-9 < dyn_ev_floor:
+                if self._noisy_log_enabled(f"skip-consistency-ev:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m consistency exec_ev "
+                        f"{execution_ev:.3f}<{dyn_ev_floor:.3f}{RS}"
+                    )
+                self._skip_tick("consistency_ev_low")
+                return None
+            # Propagate strict payout rule to execution layer so maker/fallback cannot overpay.
+            core_entry_cap = min(0.99, 1.0 / max(1e-9, _min_payout_consistency))
+            if max_entry_allowed > core_entry_cap:
+                max_entry_allowed = core_entry_cap
+                if min_entry_allowed >= max_entry_allowed:
+                    min_entry_allowed = max(0.01, max_entry_allowed - 0.01)
+            _entry_cap_consistency = CONSISTENCY_MAX_ENTRY_15M if not must_fire_active else max(CONSISTENCY_MAX_ENTRY_15M, 0.70)
+            if entry > _entry_cap_consistency and (not core_strong):
+                if self._noisy_log_enabled(f"skip-consistency-entry:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP] {asset} {duration}m consistency entry={entry:.3f} "
+                        f"> cap={_entry_cap_consistency:.3f} (not strong-core){RS}"
+                    )
+                self._skip_tick("consistency_entry_high")
+                return None
+            if not core_lead_now and not must_fire_active:
+                trail_ok = pct_remaining >= CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M and core_strong
+                if not trail_ok:
+                    if self._noisy_log_enabled(f"skip-consistency-trail:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[SKIP] {asset} {duration}m consistency trailing weak "
+                            f"(pct_left={pct_remaining:.2f} strong={core_strong}){RS}"
+                        )
+                    self._skip_tick("consistency_trail_weak")
+                    return None
+        if LOW_CENT_ONLY_ON_EXISTING_POSITION and entry <= LOW_CENT_ENTRY_THRESHOLD:
+            if not booster_eval:
+                if self._noisy_log_enabled(f"skip-lowcent-new:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP]{RS} {asset} {duration}m low-cent entry={entry:.3f} "
+                        f"allowed only as add-on to existing position"
+                    )
+                self._skip_tick("lowcent_requires_existing")
+                return None
+            # Add-on low-cent requires that current side is already leading.
+            is_leading_now = (
+                (side == "Up" and current > open_price) or
+                (side == "Down" and current < open_price)
+            )
+            if not is_leading_now:
+                if self._noisy_log_enabled(f"skip-lowcent-notlead:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP]{RS} {asset} {duration}m low-cent add-on blocked "
+                        f"(not leading now)"
+                    )
+                self._skip_tick("lowcent_not_leading")
+                return None
+        elif (not booster_eval) and entry <= LOW_CENT_ENTRY_THRESHOLD:
+            # Allow low-cent first entries too, but only for very strong setups.
+            lowcent_new_ok = (
+                duration >= 15
+                and score >= LOWCENT_NEW_MIN_SCORE
+                and true_prob >= LOWCENT_NEW_MIN_TRUE_PROB
+                and execution_ev >= LOWCENT_NEW_MIN_EXEC_EV
+                and payout_mult >= LOWCENT_NEW_MIN_PAYOUT
+                and cl_agree
+            )
+            if not lowcent_new_ok:
+                if self._noisy_log_enabled(f"skip-lowcent-weak-new:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    print(
+                        f"{Y}[SKIP]{RS} {asset} {duration}m low-cent new entry weak "
+                        f"(score={score} p={true_prob:.3f} ev={execution_ev:.3f})"
+                    )
+                self._skip_tick("lowcent_new_weak")
+                return None
+        if self._noisy_log_enabled("flow-thresholds", LOG_FLOW_EVERY_SEC):
+            print(
+                f"{B}[FLOW]{RS} "
+                f"payout>={base_min_payout_req:.3f}x→{min_payout_req:.3f}x "
+                f"ev>={base_min_ev_req:.3f}→{min_ev_req:.3f} "
+                f"entry=[{base_min_entry_allowed:.2f},{base_max_entry_allowed:.2f}]→"
+                f"[{min_entry_allowed:.2f},{max_entry_allowed:.2f}]"
+            )
+        booster_mode = False
+        booster_note = ""
+        superbet_floor_applied = False   # H-1: track whether superbet floor was activated
+        fresh_cl_disagree = (not cl_agree) and (cl_age_s is not None) and (cl_age_s <= FORCE_TAKER_CL_AGE_FRESH)
+
+        # ── ENTRY PRICE TIERS ─────────────────────────────────────────────────
+        # Higher payout (cheaper tokens) gets larger Kelly fraction.
+        # Expensive tokens still traded but with smaller exposure.
+        if entry <= 0.20:
+            if   score >= ENTRY_TIER_SCORE_HIGH: kelly_frac, bankroll_pct = 0.20, 0.10
+            elif score >= ENTRY_TIER_SCORE_MID:  kelly_frac, bankroll_pct = 0.16, 0.08
+            else:                                kelly_frac, bankroll_pct = 0.12, 0.06
+        elif entry <= 0.30:
+            if   score >= ENTRY_TIER_SCORE_HIGH: kelly_frac, bankroll_pct = 0.16, 0.08
+            elif score >= ENTRY_TIER_SCORE_MID:  kelly_frac, bankroll_pct = 0.12, 0.06
+            else:                                kelly_frac, bankroll_pct = 0.10, 0.05
+        elif entry <= 0.40:
+            if   score >= ENTRY_TIER_SCORE_HIGH: kelly_frac, bankroll_pct = 0.12, 0.06
+            elif score >= ENTRY_TIER_SCORE_MID:  kelly_frac, bankroll_pct = 0.10, 0.05
+            else:                                kelly_frac, bankroll_pct = 0.08, 0.04
+        elif entry <= 0.55:
+            if   score >= ENTRY_TIER_SCORE_HIGH: kelly_frac, bankroll_pct = 0.08, 0.04
+            elif score >= ENTRY_TIER_SCORE_MID:  kelly_frac, bankroll_pct = 0.06, 0.03
+            else:                                kelly_frac, bankroll_pct = 0.05, 0.025
+        else:
+            if   score >= ENTRY_TIER_SCORE_HIGH: kelly_frac, bankroll_pct = 0.04, 0.02
+            elif score >= ENTRY_TIER_SCORE_MID:  kelly_frac, bankroll_pct = 0.03, 0.015
+            else:                                kelly_frac, bankroll_pct = 0.02, 0.010
+
+        wr_scale   = self._wr_bet_scale()
+        oracle_scale = ORACLE_SCALE_DISAGREE_FRESH if fresh_cl_disagree else (ORACLE_SCALE_DISAGREE_STALE if not cl_agree else 1.0)
+        bucket_scale = self._bucket_size_scale(duration, score, entry)
+        # Risk-aware size decay for tail-priced entries and near-expiry windows.
+        # This preserves signal direction while preventing oversized bets on 2c/7c tails.
+        cents_scale = 1.0
+        if entry <= 0.03:
+            cents_scale = ENTRY_CENTS_SCALE_3C
+        elif entry <= 0.05:
+            cents_scale = ENTRY_CENTS_SCALE_5C
+        elif entry <= 0.10:
+            cents_scale = ENTRY_CENTS_SCALE_10C
+        elif entry <= 0.20:
+            cents_scale = ENTRY_CENTS_SCALE_20C
+        time_scale = 1.0
+        if duration >= 15:
+            if mins_left <= 2.5:
+                time_scale = TIME_SCALE_LATE_2_5
+            elif mins_left <= 3.5:
+                time_scale = TIME_SCALE_LATE_3_5
+            elif mins_left <= 5.0:
+                time_scale = TIME_SCALE_LATE_5_0
+        raw_size   = self._kelly_size(true_prob, entry, kelly_frac)
+        max_single = min(MAX_SINGLE_ABS_CAP, self.bankroll * bankroll_pct)
+        cid_cap    = max(MIN_HARD_CAP_USDC, self.bankroll * MAX_CID_EXPOSURE_PCT)
+        hard_cap   = max(MIN_HARD_CAP_USDC, min(max_single, cid_cap, self.bankroll * MAX_BANKROLL_PCT))
+        # Avoid oversized tail bets: these entries can look high-multiple but are low-quality fills.
+        if entry <= TAIL_CAP_ENTRY_1:
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * TAIL_CAP_BANKROLL_PCT_1))
+        elif entry <= TAIL_CAP_ENTRY_2:
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, self.bankroll * TAIL_CAP_BANKROLL_PCT_2))
+        # Soft cap curve for cheap entries:
+        # default around $10, but scale toward ~$30 only if conviction is truly strong.
+        if entry <= LOW_ENTRY_SOFT_THRESHOLD:
+            score_n = max(0.0, min(1.0, (float(score) - SOFTCAP_SCORE_BASE) / SOFTCAP_SCORE_SCALE))
+            prob_n = max(0.0, min(1.0, (float(true_prob) - SOFTCAP_PROB_BASE) / SOFTCAP_PROB_SCALE))
+            edge_n = max(0.0, min(1.0, (float(edge) - SOFTCAP_EDGE_BASE) / SOFTCAP_EDGE_SCALE))
+            # copy_net > 0 means leaders agree with chosen side; <0 penalizes conviction.
+            leader_n = max(0.0, min(1.0, float(copy_net) / SOFTCAP_LEADER_SCALE))
+            conviction = (
+                SOFTCAP_W_SCORE * score_n
+                + SOFTCAP_W_PROB * prob_n
+                + SOFTCAP_W_EDGE * edge_n
+                + SOFTCAP_W_LEADER * leader_n
+            )
+            soft_cap = LOW_ENTRY_BASE_SOFT_MAX + (
+                (LOW_ENTRY_HIGH_CONV_SOFT_MAX - LOW_ENTRY_BASE_SOFT_MAX) * conviction
+            )
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, soft_cap))
+        # Risk cap when leader flow is not fresh: avoid oversized bets on cheap entries.
+        # Deterministic cap from signal quality (score/prob/edge), no random guard.
+        if duration >= 15 and entry <= NOLEADER_ENTRY_MAX and (not leader_ready):
+            score_q = max(0.0, min(1.0, (float(score) - NOLEADER_SCORE_BASE) / NOLEADER_SCORE_SCALE))
+            prob_q = max(0.0, min(1.0, (float(true_prob) - NOLEADER_PROB_BASE) / NOLEADER_PROB_SCALE))
+            edge_q = max(0.0, min(1.0, (float(edge) - NOLEADER_EDGE_BASE) / NOLEADER_EDGE_SCALE))
+            qual = NOLEADER_W_SCORE * score_q + NOLEADER_W_PROB * prob_q + NOLEADER_W_EDGE * edge_q
+            # Cap range: ~$6 (weak) .. ~$12 (strong but no fresh leaders).
+            no_leader_cap = NOLEADER_CAP_BASE + (NOLEADER_CAP_RANGE * qual)
+            # Near expiry tighten further.
+            if mins_left <= NOLEADER_NEAR_END_MIN_LEFT:
+                no_leader_cap = min(no_leader_cap, NOLEADER_NEAR_END_CAP)
+            hard_cap = min(hard_cap, max(MIN_BET_ABS, no_leader_cap))
+        model_size = round(
+            min(
+                hard_cap,
+                raw_size * vol_mult * wr_scale * oracle_scale * bucket_scale * cents_scale * time_scale * leader_size_scale * asset_entry_size_mult,
+            ),
+            2,
+        )
+        if duration >= 15 and (not booster_eval):
+            model_size = round(
+                min(
+                    hard_cap,
+                    model_size * float(rolling_profile.get("size_mult", 1.0) or 1.0),
+                ),
+                2,
+            )
+        if (
+            HIGH_EV_SIZE_BOOST_ENABLED
+            and duration >= 15
+            and (not booster_eval)
+            and score >= HIGH_EV_MIN_SCORE
+            and execution_ev >= HIGH_EV_MIN_EXEC_EV
+            and entry <= HIGH_EV_ENTRY_MAX
+        ):
+            boost = min(HIGH_EV_SIZE_BOOST_MAX, max(1.0, HIGH_EV_SIZE_BOOST))
+            model_size = round(min(hard_cap, model_size * boost), 2)
+        dyn_floor  = min(hard_cap, max(MIN_BET_ABS, self.bankroll * MIN_BET_PCT))
+        # Mid-entry high-conviction floor:
+        # avoid dust-size core bets on solid 15m setups around 30c-55c.
+        if (
+            duration >= 15
+            and (not booster_eval)
+            and MID_FLOOR_ENTRY_MIN <= entry <= MID_FLOOR_ENTRY_MAX
+            and score >= MID_FLOOR_MIN_SCORE
+            and true_prob >= MID_FLOOR_MIN_TRUE_PROB
+            and execution_ev >= max(min_ev_req + MID_FLOOR_EV_MARGIN, MID_FLOOR_EV_ABS)
+            and cl_agree
+        ):
+            dyn_floor = max(
+                dyn_floor,
+                min(hard_cap, max(MID_FLOOR_MIN_USDC, self.bankroll * MID_FLOOR_BANKROLL_PCT)),
+            )
+        # Never force a big floor size on ultra-cheap tails or near-expiry entries.
+        if entry <= FORCE_MIN_ENTRY_TAIL or (duration >= 15 and mins_left <= FORCE_MIN_LEFT_TAIL):
+            dyn_floor = min(dyn_floor, MIN_BET_ABS)
+        size = round(max(model_size, dyn_floor), 2)
+        if contrarian_tail_active:
+            size = round(min(hard_cap, size * CONTRARIAN_TAIL_SIZE_MULT), 2)
+        elif ORACLE_LATENCY_ONLY_MODE:
+            size = round(min(hard_cap, size * ORACLE_SIZE_MULT), 2)
+        size = max(ABS_MIN_SIZE_USDC, min(hard_cap, size))
+
+        # Super-bet floor:
+        # for high-multiple entries (very low price), keep at least a meaningful notional.
+        if SUPER_BET_MIN_SIZE_ENABLED:
+            payout_mult = (1.0 / max(entry, 1e-9))
+            can_superbet = (
+                score >= SUPER_BET_FLOOR_MIN_SCORE
+                and execution_ev >= SUPER_BET_FLOOR_MIN_EV
+                and (_time.time() - float(self._last_superbet_ts or 0.0)) >= max(0.0, SUPER_BET_COOLDOWN_SEC)
+            )
+            if (
+                duration >= 15
+                and entry <= SUPER_BET_ENTRY_MAX
+                and payout_mult >= SUPER_BET_MIN_PAYOUT
+                and size < SUPER_BET_MIN_SIZE_USDC
+                and can_superbet
+            ):
+                old_size = size
+                size = min(hard_cap, max(size, SUPER_BET_MIN_SIZE_USDC))
+                superbet_floor_applied = True   # H-1: set timestamp after confirmed fill, not here
+                if self._noisy_log_enabled(f"superbet-floor:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet floor "
+                        f"x={payout_mult:.2f} entry={entry:.3f} "
+                        f"${old_size:.2f}->${size:.2f}"
+                    )
+
+        # Super-bet cap:
+        # keep very-high-multiple tails from over-allocating notional when liquidity/noise is high.
+        if SUPER_BET_MAX_SIZE_ENABLED:
+            payout_mult = (1.0 / max(entry, 1e-9))
+            if duration >= 15 and entry <= SUPER_BET_ENTRY_MAX and payout_mult >= SUPER_BET_MIN_PAYOUT:
+                max_super = max(ABS_MIN_SIZE_USDC, min(SUPER_BET_MAX_SIZE_USDC, self.bankroll * SUPER_BET_MAX_BANKROLL_PCT))
+                if size > max_super:
+                    old_size = size
+                    size = round(max(ABS_MIN_SIZE_USDC, max_super), 2)
+                    if self._noisy_log_enabled(f"superbet-cap:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet cap "
+                            f"x={payout_mult:.2f} entry={entry:.3f} "
+                            f"${old_size:.2f}->${size:.2f}"
+                        )
+
+        if size < MIN_EXEC_NOTIONAL_USDC:
+            return None
+
+        # Portfolio sizing mix (non-blocking):
+        # - core zone: slightly larger size
+        # - contrarian tails: keep smaller unless exceptionally strong
+        if duration >= 15 and (not booster_mode):
+            if (
+                CORE_ENTRY_MIN <= entry <= CORE_ENTRY_MAX
+                and score >= CORE_MIN_SCORE
+                and execution_ev >= CORE_MIN_EV
+            ):
+                old_size = float(size)
+                size = round(min(hard_cap, size * max(1.0, CORE_SIZE_BONUS)), 2)
+                if self._noisy_log_enabled(f"core-size-bonus:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{B}[SIZE-TUNE]{RS} {asset} {duration}m {side} core bonus "
+                        f"entry={entry:.3f} ${old_size:.2f}->${size:.2f}"
+                    )
+            elif entry <= CONTRARIAN_ENTRY_MAX:
+                # OFI surge confirming contrarian direction lowers strong_contra threshold.
+                # Reversal at extreme price + burst of buying = high payout near-certain reversal.
+                contra_score_thresh = CONTRARIAN_STRONG_SCORE - (2 if ofi_surge_active else 0)
+                strong_contra = (
+                    score >= contra_score_thresh
+                    and execution_ev >= CONTRARIAN_STRONG_EV
+                )
+                # Super-strong contrarian: surge + consensus + very high score → slight oversize
+                super_contra = (
+                    strong_contra
+                    and ofi_surge_active
+                    and cross_count >= 2
+                    and score >= (CONTRARIAN_STRONG_SCORE + 2)
+                )
+                if super_contra:
+                    mult = 1.15
+                elif strong_contra:
+                    mult = 1.0
+                else:
+                    mult = max(CONTRARIAN_SIZE_MIN_MULT, min(1.0, CONTRARIAN_SIZE_MULT))
+                old_size = float(size)
+                size = round(max(float(MIN_EXEC_NOTIONAL_USDC), min(hard_cap, size * mult)), 2)
+                if self._noisy_log_enabled(f"contra-size-mult:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} contrarian "
+                        f"entry={entry:.3f} strong={strong_contra} super={super_contra} x={mult:.2f} "
+                        f"${old_size:.2f}->${size:.2f}"
+                    )
+
+        # Event-context size modifier from soft alignment model.
+        if duration >= 15 and (not booster_mode):
+            try:
+                e_mult = max(EVENT_ALIGN_SIZE_MIN, min(EVENT_ALIGN_SIZE_MAX, float(event_align_size_mult)))
+            except Exception:
+                e_mult = 1.0
+            if abs(e_mult - 1.0) > 1e-9:
+                old_size = float(size)
+                size = round(max(float(MIN_EXEC_NOTIONAL_USDC), min(hard_cap, size * e_mult)), 2)
+                if self._noisy_log_enabled(f"event-align-size:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} event-align x={e_mult:.2f} "
+                        f"${old_size:.2f}->${size:.2f}"
+                    )
+
+        # Mid-round (or anytime) additive booster on existing same-side position.
+        # This is intentionally a separate, small bet with stricter quality filters.
+        if booster_eval and MID_BOOSTER_ENABLED:
+            if self._booster_locked():
+                if self._noisy_log_enabled(f"booster-lock:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                    rem_h = max(0.0, (self._booster_lock_until - _time.time()) / 3600.0)
+                    print(f"{Y}[BOOST-SKIP]{RS} locked {rem_h:.1f}h | cid={self._short_cid(cid)}")
+                return None
+            if duration != 15:
+                return None
+            if side != booster_side_locked:
+                return None
+            if int(self._booster_used_by_cid.get(cid, 0) or 0) >= max(1, MID_BOOSTER_MAX_PER_CID):
+                return None
+            if mins_left < MID_BOOSTER_MIN_LEFT_HARD_15M:
+                return None
+            in_ideal_window = MID_BOOSTER_MIN_LEFT_15M <= mins_left <= MID_BOOSTER_MAX_LEFT_15M
+            if (not MID_BOOSTER_ANYTIME_15M) and (not in_ideal_window):
+                return None
+
+            taker_conf = (side_up and taker_ratio > BOOSTER_TAKER_CONF_UP_MIN) or ((not side_up) and taker_ratio < BOOSTER_TAKER_CONF_DN_MAX)
+            # Mathematical conviction model (15m intraround):
+            # combines microstructure + trend persistence + oracle alignment.
+            ob_c = max(-1.0, min(1.0, ob_sig / BOOSTER_OB_SCALE))
+            tf_c = max(0.0, min(1.0, (tf_votes - BOOSTER_TF_BASE) / BOOSTER_TF_SCALE))
+            flow_c = max(-1.0, min(1.0, ((taker_ratio - 0.5) * BOOSTER_FLOW_SCALE) if side_up else ((0.5 - taker_ratio) * BOOSTER_FLOW_SCALE)))
+            vol_c = max(0.0, min(1.0, (vol_ratio - BOOSTER_VOL_BASE) / BOOSTER_VOL_SCALE))
+            basis_signed = perp_basis if side_up else -perp_basis
+            basis_c = max(-1.0, min(1.0, basis_signed / BOOSTER_BASIS_SCALE))
+            vwap_signed = vwap_dev if side_up else -vwap_dev
+            vwap_c = max(-1.0, min(1.0, vwap_signed / BOOSTER_VWAP_SCALE))
+            oracle_c = 1.0 if cl_agree else -1.0
+            booster_conv = (
+                BOOSTER_W_TF * tf_c
+                + BOOSTER_W_OB * max(0.0, ob_c)
+                + BOOSTER_W_FLOW * max(0.0, flow_c)
+                + BOOSTER_W_VOL * vol_c
+                + BOOSTER_W_BASIS * max(0.0, basis_c)
+                + BOOSTER_W_VWAP * max(0.0, vwap_c)
+                + BOOSTER_W_ORACLE * max(0.0, oracle_c)
+            )
+            base_quality = (
+                score >= MID_BOOSTER_MIN_SCORE
+                and true_prob >= MID_BOOSTER_MIN_TRUE_PROB
+                and edge >= MID_BOOSTER_MIN_EDGE
+                and execution_ev >= MID_BOOSTER_MIN_EV_NET
+                and payout_mult >= MID_BOOSTER_MIN_PAYOUT
+                and entry <= MID_BOOSTER_MAX_ENTRY
+                and ((cl_agree and imbalance_confirms) or score >= (MID_BOOSTER_MIN_SCORE + BOOSTER_STRONG_SCORE_DELTA))
+                and (taker_conf or edge >= (MID_BOOSTER_MIN_EDGE + BOOSTER_STRONG_EDGE_DELTA))
+                and vol_ratio >= BOOSTER_MIN_VOL_RATIO
+                and booster_conv >= BOOSTER_MIN_CONV
+            )
+            if not base_quality:
+                return None
+            # Outside ideal window keep booster much stricter.
+            if not in_ideal_window:
+                if not (
+                    score >= (MID_BOOSTER_MIN_SCORE + BOOSTER_OUTSIDE_SCORE_DELTA)
+                    and true_prob >= (MID_BOOSTER_MIN_TRUE_PROB + BOOSTER_OUTSIDE_PROB_DELTA)
+                    and execution_ev >= (MID_BOOSTER_MIN_EV_NET + BOOSTER_OUTSIDE_EV_DELTA)
+                    and booster_conv >= BOOSTER_OUTSIDE_MIN_CONV
+                ):
+                    return None
+
+            prev_size = float((self.pending.get(cid, ({}, {}))[1] or {}).get("size", 0.0) or 0.0)
+            b_pct = MID_BOOSTER_SIZE_PCT
+            if score >= (MID_BOOSTER_MIN_SCORE + BOOSTER_STRONG_SIZE_SCORE_DELTA) and true_prob >= (MID_BOOSTER_MIN_TRUE_PROB + BOOSTER_STRONG_SIZE_PROB_DELTA):
+                b_pct = MID_BOOSTER_SIZE_PCT_HIGH
+            b_size = round(max(MIN_BET_ABS, self.bankroll * b_pct), 2)
+            # Keep additive booster small vs existing exposure.
+            if prev_size > 0:
+                b_size = min(b_size, max(MIN_BET_ABS, prev_size * BOOSTER_PREV_SIZE_CAP_MULT))
+            size = max(MIN_BET_ABS, min(size, b_size, hard_cap))
+            booster_mode = True
+            booster_note = "mid" if in_ideal_window else "anytime"
+            signal_tier = f"{signal_tier}+BOOST"
+            signal_source = f"{signal_source}+booster"
+            if self._noisy_log_enabled(f"booster-conv:{asset}:{cid}", LOG_EDGE_EVERY_SEC):
+                print(
+                    f"{B}[BOOST-CHECK]{RS} {asset} 15m {side} "
+                    f"conv={booster_conv:.2f} score={score} ev={execution_ev:.3f} "
+                    f"payout={payout_mult:.2f}x entry={entry:.3f} "
+                    f"tf={tf_votes} ob={ob_sig:+.2f} tk={taker_ratio:.2f} vol={vol_ratio:.2f}x"
+                )
+
+        # Live EV tuning (non-blocking):
+        # 1) Reduce tail-risk sizing on very low-cent entries unless conviction is exceptional.
+        if (
+            LOW_ENTRY_SIZE_HAIRCUT_ENABLED
+            and duration >= 15
+            and (not booster_mode)
+            and entry <= LOW_ENTRY_SIZE_HAIRCUT_PX
+            and not (score >= LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE and true_prob >= LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB)
+        ):
+            old_size = float(size)
+            size = max(float(MIN_EXEC_NOTIONAL_USDC), round(old_size * LOW_ENTRY_SIZE_HAIRCUT_MULT, 2))
+            if self._noisy_log_enabled(f"low-entry-haircut:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} low-entry haircut "
+                    f"entry={entry:.3f} size=${old_size:.2f}->${size:.2f}"
+                )
+
+        # 2) Same-round concentration decay: keep trading, but scale down 2nd/3rd/... leg.
+        if duration >= 15 and (not booster_mode):
+            sig_fp = self._round_fingerprint(
+                cid=cid,
+                m=m,
+                t={"asset": asset, "side": side, "duration": duration},
+            )
+            same_round_same_side = 0
+            for c_p, (m_p, t_p) in self.pending.items():
+                try:
+                    if self._round_fingerprint(cid=c_p, m=m_p, t=t_p) != sig_fp:
+                        continue
+                    if str(t_p.get("side", "")) != side:
+                        continue
+                    same_round_same_side += 1
+                except Exception:
+                    continue
+            if same_round_same_side > 0:
+                decay = max(0.05, min(1.0, ROUND_STACK_SIZE_DECAY))
+                floor = max(0.05, min(1.0, ROUND_STACK_SIZE_MIN))
+                mult = max(floor, decay ** same_round_same_side)
+                old_size = float(size)
+                size = max(float(MIN_EXEC_NOTIONAL_USDC), round(old_size * mult, 2))
+                if self._noisy_log_enabled(f"round-stack-size:{asset}:{side}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} round-stack x{mult:.2f} "
+                        f"(legs={same_round_same_side+1}) ${old_size:.2f}->${size:.2f}"
+                    )
+            # Additional non-blocking round concentration decay:
+            # keep entries active but damp clustered same-window risk across assets.
+            same_round_total = 0
+            same_round_corr_side = 0
+            for c_p, (m_p, t_p) in self.pending.items():
+                try:
+                    if self._round_fingerprint(cid=c_p, m=m_p, t=t_p) != sig_fp:
+                        continue
+                    same_round_total += 1
+                    if str(t_p.get("side", "")) == side:
+                        same_round_corr_side += 1
+                except Exception:
+                    continue
+            if same_round_total > 0:
+                d_tot = max(0.05, min(1.0, ROUND_TOTAL_SIZE_DECAY))
+                f_tot = max(0.05, min(1.0, ROUND_TOTAL_SIZE_MIN))
+                mult_tot = max(f_tot, d_tot ** same_round_total)
+                old_size = float(size)
+                size = max(float(MIN_EXEC_NOTIONAL_USDC), round(old_size * mult_tot, 2))
+                if self._noisy_log_enabled(f"round-total-size:{asset}:{side}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} round-total x{mult_tot:.2f} "
+                        f"(open_legs={same_round_total}) ${old_size:.2f}->${size:.2f}"
+                    )
+            if same_round_corr_side > 0:
+                d_cor = max(0.05, min(1.0, ROUND_CORR_SAME_SIDE_DECAY))
+                f_cor = max(0.05, min(1.0, ROUND_CORR_SAME_SIDE_MIN))
+                mult_cor = max(f_cor, d_cor ** same_round_corr_side)
+                old_size = float(size)
+                size = max(float(MIN_EXEC_NOTIONAL_USDC), round(old_size * mult_cor, 2))
+                if self._noisy_log_enabled(f"round-corr-size:{asset}:{side}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} round-corr x{mult_cor:.2f} "
+                        f"(same_side_legs={same_round_corr_side}) ${old_size:.2f}->${size:.2f}"
+                    )
+
+        # Final superbet/tail normalization after all decays.
+        profit_push_tier = "off"
+        profit_push_size_mult = 1.0
+        if PROFIT_PUSH_MODE and PROFIT_PUSH_ADAPTIVE_MODE:
+            is_push = (
+                score >= PROFIT_PUSH_PUSH_MIN_SCORE
+                and true_prob >= PROFIT_PUSH_PUSH_MIN_TRUE_PROB
+                and execution_ev >= PROFIT_PUSH_PUSH_MIN_EXEC_EV
+                and cl_agree
+                and entry <= max(0.50, WINMODE_MAX_ENTRY_15M if duration > 5 else WINMODE_MAX_ENTRY_5M)
+            )
+            is_base = (
+                score >= PROFIT_PUSH_BASE_MIN_SCORE
+                and execution_ev >= PROFIT_PUSH_BASE_MIN_EXEC_EV
+            )
+            if is_push:
+                profit_push_tier = "push"
+                profit_push_size_mult = PROFIT_PUSH_PUSH_MULT
+            elif is_base:
+                profit_push_tier = "base"
+                profit_push_size_mult = PROFIT_PUSH_BASE_MULT
+            else:
+                profit_push_tier = "probe"
+                profit_push_size_mult = PROFIT_PUSH_PROBE_MULT
+            if duration <= 5:
+                profit_push_size_mult *= max(0.20, min(1.25, float(self._five_m_runtime_size_mult or 1.0)))
+            profit_push_size_mult = max(0.20, min(PROFIT_PUSH_MAX_MULT, float(profit_push_size_mult)))
+            if abs(profit_push_size_mult - 1.0) > 1e-9:
+                old_size = float(size)
+                size = max(float(MIN_EXEC_NOTIONAL_USDC), round(min(hard_cap, old_size * profit_push_size_mult), 2))
+                if self._noisy_log_enabled(f"profit-push-size:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{B}[SIZE-TUNE]{RS} {asset} {duration}m {side} "
+                        f"profit-push {profit_push_tier} x{profit_push_size_mult:.2f} "
+                        f"${old_size:.2f}->${size:.2f}"
+                    )
+
+        payout_mult = (1.0 / max(entry, 1e-9))
+        if SUPER_BET_MIN_SIZE_ENABLED:
+            can_superbet = (
+                score >= SUPER_BET_FLOOR_MIN_SCORE
+                and execution_ev >= SUPER_BET_FLOOR_MIN_EV
+                and (_time.time() - float(self._last_superbet_ts or 0.0)) >= max(0.0, SUPER_BET_COOLDOWN_SEC)
+            )
+            if (
+                duration >= 15
+                and entry <= SUPER_BET_ENTRY_MAX
+                and payout_mult >= SUPER_BET_MIN_PAYOUT
+                and size < SUPER_BET_MIN_SIZE_USDC
+                and can_superbet
+            ):
+                old_size = float(size)
+                size = max(float(MIN_EXEC_NOTIONAL_USDC), min(hard_cap, float(SUPER_BET_MIN_SIZE_USDC)))
+                superbet_floor_applied = True   # H-1: set timestamp after confirmed fill, not here
+                if self._noisy_log_enabled(f"superbet-floor-final:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                    print(
+                        f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet floor(final) "
+                        f"x={payout_mult:.2f} ${old_size:.2f}->${size:.2f}"
+                    )
+        if SUPER_BET_MAX_SIZE_ENABLED:
+            if duration >= 15 and entry <= SUPER_BET_ENTRY_MAX and payout_mult >= SUPER_BET_MIN_PAYOUT:
+                max_super = max(0.50, min(SUPER_BET_MAX_SIZE_USDC, self.bankroll * SUPER_BET_MAX_BANKROLL_PCT))
+                if size > max_super:
+                    old_size = float(size)
+                    size = round(max(0.50, max_super), 2)
+                    if self._noisy_log_enabled(f"superbet-cap-final:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[SIZE-TUNE]{RS} {asset} {duration}m {side} superbet cap(final) "
+                            f"x={payout_mult:.2f} ${old_size:.2f}->${size:.2f}"
+                        )
+        # Global autonomous policy multiplier (never zeroed by policy).
+        ap_mult = max(0.25, min(1.35, float(self._autopilot_size_mult or 1.0)))
+        if abs(ap_mult - 1.0) > 1e-9:
+            old_size = float(size)
+            size = max(float(MIN_EXEC_NOTIONAL_USDC), round(min(hard_cap, old_size * ap_mult), 2))
+            if self._noisy_log_enabled(f"autopilot-size:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{B}[SIZE-TUNE]{RS} {asset} {duration}m {side} autopilot "
+                    f"{self._autopilot_mode} x{ap_mult:.2f} ${old_size:.2f}->${size:.2f}"
+                )
+        # Immediate fills: FOK on strong signal, GTC limit otherwise
+        # Limit orders (use_limit=True) are always GTC — force_taker stays False
+        force_taker = (not use_limit) and (
+            (score >= FORCE_TAKER_SCORE and very_strong_mom and imbalance_confirms and move_pct > FORCE_TAKER_MOVE_MIN) or
+            (score >= FORCE_TAKER_SCORE and is_early_continuation)
+        )
+        if FAST_EXEC_ENABLED and (not use_limit):
+            if score >= FAST_EXEC_SCORE and edge >= FAST_EXEC_EDGE and entry <= MAX_ENTRY_PRICE:
+                force_taker = True
+        if arm_active:
+            force_taker = True
+
+        return {
+            "cid": cid, "m": m, "score": score,
+            "side": side, "entry": entry, "size": size, "token_id": token_id,
+            "true_prob": true_prob, "cl_agree": cl_agree, "min_edge": min_edge,
+            "force_taker": force_taker, "edge": edge,
+            "label": label, "asset": asset, "duration": duration,
+            "open_price": open_price, "current": current, "move_str": move_str,
+            "src_tag": src_tag, "bs_prob": true_prob, "mom_prob": true_prob,
+            "up_price": up_price, "ob_imbalance": ob_imbalance,
+            "imbalance_confirms": imbalance_confirms, "tf_votes": tf_votes,
+            "very_strong_mom": very_strong_mom, "taker_ratio": taker_ratio,
+            "vol_ratio": vol_ratio, "pct_remaining": pct_remaining, "mins_left": mins_left,
+            "perp_basis": perp_basis, "funding_rate": funding_rate,
+            "vwap_dev": vwap_dev, "vol_mult": vol_mult, "cross_count": cross_count,
+            "prev_win_dir": prev_win_dir, "prev_win_move": prev_win_move,
+            "is_early_continuation": is_early_continuation,
+            "pm_book_data": pm_book_data, "use_limit": use_limit,
+            "hc15_mode": hc15,
+            "open_price_source": open_src, "chainlink_age_s": cl_age_s,
+            "onchain_score_adj": onchain_adj, "source_confidence": src_conf,
+            "oracle_gap_bps": ((self.prices.get(asset, 0) - cl_now) / cl_now * 10000.0)
+                              if self.prices.get(asset, 0) > 0 and cl_now > 0 else 0.0,
+            "max_entry_allowed": max_entry_allowed,
+            "min_entry_allowed": min_entry_allowed,
+            "ev_net": ev_net,
+            "execution_ev": execution_ev,
+            "execution_slip_cost": exec_slip_cost,
+            "execution_nofill_penalty": exec_nofill_penalty,
+            "execution_fill_ratio": exec_fill_ratio,
+            "copy_adj": copy_adj,
+            "copy_net": copy_net,
+            "pm_pattern_key": pm_pattern_key,
+            "pm_pattern_score_adj": pm_pattern_score_adj,
+            "pm_pattern_edge_adj": pm_pattern_edge_adj,
+            "pm_pattern_n": pm_pattern_n,
+            "pm_pattern_exp": pm_pattern_exp,
+            "pm_pattern_wr_lb": pm_pattern_wr_lb,
+            "pm_public_pattern_score_adj": pm_public_pattern_score_adj,
+            "pm_public_pattern_edge_adj": pm_public_pattern_edge_adj,
+            "pm_public_pattern_n": pm_public_pattern_n,
+            "pm_public_pattern_dom": pm_public_pattern_dom,
+            "pm_public_pattern_avg_c": pm_public_pattern_avg_c,
+            "recent_side_n": recent_side_n,
+            "recent_side_exp": recent_side_exp,
+            "recent_side_wr_lb": recent_side_wr_lb,
+            "recent_side_score_adj": recent_side_score_adj,
+            "recent_side_edge_adj": recent_side_edge_adj,
+            "recent_side_prob_adj": recent_side_prob_adj,
+            "pred_variant": pred_variant,
+            "pred_variant_probs": pred_variant_probs,
+            "rolling_n": int(rolling_profile.get("n", 0) or 0),
+            "rolling_exp": float(rolling_profile.get("exp", 0.0) or 0.0),
+            "rolling_wr_lb": float(rolling_profile.get("wr_lb", 0.5) or 0.5),
+            "rolling_prob_add": float(rolling_profile.get("prob_add", 0.0) or 0.0),
+            "rolling_ev_add": float(rolling_profile.get("ev_add", 0.0) or 0.0),
+            "rolling_size_mult": float(rolling_profile.get("size_mult", 1.0) or 1.0),
+            "autopilot_mode": self._autopilot_mode,
+            "autopilot_size_mult": float(self._autopilot_size_mult or 1.0),
+            "min_payout_req": min_payout_req,
+            "min_ev_req": min_ev_req,
+            "analysis_quality": analysis_quality,
+            "analysis_conviction": analysis_conviction,
+            "bin_c": bin_c,
+            "analysis_prob_scale": quality_scale,
+            "signal_tier": signal_tier,
+            "signal_source": signal_source,
+            "leader_size_scale": leader_size_scale,
+            "booster_mode": booster_mode,
+            "booster_note": booster_note,
+            "superbet_floor_applied": superbet_floor_applied,
+            "book_age_ms": book_age_ms,
+            "quote_age_ms": 0.0 if px_src == "CL" else quote_age_ms,
+            "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
+            "prebid_arm": arm_active,
+            "must_fire": bool(late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15),
+            "profit_push_tier": profit_push_tier,
+            "profit_push_size_mult": profit_push_size_mult,
+            "runtime_5m_size_mult": float(self._five_m_runtime_size_mult or 1.0),
+        }
+
+    async def _execute_trade(self, sig: dict):
+        """Execute a pre-scored signal: log, mark seen, place order, update state."""
+        cid = sig["cid"]
+        m = sig["m"]
+        side = sig.get("side", "")
+        is_booster = bool(sig.get("booster_mode", False))
+        round_key = self._round_key(cid=cid, m=m, t=sig)
+        round_fp = self._round_fingerprint(cid=cid, m=m, t=sig)
+        round_side_key = f"{round_fp}|{side}|{'B' if is_booster else 'N'}"
+        cid_side_key = f"{cid}|{side}|{'B' if is_booster else 'N'}"
+        now_attempt = _time.time()
+        async with self._exec_lock:
+            # Trim expired round-side blocks.
+            for k, exp in list(self._round_side_block_until.items()):
+                if float(exp or 0) <= now_attempt:
+                    self._round_side_block_until.pop(k, None)
+            if cid in self._executing_cids:
+                return
+            if (not is_booster) and (cid in self.seen or len(self.pending) >= MAX_OPEN):
+                return
+            if is_booster:
+                if self._booster_locked():
+                    return
+                if cid not in self.pending or cid in self.pending_redeem:
+                    return
+                p_side = str((self.pending.get(cid, ({}, {}))[1] or {}).get("side", "") or "")
+                if p_side != side:
+                    return
+                if int(self._booster_used_by_cid.get(cid, 0) or 0) >= max(1, MID_BOOSTER_MAX_PER_CID):
+                    return
+            if float(self._round_side_block_until.get(round_side_key, 0) or 0) > now_attempt:
+                return
+            # Prevent rapid-fire retries on the same round/side.
+            last_try = float(self._round_side_attempt_ts.get(round_side_key, 0) or 0)
+            if last_try > 0 and (now_attempt - last_try) < ROUND_RETRY_COOLDOWN_SEC:
+                return
+            # Also prevent duplicate retries on the same exact CID+side.
+            last_try_cid_side = float(self._cid_side_attempt_ts.get(cid_side_key, 0) or 0)
+            if last_try_cid_side > 0 and (now_attempt - last_try_cid_side) < ROUND_RETRY_COOLDOWN_SEC:
+                return
+            # Never re-enter same round/side if already in pending (handles cross-CID drift).
+            for cid_p, (m_p, t_p) in list(self.pending.items()):
+                if cid_p == cid and t_p.get("side") == side:
+                    return
+                rk_p = self._round_fingerprint(m=m_p, t=t_p)
+                if rk_p == round_fp and t_p.get("side") == side:
+                    return
+            self._round_side_attempt_ts[round_side_key] = now_attempt
+            self._cid_side_attempt_ts[cid_side_key] = now_attempt
+            self._executing_cids.add(cid)
+            self._reserved_bankroll += float(sig.get("size", 0.0) or 0.0)  # H-4: pre-reserve
+        score       = sig["score"]
+        score_stars = f"{G}★★★{RS}" if score >= 12 else (f"{G}★★{RS}" if score >= 9 else "★")
+        agree_str   = "" if sig["cl_agree"] else f" {Y}[CL!]{RS}"
+        ob_str      = f" ob={sig['ob_imbalance']:+.2f}" + ("✓" if sig["imbalance_confirms"] else "")
+        tf_str      = f" TF={sig['tf_votes']}/3" + ("★" if sig["very_strong_mom"] else "")
+        prev_open   = self.asset_prev_open.get(sig["asset"], 0)
+        prev_str    = f" prev={((sig['open_price']-prev_open)/prev_open*100):+.2f}%" if prev_open > 0 else ""
+        perp_str    = f" perp={sig.get('perp_basis',0)*100:+.3f}%"
+        vwap_str    = f" vwap={sig.get('vwap_dev',0)*100:+.3f}%"
+        cross_str   = f" cross={sig.get('cross_count',0)}/3"
+        chain_str   = f" cl_age={sig.get('chainlink_age_s', 0) if sig.get('chainlink_age_s') is not None else -1:.1f}s src={sig.get('open_price_source','?')}"
+        cont_str    = (f" {G}[CONT {sig['prev_win_dir']} {sig['prev_win_move']*100:.2f}%]{RS}"
+                       if sig.get("is_early_continuation") else "")
+        tag = f"{G}[CONT-ENTRY]{RS}" if sig.get("is_early_continuation") else f"{G}[EDGE]{RS}"
+        if LOG_VERBOSE:
+            hc_tag = f" {B}[HC15]{RS}" if sig.get("hc15_mode") else ""
+            print(f"{tag} {sig['label']} → {sig['side']} | score={score} {score_stars} | "
+                  f"beat=${sig['open_price']:,.2f} {sig['src_tag']} now=${sig['current']:,.2f} "
+                  f"move={sig['move_str']}{prev_str} pct={sig['pct_remaining']:.0%} | "
+                  f"bs={sig['bs_prob']:.3f} mom={sig['mom_prob']:.3f} prob={sig['true_prob']:.3f} "
+                  f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} "
+                  f"@{sig['entry']*100:.0f}¢→{(1/sig['entry']):.2f}x ${sig['size']:.2f}"
+                  f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x"
+                  f"{perp_str}{vwap_str}{cross_str} {chain_str}{cont_str}{hc_tag}{RS}")
+        else:
+            hc_tag = " hc15" if sig.get("hc15_mode") else ""
+            cp_tag = f" copy={sig.get('copy_adj',0):+d}" if sig.get("copy_adj", 0) else ""
+            tier_tag = f" {sig.get('signal_tier','TIER-?')}/{sig.get('signal_source','na')}"
+            scale_tag = f" szx={float(sig.get('leader_size_scale', 1.0) or 1.0):.2f}"
+            booster_tag = f" BOOST({sig.get('booster_note','')})" if is_booster else ""
+            print(f"{tag} {sig['asset']} {sig['duration']}m {sig['side']} | "
+                  f"score={score} edge={sig['edge']:+.3f} size=${sig['size']:.2f} "
+                  f"entry={sig['entry']:.3f} src={sig.get('open_price_source','?')} "
+                  f"cl_age={sig.get('chainlink_age_s', -1):.0f}s{tier_tag}{scale_tag}"
+                  f" q={float(sig.get('analysis_quality',0.0) or 0.0):.2f}"
+                  f" c={float(sig.get('analysis_conviction',0.0) or 0.0):.2f}"
+                  f"{booster_tag}{hc_tag}{cp_tag}{agree_str}{RS}")
+
+        try:
+            duration = int(sig.get("duration", 0) or 0)
+            mins_left = float(sig.get("mins_left", 0.0) or 0.0)
+            min_left_gate = MIN_MINS_LEFT_5M if duration <= 5 else MIN_MINS_LEFT_15M
+            if mins_left <= min_left_gate:
+                if LOG_VERBOSE:
+                    print(
+                        f"{Y}[SKIP]{RS} {sig['asset']} {duration}m {sig['side']} "
+                        f"mins_left={mins_left:.1f} <= gate={min_left_gate:.1f}"
+                    )
+                return
+            if (
+                LATE_DIR_LOCK_ENABLED
+                and duration in (5, 15)
+                and sig.get("open_price", 0) > 0
+            ):
+                lock_mins, lock_move_min = self._late_lock_thresholds(duration)
+                if mins_left <= lock_mins:
+                    cur_now = self._current_price(sig["asset"]) or sig.get("current", 0)
+                    open_p = float(sig.get("open_price", 0) or 0)
+                    if cur_now > 0 and open_p > 0:
+                        move_abs = abs((cur_now - open_p) / max(open_p, 1e-9))
+                        if move_abs >= lock_move_min:
+                            beat_dir = "Up" if cur_now >= open_p else "Down"
+                            if sig.get("side") != beat_dir:
+                                if self._noisy_log_enabled(f"late-lock-exec:{sig['asset']}:{sig.get('side','')}", LOG_SKIP_EVERY_SEC):
+                                    print(
+                                        f"{Y}[SKIP]{RS} {sig['asset']} {duration}m {sig.get('side','')} "
+                                        f"late-lock(exec): beat_dir={beat_dir} mins_left={mins_left:.1f} "
+                                        f"move={move_abs*100:.2f}%"
+                                    )
+                                return
+            extra_score_gate = 0
+            if sig.get("asset") == "BTC" and duration <= 5:
+                extra_score_gate = max(extra_score_gate, EXTRA_SCORE_GATE_BTC_5M)
+            if sig.get("asset") == "XRP" and duration > 5:
+                extra_score_gate = max(extra_score_gate, EXTRA_SCORE_GATE_XRP_15M)
+            if extra_score_gate > 0:
+                base_gate = MIN_SCORE_GATE_5M if duration <= 5 else MIN_SCORE_GATE_15M
+                req_score = base_gate + extra_score_gate
+                if float(sig.get("score", 0.0) or 0.0) < req_score:
+                    if LOG_VERBOSE:
+                        print(
+                            f"{Y}[SKIP]{RS} {sig['asset']} {duration}m {sig['side']} "
+                            f"score={sig.get('score', 0):.0f} < req={req_score:.0f}"
+                        )
+                    return
+            if sig.get("quote_age_ms", 0) > MAX_QUOTE_STALENESS_MS:
+                # Soft gate: keep trading unless quote is extremely stale.
+                if sig.get("quote_age_ms", 0) > MAX_QUOTE_STALENESS_MS * 3:
+                    if LOG_VERBOSE:
+                        print(f"{Y}[SKIP] very stale quote {sig['asset']} age={sig.get('quote_age_ms', 0):.0f}ms{RS}")
+                    return
+            if sig.get("signal_latency_ms", 0) > MAX_SIGNAL_LATENCY_MS:
+                # Soft gate: keep coverage unless decision latency is extreme.
+                if sig.get("signal_latency_ms", 0) > MAX_SIGNAL_LATENCY_MS * 2:
+                    if LOG_VERBOSE:
+                        print(f"{Y}[SKIP] extreme latency {sig['asset']} signal={sig.get('signal_latency_ms', 0):.0f}ms{RS}")
+                    return
+            sig = await self._maybe_wait_for_better_entry(sig)
+            if sig is None:
+                return
+            # Side/token integrity check before execution:
+            # ensures we are sending BUY on the token corresponding to the normalized side.
+            token_up = str((m or {}).get("token_up", "") or "")
+            token_down = str((m or {}).get("token_down", "") or "")
+            expected_token = token_up if sig.get("side") == "Up" else (token_down if sig.get("side") == "Down" else "")
+            actual_token = str(sig.get("token_id", "") or "")
+            if expected_token and actual_token and expected_token != actual_token:
+                print(
+                    f"{R}[SIDE-CHECK]{RS} BLOCK {sig.get('asset','?')} {sig.get('duration',0)}m "
+                    f"side={sig.get('side','?')} expected_token={expected_token[:10]}.. "
+                    f"actual_token={actual_token[:10]}.. cid={self._short_cid(sig.get('cid',''))}"
+                )
+                return
+            if self._noisy_log_enabled(f"side-check:{sig.get('asset','?')}:{sig.get('cid','')}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{B}[SIDE-CHECK]{RS} OK {sig.get('asset','?')} {sig.get('duration',0)}m "
+                    f"side={sig.get('side','?')} token={actual_token[:10]}.. "
+                    f"cid={self._short_cid(sig.get('cid',''))}"
+                )
+            t_ord = _time.perf_counter()
+            exec_result = await self._place_order(
+                sig["token_id"], sig["side"], sig["entry"], sig["size"],
+                sig["asset"], sig["duration"], sig["mins_left"],
+                sig["true_prob"], sig["cl_agree"],
+                min_edge_req=sig["min_edge"], force_taker=sig["force_taker"],
+                score=sig["score"], pm_book_data=sig.get("pm_book_data"),
+                use_limit=sig.get("use_limit", False),
+                max_entry_allowed=sig.get("max_entry_allowed", MAX_ENTRY_PRICE),
+                hc15_mode=sig.get("hc15_mode", False),
+                hc15_fallback_cap=HC15_FALLBACK_MAX_ENTRY,
+                core_position=(not is_booster),
+                round_force=bool(sig.get("round_force_coverage", False)),
+            )
+            self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
+            order_id = (exec_result or {}).get("order_id", "")
+            filled = exec_result is not None
+            actual_size_usdc = float((exec_result or {}).get("notional_usdc", sig["size"]) or sig["size"])
+            fill_price = float((exec_result or {}).get("fill_price", sig["entry"]) or sig["entry"])
+            slip_bps = ((fill_price - sig["entry"]) / max(sig["entry"], 1e-9)) * 10000.0
+            stat_bucket = self._bucket_key(sig["duration"], sig["score"], sig["entry"])
+            if filled:
+                self._bucket_stats.add_fill(stat_bucket, slip_bps)
+                if sig.get("superbet_floor_applied"):   # H-1: only consume cooldown on actual fill
+                    self._last_superbet_ts = _time.time()
+            trade = {
+                "side": sig["side"], "size": actual_size_usdc, "entry": sig["entry"],
+                "open_price": sig["open_price"], "current_price": sig["current"],
+                "true_prob": sig["true_prob"], "mkt_price": sig["up_price"],
+                "edge": round(sig["edge"], 4), "mins_left": sig["mins_left"],
+                "end_ts": m["end_ts"], "asset": sig["asset"], "duration": sig["duration"],
+                "token_id": sig["token_id"], "order_id": order_id or "",
+                "score": sig["score"], "cl_agree": sig["cl_agree"],
+                "open_price_source": sig.get("open_price_source", "?"),
+                "chainlink_age_s": sig.get("chainlink_age_s"),
+                "onchain_score_adj": sig.get("onchain_score_adj", 0),
+                "source_confidence": sig.get("source_confidence", 0.0),
+                "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
+                "execution_ev": sig.get("execution_ev", 0.0),
+                "ev_net": sig.get("ev_net", 0.0),
+                "pm_pattern_key": sig.get("pm_pattern_key", ""),
+                "pm_pattern_score_adj": sig.get("pm_pattern_score_adj", 0),
+                "pm_pattern_edge_adj": sig.get("pm_pattern_edge_adj", 0.0),
+                "pm_pattern_n": sig.get("pm_pattern_n", 0),
+                "pm_pattern_exp": sig.get("pm_pattern_exp", 0.0),
+                "pm_pattern_wr_lb": sig.get("pm_pattern_wr_lb", 0.5),
+                "pm_public_pattern_score_adj": sig.get("pm_public_pattern_score_adj", 0),
+                "pm_public_pattern_edge_adj": sig.get("pm_public_pattern_edge_adj", 0.0),
+                "pm_public_pattern_n": sig.get("pm_public_pattern_n", 0),
+                "pm_public_pattern_dom": sig.get("pm_public_pattern_dom", 0.0),
+                "pm_public_pattern_avg_c": sig.get("pm_public_pattern_avg_c", 0.0),
+                "recent_side_n": sig.get("recent_side_n", 0),
+                "recent_side_exp": sig.get("recent_side_exp", 0.0),
+                "recent_side_wr_lb": sig.get("recent_side_wr_lb", 0.5),
+                "recent_side_score_adj": sig.get("recent_side_score_adj", 0),
+                "recent_side_edge_adj": sig.get("recent_side_edge_adj", 0.0),
+                "recent_side_prob_adj": sig.get("recent_side_prob_adj", 0.0),
+                "pred_variant": sig.get("pred_variant", ""),
+                "pred_variant_probs": sig.get("pred_variant_probs", {}),
+                "autopilot_mode": sig.get("autopilot_mode", ""),
+                "autopilot_size_mult": sig.get("autopilot_size_mult", 1.0),
+                "rolling_n": sig.get("rolling_n", 0),
+                "rolling_exp": sig.get("rolling_exp", 0.0),
+                "rolling_wr_lb": sig.get("rolling_wr_lb", 0.5),
+                "rolling_prob_add": sig.get("rolling_prob_add", 0.0),
+                "rolling_ev_add": sig.get("rolling_ev_add", 0.0),
+                "rolling_size_mult": sig.get("rolling_size_mult", 1.0),
+                "min_payout_req": sig.get("min_payout_req", 0.0),
+                "min_ev_req": sig.get("min_ev_req", 0.0),
+                "bucket": stat_bucket,
+                "fill_price": fill_price,
+                "slip_bps": round(slip_bps, 2),
+                "round_key": round_key,
+                "placed_ts": _time.time(),
+                "booster_mode": bool(is_booster),
+                "booster_note": sig.get("booster_note", ""),
+                "booster_count": 1 if is_booster else 0,
+                "booster_stake_usdc": actual_size_usdc if is_booster else 0.0,
+                "addon_count": 1 if is_booster else 0,
+                "addon_stake_usdc": actual_size_usdc if is_booster else 0.0,
+                "core_position": (not is_booster),
+                "core_entry_locked": (not is_booster),
+                "core_entry": (fill_price if (not is_booster) else 0.0),
+                "core_size_usdc": (actual_size_usdc if (not is_booster) else 0.0),
+            }
+            self._log_onchain_event("ENTRY", cid, {
+                "asset": sig["asset"],
+                "side": sig["side"],
+                "score": sig["score"],
+                "size_usdc": actual_size_usdc,
+                "entry_price": sig["entry"],
+                "edge": round(sig["edge"], 4),
+                "true_prob": round(sig["true_prob"], 4),
+                "cl_agree": bool(sig["cl_agree"]),
+                "open_price_source": sig.get("open_price_source", "?"),
+                "chainlink_age_s": sig.get("chainlink_age_s"),
+                "onchain_score_adj": sig.get("onchain_score_adj", 0),
+                "source_confidence": sig.get("source_confidence", 0.0),
+                "oracle_gap_bps": sig.get("oracle_gap_bps", 0.0),
+                "placed": bool(filled),
+                "order_id": order_id or "",
+                "fill_price": round(fill_price, 6),
+                "slippage_bps": round(slip_bps, 2),
+                "signal_latency_ms": round(sig.get("signal_latency_ms", 0.0), 2),
+                "quote_age_ms": round(sig.get("quote_age_ms", 0.0), 2),
+                "bucket": stat_bucket,
+                "round_key": round_key,
+                "pred_variant": sig.get("pred_variant", ""),
+                "autopilot_mode": sig.get("autopilot_mode", ""),
+                "autopilot_size_mult": sig.get("autopilot_size_mult", 1.0),
+                "booster_mode": bool(is_booster),
+                "booster_note": sig.get("booster_note", ""),
+                "duration": sig.get("duration", 15),
+            })
+            if filled and self._noisy_log_enabled(f"entry-stats:{sig['asset']}:{cid}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{B}[ENTRY-STATS]{RS} {sig['asset']} {sig['duration']}m {sig['side']} "
+                    f"ev={float(sig.get('execution_ev',0.0) or 0.0):+.3f} "
+                    f"payout={1.0/max(float(sig.get('entry',0.5) or 0.5),1e-9):.2f}x "
+                    f"min(payout/ev)={float(sig.get('min_payout_req',0.0) or 0.0):.2f}x/"
+                    f"{float(sig.get('min_ev_req',0.0) or 0.0):.3f} "
+                    f"pm={int(sig.get('pm_pattern_score_adj',0) or 0):+d}/{float(sig.get('pm_pattern_edge_adj',0.0) or 0.0):+.3f}"
+                    f"(n={int(sig.get('pm_pattern_n',0) or 0)} exp={float(sig.get('pm_pattern_exp',0.0) or 0.0):+.2f}) "
+                    f"pub={int(sig.get('pm_public_pattern_score_adj',0) or 0):+d}/{float(sig.get('pm_public_pattern_edge_adj',0.0) or 0.0):+.3f}"
+                    f"(n={int(sig.get('pm_public_pattern_n',0) or 0)} dom={float(sig.get('pm_public_pattern_dom',0.0) or 0.0):+.2f}) "
+                    f"rec={int(sig.get('recent_side_score_adj',0) or 0):+d}/{float(sig.get('recent_side_edge_adj',0.0) or 0.0):+.3f}"
+                    f"(n={int(sig.get('recent_side_n',0) or 0)} exp={float(sig.get('recent_side_exp',0.0) or 0.0):+.2f} "
+                    f"wr_lb={float(sig.get('recent_side_wr_lb',0.5) or 0.5):.2f}) "
+                    f"roll(n={int(sig.get('rolling_n',0) or 0)} exp={float(sig.get('rolling_exp',0.0) or 0.0):+.2f} "
+                    f"wr_lb={float(sig.get('rolling_wr_lb',0.5) or 0.5):.2f})"
+                )
+            if filled:
+                if is_booster and cid in self.pending:
+                    old_m, old_t = self.pending.get(cid, (m, {}))
+                    old_size = float((old_t or {}).get("size", 0.0) or 0.0)
+                    new_size = float(actual_size_usdc or 0.0)
+                    # Keep core position immutable locally: no weighted-average assimilation.
+                    # Add-ons are tracked in separate fields while on-chain remains aggregate truth.
+                    old_t["size"] = round(old_size, 6)
+                    old_t["fill_price"] = round(fill_price, 6)
+                    old_t["slip_bps"] = round(float(trade.get("slip_bps", 0.0) or 0.0), 2)
+                    old_t["placed_ts"] = _time.time()
+                    old_t["booster_mode"] = True
+                    old_t["booster_note"] = sig.get("booster_note", "")
+                    old_t["booster_count"] = int(old_t.get("booster_count", 0) or 0) + 1
+                    old_t["booster_stake_usdc"] = round(float(old_t.get("booster_stake_usdc", 0.0) or 0.0) + new_size, 6)
+                    old_t["addon_count"] = int(old_t.get("addon_count", 0) or 0) + 1
+                    old_t["addon_stake_usdc"] = round(float(old_t.get("addon_stake_usdc", 0.0) or 0.0) + new_size, 6)
+                    old_t["core_position"] = bool(old_t.get("core_position", True))
+                    old_t["core_entry_locked"] = bool(old_t.get("core_entry_locked", True))
+                    self.pending[cid] = (old_m, old_t)
+                    self._booster_used_by_cid[cid] = int(self._booster_used_by_cid.get(cid, 0) or 0) + 1
+                    self._save_pending()
+                    print(
+                        f"{G}[BOOST-FILL]{RS} {sig['asset']} {sig['duration']}m {side} "
+                        f"| +${new_size:.2f} @ {fill_price:.3f} | core=${old_size:.2f} "
+                        f"| addon_total=${old_t.get('addon_stake_usdc', 0.0):.2f} "
+                        f"| cid={self._short_cid(cid)}"
+                    )
+                else:
+                    self.seen.add(cid)
+                    self._save_seen()
+                    self.pending[cid] = (m, trade)
+                    block_until = float(m.get("end_ts", 0) or 0)
+                    if block_until <= now_attempt:
+                        block_until = now_attempt + max(60.0, ROUND_RETRY_COOLDOWN_SEC * 2)
+                    self._round_side_block_until[round_side_key] = block_until + 15.0
+                    self._save_pending()
+                    self._log(m, trade)
+        finally:
+            async with self._exec_lock:
+                self._executing_cids.discard(cid)
+                self._reserved_bankroll = max(0.0, self._reserved_bankroll - float(sig.get("size", 0.0) or 0.0))  # H-4: release
+
+    async def _maybe_wait_for_better_entry(self, sig: dict) -> dict | None:
+        """Short price-improvement wait while preserving initial conviction snapshot.
+
+        For strong 15m setups only, wait a brief window for a better entry.
+        Enter only if thesis quality is preserved (score/prob/edge decay bounded).
+        """
+        try:
+            if not ENTRY_WAIT_ENABLED:
+                return sig
+            if bool(sig.get("booster_mode", False)) or bool(sig.get("use_limit", False)):
+                return sig
+            duration = int(sig.get("duration", 0) or 0)
+            if duration != 15:
+                return sig
+            mins_left = float(sig.get("mins_left", 0.0) or 0.0)
+            if mins_left * 60.0 <= ENTRY_WAIT_MIN_LEFT_SEC:
+                return sig
+            score0 = int(sig.get("score", 0) or 0)
+            p0 = float(sig.get("true_prob", 0.0) or 0.0)
+            edge0 = float(sig.get("edge", 0.0) or 0.0)
+            e0 = float(sig.get("entry", 0.0) or 0.0)
+            if score0 < ENTRY_WAIT_MIN_SCORE or p0 < ENTRY_WAIT_MIN_TRUE_PROB:
+                return sig
+            if e0 < ENTRY_WAIT_MIN_ENTRY or e0 > ENTRY_WAIT_MAX_ENTRY:
+                return sig
+
+            m = sig.get("m")
+            if not isinstance(m, dict):
+                return sig
+
+            deadline = _time.time() + max(0.0, ENTRY_WAIT_WINDOW_15M_SEC)
+            # M-4: block copyflow on-demand refreshes during the wait window — data was just fetched
+            _cf_block_until = deadline + 1.0
+            self._copyflow_cid_on_demand_ts[sig["cid"]] = _cf_block_until
+            best = sig
+            improved = False
+            while _time.time() < deadline:
+                await asyncio.sleep(max(0.05, ENTRY_WAIT_POLL_SEC))
+                rsig = await self._score_market(m)
+                if not rsig:
+                    continue
+                if rsig.get("cid") != sig.get("cid") or rsig.get("side") != sig.get("side"):
+                    continue
+                score_t = int(rsig.get("score", 0) or 0)
+                p_t = float(rsig.get("true_prob", 0.0) or 0.0)
+                edge_t = float(rsig.get("edge", 0.0) or 0.0)
+                if (
+                    score_t < (score0 - ENTRY_WAIT_MAX_SCORE_DECAY)
+                    or p_t < (p0 - ENTRY_WAIT_MAX_PROB_DECAY)
+                    or edge_t < (edge0 - ENTRY_WAIT_MAX_EDGE_DECAY)
+                ):
+                    if self._noisy_log_enabled(f"entry-wait-decay:{sig.get('asset','?')}:{sig.get('side','?')}", LOG_SKIP_EVERY_SEC):
+                        print(
+                            f"{Y}[ENTRY-WAIT]{RS} {sig.get('asset','?')} {sig.get('side','?')} "
+                            f"thesis decayed: score {score_t}/{score0} prob {p_t:.3f}/{p0:.3f} edge {edge_t:.3f}/{edge0:.3f}"
+                        )
+                    return None
+                e_t = float(rsig.get("entry", 1.0) or 1.0)
+                tick = float(((rsig.get("pm_book_data") or {}).get("tick", 0.01)) or 0.01)
+                min_improve = max(tick * max(1, ENTRY_WAIT_MIN_IMPROVE_TICKS), ENTRY_WAIT_MIN_IMPROVE_ABS)
+                if e_t <= (float(best.get("entry", 1.0) or 1.0) - min_improve):
+                    best = rsig
+                    improved = True
+                    if self._noisy_log_enabled(f"entry-wait-improve:{sig.get('asset','?')}:{sig.get('side','?')}", LOG_EDGE_EVERY_SEC):
+                        print(
+                            f"{B}[ENTRY-WAIT]{RS} {sig.get('asset','?')} {sig.get('side','?')} "
+                            f"entry {float(sig.get('entry',0))*100:.1f}c -> {e_t*100:.1f}c "
+                            f"(score={score_t} prob={p_t:.3f} edge={edge_t:.3f})"
+                        )
+                    if e_t <= (e0 - ENTRY_WAIT_TARGET_DROP_ABS):
+                        break
+            return best if improved else sig
+        except Exception as e:
+            self._errors.tick("entry_wait", print, err=e, every=20)
+            return sig
+
+    async def evaluate(self, m: dict):
+        """RTDS fast-path: score a single market and execute if score gate passes."""
+        t0 = _time.perf_counter()
+        sig = await self._score_market(m)
+        self._perf_update("score_ms", (_time.perf_counter() - t0) * 1000.0)
+        if sig and sig["score"] >= MIN_SCORE_GATE:
+            await self._execute_trade(sig)
+
     async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None, hc15_mode=False, hc15_fallback_cap=0.36, core_position=True, round_force=False):
-        from clawbot_v2.legacy_core.execution import place_order
-        return await place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob, cl_agree, min_edge_req, force_taker, score, pm_book_data, use_limit, max_entry_allowed, hc15_mode, hc15_fallback_cap, core_position, round_force)
+        """Maker-first order strategy:
+        1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
+        2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
+        3. If unfilled, cancel and fall back to taker at best_ask+tick
+        4. If taker unfilled after 3s, cancel and return None.
+        Returns dict {order_id, fill_price, mode} or None."""
+        if DRY_RUN:
+            fake_id = f"DRY-{asset[:3]}-{int(datetime.now(timezone.utc).timestamp())}"
+            # Simulate at AMM price (approximates maker fill quality)
+            print(f"{Y}[DRY-RUN]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {price:.3f} | id={fake_id}")
+            return {"order_id": fake_id, "fill_price": price, "mode": "dry"}
+
+        # Execution backstop: never allow micro-notional orders even if upstream scoring/sync
+        # accidentally emits a tiny size. This is the final safety net before on-chain send.
+        # Keep execution floor aligned with adaptive sizing logic.
+        # Using MIN_BET_ABS here can reject valid autopilot-sized trades.
+        hard_min_notional = max(float(MIN_EXEC_NOTIONAL_USDC), 1.0)
+        if float(size_usdc or 0.0) < hard_min_notional:
+            allow_bump = bool(core_position) and (bool(round_force) or FORCE_TRADE_EVERY_ROUND)
+            target_min = hard_min_notional * max(1.0, float(ROUND_FORCE_MIN_NOTIONAL_MULT))
+            bank_cap = max(0.0, float(self.bankroll or 0.0)) * max(0.01, float(ROUND_FORCE_MAX_BANK_FRAC))
+            if allow_bump and bank_cap >= target_min:
+                bumped = round(max(float(size_usdc or 0.0), target_min), 2)
+                print(
+                    f"{Y}[SIZE-BUMP]{RS} {asset} {side} size ${float(size_usdc or 0.0):.2f} -> ${bumped:.2f} "
+                    f"(hard_min=${hard_min_notional:.2f} bank_cap=${bank_cap:.2f})"
+                )
+                size_usdc = bumped
+            else:
+                print(
+                    f"{Y}[SKIP]{RS} {asset} {side} size=${float(size_usdc or 0.0):.2f} "
+                    f"< hard_min=${hard_min_notional:.2f} (exec backstop)"
+                )
+                return None
+
+        for attempt in range(max(1, ORDER_RETRY_MAX)):
+            try:
+                loop = asyncio.get_running_loop()
+                slip_cap_bps = MAX_TAKER_SLIP_BPS_5M if duration <= 5 else MAX_TAKER_SLIP_BPS_15M
+
+                def _slip_bps(exec_price: float, ref_price: float) -> float:
+                    return ((exec_price - ref_price) / max(ref_price, 1e-9)) * 10000.0
+
+                def _normalize_order_size(exec_price: float, intended_usdc: float) -> tuple[float, float]:
+                    min_shares = max(0.01, MIN_ORDER_SIZE_SHARES + ORDER_SIZE_PAD_SHARES)
+                    px = max(exec_price, 1e-9)
+                    raw_shares = max(0.0, intended_usdc) / px
+                    # Execution hard-min is in USDC, not only in shares.
+                    min_notional = max(hard_min_notional, min_shares * px)
+                    shares_floor = min_notional / px
+                    shares = round(max(raw_shares, shares_floor), 2)
+                    notional = round(shares * px, 2)
+                    return shares, notional
+
+                def _normalize_buy_amount(intended_usdc: float) -> float:
+                    # Market BUY maker amount is USDC and must stay at 2 decimals.
+                    return float(round(max(0.0, intended_usdc), 2))
+
+                def _book_depth_usdc(levels, price_cap: float) -> float:
+                    depth = 0.0
+                    for lv in (levels or []):
+                        try:
+                            if isinstance(lv, (tuple, list)) and len(lv) >= 2:
+                                p = float(lv[0])
+                                s = float(lv[1])
+                            else:
+                                p = float(lv.price)
+                                s = float(lv.size)
+                            if p > price_cap + 1e-9:
+                                break
+                            depth += p * s
+                        except Exception:
+                            continue
+                    return float(depth)
+
+                async def _post_limit_fok(exec_price: float) -> tuple[dict, float]:
+                    # Strict instant execution with price cap to keep slippage near zero.
+                    px = round(max(0.001, min(exec_price, 0.97)), 4)
+                    px_order = round(px, 2)
+                    amount_usdc = _normalize_buy_amount(size_usdc)
+                    order_args = MarketOrderArgs(
+                        token_id=token_id,
+                        amount=float(amount_usdc),
+                        side="BUY",
+                        price=float(px_order),
+                        order_type=OrderType.FOK,
+                    )
+                    t_sign0 = _time.perf_counter()
+                    signed = await loop.run_in_executor(None, lambda: self.clob.create_market_order(order_args))
+                    t_sign_ms = (_time.perf_counter() - t_sign0) * 1000.0
+                    try:
+                        t_post0 = _time.perf_counter()
+                        resp = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.FOK))
+                        t_post_ms = (_time.perf_counter() - t_post0) * 1000.0
+                    except Exception as e:
+                        # FOK semantics: if not fully matched immediately, exchange returns a kill error.
+                        # Treat this as unfilled (not a hard order failure).
+                        msg = str(e).lower()
+                        if (
+                            "fully filled or killed" in msg
+                            or "couldn't be fully filled" in msg
+                            or "could not be fully filled" in msg
+                        ):
+                            return {"status": "killed", "orderID": "", "id": ""}, float(px_order)
+                        raise
+                    if ORDER_LATENCY_LOG_ENABLED:
+                        print(
+                            f"{B}[ORDER-LAT]{RS} {asset} {side} {duration}m "
+                            f"fok sign={t_sign_ms:.0f}ms post={t_post_ms:.0f}ms"
+                        )
+                    return resp, float(px_order)
+
+                # Use pre-fetched book from scoring phase (free — ran in parallel with Binance signals)
+                # or fetch fresh if not cached (~36ms)
+                if pm_book_data is not None:
+                    if isinstance(pm_book_data, dict):
+                        bts = float(pm_book_data.get("ts", 0.0) or 0.0)
+                        bage_ms = ((_time.time() - bts) * 1000.0) if bts > 0 else 9e9
+                        if bage_ms > MAX_ORDERBOOK_AGE_MS:
+                            pm_book_data = None
+                        else:
+                            best_bid = float(pm_book_data.get("best_bid", 0.0) or 0.0)
+                            best_ask = float(pm_book_data.get("best_ask", 0.0) or 0.0)
+                            tick = float(pm_book_data.get("tick", 0.01) or 0.01)
+                            asks = list(pm_book_data.get("asks") or [])
+                            bids = []
+                    else:
+                        # Backward compatibility with old tuple format.
+                        best_bid, best_ask, tick = pm_book_data
+                        asks = []
+                        bids = []
+                    if pm_book_data is not None and best_ask > 0:
+                        spread = best_ask - best_bid
+                    else:
+                        pm_book_data = None
+                if pm_book_data is None:
+                    ws_book = self._get_clob_ws_book(token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+                    if ws_book is not None:
+                        best_bid = float(ws_book.get("best_bid", 0.0) or 0.0)
+                        best_ask = float(ws_book.get("best_ask", 0.0) or 0.0)
+                        tick = float(ws_book.get("tick", 0.01) or 0.01)
+                        asks = list(ws_book.get("asks") or [])
+                        bids = []
+                        spread = (best_ask - best_bid) if best_ask > 0 else 0.0
+                        pm_book_data = ws_book
+                if pm_book_data is None:
+                    book     = await self._get_order_book(token_id, force_fresh=False)
+                    tick     = float(book.tick_size or "0.01")
+                    asks     = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
+                    bids     = sorted(book.bids, key=lambda x: float(x.price), reverse=True) if book.bids else []
+                    if not asks:
+                        print(f"{Y}[SKIP] {asset} {side}: empty order book{RS}")
+                        return None
+                    best_ask = float(asks[0].price)
+                    best_bid = float(bids[0].price) if bids else best_ask - 0.10
+                    spread   = best_ask - best_bid
+                book_age_exec_ms = 9e9
+                if isinstance(pm_book_data, dict):
+                    bts = float(pm_book_data.get("ts", 0.0) or 0.0)
+                    if bts > 0:
+                        book_age_exec_ms = max(0.0, (_time.time() - bts) * 1000.0)
+
+                taker_edge     = true_prob - best_ask
+                mid_est        = (best_bid + best_ask) / 2
+                maker_edge_est = true_prob - mid_est
+                # Ensure order notional always satisfies CLOB minimum size in shares.
+                _, min_notional = _normalize_order_size(best_ask, 0.0)
+                if size_usdc < min_notional:
+                    if min_notional > self.bankroll:
+                        print(
+                            f"{Y}[SKIP]{RS} {asset} {side} min-order notional=${min_notional:.2f} "
+                            f"> bankroll=${self.bankroll:.2f}"
+                        )
+                        return None
+                    if LOG_VERBOSE:
+                        print(
+                            f"{Y}[SIZE-ADJ]{RS} {asset} {side} ${size_usdc:.2f} -> "
+                            f"${min_notional:.2f} (min {MIN_ORDER_SIZE_SHARES:.0f} shares)"
+                        )
+                    size_usdc = min_notional
+                edge_floor = min_edge_req if min_edge_req is not None else EXEC_EDGE_FLOOR_DEFAULT
+                if not cl_agree:
+                    edge_floor += EXEC_EDGE_FLOOR_NO_CL
+                strong_exec = (
+                    (score >= 12)
+                    and cl_agree
+                    and (taker_edge >= (edge_floor + EXEC_EDGE_STRONG_DELTA))
+                )
+                base_spread_cap = MAX_BOOK_SPREAD_5M if duration <= 5 else MAX_BOOK_SPREAD_15M
+                if (spread - base_spread_cap) > 1e-6 and not use_limit:
+                    print(
+                        f"{Y}[SKIP]{RS} {asset} {side} spread too wide: "
+                        f"{spread:.3f} > cap={base_spread_cap:.3f}"
+                    )
+                    return None
+
+                if use_limit:
+                    # GTC limit at target price (price << market) — skip market-based edge gate
+                    # Edge is computed vs target, not current ask
+                    limit_edge = true_prob - price
+                    print(f"{B}[LIMIT]{RS} {asset} {side} target={price:.3f} limit_edge={limit_edge:.3f} ask={best_ask:.3f}")
+                elif score >= 10:
+                    # High conviction: gate on maker edge (mid price), not taker (ask)
+                    if maker_edge_est < 0:
+                        print(f"{Y}[SKIP] {asset} {side} [high-conv]: maker_edge={maker_edge_est:.3f} < 0 "
+                              f"(mid={mid_est:.3f} model={true_prob:.3f}){RS}")
+                        return None
+                    print(f"{B}[EXEC-CHECK]{RS} {asset} {side} score={score} maker_edge={maker_edge_est:.3f} taker_edge={taker_edge:.3f}")
+                else:
+                    # Normal conviction: taker edge gate applies
+                    if taker_edge < edge_floor:
+                        kind = "disagree" if not cl_agree else "directional"
+                        print(f"{Y}[SKIP] {asset} {side} [{kind}]: taker_edge={taker_edge:.3f} < {edge_floor:.2f} "
+                              f"(ask={best_ask:.3f} model={true_prob:.3f}){RS}")
+                        return None
+                    print(f"{B}[EXEC-CHECK]{RS} {asset} {side} edge={taker_edge:.3f} floor={edge_floor:.2f}")
+
+                # High conviction: skip maker, go straight to FOK taker for instant fill
+                # FOK = Fill-or-Kill: fills completely at price or cancels instantly — no waiting
+                if (not force_taker) and ORDER_FAST_MODE and (not use_limit):
+                    eff_max_entry = max_entry_allowed if max_entry_allowed is not None else 0.99
+                    fast_spread_cap = FAST_TAKER_SPREAD_MAX_5M if duration <= 5 else FAST_TAKER_SPREAD_MAX_15M
+                    score_cap = FAST_TAKER_SCORE_5M if duration <= 5 else FAST_TAKER_SCORE_15M
+                    speed_score_cap = FAST_TAKER_SPEED_SCORE_5M if duration <= 5 else FAST_TAKER_SPEED_SCORE_15M
+                    secs_elapsed = max(0.0, duration * 60.0 - max(0.0, mins_left * 60.0))
+                    early_cut = FAST_TAKER_EARLY_WINDOW_SEC_5M if duration <= 5 else FAST_TAKER_EARLY_WINDOW_SEC_15M
+                    # Execution-first path: when signal is strong and book is tradable, prefer instant fill.
+                    if (
+                        strong_exec
+                        and best_ask <= eff_max_entry
+                        and spread <= (fast_spread_cap + 0.01)
+                    ):
+                        force_taker = True
+                    if (
+                        score >= score_cap
+                        and spread <= fast_spread_cap
+                        and best_ask <= eff_max_entry
+                        and taker_edge >= (edge_floor + EXEC_EDGE_STRONG_DELTA)
+                    ):
+                        force_taker = True
+                    elif (
+                        secs_elapsed <= early_cut
+                        and score >= (score_cap + 1)
+                        and spread <= (fast_spread_cap + 0.005)
+                        and best_ask <= eff_max_entry
+                        and taker_edge >= (edge_floor + EXEC_EDGE_EARLY_DELTA)
+                    ):
+                        force_taker = True
+                    elif (
+                        best_ask <= eff_max_entry
+                        and taker_edge >= edge_floor
+                        and (maker_edge_est - taker_edge) <= FAST_TAKER_EDGE_DIFF_MAX
+                    ):
+                        force_taker = True
+                    if (
+                        EXEC_SPEED_PRIORITY_ENABLED
+                        and (book_age_exec_ms <= FAST_PATH_MAX_BOOK_AGE_MS)
+                        and score >= speed_score_cap
+                        and spread <= (fast_spread_cap + 0.002)
+                        and best_ask <= eff_max_entry
+                        and taker_edge >= edge_floor
+                    ):
+                        force_taker = True
+
+                if force_taker:
+                    taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
+                    # Execution slippage must be measured against current executable ask,
+                    # not signal/model entry price from scoring time.
+                    slip_now = _slip_bps(taker_price, best_ask)
+                    needed_notional = _normalize_buy_amount(size_usdc) * FAST_FOK_MIN_DEPTH_RATIO
+                    depth_now = _book_depth_usdc(asks, taker_price)
+                    if depth_now < needed_notional:
+                        try:
+                            ob2 = await self._get_order_book(token_id, force_fresh=True)
+                            asks2 = sorted(ob2.asks, key=lambda x: float(x.price)) if ob2.asks else []
+                            depth_now = _book_depth_usdc(asks2, taker_price)
+                        except Exception:
+                            pass
+                    if depth_now < needed_notional:
+                        print(
+                            f"{Y}[FAST-DEPTH]{RS} {asset} {side} insufficient depth "
+                            f"${depth_now:.2f} < need ${needed_notional:.2f} @<= {taker_price:.3f}"
+                        )
+                        force_taker = False
+                    elif slip_now > slip_cap_bps:
+                        print(
+                            f"{Y}[SLIP-GUARD]{RS} {asset} {side} fast-taker blocked: "
+                            f"slip={slip_now:.1f}bps(ref_ask={best_ask:.3f}) > cap={slip_cap_bps:.0f}bps"
+                        )
+                        force_taker = False
+                    else:
+                        print(
+                            f"{G}[FAST-PATH]{RS} {asset} {side} spread={spread:.3f} "
+                            f"score={score} slip={slip_now:.1f}bps -> limit FOK"
+                        )
+                        print(f"{G}[FAST-TAKER]{RS} {asset} {side} HIGH-CONV @ {taker_price:.3f} | ${size_usdc:.2f}")
+                        resp, _ = await _post_limit_fok(taker_price)
+                        order_id = resp.get("orderID") or resp.get("id", "")
+                        if resp.get("status") in ("matched", "filled"):
+                            self.bankroll -= size_usdc
+                            print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                            return {"order_id": order_id, "fill_price": taker_price, "mode": "fok", "notional_usdc": size_usdc}
+                        # FOK not filled (thin liquidity) — fall through to normal maker/taker flow
+                        print(f"{Y}[FOK] unfilled — falling back to maker{RS}")
+                        force_taker = False  # reset so we don't loop
+
+                # Near market close, prioritize instant execution over maker wait.
+                # Missing the window costs more than paying a small spread.
+                if (not force_taker) and ORDER_FAST_MODE:
+                    secs_left = max(0.0, mins_left * 60.0)
+                    near_end_cut = FAST_TAKER_NEAR_END_5M_SEC if duration <= 5 else FAST_TAKER_NEAR_END_15M_SEC
+                    if secs_left <= near_end_cut and taker_edge >= edge_floor and best_ask <= (max_entry_allowed or 0.99):
+                        force_taker = True
+                        taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
+                        slip_now = _slip_bps(taker_price, best_ask)
+                        needed_notional = _normalize_buy_amount(size_usdc) * FAST_FOK_MIN_DEPTH_RATIO
+                        depth_now = _book_depth_usdc(asks, taker_price)
+                        if depth_now < needed_notional:
+                            try:
+                                ob2 = await self._get_order_book(token_id, force_fresh=True)
+                                asks2 = sorted(ob2.asks, key=lambda x: float(x.price)) if ob2.asks else []
+                                depth_now = _book_depth_usdc(asks2, taker_price)
+                            except Exception:
+                                pass
+                        if depth_now < needed_notional:
+                            print(
+                                f"{Y}[FAST-DEPTH]{RS} {asset} {side} near-end insufficient depth "
+                                f"${depth_now:.2f} < need ${needed_notional:.2f} @<= {taker_price:.3f}"
+                            )
+                            force_taker = False
+                        elif slip_now > slip_cap_bps:
+                            print(
+                                f"{Y}[SLIP-GUARD]{RS} {asset} {side} near-end taker blocked: "
+                                f"slip={slip_now:.1f}bps(ref_ask={best_ask:.3f}) > cap={slip_cap_bps:.0f}bps"
+                            )
+                            force_taker = False
+                        else:
+                            print(f"{G}[FAST-TAKER]{RS} {asset} {side} near-end @ {taker_price:.3f} | ${size_usdc:.2f}")
+                            resp, _ = await _post_limit_fok(taker_price)
+                            order_id = resp.get("orderID") or resp.get("id", "")
+                            if resp.get("status") in ("matched", "filled"):
+                                self.bankroll -= size_usdc
+                                print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                                return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_near_end", "notional_usdc": size_usdc}
+                            print(f"{Y}[FOK] near-end unfilled — fallback maker{RS}")
+                            force_taker = False
+
+                # ── PHASE 1: Maker bid ────────────────────────────────────
+                mid          = (best_bid + best_ask) / 2
+                if use_limit:
+                    # True GTC limit at target price — will fill only on pullback
+                    maker_price = round(max(price, tick), 4)
+                else:
+                    maker_price = round(min(mid + tick, best_ask - tick), 4)
+                    maker_price = max(maker_price, tick)
+                    entry_cap = round(min(0.97, price + tick * max(0, MAKER_ENTRY_TICK_TOL)), 4)
+                    if maker_price > entry_cap:
+                        maker_price = max(tick, entry_cap)
+                maker_edge   = true_prob - maker_price
+                maker_price_order = round(maker_price, 2)
+                # If maker pullback target is too far from current book, skip futile maker post.
+                # In that case try immediate taker only if still executable and +edge.
+                if (not use_limit) and (not force_taker):
+                    gap_ticks = 0.0
+                    if tick > 0:
+                        gap_ticks = max(0.0, (best_bid - maker_price) / tick)
+                    max_gap_ticks = MAKER_PULLBACK_MAX_GAP_TICKS_5M if duration <= 5 else MAKER_PULLBACK_MAX_GAP_TICKS_15M
+                    if strong_exec:
+                        max_gap_ticks += (1 if duration <= 5 else 2)
+                    if round_force:
+                        max_gap_ticks += (2 if duration <= 5 else 3)
+                    if gap_ticks > float(max_gap_ticks):
+                        eff_max_entry = max_entry_allowed if max_entry_allowed is not None else 0.99
+                        if best_ask <= eff_max_entry and taker_edge >= edge_floor:
+                            taker_price = round(min(best_ask, eff_max_entry, 0.97), 4)
+                            slip_now = _slip_bps(taker_price, best_ask)
+                            needed_notional = _normalize_buy_amount(size_usdc) * FAST_FOK_MIN_DEPTH_RATIO
+                            depth_now = _book_depth_usdc(asks, taker_price)
+                            if depth_now >= needed_notional and slip_now <= slip_cap_bps:
+                                print(
+                                    f"{Y}[MAKER-BYPASS]{RS} {asset} {side} pullback too far "
+                                    f"(gap={gap_ticks:.1f} ticks>{max_gap_ticks}) -> FOK @ {taker_price:.3f}"
+                                )
+                                resp, _ = await _post_limit_fok(taker_price)
+                                order_id = resp.get("orderID") or resp.get("id", "")
+                                if resp.get("status") in ("matched", "filled"):
+                                    self.bankroll -= size_usdc
+                                    print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                                    return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_maker_bypass", "notional_usdc": size_usdc}
+                                bypass_filled = False
+                                if not (strong_exec or round_force):
+                                    print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=maker_bypass_fok_unfilled")
+                                    return None
+                        if strong_exec or round_force:
+                            maker_price = round(min(max(tick, best_bid), eff_max_entry, 0.97), 4)
+                            if self._noisy_log_enabled(f"maker-reprice-gap:{asset}:{side}", LOG_EXEC_EVERY_SEC):
+                                print(
+                                    f"{Y}[MAKER-REPRICE]{RS} {asset} {side} gap={gap_ticks:.1f} ticks>{max_gap_ticks} "
+                                    f"-> maker_price={maker_price:.3f}"
+                                )
+                        else:
+                            print(
+                                f"{Y}[SKIP]{RS} {asset} {side} maker pullback too far "
+                                f"(gap={gap_ticks:.1f} ticks>{max_gap_ticks})"
+                            )
+                            self._skip_tick("maker_pullback_too_far")
+                            return None
+                size_tok_m, maker_notional = _normalize_order_size(maker_price_order, size_usdc)
+                size_usdc = maker_notional
+                if size_usdc < hard_min_notional:
+                    print(
+                        f"{Y}[SKIP]{RS} {asset} {side} normalized size=${size_usdc:.2f} "
+                        f"< hard_min=${hard_min_notional:.2f} (post-normalize)"
+                    )
+                    return None
+
+                print(f"{G}[MAKER] {asset} {side}: px={maker_price:.3f} "
+                      f"book_bid={best_bid:.3f} book_ask={best_ask:.3f} spread={spread:.3f} "
+                      f"maker_edge={maker_edge:.3f} taker_edge={taker_edge:.3f}{RS}")
+
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=float(maker_price_order),
+                    size=float(round(size_tok_m, 2)),
+                    side="BUY",
+                )
+                t_sign0 = _time.perf_counter()
+                signed  = await loop.run_in_executor(None, lambda: self.clob.create_order(order_args))
+                t_sign_ms = (_time.perf_counter() - t_sign0) * 1000.0
+                t_post0 = _time.perf_counter()
+                resp    = await loop.run_in_executor(None, lambda: self.clob.post_order(signed, OrderType.GTC))
+                t_post_ms = (_time.perf_counter() - t_post0) * 1000.0
+                if ORDER_LATENCY_LOG_ENABLED:
+                    print(
+                        f"{B}[ORDER-LAT]{RS} {asset} {side} {duration}m "
+                        f"maker sign={t_sign_ms:.0f}ms post={t_post_ms:.0f}ms"
+                    )
+                order_id = resp.get("orderID") or resp.get("id", "")
+                status   = resp.get("status", "")
+
+                if not order_id:
+                    print(f"{Y}[MAKER] No order_id — skipping{RS}")
+                    return None
+
+                if status == "matched":
+                    self.bankroll -= size_usdc
+                    payout = size_usdc / maker_price
+                    print(f"{G}[MAKER FILL]{RS} {side} {asset} {duration}m | "
+                          f"${size_usdc:.2f} @ {maker_price:.3f} | payout=${payout:.2f} | "
+                          f"Bank ${self.bankroll:.2f}")
+                    return {"order_id": order_id, "fill_price": maker_price, "mode": "maker", "notional_usdc": size_usdc}
+
+                # Ultra-low-latency waits to avoid blocking other opportunities.
+                poll_interval = MAKER_POLL_5M_SEC if duration <= 5 else MAKER_POLL_15M_SEC
+                base_wait = MAKER_WAIT_5M_SEC if duration <= 5 else MAKER_WAIT_15M_SEC
+                max_wait = min(base_wait, max(0.25, mins_left * 60 * 0.02))
+                if use_limit:
+                    # Pullback limit: do not stall the cycle waiting on far-away price.
+                    max_wait = min(max_wait, 0.35 if duration <= 5 else 0.60)
+                elif strong_exec and not use_limit:
+                    # For strong setups, do not spend too long in maker limbo.
+                    max_wait = min(max_wait, 0.25 if duration <= 5 else 0.30)
+                if EXEC_SPEED_PRIORITY_ENABLED and not use_limit:
+                    # Speed-first: keep maker exposure extremely short, then re-price via FOK.
+                    speed_cap = MAX_MAKER_HOLD_5M_SEC if duration <= 5 else MAX_MAKER_HOLD_15M_SEC
+                    max_wait = min(max_wait, speed_cap)
+                polls     = max(1, int(max_wait / poll_interval))
+                print(f"{G}[MAKER] posted {asset} {side} @ {maker_price:.3f} — "
+                      f"waiting up to {polls*poll_interval}s for fill...{RS}")
+
+                filled = False
+                for i in range(polls):
+                    await asyncio.sleep(poll_interval)
+                    ev = dict(self._order_event_cache.get(order_id) or {})
+                    ev_status = str(ev.get("status", "") or "").lower()
+                    if ev_status == "filled":
+                        filled = True
+                        break
+                    if ev_status == "canceled":
+                        break
+                    try:
+                        # Poll fallback only every other tick when user-events cache is active.
+                        if i % 2 == 0:
+                            info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                        else:
+                            info = None
+                        if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
+                            filled = True
+                            self._cache_order_event(
+                                order_id,
+                                "filled",
+                                float(info.get("filled_size") or info.get("filledSize") or 0.0),
+                            )
+                            break
+                    except Exception:
+                        pass
+
+                if filled:
+                    self.bankroll -= size_usdc
+                    payout = size_usdc / maker_price
+                    print(f"{G}[MAKER FILL]{RS} {side} {asset} {duration}m | "
+                          f"${size_usdc:.2f} @ {maker_price:.3f} | payout=${payout:.2f} | "
+                          f"Bank ${self.bankroll:.2f}")
+                    return {"order_id": order_id, "fill_price": maker_price, "mode": "maker", "notional_usdc": size_usdc}
+
+                # Partial maker fill protection:
+                # status may remain "live" while filled_size > 0. Track it so position is not missed.
+                try:
+                    ev = dict(self._order_event_cache.get(order_id) or {})
+                    ev_fill = float(ev.get("filled_size", 0.0) or 0.0)
+                    info = None
+                    if ev_fill <= 0:
+                        info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                    if isinstance(info, dict):
+                        filled_sz = float(info.get("filled_size") or info.get("filledSize") or 0.0)
+                    else:
+                        filled_sz = ev_fill
+                    if filled_sz > 0:
+                        self._cache_order_event(order_id, "live", filled_sz)
+                        fill_usdc = filled_sz * maker_price
+                        partial_track_floor = max(float(DUST_RECOVER_MIN), float(MIN_PARTIAL_TRACK_USDC))
+                        if fill_usdc >= partial_track_floor:
+                            self.bankroll -= min(size_usdc, fill_usdc)
+                            print(f"{Y}[PARTIAL]{RS} {side} {asset} {duration}m | "
+                                  f"filled≈${fill_usdc:.2f} @ {maker_price:.3f} | tracking open position")
+                            return {"order_id": order_id, "fill_price": maker_price, "mode": "maker_partial", "notional_usdc": min(size_usdc, fill_usdc)}
+                        print(
+                            f"{Y}[PARTIAL-DUST]{RS} {side} {asset} {duration}m | "
+                            f"filled≈${fill_usdc:.2f} @ {maker_price:.3f} < track_min=${partial_track_floor:.2f} "
+                            f"| ignore partial tracking"
+                        )
+                except Exception:
+                    self._errors.tick("order_partial_check", print, every=50)
+
+                # Cancel maker, fall back to taker with fresh book
+                try:
+                    await loop.run_in_executor(None, lambda: self.clob.cancel(order_id))
+                except Exception:
+                    pass
+
+                # ── PHASE 2: price-capped FOK fallback — re-fetch book for fresh ask ──
+                try:
+                    fresh     = await self._get_order_book(token_id, force_fresh=True)
+                    f_asks    = sorted(fresh.asks, key=lambda x: float(x.price)) if fresh.asks else []
+                    f_bids    = sorted(fresh.bids, key=lambda x: float(x.price), reverse=True) if fresh.bids else []
+                    f_tick    = float(fresh.tick_size or tick)
+                    fresh_ask = float(f_asks[0].price) if f_asks else best_ask
+                    fresh_bid = float(f_bids[0].price) if f_bids else max(0.0, fresh_ask - f_tick)
+                    fresh_spread = max(0.0, fresh_ask - fresh_bid)
+                    if (fresh_spread - base_spread_cap) > 1e-6:
+                        print(
+                            f"{Y}[SKIP]{RS} {asset} {side} fallback spread too wide: "
+                            f"{fresh_spread:.3f} > cap={base_spread_cap:.3f}"
+                        )
+                        self._skip_tick("fallback_spread")
+                        return None
+                    eff_max_entry = max_entry_allowed if max_entry_allowed is not None else MAX_ENTRY_PRICE
+                    if fresh_ask > eff_max_entry:
+                        if fresh_ask <= (eff_max_entry + ENTRY_NEAR_MISS_TOL):
+                            # Near-miss tolerance: allow 1-2 ticks overshoot when still +EV.
+                            if LOG_VERBOSE:
+                                print(
+                                    f"{Y}[NEAR-MISS]{RS} {asset} {side} ask={fresh_ask:.3f} "
+                                    f"within tol={ENTRY_NEAR_MISS_TOL:.3f} over max_entry={eff_max_entry:.3f}"
+                                )
+                        else:
+                            print(f"{Y}[SKIP] {asset} {side} pullback missed: ask={fresh_ask:.3f} > max_entry={eff_max_entry:.2f}{RS}")
+                            self._skip_tick("pullback_missed")
+                            return None
+                    fresh_payout = 1.0 / max(fresh_ask, 1e-9)
+                    min_payout_fb, min_ev_fb, _ = self._adaptive_thresholds(duration)
+                    _must_fire_exec = bool(round_force)
+                    if _must_fire_exec:
+                        # Must-fire: accept any EV-positive payout (>= 1.30x minimum)
+                        min_payout_fb = max(1.30, min_payout_fb - 0.35)
+                        min_ev_fb     = max(-0.005, min_ev_fb - 0.015)
+                    elif core_position and duration >= 15 and CONSISTENCY_CORE_ENABLED:
+                        # Keep execution fully aligned with core 15m consistency floor.
+                        min_payout_fb = max(min_payout_fb, CONSISTENCY_MIN_PAYOUT_15M)
+                    elif strong_exec:
+                        # Non-core fallback can relax slightly to preserve executable flow.
+                        min_payout_fb = max(1.65, min_payout_fb - 0.08)
+                    if fresh_payout < min_payout_fb:
+                        if fresh_payout >= max(1.0, (min_payout_fb - PAYOUT_NEAR_MISS_TOL)):
+                            if self._noisy_log_enabled(f"payout-near-miss-fb:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                                print(
+                                    f"{Y}[PAYOUT-TOL]{RS} {asset} {side} fallback payout={fresh_payout:.2f}x "
+                                    f"near min={min_payout_fb:.2f}x (tol={PAYOUT_NEAR_MISS_TOL:.2f}x)"
+                                )
+                        else:
+                            print(f"{Y}[SKIP] {asset} {side} fallback payout={fresh_payout:.2f}x < min={min_payout_fb:.2f}x{RS}")
+                            self._skip_tick("fallback_payout_below")
+                            print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=fallback_payout_below")
+                            return None
+                    fresh_ep  = true_prob - fresh_ask
+                    if fresh_ep < edge_floor:
+                        print(f"{Y}[SKIP] {asset} {side} taker: fresh ask={fresh_ask:.3f} edge={fresh_ep:.3f} < {edge_floor:.2f} — price moved against us{RS}")
+                        self._skip_tick("fallback_edge_below")
+                        return None
+                    fresh_ev_net = (true_prob / max(fresh_ask, 1e-9)) - 1.0 - max(0.001, fresh_ask * (1.0 - fresh_ask) * 0.0624)
+                    if fresh_ev_net < min_ev_fb:
+                        print(f"{Y}[SKIP] {asset} {side} fallback ev_net={fresh_ev_net:.3f} < min={min_ev_fb:.3f}{RS}")
+                        self._skip_tick("fallback_ev_below")
+                        return None
+                    taker_price = round(min(fresh_ask, eff_max_entry, 0.97), 4)
+                    slip_now = _slip_bps(taker_price, fresh_ask)
+                    if slip_now > slip_cap_bps:
+                        print(
+                            f"{Y}[SLIP-GUARD]{RS} {asset} {side} fallback taker blocked: "
+                            f"slip={slip_now:.1f}bps(ref_ask={fresh_ask:.3f}) > cap={slip_cap_bps:.0f}bps"
+                        )
+                        self._skip_tick("fallback_slip_guard")
+                        print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=fallback_slip_guard")
+                        return None
+                except Exception:
+                    taker_price = round(min(best_ask, max_entry_allowed or 0.99, 0.97), 4)
+                    fresh_ask   = best_ask
+                print(f"{Y}[MAKER] unfilled — FOK taker @ {taker_price:.3f} (fresh ask={fresh_ask:.3f}){RS}")
+                resp, _  = await _post_limit_fok(taker_price)
+                order_id = resp.get("orderID") or resp.get("id", "")
+                status   = resp.get("status", "")
+
+                if order_id and status in ("matched", "filled"):
+                    self.bankroll -= size_usdc
+                    self._cache_order_event(order_id, "filled", 0.0)
+                    print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
+                          f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                    return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_fallback", "notional_usdc": size_usdc}
+
+                # FOK should not partially fill, but keep single state-check for exchange race.
+                if order_id:
+                    try:
+                        ev = dict(self._order_event_cache.get(order_id) or {})
+                        ev_status = str(ev.get("status", "") or "").lower()
+                        if ev_status == "filled":
+                            info = {"status": "filled"}
+                        else:
+                            info = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+                        if isinstance(info, dict) and info.get("status") in ("matched", "filled"):
+                            self.bankroll -= size_usdc
+                            self._cache_order_event(order_id, "filled", 0.0)
+                            print(f"{Y}[TAKER FILL]{RS} {side} {asset} {duration}m | "
+                                  f"${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
+                            return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_fallback", "notional_usdc": size_usdc}
+                    except Exception:
+                        self._errors.tick("order_status_check", print, every=50)
+                print(f"{Y}[ORDER] Both maker and FOK taker unfilled — cancelled{RS}")
+                print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=maker_and_fok_unfilled")
+                return None
+
+            except Exception as e:
+                err = str(e)
+                err_l = err.lower()
+                transient = (
+                    "request exception" in err_l
+                    or "timed out" in err_l
+                    or "timeout" in err_l
+                    or "connection reset" in err_l
+                    or "temporarily unavailable" in err_l
+                    or "502" in err_l
+                    or "503" in err_l
+                    or "504" in err_l
+                )
+                if "429" in err or "rate limit" in err_l:
+                    wait = min(12.0, 2.0 * (attempt + 1))
+                    print(f"{Y}[ORDER-RETRY]{RS} {asset} {side} rate-limit, retry in {wait:.1f}s ({attempt+1}/{ORDER_RETRY_MAX})")
+                    await asyncio.sleep(wait)
+                    continue
+                if transient and attempt < (max(1, ORDER_RETRY_MAX) - 1):
+                    wait = min(2.0, ORDER_RETRY_BASE_SEC * (attempt + 1))
+                    print(
+                        f"{Y}[ORDER-RETRY]{RS} {asset} {side} transient error "
+                        f"({attempt+1}/{ORDER_RETRY_MAX}): {e} — retry in {wait:.2f}s"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                self._errors.tick("place_order", print, err=e, every=10)
+                print(f"{R}[ORDER FAILED]{RS} {asset} {side} after {attempt+1} attempts: {e}")
+                return None
+        return None
+
+    # ── RESOLVE ───────────────────────────────────────────────────────────────
+    async def _resolve(self):
+        """Queue all expired positions for on-chain resolution.
+        Never trust local price comparison — Polymarket resolves on Chainlink
+        at the exact expiry timestamp, which may differ from current price."""
+        for _, (m_fix, t_fix) in list(self.pending.items()):
+            self._force_expired_from_question_if_needed(m_fix, t_fix)
+            self._apply_exact_window_from_question(m_fix, t_fix)
+        now     = datetime.now(timezone.utc).timestamp()
+        expired = [k for k, (m, t) in self.pending.items() if m.get("end_ts", 0) > 0 and m["end_ts"] <= now]
+
+        for k in expired:
+            m, trade = self.pending.pop(k)
+            self._save_pending()
+            asset = trade["asset"]
+
+            if DRY_RUN:
+                # Simulation only: use current price as approximation
+                price  = self._current_price(asset) or self.prices.get(asset, trade["open_price"])
+                up_won = price >= trade["open_price"]
+                won    = (trade["side"] == "Up" and up_won) or (trade["side"] == "Down" and not up_won)
+                pnl    = trade["size"] * (1/trade["entry"] - 1) if won else -trade["size"]
+                self.daily_pnl += pnl
+                if won:
+                    self.bankroll += trade["size"] / trade["entry"]
+                self.total += 1
+                if won: self.wins += 1
+                self._record_result(asset, trade["side"], won, trade.get("structural", False), pnl=pnl)
+                self._log(m, trade, "WIN" if won else "LOSS", pnl)
+                c  = G if won else R
+                wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
+                print(f"{c}[{'WIN' if won else 'LOSS'}]{RS} {asset} {trade['side']} "
+                      f"{trade['duration']}m | {c}${pnl:+.2f}{RS} | Bank ${self.bankroll:.2f} | WR {wr}")
+            else:
+                # Live: queue for on-chain check — result determined by payoutNumerators
+                self.pending_redeem[k] = (m, trade)
+                self._redeem_queued_ts[k] = _time.time()
+                self._log_onchain_event("QUEUE_REDEEM", k, {
+                    "asset": asset,
+                    "side": trade.get("side", ""),
+                    "size_usdc": trade.get("size", 0),
+                    "entry_price": trade.get("entry", 0),
+                    "open_price_source": trade.get("open_price_source", "?"),
+                    "chainlink_age_s": trade.get("chainlink_age_s"),
+                    "round_key": self._round_key(cid=k, m=m, t=trade),
+                })
+                print(
+                    f"{B}[RESOLVE]{RS} {asset} {trade['side']} {trade['duration']}m → on-chain queue "
+                    f"(checking in {REDEEM_POLL_SEC:.1f}s) | rk={self._round_key(cid=k, m=m, t=trade)} "
+                    f"cid={self._short_cid(k)}"
+                )
+
+    # ── REDEEM LOOP — polls every 30s, determines win/loss on-chain ───────────
     async def _redeem_loop(self):
-        from clawbot_v2.legacy_core.settlement import redeem_loop
-        return await redeem_loop(self)
+        """Authoritative win/loss determination via payoutNumerators on-chain.
+        Updates bankroll/P&L only after confirmed on-chain result."""
+        if DRY_RUN or self.w3 is None:
+            return
+        cfg      = get_contract_config(CHAIN_ID, neg_risk=False)
+        ctf_addr = Web3.to_checksum_address(cfg.conditional_tokens)
+        collat   = Web3.to_checksum_address(cfg.collateral)
+        acct     = Account.from_key(PRIVATE_KEY)
+        CTF_ABI_FULL = CTF_ABI + [
+            {"inputs":[{"name":"conditionId","type":"bytes32"}],
+             "name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"conditionId","type":"bytes32"},{"name":"index","type":"uint256"}],
+             "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"owner","type":"address"},{"name":"id","type":"uint256"}],
+             "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+        ]
+        ctf  = self.w3.eth.contract(address=ctf_addr, abi=CTF_ABI_FULL)
+        loop = asyncio.get_running_loop()
+        # USDC contract for immediate bankroll refresh after wins
+        _usdc = self.w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_E),
+            abi=[{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf",
+                  "outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+        )
+        _addr_cs = Web3.to_checksum_address(ADDRESS)
+
+        _wait_log_ts = {}   # cid → last time we printed [WAIT] for it
+        while True:
+            poll_sleep = REDEEM_POLL_SEC_ACTIVE if self.pending_redeem else REDEEM_POLL_SEC
+            await asyncio.sleep(max(0.05, poll_sleep))
+            if not self.pending_redeem:
+                continue
+            positions_by_cid = {}
+            try:
+                pos_rows = await self._http_get_json(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "true"},
+                    timeout=8,
+                )
+                if isinstance(pos_rows, list):
+                    positions_by_cid = {
+                        p.get("conditionId", ""): p
+                        for p in pos_rows if p.get("conditionId")
+                    }
+            except Exception:
+                positions_by_cid = {}
+            done = []
+            for cid, val in list(self.pending_redeem.items()):
+                # Support both (m, trade) from _resolve and legacy (side, asset) from _sync_redeemable
+                if isinstance(val[0], dict):
+                    m, trade = val
+                    side  = trade["side"]
+                    asset = trade["asset"]
+                else:
+                    side, asset = val
+                    m     = {"conditionId": cid, "question": ""}
+                    trade = {"side": side, "asset": asset, "size": 0, "entry": 0.5,
+                             "duration": 0, "mkt_price": 0.5, "mins_left": 0,
+                             "open_price": 0, "token_id": "", "order_id": ""}
+                rk = self._round_key(cid=cid, m=m, t=trade)
+                try:
+                    cid_bytes = bytes.fromhex(cid.lstrip("0x").zfill(64))
+                    denom = await loop.run_in_executor(
+                        None, lambda b=cid_bytes: ctf.functions.payoutDenominator(b).call()
+                    )
+                    if denom == 0:
+                        # Throttled wait log so operator sees progress without spam
+                        now_ts = _time.time()
+                        if now_ts - _wait_log_ts.get(cid, 0) >= LOG_REDEEM_WAIT_EVERY_SEC:
+                            _wait_log_ts[cid] = now_ts
+                            elapsed = (now_ts - self._redeem_queued_ts.get(cid, now_ts)) / 60
+                            size_local = float(trade.get("size", 0) or 0.0)
+                            size_onchain = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
+                            size = size_onchain if size_onchain > 0 else size_local
+                            print(
+                                f"{Y}[WAIT]{RS} {asset} {side} ~${size:.2f} — awaiting oracle "
+                                f"({elapsed:.0f}min) | rk={rk} cid={self._short_cid(cid)}"
+                            )
+                        continue   # not yet resolved on-chain
+
+                    # On-chain truth only: determine winner from payoutNumerators.
+                    n0 = await loop.run_in_executor(
+                        None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 0).call()
+                    )
+                    n1 = await loop.run_in_executor(
+                        None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 1).call()
+                    )
+                    winner_source = "ONCHAIN_NUMERATOR"
+                    if n0 > 0 and n1 == 0:
+                        winner = "Up"
+                    elif n1 > 0 and n0 == 0:
+                        winner = "Down"
+                    elif n0 == 0 and n1 == 0:
+                        # Not finalized in a usable way yet
+                        continue
+                    else:
+                        # Ambiguous payout state (unexpected for binary market) — skip and retry
+                        print(f"{Y}[REDEEM] Ambiguous numerators for {asset} cid={cid[:10]}... n0={n0} n1={n1}{RS}")
+                        continue
+                    won = (winner == side)
+                    if self._noisy_log_enabled(f"settle-check:{cid}", LOG_REDEEM_WAIT_EVERY_SEC):
+                        print(
+                            f"{B}[SETTLE-CHECK]{RS} cid={self._short_cid(cid)} "
+                            f"side={side} winner={winner} won={won} "
+                            f"num0={int(n0)} num1={int(n1)} src={winner_source}"
+                        )
+                    size   = trade.get("size", 0)
+                    entry  = trade.get("entry", 0.5)
+                    size_f = float(size or 0.0)
+                    # Idempotency guard: avoid re-reconciling the same settled CID
+                    # across overlapping loops/restarts/API lag windows.
+                    prev_settle = self._settled_outcomes.get(cid, {})
+                    prev_res = str((prev_settle or {}).get("result", "") or "").upper()
+                    if prev_res in ("WIN", "LOSS"):
+                        prev_rk = str((prev_settle or {}).get("rk", "") or "")
+                        if self._noisy_log_enabled(f"settle-dupe:{cid}", LOG_REDEEM_WAIT_EVERY_SEC):
+                            print(
+                                f"{Y}[SETTLE-DUPE]{RS} skip {asset} {side} "
+                                f"result={prev_res} | rk={prev_rk or rk} cid={self._short_cid(cid)}"
+                            )
+                        done.append(cid)
+                        continue
+
+                    # For CLOB positions: CTF tokens are held by the exchange contract,
+                    # not the user wallet. Always try redeemPositions — if Polymarket
+                    # already auto-redeemed, the tx reverts harmlessly; if not, we collect.
+                    if won and size_f > 0:
+                        fee    = size_f * 0.0156 * (1 - abs(trade.get("mkt_price", 0.5) - 0.5) * 2)
+                        payout = size_f / max(float(entry or 0.5), 1e-9) - fee
+                        pnl    = payout - size_f
+
+                        # Try redeemPositions from wallet first; if unclaimable, settle as auto-redeemed.
+                        suffix = "auto-redeemed"
+                        tx_hash_full = ""
+                        redeem_confirmed = False
+                        usdc_before = 0.0
+                        usdc_after = 0.0
+                        try:
+                            _raw_before = await loop.run_in_executor(
+                                None, lambda: _usdc.functions.balanceOf(_addr_cs).call()
+                            )
+                            usdc_before = (_raw_before or 0) / 1e6
+                        except Exception:
+                            usdc_before = 0.0
+                        try:
+                            tx_hash = await self._submit_redeem_tx(
+                                ctf=ctf, collat=collat, acct=acct,
+                                cid_bytes=cid_bytes, index_set=(1 if side == "Up" else 2),
+                                loop=loop
+                            )
+                            self._redeem_verify_counts.pop(cid, None)
+                            tx_hash_full = tx_hash
+                            redeem_confirmed = True
+                            suffix = f"tx={tx_hash[:16]}"
+                        except Exception:
+                            # If still claimable, keep in queue and retry later (never miss redeem).
+                            if await self._is_redeem_claimable(
+                                ctf=ctf, collat=collat, acct_addr=acct.address,
+                                cid_bytes=cid_bytes, index_set=(1 if side == "Up" else 2), loop=loop
+                            ):
+                                print(
+                                    f"{Y}[REDEEM-RETRY]{RS} claimable but tx failed; will retry "
+                                    f"{asset} {side} | rk={rk} cid={self._short_cid(cid)}"
+                                )
+                                continue
+                            pos = positions_by_cid.get(cid, {})
+                            pos_redeemable = bool(pos.get("redeemable", False))
+                            pos_val = float(pos.get("currentValue", 0) or 0)
+                            if pos_redeemable and pos_val >= 0.01:
+                                print(
+                                    f"{Y}[REDEEM-PENDING]{RS} still redeemable on API "
+                                    f"(value=${pos_val:.2f}) | rk={rk} cid={self._short_cid(cid)}"
+                                )
+                                continue
+                            if REDEEM_REQUIRE_ONCHAIN_CONFIRM:
+                                # Strict mode: close only with explicit on-chain confirmation.
+                                # If winning token balance is zero on-chain, there is nothing claimable
+                                # in this wallet, so position can be finalized as non-wallet-redeem.
+                                tok = str(trade.get("token_id", "") or "").strip()
+                                tok_bal = -1
+                                if tok.isdigit():
+                                    try:
+                                        tok_bal = await loop.run_in_executor(
+                                            None,
+                                            lambda ti=int(tok): ctf.functions.balanceOf(_addr_cs, ti).call(),
+                                        )
+                                    except Exception:
+                                        tok_bal = -1
+                                if tok_bal == 0:
+                                    redeem_confirmed = True
+                                    suffix = "onchain-no-wallet-balance"
+                                else:
+                                    print(
+                                        f"{Y}[REDEEM-UNCONFIRMED]{RS} waiting on-chain confirm "
+                                        f"(tx missing, token_balance={tok_bal}) | rk={rk} cid={self._short_cid(cid)}"
+                                    )
+                                    continue
+                            else:
+                                checks = int(self._redeem_verify_counts.get(cid, 0)) + 1
+                                self._redeem_verify_counts[cid] = checks
+                                if checks < 3:
+                                    print(
+                                        f"{Y}[REDEEM-VERIFY]{RS} non-claimable; waiting confirm "
+                                        f"({checks}/3) | rk={rk} cid={self._short_cid(cid)}"
+                                    )
+                                    continue
+                                self._redeem_verify_counts.pop(cid, None)
+
+                        # Record win only after strict on-chain confirmation.
+                        if REDEEM_REQUIRE_ONCHAIN_CONFIRM and not redeem_confirmed:
+                            print(
+                                f"{Y}[REDEEM-UNCONFIRMED]{RS} strict mode active; keeping in queue "
+                                f"| rk={rk} cid={self._short_cid(cid)}"
+                            )
+                            continue
+
+                        # Record confirmed win
+                        try:
+                            _raw = await loop.run_in_executor(
+                                None, lambda: _usdc.functions.balanceOf(_addr_cs).call()
+                            )
+                            if _raw > 0:
+                                usdc_after = _raw / 1e6
+                                self.bankroll = usdc_after
+                        except Exception:
+                            pass
+                        if usdc_after <= 0:
+                            usdc_after = usdc_before
+                        stake_out = max(size_f, float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0))
+                        redeem_in = 0.0
+                        if tx_hash_full:
+                            redeem_in = self._extract_usdc_in_from_tx(tx_hash_full)
+                        if redeem_in <= 0:
+                            usdc_delta = usdc_after - usdc_before
+                            redeem_in = usdc_delta if usdc_delta > 0 else float(payout)
+                        pnl = redeem_in - stake_out
+                        order_id_u = str(trade.get("order_id", "") or "").upper()
+                        reconcile_only = (
+                            bool(trade.get("historical_sync"))
+                            or order_id_u.startswith("SYNC")
+                            or order_id_u.startswith("RECOVER")
+                            or order_id_u.startswith("ONCHAIN-REDEEM-QUEUE")
+                        )
+                        if int(trade.get("booster_count", 0) or 0) > 0:
+                            self._booster_consec_losses = 0
+                            self._booster_lock_until = 0.0
+                        if not reconcile_only:
+                            self.daily_pnl += pnl
+                            self.total += 1; self.wins += 1
+                            self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), True, pnl)
+                            _bs_save(self._bucket_stats)
+                            self._record_result(asset, side, True, trade.get("structural", False), pnl=pnl)
+                            self._record_resolved_sample(trade, pnl, True)
+                            self._record_pm_pattern_outcome(trade, pnl, True)
+                            if self._pred_agent is not None:
+                                self._pred_agent.observe_outcome(trade, True, pnl)
+                        self._log(m, trade, "WIN", pnl)
+                        self._log_onchain_event("RESOLVE", cid, {
+                            "asset": asset,
+                            "side": side,
+                            "result": "WIN",
+                            "winner_side": winner,
+                            "winner_source": winner_source,
+                            "size_usdc": size_f,
+                            "entry_price": entry,
+                            "stake_out_usdc": round(stake_out, 6),
+                            "redeem_in_usdc": round(redeem_in, 6),
+                            "pnl": round(pnl, 4),
+                            "bankroll_after": round(self.bankroll, 4),
+                            "score": trade.get("score"),
+                            "cl_agree": trade.get("cl_agree"),
+                            "open_price_source": trade.get("open_price_source", "?"),
+                            "chainlink_age_s": trade.get("chainlink_age_s"),
+                            "onchain_score_adj": trade.get("onchain_score_adj", 0),
+                            "source_confidence": trade.get("source_confidence", 0.0),
+                            "round_key": rk,
+                            "duration": trade.get("duration", 15),
+                        })
+                        wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
+                        rk_n = self._count_pending_redeem_by_rk(rk)
+                        usdc_delta = usdc_after - usdc_before
+                        tag = "[WIN-RECONCILE]" if reconcile_only else "[WIN]"
+                        print(f"{G}{tag}{RS} {asset} {side} {trade.get('duration',0)}m | "
+                              f"{G}${pnl:+.2f}{RS} | stake=${stake_out:.2f} redeem=${redeem_in:.2f} "
+                              f"| rk_trades={rk_n} | Bank ${self.bankroll:.2f} | WR {wr} | "
+                              f"{suffix} | rk={rk} cid={self._short_cid(cid)}")
+                        if not reconcile_only:
+                            print(
+                                f"{B}[OUTCOME-STATS]{RS} {asset} {side} {trade.get('duration',0)}m "
+                                f"ev={float(trade.get('execution_ev',0.0) or 0.0):+.3f} "
+                                f"payout={1.0/max(float(trade.get('entry',0.5) or 0.5),1e-9):.2f}x "
+                                f"pm={int(trade.get('pm_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_pattern_edge_adj',0.0) or 0.0):+.3f} "
+                                f"pub={int(trade.get('pm_public_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_public_pattern_edge_adj',0.0) or 0.0):+.3f} "
+                                f"rec={int(trade.get('recent_side_score_adj',0) or 0):+d}/{float(trade.get('recent_side_edge_adj',0.0) or 0.0):+.3f} "
+                                f"roll_n={int(trade.get('rolling_n',0) or 0)} roll_exp={float(trade.get('rolling_exp',0.0) or 0.0):+.2f}"
+                            )
+                        if tx_hash_full:
+                            print(
+                                f"{G}[REDEEMED-ONCHAIN]{RS} cid={self._short_cid(cid)} "
+                                f"tx={tx_hash_full} usdc_delta=${usdc_delta:+.2f} "
+                                f"({usdc_before:.2f}->{usdc_after:.2f})"
+                            )
+                        else:
+                            print(
+                                f"{Y}[REDEEMED-AUTO]{RS} cid={self._short_cid(cid)} "
+                                f"usdc_delta=${usdc_delta:+.2f} ({usdc_before:.2f}->{usdc_after:.2f})"
+                            )
+                        self._settled_outcomes[cid] = {
+                            "result": "WIN",
+                            "side": side,
+                            "rk": rk,
+                            "pnl": round(float(pnl), 6),
+                            "ts": _time.time(),
+                        }
+                        self._save_settled_outcomes()
+                        done.append(cid)
+                    else:
+                        # Lost on-chain (on-chain is authoritative)
+                        if size_f > 0:
+                            stake_loss = max(size_f, float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0))
+                            pnl = -stake_loss
+                            order_id_u = str(trade.get("order_id", "") or "").upper()
+                            reconcile_only = (
+                                bool(trade.get("historical_sync"))
+                                or order_id_u.startswith("SYNC")
+                                or order_id_u.startswith("RECOVER")
+                                or order_id_u.startswith("ONCHAIN-REDEEM-QUEUE")
+                            )
+                            if int(trade.get("booster_count", 0) or 0) > 0:
+                                self._booster_consec_losses = int(self._booster_consec_losses or 0) + 1
+                                lock_n = max(1, MID_BOOSTER_LOSS_STREAK_LOCK)
+                                if self._booster_consec_losses >= lock_n:
+                                    self._booster_lock_until = _time.time() + max(1.0, MID_BOOSTER_LOCK_HOURS) * 3600.0
+                                    rem_h = max(0.0, (self._booster_lock_until - _time.time()) / 3600.0)
+                                    print(
+                                        f"{Y}[BOOST-LOCK]{RS} disabled for {rem_h:.1f}h "
+                                        f"after {self._booster_consec_losses} booster losses"
+                                    )
+                            if not reconcile_only:
+                                self.daily_pnl += pnl
+                                self.total += 1
+                                self._bucket_stats.add_outcome(trade.get("bucket", "unknown"), False, pnl)
+                                _bs_save(self._bucket_stats)
+                                self._record_result(asset, side, False, trade.get("structural", False), pnl=pnl)
+                                self._record_resolved_sample(trade, pnl, False)
+                                self._record_pm_pattern_outcome(trade, pnl, False)
+                                if self._pred_agent is not None:
+                                    self._pred_agent.observe_outcome(trade, False, pnl)
+                            self._log(m, trade, "LOSS", pnl)
+                            self._log_onchain_event("RESOLVE", cid, {
+                                "asset": asset,
+                                "side": side,
+                                "result": "LOSS",
+                                "winner_side": winner,
+                                "winner_source": winner_source,
+                                "size_usdc": stake_loss,
+                                "entry_price": entry,
+                                "stake_out_usdc": round(stake_loss, 6),
+                                "redeem_in_usdc": 0.0,
+                                "pnl": round(pnl, 4),
+                                "bankroll_after": round(self.bankroll, 4),
+                                "score": trade.get("score"),
+                                "cl_agree": trade.get("cl_agree"),
+                                "open_price_source": trade.get("open_price_source", "?"),
+                                "chainlink_age_s": trade.get("chainlink_age_s"),
+                                "onchain_score_adj": trade.get("onchain_score_adj", 0),
+                                "source_confidence": trade.get("source_confidence", 0.0),
+                                "round_key": rk,
+                                "duration": trade.get("duration", 15),
+                            })
+                            wr = f"{self.wins/self.total*100:.0f}%" if self.total else "–"
+                            rk_n = self._count_pending_redeem_by_rk(rk)
+                            tag = "[LOSS-RECONCILE]" if reconcile_only else "[LOSS]"
+                            print(f"{R}{tag}{RS} {asset} {side} {trade.get('duration',0)}m | "
+                                  f"{R}${pnl:+.2f}{RS} | stake=${stake_loss:.2f} redeem=$0.00 "
+                                  f"| rk_trades={rk_n} | Bank ${self.bankroll:.2f} | WR {wr} | "
+                                  f"rk={rk} cid={self._short_cid(cid)}")
+                            if not reconcile_only:
+                                print(
+                                    f"{B}[OUTCOME-STATS]{RS} {asset} {side} {trade.get('duration',0)}m "
+                                    f"ev={float(trade.get('execution_ev',0.0) or 0.0):+.3f} "
+                                    f"payout={1.0/max(float(trade.get('entry',0.5) or 0.5),1e-9):.2f}x "
+                                    f"pm={int(trade.get('pm_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_pattern_edge_adj',0.0) or 0.0):+.3f} "
+                                    f"pub={int(trade.get('pm_public_pattern_score_adj',0) or 0):+d}/{float(trade.get('pm_public_pattern_edge_adj',0.0) or 0.0):+.3f} "
+                                    f"rec={int(trade.get('recent_side_score_adj',0) or 0):+d}/{float(trade.get('recent_side_edge_adj',0.0) or 0.0):+.3f} "
+                                    f"roll_n={int(trade.get('rolling_n',0) or 0)} roll_exp={float(trade.get('rolling_exp',0.0) or 0.0):+.2f}"
+                                )
+                            self._settled_outcomes[cid] = {
+                                "result": "LOSS",
+                                "side": side,
+                                "rk": rk,
+                                "pnl": round(float(pnl), 6),
+                                "ts": _time.time(),
+                            }
+                            self._save_settled_outcomes()
+                        done.append(cid)
+                except Exception as e:
+                    print(f"{Y}[REDEEM] {asset}: {e}{RS}")
+            changed_pending = False
+            for cid in done:
+                self.redeemed_cids.add(cid)
+                self._redeem_verify_counts.pop(cid, None)
+                self.pending_redeem.pop(cid, None)
+                if self.pending.pop(cid, None) is not None:
+                    changed_pending = True
+                # Remove closed cid from live-log caches immediately.
+                self._mkt_log_ts.pop(cid, None)
+                self.open_prices.pop(cid, None)
+                self.open_prices_source.pop(cid, None)
+                self.onchain_open_usdc_by_cid.pop(cid, None)
+                self.onchain_open_stake_by_cid.pop(cid, None)
+                self.onchain_open_shares_by_cid.pop(cid, None)
+                self.onchain_open_meta_by_cid.pop(cid, None)
+                self._booster_used_by_cid.pop(cid, None)
+            if changed_pending:
+                self._save_pending()
+
+    async def _submit_redeem_tx(self, ctf, collat, acct, cid_bytes: bytes, index_set: int, loop):
+        """Submit redeem tx with serialized nonce handling."""
+        async with self._redeem_tx_lock:
+            last_err = None
+            for _ in range(4):
+                try:
+                    if self._nonce_mgr is None:
+                        self._nonce_mgr = NonceManager(self.w3, acct.address)
+                    nonce = await self._nonce_mgr.next_nonce(loop)
+                    latest = await loop.run_in_executor(None, lambda: self.w3.eth.get_block("latest"))
+                    base_fee = latest["baseFeePerGas"]
+                    pri_fee = self.w3.to_wei(40, "gwei")
+                    max_fee = base_fee * 2 + pri_fee
+                    tx = ctf.functions.redeemPositions(
+                        collat, b'\x00' * 32, cid_bytes, [index_set]
+                    ).build_transaction({
+                        "from": acct.address, "nonce": nonce,
+                        "gas": 200_000,
+                        "maxFeePerGas": max_fee,
+                        "maxPriorityFeePerGas": pri_fee,
+                        "chainId": 137,
+                    })
+                    signed = acct.sign_transaction(tx)
+                    tx_hash = await loop.run_in_executor(
+                        None, lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction)
+                    )
+                    receipt = await loop.run_in_executor(
+                        None, lambda h=tx_hash: self.w3.eth.wait_for_transaction_receipt(h, timeout=60)
+                    )
+                    if receipt.status != 1:
+                        raise RuntimeError("redeem tx reverted")
+                    return tx_hash.hex()
+                except Exception as e:
+                    last_err = e
+                    msg = str(e).lower()
+                    if "nonce too low" in msg or "already known" in msg:
+                        if self._nonce_mgr is not None:
+                            await self._nonce_mgr.reset_from_chain(loop)
+                        await asyncio.sleep(0.4)
+                        continue
+                    raise
+            raise RuntimeError(f"redeem tx failed after retries: {last_err}")
+
+    async def _is_redeem_claimable(self, ctf, collat, acct_addr: str, cid_bytes: bytes, index_set: int, loop) -> bool:
+        """Best-effort eth_call preflight for redeem claimability."""
+        try:
+            await loop.run_in_executor(
+                None, lambda: ctf.functions.redeemPositions(
+                    collat, b'\x00' * 32, cid_bytes, [index_set]
+                ).call({"from": acct_addr})
+            )
+            return True
+        except Exception:
+            return False
+
+    # ── STARTUP OPEN POSITIONS SYNC ───────────────────────────────────────────
+    def _sync_open_positions(self):
+        """Rebuild self.pending from Polymarket API for any active (non-resolved) positions."""
+        try:
+            import requests as _req
+            positions = _req.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "false"},
+                timeout=10
+            ).json()
+        except Exception as e:
+            print(f"{Y}[SYNC] Could not fetch positions: {e}{RS}")
+            return
+
+        now     = datetime.now(timezone.utc).timestamp()
+        synced  = 0
+        api_cids = {p.get("conditionId","") for p in positions}
+
+        # Remove from pending any position the API now shows as resolved/redeemable
+        for cid in list(self.pending.keys()):
+            pos_data = next((p for p in positions if p.get("conditionId") == cid), None)
+            if pos_data is None:
+                continue  # not in API at all — leave it, _resolve() handles expiry
+            if pos_data.get("redeemable"):
+                val = float(pos_data.get("currentValue", 0))
+                m_p, t_p = self.pending.pop(cid)
+                title_p = m_p.get("question", "")[:40]
+                side_p  = t_p.get("side", "")
+                asset_p = t_p.get("asset", "")
+                if val >= 0.01 and cid not in self.pending_redeem:
+                    self.pending_redeem[cid] = (m_p, t_p)
+                    print(f"{G}[SYNC] Resolved→redeem: {title_p} {side_p} ~${val:.2f}{RS}")
+                else:
+                    print(f"{Y}[SYNC] Resolved→loss: {title_p} {side_p} (${val:.2f}){RS}")
+                    # Record loss only for non-historical rows; skip replaying old history as live loss.
+                    if not self._is_historical_expired_position(pos_data, now, grace_sec=1800.0):
+                        size_p = t_p.get("size", 0)
+                        if size_p > 0:
+                            self.total += 1
+                            self._record_result(asset_p, side_p, False, t_p.get("structural", False), pnl=-size_p)
+                self._save_pending()
+
+        for pos in positions:
+            cid        = pos.get("conditionId", "")
+            redeemable = pos.get("redeemable", False)
+            outcome    = self._normalize_side_label(pos.get("outcome", ""))   # canonical Up/Down
+            val        = float(pos.get("currentValue", 0))
+            size_tok   = float(pos.get("size", 0))
+            title      = pos.get("title", "")
+
+            # Skip resolved/redeemable or incomplete
+            if redeemable or not outcome or not cid:
+                continue
+
+            self.seen.add(cid)
+
+            # Keep all materially present on-chain positions for sync/reconcile.
+            size_tok = self._as_float(pos.get("size", 0.0), 0.0)
+            spent_probe = 0.0
+            for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                vv = self._as_float(pos.get(k_st, 0.0), 0.0)
+                if vv > 0:
+                    spent_probe = vv
+                    break
+            if not ((size_tok > 0) or (spent_probe >= OPEN_PRESENCE_MIN) or (val >= OPEN_PRESENCE_MIN)):
+                continue
+            if self._is_historical_expired_position(pos, now, grace_sec=1800.0) and val < OPEN_PRESENCE_MIN:
+                continue
+
+            # Fetch real market data from Gamma API — always, even if already in pending
+            # (to fix wrong end_ts set by _load_pending or _position_sync_loop)
+            asset    = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                        else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+            end_ts   = 0
+            start_ts = now - 60
+            duration = 15
+            token_up = token_down = ""
+            try:
+                import requests as _req
+                mkt_data = _req.get(
+                    f"{GAMMA}/markets",
+                    params={"conditionId": cid},
+                    timeout=8
+                ).json()
+                mkt = mkt_data[0] if isinstance(mkt_data, list) and mkt_data else (
+                      mkt_data if isinstance(mkt_data, dict) else {})
+                end_str   = mkt.get("endDate") or mkt.get("end_date", "")
+                start_str = mkt.get("eventStartTime") or mkt.get("startDate") or mkt.get("start_date", "")
+                if end_str:
+                    end_ts = datetime.fromisoformat(end_str.replace("Z", "+00:00")).timestamp()
+                if start_str:
+                    start_ts = datetime.fromisoformat(start_str.replace("Z", "+00:00")).timestamp()
+                slug = mkt.get("seriesSlug") or mkt.get("series_slug", "")
+                if slug in SERIES:
+                    duration = SERIES[slug]["duration"]
+                    asset    = SERIES[slug]["asset"]
+                _, token_up, token_down = self._map_updown_market_fields(mkt)
+            except Exception as e:
+                print(f"{Y}[SYNC] Gamma lookup failed for {cid[:10]}: {e}{RS}")
+            q_st, q_et = self._round_bounds_from_question(title)
+            if self._is_exact_round_bounds(q_st, q_et, duration):
+                start_ts, end_ts = q_st, q_et
+            elif q_et > 0 and q_et <= now:
+                end_ts = q_et
+
+            # Gamma /markets sometimes returns date-only endDate (e.g. "2026-02-20") which
+            # parses to midnight UTC — falsely appears expired.
+            # Authoritative truth: Polymarket positions API said redeemable=False → still open.
+            # Fix: trust stored end_ts if valid; else estimate from duration; never expire
+            # a position the API confirms is still open.
+            if end_ts > 0 and end_ts <= now:
+                stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
+                if stored_end > now:
+                    end_ts = stored_end  # trust stored value
+                    print(f"{Y}[SYNC] {title[:40]} — Gamma date-only, using stored end_ts ({(end_ts-now)/60:.1f}min){RS}")
+                else:
+                    # No reliable end_ts — API says open, so use duration estimate
+                    if not self._is_exact_round_bounds(start_ts, end_ts, duration):
+                        end_ts = now + duration * 60
+                        print(f"{Y}[SYNC] {title[:40]} — Gamma date-only, estimating {duration}min remaining{RS}")
+
+            if end_ts == 0:
+                # No end_ts at all — estimate from duration
+                end_ts = now + duration * 60
+                print(f"{Y}[SYNC] {title[:40]} — no end_ts, estimating {duration}min{RS}")
+            avg_px = self._as_float(pos.get("avgPrice", 0.0), 0.0)
+            rec_spent = 0.0
+            for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                vv = self._as_float(pos.get(k_st, 0.0), 0.0)
+                if vv > 0:
+                    rec_spent = vv
+                    break
+            if rec_spent <= 0 and size_tok > 0 and avg_px > 0:
+                rec_spent = size_tok * avg_px
+            if rec_spent <= 0:
+                rec_spent = val
+            entry = avg_px if avg_px > 0 else ((rec_spent / size_tok) if size_tok > 0 else 0.5)
+            mins_left = (end_ts - now) / 60
+
+            m = {"conditionId": cid, "question": title, "asset": asset,
+                 "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
+                 "up_price": entry if outcome == "Up" else 1 - entry,
+                 "mins_left": mins_left, "token_up": token_up, "token_down": token_down}
+
+            if cid in self.pending_redeem:
+                # Already queued for on-chain redeem — don't move it back to pending
+                print(f"{Y}[SYNC] Skip re-add (in redeem queue): {title[:40]} {outcome}{RS}")
+                continue
+            elif cid in self.pending:
+                # Update end_ts and market data on existing pending entry
+                old_m, old_t = self.pending[cid]
+                prev_side = str(old_t.get("side", "") or "")
+                old_m.update({"end_ts": end_ts, "start_ts": start_ts, "duration": duration,
+                               "asset": asset, "token_up": token_up, "token_down": token_down})
+                old_t.update({"end_ts": end_ts, "asset": asset, "duration": duration,
+                               "side": outcome,
+                               "token_id": token_up if outcome == "Up" else token_down})
+                if prev_side and prev_side != outcome:
+                    print(f"{Y}[SYNC-SIDE]{RS} {title[:40]} side corrected {prev_side}->{outcome}")
+                # Keep local core parameters stable once locked (no local average overwrite).
+                if not bool(old_t.get("core_entry_locked", False)):
+                    if rec_spent > 0:
+                        old_t["size"] = rec_spent
+                    if entry > 0:
+                        old_t["entry"] = entry
+                old_t["onchain_stake_usdc"] = round(rec_spent, 6)
+                old_t["onchain_entry"] = round(entry, 6)
+                print(f"{Y}[SYNC] Updated: {title[:40]} {outcome} | spent=${old_t.get('size',0):.2f} mark=${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
+            else:
+                trade = {"side": outcome, "size": rec_spent, "entry": entry,
+                         "open_price": 0, "current_price": 0, "true_prob": 0.5,
+                         "mkt_price": entry, "edge": 0, "mins_left": mins_left,
+                         "end_ts": end_ts, "asset": asset, "duration": duration,
+                         "token_id": token_up if outcome == "Up" else token_down,
+                         "order_id": "SYNCED",
+                         "core_position": True,
+                         "core_entry_locked": True,
+                         "core_entry": entry,
+                         "core_size_usdc": rec_spent,
+                         "addon_count": 0,
+                         "addon_stake_usdc": 0.0}
+                if mins_left <= 0:
+                    self.pending_redeem[cid] = (m, trade)
+                    print(f"{Y}[SYNC] Restored->settling: {title[:40]} {outcome} | spent=${rec_spent:.2f} mark=${val:.2f} | {duration}m ended {abs(mins_left):.1f}min ago{RS}")
+                else:
+                    self.pending[cid] = (m, trade)
+                    synced += 1
+                    print(f"{Y}[SYNC] Restored: {title[:40]} {outcome} | spent=${rec_spent:.2f} mark=${val:.2f} | {duration}m ends in {mins_left:.1f}min{RS}")
+
+        if synced:
+            self._save_pending()
+            self._save_seen()
+            print(f"{Y}[SYNC] {synced} open position(s) restored to pending{RS}")
+
+    # ── STARTUP REDEEM SYNC ───────────────────────────────────────────────────
+    def _sync_redeemable(self):
+        """At startup, find any winning positions not yet redeemed and queue them."""
+        if DRY_RUN or self.w3 is None:
+            return
+        try:
+            import requests as _req
+            r = _req.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "true"},
+                timeout=10
+            )
+            positions = r.json()
+        except Exception as e:
+            print(f"{Y}[SYNC] Could not fetch positions: {e}{RS}")
+            return
+
+        # No on-chain checks at startup — _redeem_loop handles payoutDenominator/winner
+        # determination. Just queue all API-confirmed redeemable positions immediately.
+        queued = 0
+        for pos in positions:
+            cid        = pos.get("conditionId", "")
+            redeemable = pos.get("redeemable", False)
+            val        = float(pos.get("currentValue", 0))
+            outcome    = self._normalize_side_label(pos.get("outcome", ""))
+            title      = pos.get("title", "")[:40]
+
+            if not redeemable or val < 0.01 or not outcome or not cid:
+                continue
+            if cid in self.pending_redeem:
+                continue
+
+            asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                     else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+            m_s = {"conditionId": cid, "question": title}
+            t_s = {"side": outcome, "asset": asset, "size": val, "entry": 0.5,
+                   "duration": 0, "mkt_price": 0.5, "mins_left": 0,
+                   "open_price": 0, "token_id": "", "order_id": "SYNC"}
+            self.pending.pop(cid, None)   # remove from pending — _redeem_loop now owns it
+            self.pending_redeem[cid] = (m_s, t_s)
+            queued += 1
+            print(f"{G}[SYNC] Queued for redeem: {title} {outcome} ~${val:.2f}{RS}")
+
+        if queued:
+            print(f"{G}[SYNC] {queued} winning position(s) queued for redemption{RS}")
+        else:
+            print(f"{B}[SYNC] No unredeemed wins found{RS}")
+
+    # ── MATH ──────────────────────────────────────────────────────────────────
+    def _prob_up(self, current, open_price, mins_left, vol):
+        if open_price <= 0 or vol <= 0 or mins_left <= 0:
+            return 0.5
+        T = max(mins_left, 0.1) / (252 * 24 * 60)
+        d = math.log(current / open_price) / (vol * math.sqrt(T))
+        return float(norm.cdf(d))
+
+    def _momentum_prob(self, asset: str, seconds: int = 60) -> float:
+        """P(Up) from time-based EMA at the closest cached half-life; O(1) from cache."""
+        ema_dict = self.emas.get(asset)
+        if not ema_dict:
+            return 0.5
+        hl    = min(ema_dict.keys(), key=lambda h: abs(h - seconds))
+        price = self.prices.get(asset, 0.0)
+        ema   = ema_dict.get(hl, 0.0)
+        if price == 0 or ema == 0:
+            return 0.5
+        move  = (price - ema) / ema
+        vol   = self.vols.get(asset, 0.70)
+        vol_t = vol * math.sqrt(hl / (252 * 24 * 3600))
+        if vol_t == 0:
+            return 0.5
+        return float(norm.cdf(move / vol_t))
+
+    # ── Binance helpers — read from WS cache (instant, no network) ───────────
+
+    def _binance_imbalance(self, asset: str) -> float:
+        c = self.binance_cache.get(asset, {})
+        bids = c.get("depth_bids", [])
+        asks = c.get("depth_asks", [])
+        bid_vol = sum(float(b[1]) for b in bids[:10])
+        ask_vol = sum(float(a[1]) for a in asks[:10])
+        if bid_vol + ask_vol == 0:
+            return 0.0
+        return (bid_vol - ask_vol) / (bid_vol + ask_vol)
+
+    def _binance_taker_flow(self, asset: str) -> tuple:
+        klines = self.binance_cache.get(asset, {}).get("klines", [])
+        if len(klines) < 4:
+            return 0.5, 1.0
+        recent = klines[-3:]
+        hist   = klines[:-3]
+        rec_vol   = sum(float(k[5]) for k in recent)
+        rec_taker = sum(float(k[9]) for k in recent)
+        hist_avg  = (sum(float(k[5]) for k in hist) / len(hist)) if hist else rec_vol
+        kline_ratio = rec_taker / rec_vol if rec_vol > 0 else 0.5
+        vol_ratio   = (rec_vol / 3) / hist_avg if hist_avg > 0 else 1.0
+        # Blend with real-time aggTrade OFI when available (higher weight = more responsive)
+        agg_ratio = self._binance_agg_ofi(asset)
+        if agg_ratio != 0.5:
+            taker_ratio = AGG_OFI_BLEND_W * agg_ratio + (1.0 - AGG_OFI_BLEND_W) * kline_ratio
+        else:
+            taker_ratio = kline_ratio
+        return round(taker_ratio, 3), round(vol_ratio, 2)
+
+    def _binance_perp_signals(self, asset: str) -> tuple:
+        c = self.binance_cache.get(asset, {})
+        mark    = c.get("mark", 0.0)
+        index   = c.get("index", 0.0)
+        funding = c.get("funding", 0.0)
+        basis   = (mark - index) / index if index > 0 else 0.0
+        return round(basis, 7), round(funding, 7)
+
+    def _binance_window_stats(self, asset: str, window_start_ts: float) -> tuple:
+        import statistics as _stats
+        klines = self.binance_cache.get(asset, {}).get("klines", [])
+        if not klines or len(klines) < 3:
+            return 0.0, 1.0
+        start_ms = int(window_start_ts * 1000)
+        window_k = [k for k in klines if int(k[0]) >= start_ms] or klines[-3:]
+        sum_tv = sum((float(k[2])+float(k[3])+float(k[4]))/3 * float(k[5]) for k in window_k)
+        sum_v  = sum(float(k[5]) for k in window_k)
+        vwap   = sum_tv / sum_v if sum_v > 0 else float(window_k[-1][4])
+        cur    = float(klines[-1][4])
+        vwap_dev = (cur - vwap) / vwap if vwap > 0 else 0.0
+        closes = [float(k[4]) for k in klines]
+        pct_ch = [abs(closes[i]/closes[i-1]-1) for i in range(1, len(closes)) if closes[i-1] > 0]
+        if pct_ch:
+            ann = _stats.mean(pct_ch) * (252 * 24 * 60) ** 0.5
+            if   ann < 0.40: vol_mult = 0.7
+            elif ann < 0.80: vol_mult = 1.0
+            elif ann < 1.50: vol_mult = 1.2
+            else:            vol_mult = 1.4
+        else:
+            vol_mult = 1.0
+        return round(vwap_dev, 6), vol_mult
+
+    # ── Binance WebSocket streams ─────────────────────────────────────────────
+
+    async def _seed_binance_cache(self):
+        """One-time REST seed so cache is ready before WS streams connect."""
+        import requests as _req
+        loop = asyncio.get_running_loop()
+        for asset, sym in BNB_SYM.items():
+            sym_api = sym.upper()
+            try:
+                depth = await loop.run_in_executor(None, lambda s=sym_api: _req.get(
+                    "https://api.binance.com/api/v3/depth",
+                    params={"symbol": s, "limit": 20}, timeout=5).json())
+                self.binance_cache[asset]["depth_bids"] = depth.get("bids", [])
+                self.binance_cache[asset]["depth_asks"] = depth.get("asks", [])
+            except Exception as e:
+                self._errors.tick("bnb_seed_depth", print, err=e, every=25)
+            try:
+                klines = await loop.run_in_executor(None, lambda s=sym_api: _req.get(
+                    "https://api.binance.com/api/v3/klines",
+                    params={"symbol": s, "interval": "1m", "limit": 33}, timeout=5).json())
+                if isinstance(klines, list):
+                    self.binance_cache[asset]["klines"] = klines
+            except Exception as e:
+                self._errors.tick("bnb_seed_klines", print, err=e, every=25)
+            try:
+                mark = await loop.run_in_executor(None, lambda s=sym_api: _req.get(
+                    "https://fapi.binance.com/fapi/v1/premiumIndex",
+                    params={"symbol": s}, timeout=5).json())
+                self.binance_cache[asset]["mark"]    = float(mark.get("markPrice", 0))
+                self.binance_cache[asset]["index"]   = float(mark.get("indexPrice", 0))
+                self.binance_cache[asset]["funding"] = float(mark.get("lastFundingRate", 0))
+            except Exception as e:
+                self._errors.tick("bnb_seed_perp", print, err=e, every=25)
+        print(f"{G}[BNB-SEED] Binance cache seeded for {list(BNB_SYM)}{RS}")
+
+    async def _stream_binance_spot(self):
+        """Persistent WS: depth20 + kline_1m for all assets → binance_cache."""
+        import websockets as _ws, json as _j
+        sym_map = {v: k for k, v in BNB_SYM.items()}  # "btcusdt" → "BTC"
+        streams = [f"{s}@depth20@100ms/{s}@kline_1m" for s in BNB_SYM.values()]
+        url = "wss://stream.binance.com/stream?streams=" + "/".join(streams)
+        delay = 5
+        while True:
+            try:
+                async with _ws.connect(url, ping_interval=20, ping_timeout=30, compression=None) as ws:
+                    print(f"{G}[BNB-SPOT] WS connected{RS}")
+                    delay = 5
+                    async for raw in ws:
+                        msg    = _j.loads(raw)
+                        stream = msg.get("stream", "")
+                        data   = msg.get("data", {})
+                        sym    = stream.split("@")[0]
+                        asset  = sym_map.get(sym)
+                        if not asset:
+                            continue
+                        c = self.binance_cache[asset]
+                        if "@depth20" in stream:
+                            c["depth_bids"] = data.get("bids", [])
+                            c["depth_asks"] = data.get("asks", [])
+                        elif "@kline_1m" in stream:
+                            k = data.get("k", {})
+                            kline = [k.get("t",0), k.get("o","0"), k.get("h","0"),
+                                     k.get("l","0"), k.get("c","0"), k.get("v","0"),
+                                     0, 0, 0, k.get("V","0"), 0, 0]
+                            klines = c["klines"]
+                            if klines and klines[-1][0] == kline[0]:
+                                klines[-1] = kline
+                            else:
+                                klines.append(kline)
+                                if len(klines) > 33:
+                                    klines.pop(0)
+            except Exception as e:
+                print(f"{Y}[BNB-SPOT] {e} — reconnect in {delay}s{RS}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
+    async def _stream_binance_futures(self):
+        """Persistent WS: markPrice for all assets → binance_cache mark/index/funding."""
+        import websockets as _ws, json as _j
+        sym_map = {v: k for k, v in BNB_SYM.items()}
+        streams = [f"{s}@markPrice" for s in BNB_SYM.values()]
+        url = "wss://fstream.binance.com/stream?streams=" + "/".join(streams)
+        delay = 5
+        while True:
+            try:
+                async with _ws.connect(url, ping_interval=20, ping_timeout=30, compression=None) as ws:
+                    print(f"{G}[BNB-PERP] WS connected{RS}")
+                    delay = 5
+                    async for raw in ws:
+                        msg   = _j.loads(raw)
+                        data  = msg.get("data", {})
+                        s     = data.get("s", "").lower()
+                        asset = sym_map.get(s)
+                        if not asset:
+                            continue
+                        c = self.binance_cache[asset]
+                        c["mark"]    = float(data.get("p", 0) or 0)
+                        c["index"]   = float(data.get("i", 0) or 0)
+                        c["funding"] = float(data.get("r", 0) or 0)
+            except Exception as e:
+                print(f"{Y}[BNB-PERP] {e} — reconnect in {delay}s{RS}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
+    async def _stream_binance_aggtrade(self):
+        """Persistent WS: aggTrade stream for all assets → real-time OFI in binance_cache."""
+        import websockets as _ws, json as _j, time as _t
+        sym_map = {v: k for k, v in BNB_SYM.items()}
+        streams = [f"{s}@aggTrade" for s in BNB_SYM.values()]
+        url = "wss://stream.binance.com/stream?streams=" + "/".join(streams)
+        delay = 5
+        while True:
+            try:
+                async with _ws.connect(url, ping_interval=20, ping_timeout=30, compression=None) as ws:
+                    print(f"{G}[BNB-AGG] aggTrade OFI stream connected{RS}")
+                    delay = 5
+                    async for raw in ws:
+                        msg    = _j.loads(raw)
+                        stream = msg.get("stream", "")
+                        data   = msg.get("data", {})
+                        sym    = stream.split("@")[0]
+                        asset  = sym_map.get(sym)
+                        if not asset:
+                            continue
+                        # m=True means maker was buyer → taker is SELLER; m=False → taker is BUYER
+                        is_buy = not bool(data.get("m", False))
+                        qty    = float(data.get("q", 0) or 0)
+                        ts     = _t.time()
+                        self.binance_cache[asset]["agg_ofi_buf"].append((ts, is_buy, qty))
+            except Exception as e:
+                print(f"{Y}[BNB-AGG] {e} — reconnect in {delay}s{RS}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
+    def _binance_agg_ofi(self, asset: str, window_sec: float | None = None) -> float:
+        """Rolling OFI ratio from aggTrade buffer. Returns 0.5 if no data."""
+        import time as _t
+        win = window_sec if window_sec is not None else AGG_OFI_WINDOW_SEC
+        buf = self.binance_cache.get(asset, {}).get("agg_ofi_buf")
+        if not buf:
+            return 0.5
+        cutoff = _t.time() - win
+        buy_q = sell_q = 0.0
+        for (ts, is_buy, qty) in reversed(buf):   # newest-first; break on first old entry
+            if ts < cutoff:
+                break
+            if is_buy:
+                buy_q += qty
+            else:
+                sell_q += qty
+        total = buy_q + sell_q
+        return round(buy_q / total, 4) if total > 0 else 0.5
+
+    # ── Free Binance gap-closer streams ──────────────────────────────────────
+
+    async def _stream_binance_liquidations(self):
+        """Subscribe to all-market forced-liquidation stream (free, no auth).
+        Opposing-side liquidations confirm our direction signal."""
+        import time as _t, json as _json
+        url  = "wss://fstream.binance.com/ws/!forceOrder@arr"
+        SYMS = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL", "XRPUSDT": "XRP"}
+        delay = 5
+        while True:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                    delay = 5
+                    async for raw in ws:
+                        data  = _json.loads(raw)
+                        order = data.get("o", {})
+                        sym   = order.get("s", "")
+                        asset = SYMS.get(sym)
+                        if asset is None:
+                            continue
+                        side  = order.get("S", "")   # "BUY"=liquidated long, "SELL"=liquidated short
+                        qty   = float(order.get("q", 0) or 0)
+                        price = float(order.get("p", 0) or 0)
+                        usd   = qty * price
+                        self._liq_buf[asset].append((_t.time(), side, usd))
+            except Exception as e:
+                print(f"{Y}[BNB-LIQ] {e} — reconnect in {delay}s{RS}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
+    def _liq_signal(self, asset: str, direction: str) -> int:
+        """Score from liquidation stream: opposing-side liquidations confirm our direction.
+        BUY-side liquidated = leveraged longs blown out = bearish pressure (Down confirms).
+        SELL-side liquidated = leveraged shorts blown out = bullish pressure (Up confirms).
+        Returns 0..+2."""
+        import time as _t
+        buf = self._liq_buf.get(asset)
+        if not buf:
+            return 0
+        cutoff = _t.time() - LIQ_WINDOW_SEC
+        is_up  = direction == "Up"
+        # Opposing-side liq = confirms our direction
+        opp_usd = sum(usd for ts, side, usd in buf
+                      if ts >= cutoff and ((is_up and side == "SELL") or (not is_up and side == "BUY")))
+        if   opp_usd >= LIQ_SCORE_USD_2: return 2
+        elif opp_usd >= LIQ_SCORE_USD_1: return 1
+        return 0
+
+    async def _oi_ls_loop(self):
+        """Poll Open Interest and global Long/Short ratio every OI_POLL_SEC (free Binance REST)."""
+        import aiohttp, time as _t
+        SYMS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
+        while True:
+            await asyncio.sleep(OI_POLL_SEC)
+            if not OI_ENABLED:
+                continue
+            async with aiohttp.ClientSession() as sess:
+                for asset, sym in SYMS.items():
+                    # Open Interest
+                    try:
+                        async with sess.get(
+                            f"https://fapi.binance.com/fapi/v1/openInterest?symbol={sym}",
+                            timeout=aiohttp.ClientTimeout(total=5)
+                        ) as r:
+                            d = await r.json()
+                            oi_now = float(d.get("openInterest", 0) or 0)
+                            if oi_now > 0:
+                                prev = self._oi[asset]["cur"]
+                                self._oi[asset] = {"cur": oi_now, "prev": prev, "ts": _t.time()}
+                    except Exception:
+                        pass
+                    # Global Long/Short ratio
+                    try:
+                        async with sess.get(
+                            f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+                            f"?symbol={sym}&period=5m&limit=1",
+                            timeout=aiohttp.ClientTimeout(total=5)
+                        ) as r:
+                            rows = await r.json()
+                            if rows and isinstance(rows, list):
+                                long_pct = float(rows[0].get("longAccount", 0.5) or 0.5)
+                                self._ls_ratio[asset] = long_pct
+                    except Exception:
+                        pass
+
+    def _cross_asset_direction(self, asset: str, direction: str) -> int:
+        """Count how many OTHER assets are trending in the same direction right now.
+        Uses Binance RTDS price vs window open_price as primary signal; falls back to
+        Kalman velocity when the price move is too small (<0.03%) to be directionally
+        reliable (first ~60s of a new window). Returns 0-3.
+        Each distinct asset is counted at most once (uses freshest window open_price)."""
+        is_up = (direction == "Up")
+        count = 0
+        now_ts = _time.time()
+        seen_assets: set[str] = set()
+        for cid, m in self.active_mkts.items():
+            a = m.get("asset", "")
+            if a == asset or a in seen_assets:
+                continue
+            op  = self.open_prices.get(cid, 0)
+            if op <= 0:
+                continue
+            # Prefer RTDS price; skip if stale (> 30s) to avoid false consensus from stale feed
+            cur = self.prices.get(a, 0)
+            ph = self.price_history.get(a)
+            ts_cur = ph[-1][0] if ph else 0.0
+            if cur <= 0 or (ts_cur > 0 and now_ts - ts_cur > 30.0):
+                cur = self.cl_prices.get(a, 0)
+            if cur <= 0:
+                continue
+            seen_assets.add(a)
+            move_pct = abs(cur - op) / max(op, 1e-8)
+            if move_pct >= 0.0003:
+                # Price has moved enough from open → trust direct price direction
+                dir_up = (cur > op)
+            else:
+                # Near window open: use Kalman velocity for instantaneous direction
+                kp = self._kalman_vel_prob(a)
+                if kp < 0.45 or kp > 0.55:
+                    dir_up = (kp > 0.50)
+                else:
+                    continue  # Kalman also undecided → skip this asset
+            if dir_up == is_up:
+                count += 1
+        return count
+
+    def _bucket_key(self, duration: int, score: int, entry: float) -> str:
+        score_bucket = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
+        entry_bucket = "<30c" if entry < 0.30 else ("30-50c" if entry <= 0.50 else ">50c")
+        return f"{duration}m|{score_bucket}|{entry_bucket}"
+
+    @staticmethod
+    def _entry_band(entry: float) -> str:
+        e = float(entry or 0.0)
+        if e <= 0:
+            return "missing"
+        if e < 0.45:
+            return "<45c"
+        if e < 0.55:
+            return "45-55c"
+        if e < 0.65:
+            return "55-65c"
+        return "65c+"
+
+    def _record_resolved_sample(self, trade: dict, pnl: float, won: bool):
+        try:
+            self._resolved_samples.append({
+                "ts": _time.time(),
+                "asset": str(trade.get("asset", "") or ""),
+                "side": str(trade.get("side", "") or ""),
+                "duration": int(trade.get("duration", 0) or 0),
+                "entry": float(trade.get("entry", 0.0) or 0.0),
+                "source": str(trade.get("open_price_source", "?") or "?"),
+                "cl_age_s": trade.get("chainlink_age_s", None),
+                "pnl": float(pnl),
+                "won": bool(won),
+            })
+        except Exception:
+            pass
+
+    def _bootstrap_resolved_samples_from_metrics(self):
+        """Warm-start resolved sample buffer from persisted on-chain metrics file.
+
+        This avoids a blind period after bot restart where 5m runtime guard has
+        no settled history and keeps trading low-quality 5m rounds.
+        """
+        try:
+            loaded = 0
+            rows = []
+            if self._metrics_db_ready:
+                try:
+                    conn = sqlite3.connect(METRICS_DB_FILE, timeout=3.0)
+                    try:
+                        cur = conn.cursor()
+                        rows = cur.execute(
+                            """
+                            SELECT asset, side, duration, entry_price, open_price_source, chainlink_age_s, pnl, result, round_key
+                            FROM resolve_metrics
+                            WHERE event='RESOLVE'
+                            ORDER BY id DESC
+                            LIMIT 5000
+                            """
+                        ).fetchall()
+                    finally:
+                        conn.close()
+                    rows = list(reversed(rows))
+                except Exception:
+                    rows = []
+            if rows:
+                for asset, side, dur, entry_price, open_src, cl_age_s, pnl, result, rk in rows:
+                    d = int(dur or 0)
+                    if d <= 0:
+                        rks = str(rk or "")
+                        d = 5 if "-5m-" in rks else (15 if "-15m-" in rks else 0)
+                    if d <= 0:
+                        continue
+                    self._resolved_samples.append({
+                        "ts": _time.time(),
+                        "asset": str(asset or ""),
+                        "side": str(side or ""),
+                        "duration": d,
+                        "entry": float(entry_price or 0.0),
+                        "source": str(open_src or "?"),
+                        "cl_age_s": cl_age_s,
+                        "pnl": float(pnl or 0.0),
+                        "won": str(result or "").upper() == "WIN",
+                    })
+                    loaded += 1
+            elif os.path.exists(METRICS_FILE):
+                # Fallback path for first migration / db unavailable.
+                with open(METRICS_FILE, encoding="utf-8") as f:
+                    lines = f.readlines()[-5000:]
+                for ln in lines:
+                    try:
+                        row = json.loads(ln)
+                    except Exception:
+                        continue
+                    if str(row.get("event", "")) != "RESOLVE":
+                        continue
+                    dur = int(row.get("duration", 0) or 0)
+                    if dur <= 0:
+                        rk = str(row.get("round_key", "") or "")
+                        if "-5m-" in rk:
+                            dur = 5
+                        elif "-15m-" in rk:
+                            dur = 15
+                    if dur <= 0:
+                        continue
+                    pnl = float(row.get("pnl", 0.0) or 0.0)
+                    won = str(row.get("result", "")).upper() == "WIN"
+                    self._resolved_samples.append({
+                        "ts": _time.time(),
+                        "asset": str(row.get("asset", "") or ""),
+                        "side": str(row.get("side", "") or ""),
+                        "duration": dur,
+                        "entry": float(row.get("entry_price", 0.0) or 0.0),
+                        "source": str(row.get("open_price_source", "?") or "?"),
+                        "cl_age_s": row.get("chainlink_age_s", None),
+                        "pnl": pnl,
+                        "won": bool(won),
+                    })
+                    loaded += 1
+            if loaded > 0:
+                print(f"{B}[BOOT]{RS} loaded {loaded} resolved samples from metrics for runtime guards")
+        except Exception as e:
+            print(f"{Y}[BOOT] resolved-sample bootstrap failed: {e}{RS}")
+
+    def _pm_pattern_key(self, asset: str, duration: int, side: str, copy_net: float, flow: dict) -> str:
+        low_share = float((flow or {}).get("low_c_share", 0.0) or 0.0)
+        high_share = float((flow or {}).get("high_c_share", 0.0) or 0.0)
+        multibet = float((flow or {}).get("multibet_ratio", 0.0) or 0.0)
+        if abs(copy_net) >= 0.35:
+            dom = "dom-strong"
+        elif abs(copy_net) >= 0.15:
+            dom = "dom-med"
+        else:
+            dom = "dom-weak"
+        if low_share >= 0.55:
+            px_style = "lowcent"
+        elif high_share >= 0.55:
+            px_style = "highcent"
+        else:
+            px_style = "midcent"
+        mb = "multibet-high" if multibet >= 0.30 else "multibet-low"
+        return f"{asset}|{duration}m|{side}|{dom}|{px_style}|{mb}"
+
+    def _pm_pattern_profile(self, pattern_key: str) -> dict:
+        row = self._pm_pattern_stats.get(pattern_key, {})
+        n = int(row.get("n", 0) or 0)
+        if n <= 0:
+            return {"score_adj": 0, "edge_adj": 0.0, "n": 0, "exp": 0.0, "wr_lb": 0.5, "min_n": PM_PATTERN_MIN_N}
+        wins = int(row.get("wins", 0) or 0)
+        pnl = float(row.get("pnl", 0.0) or 0.0)
+        exp = pnl / max(1, n)
+        wr_lb = self._wilson_lower_bound(wins, n)
+        score_adj = 0
+        edge_adj = 0.0
+        if n >= PM_PATTERN_MIN_N:
+            if exp >= 0.25 and wr_lb >= 0.52:
+                score_adj = 2
+                edge_adj = min(PM_PATTERN_MAX_EDGE_ADJ, 0.004 + min(0.006, exp / 80.0))
+            elif exp >= 0.08 and wr_lb >= 0.50:
+                score_adj = 1
+                edge_adj = min(PM_PATTERN_MAX_EDGE_ADJ, 0.002 + min(0.004, exp / 120.0))
+            elif exp <= -0.20 and wr_lb < 0.45:
+                score_adj = -2
+                edge_adj = -min(PM_PATTERN_MAX_EDGE_ADJ, 0.004 + min(0.006, abs(exp) / 80.0))
+            elif exp < 0.0 and wr_lb < 0.48:
+                score_adj = -1
+                edge_adj = -min(PM_PATTERN_MAX_EDGE_ADJ, 0.002 + min(0.004, abs(exp) / 120.0))
+        return {
+            "score_adj": score_adj,
+            "edge_adj": edge_adj,
+            "n": n,
+            "exp": exp,
+            "wr_lb": wr_lb,
+            "min_n": PM_PATTERN_MIN_N,
+        }
+
+    def _record_pm_pattern_outcome(self, trade: dict, pnl: float, won: bool):
+        try:
+            key = str(trade.get("pm_pattern_key", "") or "")
+            if not key:
+                return
+            row = self._pm_pattern_stats.get(key, {"n": 0, "wins": 0, "pnl": 0.0})
+            row["n"] = int(row.get("n", 0) or 0) + 1
+            row["wins"] = int(row.get("wins", 0) or 0) + (1 if won else 0)
+            row["pnl"] = float(row.get("pnl", 0.0) or 0.0) + float(pnl)
+            self._pm_pattern_stats[key] = row
+        except Exception:
+            pass
+
+    def _pm_public_pattern_profile(self, side: str, flow: dict, entry_px: float) -> dict:
+        """Pattern prior from public PM activity (leader/live flow), independent from own outcomes."""
+        try:
+            f = flow or {}
+            n = int(f.get("n", 0) or 0)
+            up = float(f.get("Up", f.get("up", 0.0)) or 0.0)
+            dn = float(f.get("Down", f.get("down", 0.0)) or 0.0)
+            avg_c = float(f.get("avg_entry_c", 0.0) or 0.0)
+            low_share = float(f.get("low_c_share", 0.0) or 0.0)
+            high_share = float(f.get("high_c_share", 0.0) or 0.0)
+            multibet = float(f.get("multibet_ratio", 0.0) or 0.0)
+            pref = up if side == "Up" else dn
+            opp = dn if side == "Up" else up
+            dom = pref - opp
+            if n <= 0:
+                return {"score_adj": 0, "edge_adj": 0.0, "n": 0, "dom": 0.0, "avg_c": 0.0, "min_n": PM_PUBLIC_PATTERN_MIN_N}
+            if n < PM_PUBLIC_PATTERN_MIN_N:
+                return {
+                    "score_adj": 0,
+                    "edge_adj": 0.0,
+                    "n": n,
+                    "dom": dom,
+                    "avg_c": avg_c,
+                    "min_n": PM_PUBLIC_PATTERN_MIN_N,
+                }
+            score_adj = 0
+            edge_adj = 0.0
+            # Crowd-extreme filter: when public flow is concentrated at very high cents,
+            # treat matching-side dominance as overpay risk (anti-EV), not a buy signal.
+            overcrowded_highcent = (
+                (avg_c >= 90.0 and abs(dom) >= PM_PUBLIC_PATTERN_DOM_MED)
+                or (avg_c >= 85.0 and high_share >= 0.55 and abs(dom) >= PM_PUBLIC_PATTERN_DOM_MED)
+            )
+            if overcrowded_highcent:
+                if dom >= PM_PUBLIC_PATTERN_DOM_MED:
+                    score_adj -= 1
+                    edge_adj -= min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.003 + (dom - PM_PUBLIC_PATTERN_DOM_MED) * 0.010)
+                elif dom <= -PM_PUBLIC_PATTERN_DOM_MED:
+                    score_adj += 1
+                    edge_adj += min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.002 + (abs(dom) - PM_PUBLIC_PATTERN_DOM_MED) * 0.008)
+            else:
+                # Dominance prior from public side-bias (weighted by ranked wallets/live flow),
+                # only outside overheated high-cent regimes.
+                if dom >= PM_PUBLIC_PATTERN_DOM_STRONG:
+                    score_adj += 1
+                    edge_adj += min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.003 + (dom - PM_PUBLIC_PATTERN_DOM_STRONG) * 0.015)
+                elif dom <= -PM_PUBLIC_PATTERN_DOM_STRONG:
+                    score_adj -= 1
+                    edge_adj -= min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.003 + (abs(dom) - PM_PUBLIC_PATTERN_DOM_STRONG) * 0.015)
+                elif dom >= PM_PUBLIC_PATTERN_DOM_MED:
+                    edge_adj += min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.0015 + (dom - PM_PUBLIC_PATTERN_DOM_MED) * 0.010)
+                elif dom <= -PM_PUBLIC_PATTERN_DOM_MED:
+                    edge_adj -= min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, 0.0015 + (abs(dom) - PM_PUBLIC_PATTERN_DOM_MED) * 0.010)
+            # Entry-style prior: prefer side aligned with public low-cent behavior at better pricing.
+            if avg_c > 0 and avg_c <= 65.0 and low_share >= 0.55 and 0.30 <= entry_px <= 0.55:
+                score_adj += 1
+                edge_adj += 0.0015
+            elif avg_c > 0 and avg_c >= 75.0 and high_share >= 0.60 and entry_px >= 0.62:
+                score_adj -= 1
+                edge_adj -= 0.0025
+            # Repeated same-wallet stacking is useful, but keep impact small.
+            if multibet >= 0.35 and 25.0 <= avg_c <= 70.0:
+                edge_adj += 0.001
+            score_adj = max(-2, min(2, score_adj))
+            edge_adj = max(-PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, min(PM_PUBLIC_PATTERN_MAX_EDGE_ADJ, edge_adj))
+            return {
+                "score_adj": score_adj,
+                "edge_adj": edge_adj,
+                "n": n,
+                "dom": dom,
+                "avg_c": avg_c,
+                "min_n": PM_PUBLIC_PATTERN_MIN_N,
+            }
+        except Exception:
+            return {"score_adj": 0, "edge_adj": 0.0, "n": 0, "dom": 0.0, "avg_c": 0.0, "min_n": PM_PUBLIC_PATTERN_MIN_N}
+
+    def _recent_side_profile(self, asset: str, duration: int, side: str) -> dict:
+        """Recent on-chain-only side quality profile for adaptive scoring (non-blocking)."""
+        if not RECENT_SIDE_PRIOR_ENABLED:
+            return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "n": 0, "exp": 0.0, "wr_lb": 0.5}
+        try:
+            now_ts = _time.time()
+            lookback_s = max(0.0, float(RECENT_SIDE_PRIOR_LOOKBACK_H) * 3600.0)
+            vals = []
+            for s in list(self._resolved_samples)[-600:]:
+                if str(s.get("asset", "") or "") != asset:
+                    continue
+                if int(s.get("duration", 0) or 0) != int(duration):
+                    continue
+                if str(s.get("side", "") or "") != side:
+                    continue
+                ts = float(s.get("ts", 0.0) or 0.0)
+                if ts <= 0:
+                    continue
+                if lookback_s > 0 and (now_ts - ts) > lookback_s:
+                    continue
+                vals.append(s)
+            n = len(vals)
+            if n < max(1, RECENT_SIDE_PRIOR_MIN_N):
+                return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "n": n, "exp": 0.0, "wr_lb": 0.5}
+            wins = sum(1 for x in vals if bool(x.get("won", False)))
+            pnl = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals)
+            exp = pnl / max(1, n)
+            wr_lb = self._wilson_lower_bound(wins, n)
+            score_adj = 0
+            edge_adj = 0.0
+            prob_adj = 0.0
+            if wr_lb >= 0.55 and exp >= 0.20:
+                score_adj = min(RECENT_SIDE_PRIOR_MAX_SCORE_ADJ, 2)
+                edge_adj = min(RECENT_SIDE_PRIOR_MAX_EDGE_ADJ, 0.004 + min(0.006, exp / 80.0))
+                prob_adj = min(RECENT_SIDE_PRIOR_MAX_PROB_ADJ, 0.010 + min(0.015, exp / 40.0))
+            elif wr_lb >= 0.51 and exp > 0.0:
+                score_adj = min(RECENT_SIDE_PRIOR_MAX_SCORE_ADJ, 1)
+                edge_adj = min(RECENT_SIDE_PRIOR_MAX_EDGE_ADJ, 0.003)
+                prob_adj = min(RECENT_SIDE_PRIOR_MAX_PROB_ADJ, 0.008)
+            elif wr_lb <= 0.45 and exp <= -0.20:
+                score_adj = -min(RECENT_SIDE_PRIOR_MAX_SCORE_ADJ, 2)
+                edge_adj = -min(RECENT_SIDE_PRIOR_MAX_EDGE_ADJ, 0.004 + min(0.006, abs(exp) / 80.0))
+                prob_adj = -min(RECENT_SIDE_PRIOR_MAX_PROB_ADJ, 0.010 + min(0.015, abs(exp) / 40.0))
+            elif wr_lb < 0.49 and exp < 0.0:
+                score_adj = -min(RECENT_SIDE_PRIOR_MAX_SCORE_ADJ, 1)
+                edge_adj = -min(RECENT_SIDE_PRIOR_MAX_EDGE_ADJ, 0.003)
+                prob_adj = -min(RECENT_SIDE_PRIOR_MAX_PROB_ADJ, 0.008)
+            return {
+                "score_adj": int(score_adj),
+                "edge_adj": float(edge_adj),
+                "prob_adj": float(prob_adj),
+                "n": int(n),
+                "exp": float(exp),
+                "wr_lb": float(wr_lb),
+            }
+        except Exception:
+            return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "n": 0, "exp": 0.0, "wr_lb": 0.5}
+
+    def _rolling_15m_profile(self, duration: int, entry: float, open_src: str, cl_age_s) -> dict:
+        if (not ROLLING_15M_CALIB_ENABLED) or duration < 15:
+            return {"prob_add": 0.0, "ev_add": 0.0, "size_mult": 1.0, "n": 0, "exp": 0.0, "wr_lb": 0.5}
+        band = self._entry_band(entry)
+        src_ok = (open_src == "PM") and (cl_age_s is not None) and (float(cl_age_s) <= 45.0)
+        vals = []
+        for s in list(self._resolved_samples)[-max(50, ROLLING_15M_CALIB_WINDOW):]:
+            if int(s.get("duration", 0) or 0) < 15:
+                continue
+            if self._entry_band(float(s.get("entry", 0.0) or 0.0)) != band:
+                continue
+            s_src = str(s.get("source", "?") or "?")
+            s_age = s.get("cl_age_s", None)
+            s_ok = (s_src == "PM") and (s_age is not None) and (float(s_age) <= 45.0)
+            if s_ok != src_ok:
+                continue
+            vals.append(s)
+        n = len(vals)
+        if n < ROLLING_15M_CALIB_MIN_N:
+            return {"prob_add": 0.0, "ev_add": 0.0, "size_mult": 1.0, "n": n, "exp": 0.0, "wr_lb": 0.5}
+        wins = sum(1 for x in vals if bool(x.get("won", False)))
+        pnl = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals)
+        exp = pnl / max(1, n)
+        gw = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) > 0)
+        gl = -sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) < 0)
+        pf = (gw / gl) if gl > 0 else (2.0 if gw > 0 else 1.0)
+        wr_lb = self._wilson_lower_bound(wins, n)
+        prob_add = 0.0
+        ev_add = 0.0
+        size_mult = 1.0
+        if exp <= -0.30 or wr_lb < 0.45 or pf < 0.90:
+            prob_add += 0.025
+            ev_add += 0.006
+            size_mult *= 0.75
+        elif exp >= 0.20 and wr_lb >= 0.52 and pf >= 1.10:
+            prob_add -= 0.008
+            ev_add -= 0.001
+            size_mult *= 1.12
+        if (not src_ok) and (exp < 0):
+            prob_add += 0.020
+            ev_add += 0.004
+            size_mult *= 0.85
+        return {
+            "prob_add": max(-0.02, min(0.05, prob_add)),
+            "ev_add": max(-0.004, min(0.012, ev_add)),
+            "size_mult": max(0.65, min(1.25, size_mult)),
+            "n": n,
+            "exp": exp,
+            "wr_lb": wr_lb,
+        }
+
+    def _asset_entry_profile(self, asset: str, duration: int, side: str, entry: float, open_src: str, cl_age_s) -> dict:
+        """Data-driven quality prior from settled on-chain outcomes for (asset,duration,side,entry-band).
+        Non-blocking: adjusts score/edge/prob/size continuously."""
+        if not ASSET_ENTRY_PRIOR_ENABLED:
+            return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "size_mult": 1.0, "n": 0, "exp": 0.0, "wr_lb": 0.5, "pf": 1.0, "band": "na"}
+        try:
+            band = self._entry_band(float(entry or 0.0))
+            now_ts = _time.time()
+            lookback_s = max(0.0, float(ASSET_ENTRY_PRIOR_LOOKBACK_H) * 3600.0)
+            src_ok = (open_src == "PM") and (cl_age_s is not None) and (float(cl_age_s) <= 45.0)
+            vals = []
+            for s in list(self._resolved_samples)[-1200:]:
+                if str(s.get("asset", "") or "") != str(asset):
+                    continue
+                if int(s.get("duration", 0) or 0) != int(duration):
+                    continue
+                if str(s.get("side", "") or "") != str(side):
+                    continue
+                if self._entry_band(float(s.get("entry", 0.0) or 0.0)) != band:
+                    continue
+                ts = float(s.get("ts", 0.0) or 0.0)
+                if ts <= 0:
+                    continue
+                if lookback_s > 0 and (now_ts - ts) > lookback_s:
+                    continue
+                s_src = str(s.get("source", "?") or "?")
+                s_age = s.get("cl_age_s", None)
+                s_ok = (s_src == "PM") and (s_age is not None) and (float(s_age) <= 45.0)
+                # Prefer same source-quality bucket; if sparse, fall back to full bucket.
+                if s_ok == src_ok:
+                    vals.append(s)
+            if len(vals) < max(1, ASSET_ENTRY_PRIOR_MIN_N // 2):
+                vals = []
+                for s in list(self._resolved_samples)[-1200:]:
+                    if str(s.get("asset", "") or "") != str(asset):
+                        continue
+                    if int(s.get("duration", 0) or 0) != int(duration):
+                        continue
+                    if str(s.get("side", "") or "") != str(side):
+                        continue
+                    if self._entry_band(float(s.get("entry", 0.0) or 0.0)) != band:
+                        continue
+                    ts = float(s.get("ts", 0.0) or 0.0)
+                    if ts <= 0:
+                        continue
+                    if lookback_s > 0 and (now_ts - ts) > lookback_s:
+                        continue
+                    vals.append(s)
+            n = len(vals)
+            if n < max(1, ASSET_ENTRY_PRIOR_MIN_N):
+                return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "size_mult": 1.0, "n": n, "exp": 0.0, "wr_lb": 0.5, "pf": 1.0, "band": band}
+            wins = sum(1 for x in vals if bool(x.get("won", False)))
+            pnl = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals)
+            exp = pnl / max(1, n)
+            wr_lb = self._wilson_lower_bound(wins, n)
+            gross_win = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) > 0)
+            gross_loss = -sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) < 0)
+            pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
+
+            score_adj = 0
+            edge_adj = 0.0
+            prob_adj = 0.0
+            size_mult = 1.0
+            # Poor cluster => reduce confidence and size, but never block.
+            if (wr_lb < 0.44 and pf < 0.90) or exp <= -0.70:
+                score_adj = -3 if (n >= 24 and wr_lb < 0.42 and exp <= -1.00) else -2
+                edge_adj = -(0.005 + min(0.007, abs(exp) / 120.0))
+                prob_adj = -(0.008 + min(0.010, abs(exp) / 90.0))
+                size_mult = 0.55 if score_adj <= -3 else 0.70
+            elif (wr_lb < 0.49 and pf < 0.98) or exp < 0.0:
+                score_adj = -1
+                edge_adj = -0.003
+                prob_adj = -0.005
+                size_mult = 0.85
+            # Strong cluster => boost confidence and allow modest size increase.
+            elif (wr_lb >= 0.58 and pf >= 1.25 and exp >= 0.90 and n >= 24):
+                score_adj = 2
+                edge_adj = 0.005
+                prob_adj = 0.008
+                size_mult = 1.15
+            elif (wr_lb >= 0.54 and pf >= 1.10 and exp >= 0.30):
+                score_adj = 1
+                edge_adj = 0.003
+                prob_adj = 0.005
+                size_mult = 1.06
+
+            score_adj = int(max(-ASSET_ENTRY_PRIOR_MAX_SCORE_ADJ, min(ASSET_ENTRY_PRIOR_MAX_SCORE_ADJ, score_adj)))
+            edge_adj = float(max(-ASSET_ENTRY_PRIOR_MAX_EDGE_ADJ, min(ASSET_ENTRY_PRIOR_MAX_EDGE_ADJ, edge_adj)))
+            prob_adj = float(max(-ASSET_ENTRY_PRIOR_MAX_PROB_ADJ, min(ASSET_ENTRY_PRIOR_MAX_PROB_ADJ, prob_adj)))
+            size_mult = float(max(ASSET_ENTRY_PRIOR_MIN_SIZE_MULT, min(ASSET_ENTRY_PRIOR_MAX_SIZE_MULT, size_mult)))
+            return {
+                "score_adj": score_adj,
+                "edge_adj": edge_adj,
+                "prob_adj": prob_adj,
+                "size_mult": size_mult,
+                "n": int(n),
+                "exp": float(exp),
+                "wr_lb": float(wr_lb),
+                "pf": float(pf),
+                "band": band,
+            }
+        except Exception:
+            return {"score_adj": 0, "edge_adj": 0.0, "prob_adj": 0.0, "size_mult": 1.0, "n": 0, "exp": 0.0, "wr_lb": 0.5, "pf": 1.0, "band": "na"}
+
+    def _macro_blackout_active(self) -> str:
+        """Return event name if current time is within macro blackout window, else empty string."""
+        if not MACRO_BLACKOUT_ENABLED:
+            return ""
+        import time as _t
+        try:
+            with open(MACRO_BLACKOUT_FILE, "r") as f:
+                events = json.load(f)
+        except Exception:
+            return ""
+        now = _t.time()
+        before_s = MACRO_BLACKOUT_MINS_BEFORE * 60
+        after_s  = MACRO_BLACKOUT_MINS_AFTER  * 60
+        for ev in events:
+            ev_ts = float(ev.get("ts", 0))
+            if (now >= ev_ts - before_s) and (now <= ev_ts + after_s):
+                return str(ev.get("name", "MACRO"))
+        return ""
+
+    @staticmethod
+    def _wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
+        """Conservative confidence lower-bound for Bernoulli win-rate."""
+        if n <= 0:
+            return 0.0
+        phat = max(0.0, min(1.0, wins / max(1, n)))
+        z2 = z * z
+        denom = 1.0 + z2 / n
+        center = phat + z2 / (2.0 * n)
+        margin = z * math.sqrt((phat * (1.0 - phat) + z2 / (4.0 * n)) / n)
+        return max(0.0, min(1.0, (center - margin) / denom))
+
+    def _growth_snapshot(self) -> dict:
+        rows = list(self._bucket_stats.rows.values())
+        outcomes = sum(int(r.get("outcomes", r.get("wins", 0) + r.get("losses", 0))) for r in rows)
+        gross_win = sum(float(r.get("gross_win", 0.0)) for r in rows)
+        gross_loss = sum(float(r.get("gross_loss", 0.0)) for r in rows)
+        pnl = sum(float(r.get("pnl", 0.0)) for r in rows)
+        fills = sum(int(r.get("fills", 0)) for r in rows)
+        slip = sum(float(r.get("slip_bps", 0.0)) for r in rows)
+        pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
+        expectancy = pnl / max(1, outcomes)
+        avg_slip = slip / max(1, fills)
+        recent_pnl = list(self.recent_pnl)[-20:]
+        recent_pf = 1.0
+        if recent_pnl:
+            rp_win = sum(p for p in recent_pnl if p > 0)
+            rp_loss = -sum(p for p in recent_pnl if p < 0)
+            recent_pf = (rp_win / rp_loss) if rp_loss > 0 else (2.0 if rp_win > 0 else 1.0)
+        recent_trades = list(self.recent_trades)[-20:]
+        recent_n = len(recent_trades)
+        recent_wins = int(sum(1 for x in recent_trades if x))
+        recent_wr = (recent_wins / recent_n) if recent_n > 0 else 0.5
+        recent_wr_lb = self._wilson_lower_bound(recent_wins, recent_n)
+        return {
+            "outcomes": outcomes,
+            "gross_win": gross_win,
+            "gross_loss": gross_loss,
+            "pf": pf,
+            "recent_pf": recent_pf,
+            "expectancy": expectancy,
+            "avg_slip": avg_slip,
+            "recent_n": recent_n,
+            "recent_wr": recent_wr,
+            "recent_wr_lb": recent_wr_lb,
+        }
+
+    def _load_autopilot_policy(self):
+        # Profit-oriented defaults with safety rails; never hard-stop trading by default.
+        self._autopilot_policy = {
+            "enabled": True,
+            "target_daily_profit_usdc": 100.0,
+            "soft_daily_loss_usdc": 25.0,
+            "hard_daily_loss_usdc": 45.0,
+            "soft_intraday_drawdown_usdc": 20.0,
+            "hard_intraday_drawdown_usdc": 35.0,
+            "size_mult_boost": 1.12,
+            "size_mult_normal": 1.00,
+            "size_mult_soft": 0.82,
+            "size_mult_hard": 0.62,
+            "size_mult_floor": 0.55,   # never 0: avoids false no-trade days
+            "disable_5m_on_hard": False,  # keep trading unless explicitly enabled
+        }
+        try:
+            if os.path.exists(AUTOPILOT_POLICY_FILE):
+                with open(AUTOPILOT_POLICY_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self._autopilot_policy.update(data)
+        except Exception:
+            pass
+
+    def _safe_daily_pnl(self) -> float:
+        # Use cached UTC-day reconciliation, not historical start-bank deltas.
+        try:
+            now_ts = _time.time()
+            day_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            dc = self._dash_daily_cache or {}
+            if dc.get("day") == day_utc and (now_ts - float(dc.get("ts", 0.0) or 0.0)) <= 60.0:
+                return float(dc.get("pnl", 0.0) or 0.0)
+            pnl = 0.0
+            for r in self._metrics_resolve_rows_cached(ttl_sec=15.0):
+                if str(r.get("ts", "")).startswith(day_utc):
+                    pnl += float(r.get("pnl", 0.0) or 0.0)
+            return float(pnl)
+        except Exception:
+            return float(self.daily_pnl or 0.0)
+
+    def _apply_autopilot_policy(self):
+        if not AUTOPILOT_ENABLED:
+            self._autopilot_size_mult = 1.0
+            self._autopilot_mode = "off"
+            return
+        now_ts = _time.time()
+        if (now_ts - float(self._autopilot_last_eval_ts or 0.0)) < max(3.0, AUTOPILOT_CHECK_SEC):
+            return
+        self._autopilot_last_eval_ts = now_ts
+
+        pol = dict(self._autopilot_policy or {})
+        if not bool(pol.get("enabled", True)):
+            self._autopilot_size_mult = 1.0
+            self._autopilot_mode = "disabled"
+            return
+
+        day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        eq_now = float(self.onchain_total_equity if self.onchain_snapshot_ts > 0 else self.bankroll)
+        if self._autopilot_day_key != day_key:
+            self._autopilot_day_key = day_key
+            self._autopilot_day_peak = eq_now
+        self._autopilot_day_peak = max(float(self._autopilot_day_peak or eq_now), eq_now)
+
+        day_pnl = self._safe_daily_pnl()
+        day_dd = max(0.0, float(self._autopilot_day_peak) - eq_now)
+        snap = self._growth_snapshot()
+        recent_pf = float(snap.get("recent_pf", 1.0) or 1.0)
+        recent_wr_lb = float(snap.get("recent_wr_lb", 0.5) or 0.5)
+
+        target = float(pol.get("target_daily_profit_usdc", 100.0) or 100.0)
+        base_soft_loss = abs(float(pol.get("soft_daily_loss_usdc", 25.0) or 25.0))
+        base_hard_loss = abs(float(pol.get("hard_daily_loss_usdc", 45.0) or 45.0))
+        base_soft_dd = abs(float(pol.get("soft_intraday_drawdown_usdc", 20.0) or 20.0))
+        base_hard_dd = abs(float(pol.get("hard_intraday_drawdown_usdc", 35.0) or 35.0))
+        # Dynamic thresholds from realized PnL volatility (agentic, regime-aware).
+        rp = [abs(float(x or 0.0)) for x in list(self.recent_pnl)[-30:]]
+        avg_abs = (sum(rp) / len(rp)) if rp else 2.5
+        soft_loss = max(base_soft_loss, avg_abs * 5.0)
+        hard_loss = max(base_hard_loss, avg_abs * 8.0)
+        soft_dd = max(base_soft_dd, avg_abs * 4.0)
+        hard_dd = max(base_hard_dd, avg_abs * 7.0)
+        m_boost = float(pol.get("size_mult_boost", 1.12) or 1.12)
+        m_norm = float(pol.get("size_mult_normal", 1.0) or 1.0)
+        m_soft = float(pol.get("size_mult_soft", 0.82) or 0.82)
+        m_hard = float(pol.get("size_mult_hard", 0.62) or 0.62)
+        m_floor = max(0.25, float(pol.get("size_mult_floor", 0.55) or 0.55))
+        disable_5m_on_hard = bool(pol.get("disable_5m_on_hard", False))
+
+        mode = "normal"
+        mult = m_norm
+        if (day_pnl <= -hard_loss) or (day_dd >= hard_dd):
+            mode = "hard-protect"
+            mult = m_hard
+            if disable_5m_on_hard:
+                self._enable_5m_runtime = False
+        elif (day_pnl <= -soft_loss) or (day_dd >= soft_dd):
+            mode = "soft-protect"
+            mult = m_soft
+        elif (day_pnl >= target) and (recent_pf >= 1.10) and (recent_wr_lb >= 0.50):
+            mode = "boost"
+            mult = m_boost
+
+        # Never drop to no-trade due to policy noise/mismeasurement.
+        mult = max(m_floor, min(1.35, mult))
+        changed = (abs(mult - float(self._autopilot_size_mult or 1.0)) >= 0.03) or (mode != self._autopilot_mode)
+        self._autopilot_size_mult = mult
+        self._autopilot_mode = mode
+        if changed and self._should_log("autopilot-mode", 30):
+            print(
+                f"{B}[AUTOPILOT]{RS} mode={mode} size_x={mult:.2f} "
+                f"day_pnl={day_pnl:+.2f} day_dd={day_dd:.2f} "
+                f"pf20={recent_pf:.2f} wr_lb20={recent_wr_lb:.2f}"
+            )
+
+    def _late_lock_thresholds(self, duration: int) -> tuple[float, float]:
+        """Adaptive late-lock thresholds; avoids rigid hardcoded behavior."""
+        lock_mins = LATE_DIR_LOCK_MIN_LEFT_5M if int(duration or 0) <= 5 else LATE_DIR_LOCK_MIN_LEFT_15M
+        move_min = float(LATE_DIR_LOCK_MIN_MOVE_PCT)
+        snap = self._growth_snapshot()
+        pf = float(snap.get("recent_pf", 1.0) or 1.0)
+        wr_lb = float(snap.get("recent_wr_lb", 0.5) or 0.5)
+        mode = str(self._autopilot_mode or "normal")
+
+        if mode == "boost" and pf >= 1.10 and wr_lb >= 0.50:
+            lock_mins = max(0.8, lock_mins - (0.5 if int(duration or 0) <= 5 else 1.0))
+            move_min = min(0.0030, move_min + 0.00008)
+        elif mode in ("soft-protect", "hard-protect"):
+            lock_mins = min(lock_mins + (0.4 if mode == "soft-protect" else 0.8), 3.5 if int(duration or 0) <= 5 else 8.5)
+            move_min = max(0.00012, move_min - (0.00003 if mode == "soft-protect" else 0.00006))
+        # Global clamps to prevent pathological no-trade behavior.
+        lock_mins = max(0.8, min(3.5 if int(duration or 0) <= 5 else 8.5, lock_mins))
+        move_min = max(0.00010, min(0.0035, move_min))
+        return lock_mins, move_min
+
+    def _five_m_quality_snapshot(self, window: int | None = None) -> dict:
+        """Rolling settled quality snapshot for 5m only (from on-chain resolved samples)."""
+        w = int(window or FIVE_M_GUARD_WINDOW)
+        vals = []
+        for s in reversed(self._resolved_samples):
+            if int(s.get("duration", 0) or 0) > 5:
+                continue
+            vals.append(s)
+            if len(vals) >= max(1, w):
+                break
+        vals.reverse()
+        n = len(vals)
+        wins = sum(1 for x in vals if bool(x.get("won", False)))
+        wr = (wins / n) if n > 0 else 0.0
+        pnl = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals)
+        gross_win = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) > 0.0)
+        gross_loss = -sum(float(x.get("pnl", 0.0) or 0.0) for x in vals if float(x.get("pnl", 0.0) or 0.0) < 0.0)
+        pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
+        return {
+            "n": n,
+            "wins": wins,
+            "wr": wr,
+            "pnl": pnl,
+            "pf": pf,
+        }
+
+    def _update_5m_runtime_guard(self):
+        """Auto-disable/enable 5m based on rolling settled quality."""
+        if not ENABLE_5M:
+            self._enable_5m_runtime = False
+            self._five_m_runtime_size_mult = 0.0
+            return
+        if not FIVE_M_RUNTIME_GUARD_ENABLED:
+            self._enable_5m_runtime = True
+            self._five_m_runtime_size_mult = 1.0
+            return
+        now = _time.time()
+        if (now - self._five_m_guard_last_eval_ts) < max(5.0, FIVE_M_GUARD_CHECK_EVERY_SEC):
+            return
+        self._five_m_guard_last_eval_ts = now
+
+        snap = self._five_m_quality_snapshot(max(FIVE_M_GUARD_WINDOW, FIVE_M_GUARD_REENABLE_MIN_OUTCOMES))
+        n = int(snap.get("n", 0) or 0)
+        wr = float(snap.get("wr", 0.0) or 0.0)
+        pf = float(snap.get("pf", 1.0) or 1.0)
+        pnl = float(snap.get("pnl", 0.0) or 0.0)
+
+        # Profit-push adaptive path:
+        # keep 5m active but resize exposure by rolling realized quality.
+        if PROFIT_PUSH_MODE and PROFIT_PUSH_ADAPTIVE_MODE:
+            self._enable_5m_runtime = True
+            prev_mult = float(self._five_m_runtime_size_mult or 1.0)
+            mult = 1.0
+            if n < max(1, FIVE_M_DYNAMIC_SCORE_MIN_OUTCOMES):
+                mult = 1.0
+            elif pf < 0.85 or wr < 0.40:
+                mult = 0.22
+            elif pf < 1.00 or wr < 0.45:
+                mult = 0.35
+            elif pf < 1.05 or wr < 0.50:
+                mult = 0.60
+            elif pf >= 1.15 and wr >= 0.55:
+                mult = 1.15
+            self._five_m_runtime_size_mult = max(0.20, min(1.25, mult))
+            if (
+                abs(self._five_m_runtime_size_mult - prev_mult) >= 0.05
+                or (now - self._five_m_guard_last_state_log_ts) >= 60.0
+            ):
+                self._five_m_guard_last_state_log_ts = now
+                print(
+                    f"{B}[5M-ADAPT]{RS} size_x={self._five_m_runtime_size_mult:.2f} "
+                    f"(n={n} wr={wr*100.0:.1f}% pf={pf:.2f} pnl={pnl:+.2f})"
+                )
+            return
+
+        if self._enable_5m_runtime:
+            bad_quality = (
+                n >= max(1, FIVE_M_GUARD_DISABLE_MIN_OUTCOMES)
+                and (pf < FIVE_M_GUARD_DISABLE_PF or wr < FIVE_M_GUARD_DISABLE_WR)
+            )
+            if bad_quality:
+                self._enable_5m_runtime = False
+                self._five_m_runtime_size_mult = 0.0
+                self._five_m_disabled_until = now + max(60.0, FIVE_M_GUARD_MIN_DISABLE_SEC)
+                self._five_m_guard_last_state_log_ts = now
+                print(
+                    f"{Y}[5M-GUARD]{RS} disabled for {max(1.0, FIVE_M_GUARD_MIN_DISABLE_SEC)/60.0:.1f}m "
+                    f"(n={n} wr={wr*100.0:.1f}% pf={pf:.2f} pnl={pnl:+.2f})"
+                )
+            return
+
+        # Currently disabled.
+        if now < float(self._five_m_disabled_until or 0.0):
+            if (now - self._five_m_guard_last_state_log_ts) >= 60.0:
+                mins_left = (float(self._five_m_disabled_until) - now) / 60.0
+                self._five_m_guard_last_state_log_ts = now
+                print(
+                    f"{Y}[5M-GUARD]{RS} cooling-down {max(0.0, mins_left):.1f}m "
+                    f"(n={n} wr={wr*100.0:.1f}% pf={pf:.2f} pnl={pnl:+.2f})"
+                )
+            return
+
+        good_quality = (
+            n >= max(1, FIVE_M_GUARD_REENABLE_MIN_OUTCOMES)
+            and pf >= FIVE_M_GUARD_REENABLE_PF
+            and wr >= FIVE_M_GUARD_REENABLE_WR
+        )
+        if good_quality:
+            self._enable_5m_runtime = True
+            self._five_m_runtime_size_mult = 1.0
+            self._five_m_guard_last_state_log_ts = now
+            print(
+                f"{G}[5M-GUARD]{RS} re-enabled "
+                f"(n={n} wr={wr*100.0:.1f}% pf={pf:.2f} pnl={pnl:+.2f})"
+            )
+
+    def _bucket_size_scale(self, duration: int, score: int, entry: float) -> float:
+        """Adaptive size control from realized EV quality by bucket."""
+        k = self._bucket_key(duration, score, entry)
+        r = self._bucket_stats.rows.get(k)
+        if not r:
+            return 1.0
+        outcomes = int(r.get("outcomes", r.get("wins", 0) + r.get("losses", 0)))
+        if outcomes < 8:
+            return 1.0
+        pnl = float(r.get("pnl", 0.0))
+        gross_win = float(r.get("gross_win", 0.0))
+        gross_loss = float(r.get("gross_loss", 0.0))
+        pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
+        exp = pnl / max(1, outcomes)
+        fills = int(r.get("fills", 0))
+        avg_slip = (float(r.get("slip_bps", 0.0)) / max(1, fills))
+        scale = 1.0
+        if outcomes >= 12 and (pf < 0.90 or exp < -0.25):
+            scale = 0.45
+        elif pf < 1.05 or exp < 0.0:
+            scale = 0.70
+        elif pf > 1.35 and exp > 0.30 and avg_slip < 120.0:
+            scale = 1.15
+        if avg_slip > 350.0:
+            scale *= 0.75
+        return max(0.40, min(1.20, scale))
+
+    def _adaptive_thresholds(self, duration: int) -> tuple[float, float, float]:
+        """Dynamic payout/EV/entry thresholds from realized quality (PF/expectancy/slippage)."""
+        base_payout = MIN_PAYOUT_MULT_5M if duration <= 5 else MIN_PAYOUT_MULT
+        base_ev = MIN_EV_NET_5M if duration <= 5 else MIN_EV_NET
+        hard_cap = ENTRY_HARD_CAP_5M if duration <= 5 else ENTRY_HARD_CAP_15M
+        payout_upshift_cap = (
+            ADAPTIVE_PAYOUT_MAX_UPSHIFT_5M
+            if duration <= 5
+            else ADAPTIVE_PAYOUT_MAX_UPSHIFT_15M
+        )
+
+        snap = self._growth_snapshot()
+        tightness = 0.0
+        if snap["outcomes"] >= 10 and snap["pf"] < 1.0:
+            tightness += min(1.2, (1.0 - snap["pf"]) * 1.5)
+        if snap["outcomes"] >= 10 and snap["expectancy"] < 0:
+            tightness += min(1.0, abs(snap["expectancy"]) / 0.8)
+        # Conservative confidence guard: if the lower confidence bound of recent WR drops below 50%,
+        # tighten aggressively to protect EV under uncertainty.
+        if snap["recent_n"] >= 10 and snap["recent_wr_lb"] < 0.50:
+            tightness += min(0.45, (0.50 - snap["recent_wr_lb"]) * 2.0)
+        if snap["avg_slip"] > 220:
+            tightness += min(0.6, (snap["avg_slip"] - 220.0) / 600.0)
+        if self.consec_losses >= 2:
+            tightness += min(0.45, (self.consec_losses - 1) * 0.15)
+        if snap["outcomes"] >= 12 and snap["pf"] > 1.35 and snap["expectancy"] > 0.30 and snap["avg_slip"] < 120:
+            tightness -= 0.35
+        # Momentum regime relaxation: require both observed WR and confidence.
+        if (
+            snap["outcomes"] >= 12
+            and snap["pf"] >= 1.15
+            and snap["recent_pf"] >= 1.10
+            and snap["expectancy"] >= 0.10
+            and snap["avg_slip"] < 180
+            and snap["recent_n"] >= 12
+            and snap["recent_wr"] >= 0.58
+            and snap["recent_wr_lb"] >= 0.50
+            and self.consec_losses == 0
+        ):
+            tightness -= 0.15
+        tightness = min(1.8, max(-0.5, tightness))
+
+        min_payout_raw = base_payout + (0.20 * tightness)
+        if duration >= 15:
+            # Keep 15m payout floor strict: adapt upward only, never below base.
+            min_payout = max(base_payout, min(base_payout + min(payout_upshift_cap, 0.18), min_payout_raw))
+        else:
+            min_payout = max(1.55, min(base_payout + payout_upshift_cap, min_payout_raw))
+        min_ev = max(0.005, base_ev + (0.015 * tightness))
+        max_entry_hard = max(0.33, min(0.80, hard_cap - (0.06 * tightness)))
+        # In favorable regime, allow slightly wider executable entry band.
+        if (
+            snap["outcomes"] >= 12
+            and snap["pf"] >= 1.15
+            and snap["recent_pf"] >= 1.10
+            and snap["expectancy"] >= 0.10
+            and snap["avg_slip"] < 180
+        ):
+            max_entry_hard = min(0.82, max_entry_hard + 0.02)
+
+        return min_payout, min_ev, max_entry_hard
+
+    def _execution_penalties(self, duration: int, score: int, entry: float) -> tuple[float, float, float]:
+        """Estimate execution frictions from realized bucket stats.
+        Returns (slip_cost, nofill_penalty, fill_ratio)."""
+        k = self._bucket_key(duration, score, entry)
+        r = self._bucket_stats.rows.get(k)
+        if not r:
+            # Conservative cold-start defaults.
+            return 0.003, 0.006, 0.90
+        fills = int(r.get("fills", 0) or 0)
+        outcomes = int(r.get("outcomes", 0) or 0)
+        avg_slip_bps = float(r.get("slip_bps", 0.0) or 0.0) / max(1, fills)
+        # Convert bps into expected probability-cost space.
+        slip_cost = max(0.0, min(0.03, (avg_slip_bps / 10000.0) * max(0.05, float(entry or 0.0))))
+        fill_ratio = fills / max(1, outcomes) if outcomes > 0 else min(1.0, fills / 12.0)
+        # Penalize low historical fill reliability on this bucket.
+        nofill_penalty = max(0.0, min(0.02, (1.0 - max(0.0, min(1.0, fill_ratio))) * 0.02))
+        return slip_cost, nofill_penalty, max(0.0, min(1.0, fill_ratio))
+
+    def _prob_shrink_factor(self) -> float:
+        """Calibrate model confidence to realized PnL quality (anti-overconfidence)."""
+        snap = self._growth_snapshot()
+        if snap["outcomes"] < 8:
+            return 0.78  # was 0.70: less aggressive cold-start suppression
+        shrink = 0.82
+        if snap["pf"] < 1.0:
+            shrink -= min(0.25, (1.0 - snap["pf"]) * 0.50)
+        if snap["expectancy"] < 0:
+            shrink -= min(0.20, abs(snap["expectancy"]) / 1.0)
+        if snap["avg_slip"] > 240:
+            shrink -= min(0.10, (snap["avg_slip"] - 240.0) / 900.0)
+        if snap["pf"] > 1.40 and snap["expectancy"] > 0.20 and snap["avg_slip"] < 120:
+            shrink += 0.05
+        if self.consec_losses >= 2:
+            shrink -= min(0.15, 0.04 * self.consec_losses)
+        # Anchor to realized win rate: if recent WR is below 50%, model is overconfident
+        if snap["recent_n"] >= 10:
+            rwr = snap["recent_wr_lb"]  # Wilson lower bound on last 20 trades
+            if rwr < 0.50:
+                shrink -= min(0.20, (0.50 - rwr) * 2.5)
+            elif rwr > 0.55:
+                shrink += min(0.05, (rwr - 0.55) * 0.50)
+        return max(0.35, min(0.92, shrink))
+
+    def _signal_growth_score(self, sig: dict) -> float:
+        """Rank candidates by growth quality (higher is better)."""
+        entry = max(float(sig.get("entry", 0.5)), 1e-6)
+        score = float(sig.get("score", 0))
+        edge = float(sig.get("edge", 0.0))
+        cl_bonus = 0.02 if sig.get("cl_agree", True) else -0.03
+        payout = (1.0 / entry) - 1.0
+        _fee_dyn_sg = max(0.001, entry * (1.0 - entry) * 0.0624)  # parabolic fee model (peaks at 0.50)
+        ev_net = float(sig.get("execution_ev", (float(sig.get("true_prob", 0.5)) / entry) - 1.0 - _fee_dyn_sg))
+        q_age = float(sig.get("quote_age_ms", 0.0) or 0.0)
+        s_lat = float(sig.get("signal_latency_ms", 0.0) or 0.0)
+        lag_penalty = 0.0
+        if q_age > 900:
+            lag_penalty -= 0.03
+        if s_lat > 550:
+            lag_penalty -= 0.03
+        wr_lb = float(sig.get("recent_side_wr_lb", 0.5) or 0.5)
+        wr_pen = 0.0
+        if wr_lb < 0.49:
+            wr_pen -= min(0.06, (0.49 - wr_lb) * 0.30)
+        elif wr_lb >= 0.55:
+            wr_pen += min(0.03, (wr_lb - 0.55) * 0.20)
+        # Portfolio-aware utility:
+        # keep contrarian opportunities, but avoid over-prioritizing low-cent tails.
+        low_cent_pen = 0.0
+        if entry <= CONTRARIAN_ENTRY_MAX and score < CONTRARIAN_STRONG_SCORE:
+            low_cent_pen -= min(0.08, (CONTRARIAN_ENTRY_MAX - entry) * 0.20)
+        core_bonus = 0.0
+        if (
+            CORE_ENTRY_MIN <= entry <= CORE_ENTRY_MAX
+            and score >= CORE_MIN_SCORE
+            and ev_net >= CORE_MIN_EV
+        ):
+            core_bonus += 0.03
+        # Wallet-alpha (Polymarket copyflow) bonus: reward fresh, coherent leader flow,
+        # but keep bounded to avoid overfitting crowd signals.
+        wallet_alpha = self._wallet_alpha_bonus(sig)
+        # Horizon optimizer (Polymarket 5m/15m round outcomes): reward duration
+        # with stronger recent win-quality / expectancy on resolved markets.
+        horizon_bonus = self._horizon_quality_bonus(int(sig.get("duration", 0) or 0))
+        return (
+            ev_net
+            + edge * 0.38
+            + payout * 0.03
+            + score * 0.005
+            + cl_bonus
+            + core_bonus
+            + wallet_alpha
+            + horizon_bonus
+            + low_cent_pen
+            + wr_pen
+            + lag_penalty
+        )
+
+    def _wallet_alpha_bonus(self, sig: dict) -> float:
+        """Bounded alpha bonus from Polymarket leader-flow quality."""
+        try:
+            copy_net = float(sig.get("copy_net", 0.0) or 0.0)
+            src = str(sig.get("signal_source", "") or "")
+            tier = str(sig.get("signal_tier", "") or "")
+            aq = float(sig.get("analysis_quality", 0.0) or 0.0)
+            b = 0.0
+            if src.startswith("leader"):
+                b += 0.010
+            if tier == "TIER-A":
+                b += 0.008
+            b += max(-0.010, min(0.010, copy_net * 0.025))
+            # Only trust copyflow more when full signal stack is fresh/coherent.
+            b *= max(0.55, min(1.10, 0.65 + (aq * 0.55)))
+            return max(-0.018, min(0.028, b))
+        except Exception:
+            return 0.0
+
+    def _horizon_quality_bonus(self, duration: int) -> float:
+        """Duration-level adaptive bonus from resolved Polymarket round outcomes."""
+        d = int(duration or 0)
+        if d not in (5, 15):
+            return 0.0
+        vals = []
+        for s in reversed(self._resolved_samples):
+            if int(s.get("duration", 0) or 0) != d:
+                continue
+            vals.append(s)
+            if len(vals) >= 160:
+                break
+        n = len(vals)
+        if n < 12:
+            return 0.0
+        wins = sum(1 for x in vals if bool(x.get("won", False)))
+        pnl = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals)
+        wr_lb = self._wilson_lower_bound(int(wins), int(n), z=1.0)
+        exp = pnl / max(1, n)
+        b = 0.0
+        if wr_lb >= 0.52:
+            b += min(0.012, (wr_lb - 0.52) * 0.10)
+        elif wr_lb <= 0.47:
+            b -= min(0.012, (0.47 - wr_lb) * 0.10)
+        if exp > 0:
+            b += min(0.010, exp / 60.0)
+        elif exp < 0:
+            b -= min(0.010, abs(exp) / 60.0)
+        return max(-0.016, min(0.020, b))
+
+    def _allow_second_round_trade(self, sig: dict, first_sig: dict | None = None) -> bool:
+        """Permit second trade in same round only for high-quality push setups."""
+        if not ROUND_SECOND_TRADE_PUSH_ONLY:
+            return True
+        if int(sig.get("score", 0) or 0) < ROUND_SECOND_TRADE_MIN_SCORE:
+            return False
+        if float(sig.get("execution_ev", 0.0) or 0.0) < ROUND_SECOND_TRADE_MIN_EXEC_EV:
+            return False
+        if float(sig.get("true_prob", 0.0) or 0.0) < ROUND_SECOND_TRADE_MIN_TRUE_PROB:
+            return False
+        if ROUND_SECOND_TRADE_REQUIRE_CL_AGREE and (not bool(sig.get("cl_agree", False))):
+            return False
+        if float(sig.get("entry", 1.0) or 1.0) > ROUND_SECOND_TRADE_MAX_ENTRY:
+            return False
+        if first_sig is not None:
+            g = float(self._signal_growth_score(sig))
+            g0 = float(self._signal_growth_score(first_sig))
+            if g < (g0 - ROUND_SECOND_TRADE_MAX_GSCORE_GAP):
+                return False
+        return True
+
+    def _regime_caps(self) -> tuple[float, float]:
+        vals = []
+        for a in BNB_SYM:
+            vals.append((self._variance_ratio(a), self._autocorr_regime(a)))
+        if not vals:
+            return EXPOSURE_CAP_TOTAL_CHOP, EXPOSURE_CAP_SIDE_CHOP
+        trending = sum(1 for vr, ac in vals if vr > 1.02 and ac > 0.02)
+        if trending >= max(1, len(vals) // 2):
+            return EXPOSURE_CAP_TOTAL_TREND, EXPOSURE_CAP_SIDE_TREND
+        return EXPOSURE_CAP_TOTAL_CHOP, EXPOSURE_CAP_SIDE_CHOP
+
+    def _exposure_ok(self, sig: dict, active_pending: dict) -> bool:
+        cid = sig.get("cid", "")
+        side = sig.get("side", "")
+        bankroll_ref = max(self.bankroll, 1.0)
+        cid_cap = bankroll_ref * MAX_CID_EXPOSURE_PCT
+        sig_m = sig.get("m", {}) if isinstance(sig.get("m", {}), dict) else {}
+        sig_fp = self._round_fingerprint(cid=cid, m=sig_m, t=sig)
+        sig_asset = str(sig.get("asset", "") or "").upper()
+        sig_dur = int(sig.get("duration", 0) or 0)
+        sig_end = float(sig.get("end_ts", sig_m.get("end_ts", 0)) or 0)
+        sig_exact = self._is_exact_round_bounds(
+            float(sig_m.get("start_ts", 0) or 0),
+            sig_end,
+            sig_dur,
+        )
+        same_cid = [(m, t) for c, (m, t) in active_pending.items() if c == cid]
+        if same_cid:
+            same_side_open = sum(max(0.0, t.get("size", 0.0)) for _, t in same_cid if t.get("side") == side)
+            opposite_open = sum(max(0.0, t.get("size", 0.0)) for _, t in same_cid if t.get("side") != side)
+            if BLOCK_OPPOSITE_SIDE_SAME_CID and opposite_open > 0:
+                if LOG_VERBOSE:
+                    print(f"{Y}[RISK] skip {sig.get('asset')} {side} opposite-side open on same cid{RS}")
+                return False
+            if same_side_open + sig.get("size", 0.0) > cid_cap:
+                if LOG_VERBOSE:
+                    print(f"{Y}[RISK] skip {sig.get('asset')} cid exposure {(same_side_open + sig.get('size', 0.0)):.2f}>{cid_cap:.2f}{RS}")
+                return False
+        same_round = [
+            (c, m, t) for c, (m, t) in active_pending.items()
+            if self._round_fingerprint(cid=c, m=m, t=t) == sig_fp
+        ]
+        if same_round:
+            round_same_side = sum(max(0.0, t.get("size", 0.0)) for _, _, t in same_round if t.get("side") == side)
+            round_opp_side = sum(max(0.0, t.get("size", 0.0)) for _, _, t in same_round if t.get("side") != side)
+            if BLOCK_OPPOSITE_SIDE_SAME_ROUND and round_opp_side > 0:
+                if LOG_VERBOSE:
+                    print(f"{Y}[RISK] skip {sig.get('asset')} {side} opposite-side open on same round{RS}")
+                return False
+            if round_same_side + sig.get("size", 0.0) > cid_cap:
+                if LOG_VERBOSE:
+                    print(f"{Y}[RISK] skip {sig.get('asset')} round exposure {(round_same_side + sig.get('size', 0.0)):.2f}>{cid_cap:.2f}{RS}")
+                return False
+        # Ambiguous-round safeguard:
+        # if either side lacks exact round bounds (fallback cid/question identity),
+        # never allow opposite-side overlap on same asset+duration.
+        if BLOCK_OPPOSITE_SIDE_SAME_ROUND:
+            for c, (m, t) in active_pending.items():
+                p_asset = str((t or {}).get("asset", (m or {}).get("asset", "") or "")).upper()
+                p_dur = int((t or {}).get("duration", (m or {}).get("duration", 0) or 0))
+                if p_asset != sig_asset or p_dur != sig_dur:
+                    continue
+                p_side = str((t or {}).get("side", "") or "")
+                if not p_side or p_side == side:
+                    continue
+                p_exact = self._is_exact_round_bounds(
+                    float((m or {}).get("start_ts", 0) or 0),
+                    float((t or {}).get("end_ts", (m or {}).get("end_ts", 0)) or 0),
+                    p_dur,
+                )
+                if (not sig_exact) or (not p_exact):
+                    if LOG_VERBOSE:
+                        print(
+                            f"{Y}[RISK] skip {sig.get('asset')} {side} opposite-side with ambiguous round "
+                            f"(sig_exact={sig_exact} pending_exact={p_exact}){RS}"
+                        )
+                    return False
+        # Same-side duplicate safeguard across Polymarket short rounds:
+        # do not stack same asset/side in the same 5m/15m round due to cid/fallback drift.
+        if sig_dur in (5, 15) and sig_end > 0:
+            end_tol = 60.0 if sig_dur <= 5 else 120.0
+            for c, (m, t) in active_pending.items():
+                p_asset = str((t or {}).get("asset", (m or {}).get("asset", "") or "")).upper()
+                p_dur = int((t or {}).get("duration", (m or {}).get("duration", 0) or 0))
+                p_side = str((t or {}).get("side", "") or "")
+                if p_asset != sig_asset or p_dur != sig_dur or p_side != side:
+                    continue
+                p_end = float((t or {}).get("end_ts", (m or {}).get("end_ts", 0)) or 0)
+                if p_end > 0 and abs(p_end - sig_end) <= end_tol:
+                    if LOG_VERBOSE:
+                        print(
+                            f"{Y}[RISK] skip {sig_asset} {sig_dur}m {side} duplicate same-side round "
+                            f"(sig_end={sig_end:.0f} pending_end={p_end:.0f} tol={end_tol:.0f}s){RS}"
+                        )
+                    return False
+        total_cap, side_cap = self._regime_caps()
+        total_open = sum(max(0.0, t.get("size", 0.0)) for _, t in active_pending.values())
+        side_open = sum(
+            max(0.0, t.get("size", 0.0))
+            for _, t in active_pending.values()
+            if t.get("side") == side
+        )
+        after_total = total_open + sig.get("size", 0.0)
+        after_side = side_open + sig.get("size", 0.0)
+        if after_total > bankroll_ref * total_cap:
+            if LOG_VERBOSE:
+                print(f"{Y}[RISK] skip {sig.get('asset')} total exposure {after_total/bankroll_ref:.0%}>{total_cap:.0%}{RS}")
+            return False
+        if after_side > bankroll_ref * side_cap:
+            if LOG_VERBOSE:
+                print(f"{Y}[RISK] skip {sig.get('asset')} {sig.get('side')} exposure {after_side/bankroll_ref:.0%}>{side_cap:.0%}{RS}")
+            return False
+        return True
+
+    def _direction_bias(self, asset: str, side: str, duration: int | None = None) -> float:
+        """Small additive bias from realized side quality.
+        Prefers recent on-chain outcomes over long-lived persisted aggregates."""
+        if duration is not None and RECENT_SIDE_PRIOR_ENABLED:
+            rs = self._recent_side_profile(asset, int(duration), side)
+            rn = int(rs.get("n", 0) or 0)
+            if rn >= max(1, RECENT_SIDE_PRIOR_MIN_N):
+                # Convert recent posterior prior into a compact additive bias.
+                rb = float(rs.get("prob_adj", 0.0) or 0.0) * 0.80
+                return max(-0.05, min(0.05, rb))
+        k = f"{asset}|{side}"
+        s = self.side_perf.get(k, {})
+        n = int(s.get("n", 0))
+        if n < 8:
+            return 0.0
+        gw = float(s.get("gross_win", 0.0))
+        gl = float(s.get("gross_loss", 0.0))
+        pnl = float(s.get("pnl", 0.0))
+        pf = (gw / gl) if gl > 0 else (2.0 if gw > 0 else 1.0)
+        exp = pnl / max(1, n)
+        bias = (pf - 1.0) * 0.02 + (exp / 8.0)
+        return max(-0.06, min(0.06, bias))
+
+    def _asset_side_quality(self, asset: str, side: str) -> tuple[int, float, float]:
+        """Return realized quality for asset+side from settled on-chain outcomes.
+        Returns (n, pf, expectancy_usdc)."""
+        k = f"{asset}|{side}"
+        s = self.side_perf.get(k, {})
+        n = int(s.get("n", 0) or 0)
+        if n <= 0:
+            return 0, 1.0, 0.0
+        gw = float(s.get("gross_win", 0.0) or 0.0)
+        gl = float(s.get("gross_loss", 0.0) or 0.0)
+        pnl = float(s.get("pnl", 0.0) or 0.0)
+        pf = (gw / gl) if gl > 0 else (2.0 if gw > 0 else 1.0)
+        exp = pnl / max(1, n)
+        return n, pf, exp
+
+    def _kelly_drawdown_scale(self) -> float:
+        """Scale Kelly fraction down when in drawdown vs session high.
+        Bot keeps trading but reduces size automatically — no hard stop."""
+        if self.peak_bankroll <= 0:
+            return 1.0
+        dd = (self.peak_bankroll - self.bankroll) / self.peak_bankroll
+        if dd < 0.10:
+            return 1.0       # normal
+        elif dd < 0.20:
+            return 0.60      # -10-20% drawdown: 60% of normal size
+        elif dd < 0.30:
+            return 0.35      # -20-30%: 35%
+        else:
+            return 0.20      # >30%: 20% (survival mode, still trading)
+
+    def _wr_bet_scale(self) -> float:
+        """EV/PF-only size controller for growth. No win-rate input."""
+        pnl = list(self.recent_pnl)[-30:]
+        if len(pnl) < 10:
+            return 1.0
+        gross_win = sum(p for p in pnl if p > 0)
+        gross_loss = -sum(p for p in pnl if p < 0)
+        pf = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
+        exp = sum(pnl) / len(pnl)
+        if pf >= 1.35 and exp >= 0.40:
+            return 1.35
+        if pf >= 1.25 and exp >= 0.25:
+            return 1.20
+        if pf < 1.10 or exp < 0.10:
+            return 0.90
+        return 1.0
+
+    def _adaptive_min_edge(self) -> float:
+        """CLOB edge sanity floor — keeps us from buying at obviously bad prices.
+        Range: 3-8% only. Never blocks trading on its own."""
+        snap = self._growth_snapshot()
+        edge = 0.045
+        if snap["avg_slip"] > 250:
+            edge += min(0.015, (snap["avg_slip"] - 250.0) / 25000.0)
+        if snap["outcomes"] >= 10 and snap["pf"] < 1.0:
+            edge += min(0.015, (1.0 - snap["pf"]) * 0.03)
+        if snap["outcomes"] >= 10 and snap["pf"] > 1.35 and snap["expectancy"] > 0.2:
+            edge -= 0.008
+        return max(0.03, min(0.08, edge))
+
+    def _adaptive_momentum_weight(self) -> float:
+        """Shift toward momentum only when realized expectancy degrades."""
+        pnl = list(self.recent_pnl)[-10:]
+        if len(pnl) < 5:
+            return MOMENTUM_WEIGHT
+        exp = sum(pnl) / max(1, len(pnl))
+        if exp < 0:
+            return min(0.65, MOMENTUM_WEIGHT + 0.15)
+        return MOMENTUM_WEIGHT
+
+    def _load_stats(self):
+        try:
+            with open(STATS_FILE) as f:
+                data = json.load(f)
+            self.stats        = data.get("stats", {})
+            self.recent_trades = deque(data.get("recent", []), maxlen=30)
+            self.recent_pnl = deque(data.get("recent_pnl", []), maxlen=40)
+            self.side_perf = data.get("side_perf", {})
+            self._pm_pattern_stats = data.get("pm_pattern_stats", {}) or {}
+            total = sum(s.get("total",0) for a in self.stats.values() for s in a.values())
+            wins  = sum(s.get("wins",0)  for a in self.stats.values() for s in a.values())
+            if total and LOG_STATS_LOCAL:
+                print(f"{B}[STATS-LOCAL]{RS} cache={total} wr={wins/total*100:.1f}% (not on-chain)")
+        except Exception:
+            self.stats        = {}
+            self.recent_trades = deque(maxlen=30)
+            self.recent_pnl = deque(maxlen=40)
+            self.side_perf = {}
+            self._pm_pattern_stats = {}
+
+    def _load_pnl_baseline(self):
+        """Load persistent on-chain PnL baseline unless reset is requested on boot."""
+        if PNL_BASELINE_RESET_ON_BOOT:
+            self._pnl_baseline_locked = False
+            self._pnl_baseline_ts = ""
+            return
+        try:
+            with open(PNL_BASELINE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            sb = float(data.get("start_bank", 0.0) or 0.0)
+            ts = str(data.get("baseline_ts", "") or "")
+            if sb > 0:
+                self.start_bank = sb
+                self._pnl_baseline_locked = True
+                self._pnl_baseline_ts = ts
+                print(f"{B}[P&L-BASELINE]{RS} loaded on-chain baseline ${sb:.2f} ts={ts or 'n/a'}")
+        except Exception:
+            self._pnl_baseline_locked = False
+            self._pnl_baseline_ts = ""
+
+    def _save_pnl_baseline(self, total_equity: float, wallet_usdc: float):
+        try:
+            rec = {
+                "start_bank": round(float(total_equity), 2),
+                "wallet_usdc": round(float(wallet_usdc), 2),
+                "baseline_ts": self._pnl_baseline_ts,
+            }
+            with open(PNL_BASELINE_FILE, "w", encoding="utf-8") as f:
+                json.dump(rec, f)
+        except Exception:
+            pass
+
+    def _save_stats(self):
+        try:
+            with open(STATS_FILE, "w") as f:
+                json.dump(
+                    {
+                        "stats": self.stats,
+                        "recent": list(self.recent_trades),
+                        "recent_pnl": list(self.recent_pnl),
+                        "side_perf": self.side_perf,
+                        "pm_pattern_stats": self._pm_pattern_stats,
+                    },
+                    f,
+                )
+        except Exception:
+            pass
+
+    def _load_settled_outcomes(self):
+        """Load settled CID cache to keep settle accounting idempotent across restarts."""
+        self._settled_outcomes = {}
+        try:
+            with open(SETTLED_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            now = _time.time()
+            keep = {}
+            for cid, row in data.items():
+                if not isinstance(row, dict):
+                    continue
+                ts = float(row.get("ts", 0.0) or 0.0)
+                # Keep 36h of settle cache (covers restart/redeploy overlaps).
+                if ts > 0 and (now - ts) <= 36 * 3600:
+                    keep[str(cid)] = row
+            self._settled_outcomes = keep
+        except Exception:
+            self._settled_outcomes = {}
+
+    def _save_settled_outcomes(self):
+        try:
+            now = _time.time()
+            pruned = {}
+            for cid, row in self._settled_outcomes.items():
+                ts = float((row or {}).get("ts", 0.0) or 0.0)
+                if ts > 0 and (now - ts) <= 36 * 3600:
+                    pruned[cid] = row
+            self._settled_outcomes = pruned
+            with open(SETTLED_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._settled_outcomes, f)
+        except Exception:
+            pass
+
+    def _record_result(self, asset: str, side: str, won: bool, structural: bool = False, pnl: float = 0.0):
+        if asset not in self.stats:
+            self.stats[asset] = {}
+        if side not in self.stats[asset]:
+            self.stats[asset][side] = {"wins": 0, "total": 0}
+        self.stats[asset][side]["total"] += 1
+        if won:
+            self.stats[asset][side]["wins"] += 1
+        self.recent_trades.append(1 if won else 0)
+        self.recent_pnl.append(float(pnl))
+        sp_key = f"{asset}|{side}"
+        row = self.side_perf.get(sp_key, {"n": 0, "gross_win": 0.0, "gross_loss": 0.0, "pnl": 0.0})
+        row["n"] = int(row.get("n", 0)) + 1
+        if pnl >= 0:
+            row["gross_win"] = float(row.get("gross_win", 0.0)) + float(pnl)
+        else:
+            row["gross_loss"] = float(row.get("gross_loss", 0.0)) + abs(float(pnl))
+        row["pnl"] = float(row.get("pnl", 0.0)) + float(pnl)
+        self.side_perf[sp_key] = row
+        # Track consecutive losses for adaptive signals (no pause — trade every cycle)
+        if won:
+            self.consec_losses = 0
+            self._pause_entries_until = 0.0
+        else:
+            self.consec_losses += 1
+            if (
+                LOSS_STREAK_PAUSE_ENABLED
+                and self.consec_losses >= max(1, int(LOSS_STREAK_PAUSE_N))
+            ):
+                self._pause_entries_until = max(
+                    float(self._pause_entries_until or 0.0),
+                    _time.time() + max(30.0, float(LOSS_STREAK_PAUSE_SEC)),
+                )
+        # Update peak bankroll
+        if self.bankroll > self.peak_bankroll:
+            self.peak_bankroll = self.bankroll
+        self._save_stats()
+        # Print adaptive state for visibility
+        me   = self._adaptive_min_edge()
+        snap = self._growth_snapshot()
+        last5 = list(self.recent_pnl)[-5:]
+        streak = "".join("+" if x > 0 else "-" for x in last5) if last5 else ""
+        wr_scale = self._wr_bet_scale()
+        wr_str   = f"  BetScale={wr_scale:.1f}x" if wr_scale > 1.0 else ""
+        print(
+            f"{B}[ADAPT]{RS} Last5PnL={streak or '–'} PF={snap['recent_pf']:.2f} "
+            f"WR={snap['recent_wr']*100:.1f}% LB={snap['recent_wr_lb']*100:.1f}% "
+            f"Exp={sum(last5)/max(1,len(last5)):+.2f} MinEdge={me:.2f} "
+            f"Streak={self.consec_losses}L DrawdownScale={self._kelly_drawdown_scale():.0%}{wr_str}"
+        )
+        if self._pause_entries_until > _time.time():
+            rem_s = max(0.0, self._pause_entries_until - _time.time())
+            print(
+                f"{Y}[PAUSE]{RS} entries paused for {rem_s:.0f}s "
+                f"(loss_streak={self.consec_losses} >= {LOSS_STREAK_PAUSE_N})"
+            )
+
+    # ── CHAINLINK HISTORICAL PRICE ────────────────────────────────────────────
+    async def _get_polymarket_open_price(self, asset: str, start_ts: float, end_ts: float, duration: int = 15) -> float:
+        """Call Polymarket's own price API to get the authoritative 'price to beat'.
+        Returns openPrice float or 0.0 on any error."""
+        try:
+            from datetime import datetime, timezone as _tz
+            sym = asset  # BTC, ETH, SOL, XRP
+            dur = 5 if int(duration or 0) <= 5 else 15
+
+            # Canonical PM round boundaries: start at exact 5m/15m slot.
+            st_dt = datetime.fromtimestamp(start_ts, tz=_tz.utc)
+            st_floor = st_dt.replace(minute=(st_dt.minute // dur) * dur, second=0, microsecond=0)
+            et_floor = st_floor.timestamp() + dur * 60
+            st = st_floor.strftime("%Y-%m-%dT%H:%M:%SZ")
+            et = datetime.fromtimestamp(et_floor, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            variants = ["five", "fifteen"] if dur == 5 else ["fifteen"]
+            for variant in variants:
+                data = await self._http_get_json(
+                    "https://polymarket.com/api/crypto/crypto-price",
+                    params={"symbol": sym, "eventStartTime": st, "variant": variant, "endDate": et},
+                    timeout=6,
+                )
+                price = (data or {}).get("openPrice", 0.0) if isinstance(data, dict) else 0.0
+                if price:
+                    return float(price)
+            return 0.0
+        except Exception:
+            return 0.0
+
+    async def _get_chainlink_at(self, asset: str, start_ts: float) -> tuple:
+        """Return (price, source) matching Polymarket's 'price to beat'.
+        Polymarket uses the FIRST Chainlink round posted AT OR AFTER eventStartTime.
+        Walk backward to find where we cross start_ts, then return the round just before that
+        (i.e. the first one that's >= start_ts as seen walking forward).
+        BTC/ETH update every ~27s → 60 rounds covers ~27 minutes lookback."""
+        if self.w3 is None or asset not in CHAINLINK_FEEDS:
+            return 0.0, "no-w3"
+        loop = asyncio.get_running_loop()
+        try:
+            contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(CHAINLINK_FEEDS[asset]),
+                abi=CHAINLINK_ABI
+            )
+            latest = await loop.run_in_executor(None, contract.functions.latestRoundData().call)
+            round_id   = latest[0]
+            updated_at = latest[3]
+            price      = latest[1]
+
+            # Latest round is before start_ts: no post-start round exists yet → wait
+            if updated_at < start_ts:
+                return 0.0, "not-ready"
+
+            # Latest round is at or after start — walk backward to find the FIRST round
+            # that is >= start_ts (i.e. the first Chainlink update after window opened).
+            # As we walk back, track the most recent round still >= start_ts.
+            first_after_price = price
+            first_after_ts    = updated_at
+
+            phase_id = round_id >> 64
+            agg_id   = round_id & ((1 << 64) - 1)
+            for i in range(1, 61):
+                prev_agg = agg_id - i
+                if prev_agg <= 0:
+                    break
+                prev_id = (phase_id << 64) | prev_agg
+                try:
+                    data = await loop.run_in_executor(
+                        None, lambda rid=prev_id: contract.functions.getRoundData(rid).call()
+                    )
+                    prev_updated = data[3]
+                    prev_price   = data[1]
+                    if prev_price <= 0:
+                        continue
+                    if prev_updated >= start_ts:
+                        # Still at or after window start — this is now the earliest candidate
+                        first_after_price = prev_price
+                        first_after_ts    = prev_updated
+                    else:
+                        # Crossed into pre-window territory — first_after is our answer
+                        secs_after = first_after_ts - start_ts
+                        print(f"{G}[CL] {asset} price to beat: ${first_after_price/1e8:,.2f} "
+                              f"(first CL round +{secs_after:.0f}s after window open){RS}")
+                        return first_after_price / 1e8, "CL-exact"
+                except Exception:
+                    continue
+
+            # All 60 rounds were >= start_ts (market started very recently or long window)
+            # first_after_price is the oldest available round after start
+            secs_after = first_after_ts - start_ts
+            print(f"{G}[CL] {asset} price to beat: ${first_after_price/1e8:,.2f} "
+                  f"(oldest round in window, +{secs_after:.0f}s){RS}")
+            return first_after_price / 1e8, "CL-exact"
+        except Exception as e:
+            print(f"{Y}[CL] _get_chainlink_at {asset}: {e}{RS}")
+            return 0.0, "error"
+
+    # ── SCAN LOOP ─────────────────────────────────────────────────────────────
+    async def scan_loop(self):
+        await asyncio.sleep(6)
+        while True:
+          try:
+            self._reload_copyflow()
+            # Cleanup stale pre-bid plans.
+            now_epoch = _time.time()
+            for pcid, plan in list(self._prebid_plan.items()):
+                st = float((plan or {}).get("start_ts", 0) or 0)
+                if st <= 0 or now_epoch > (st + PREBID_ARM_WINDOW_SEC + 120):
+                    self._prebid_plan.pop(pcid, None)
+            # Settlement always has priority over new entries.
+            await self._resolve()
+            self._update_5m_runtime_guard()
+            self._apply_autopilot_policy()
+            if self.pending_redeem:
+                pending_n = len(self.pending_redeem)
+                claimable_n = int(self.onchain_redeemable_count or 0)
+                oldest_q_min = 0.0
+                if self._redeem_queued_ts:
+                    try:
+                        now_q = _time.time()
+                        oldest_q = min(float(v or now_q) for v in self._redeem_queued_ts.values())
+                        oldest_q_min = max(0.0, (now_q - oldest_q) / 60.0)
+                    except Exception:
+                        oldest_q_min = 0.0
+                should_block_settle = True
+                if SETTLE_FIRST_REQUIRE_ONCHAIN_CLAIMABLE:
+                    should_block_settle = (
+                        (claimable_n > 0)
+                        or (oldest_q_min >= max(0.0, SETTLE_FIRST_FORCE_BLOCK_AFTER_MIN))
+                    )
+                if should_block_settle:
+                    if self._should_log("settle-first", LOG_SETTLE_FIRST_EVERY_SEC):
+                        print(
+                            f"{Y}[SETTLE-FIRST]{RS} pending_redeem={pending_n} "
+                            f"(claimable={claimable_n}, oldest={oldest_q_min:.1f}m) "
+                            f"— skipping new entries until win/loss is finalized on-chain"
+                        )
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    continue
+                if self._should_log("settle-first-soft", LOG_SETTLE_FIRST_EVERY_SEC):
+                    print(
+                        f"{Y}[SETTLE-FIRST-SOFT]{RS} pending_redeem={pending_n} "
+                        f"(claimable={claimable_n}, oldest={oldest_q_min:.1f}m) "
+                        f"— continue scanning while waiting on redeem claimability"
+                    )
+            if self._pause_entries_until > _time.time():
+                if self._should_log("pause-entries", LOG_SETTLE_FIRST_EVERY_SEC):
+                    rem_s = max(0.0, self._pause_entries_until - _time.time())
+                    print(f"{Y}[PAUSE]{RS} skipping new entries for {rem_s:.0f}s (loss streak guard)")
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
+            markets = await self.fetch_markets()
+            now     = datetime.now(timezone.utc).timestamp()
+            open_local, settling_local = self._local_position_counts()
+            scan_state = (
+                len(markets),
+                open_local,
+                int(self.onchain_open_count),
+                settling_local,
+                int(self.onchain_redeemable_count),
+            )
+            state_changed = scan_state != self._scan_state_last
+            if (not LOG_SCAN_ON_CHANGE_ONLY) or state_changed or self._should_log("scan-heartbeat", LOG_SCAN_EVERY_SEC):
+                print(
+                    f"{B}[SCAN]{RS} Live markets: {len(markets)} | "
+                    f"Open(onchain): {self.onchain_open_count} | "
+                    f"Settling(onchain): {self.onchain_redeemable_count}"
+                )
+            self._scan_state_last = scan_state
+
+            # Global WS health is advisory only: per-market scorer enforces freshness-first
+            # (strict WS when available, otherwise fresh REST fallback).
+            if WS_HEALTH_REQUIRED:
+                ws_ok, hs = self._ws_trade_gate_ok()
+                if not ws_ok:
+                    warmup_left = max(0.0, WS_GATE_WARMUP_SEC - (_time.time() - float(self._boot_ts or 0.0)))
+                    if warmup_left > 0:
+                        if self._should_log("ws-health-warmup", LOG_HEALTH_EVERY_SEC):
+                            at = int(hs.get("active_markets", 0) or 0)
+                            fresh = int(hs.get("fresh_markets", 0) or 0)
+                            print(
+                                f"{Y}[WS-WARMUP]{RS} hold gate for {warmup_left:.0f}s "
+                                f"(fresh_books={fresh}/{at})"
+                            )
+                    else:
+                        if self._should_log("ws-health-gate", LOG_HEALTH_EVERY_SEC):
+                            at = int(hs.get("active_markets", 0) or 0)
+                            fresh = int(hs.get("fresh_markets", 0) or 0)
+                            ratio = (fresh / max(1, at)) if at > 0 else 0.0
+                            ws_med = float(hs.get("ws_market_med_ms", 9e9) or 9e9)
+                            print(
+                                f"{Y}[WS-GATE-SOFT]{RS} degraded ws: fresh_books={fresh}/{at} "
+                                f"ratio={ratio:.2f} < {WS_HEALTH_MIN_FRESH_RATIO:.2f} "
+                                f"or ws_med={ws_med:.0f}ms > {WS_HEALTH_MAX_MED_AGE_MS:.0f}ms "
+                                f"— continuing with per-market freshness checks"
+                            )
+
+            # Subscribe new markets to RTDS token price stream.
+            # Also queue token ids for immediate CLOB market-WS subscription.
+            if self._rtds_ws:
+                for cid, m in markets.items():
+                    if cid not in self.active_mkts:
+                        for tid in [m.get("token_up",""), m.get("token_down","")]:
+                            if tid:
+                                try:
+                                    await self._rtds_ws.send(json.dumps({
+                                        "action": "subscribe",
+                                        "subscriptions": [{"asset_id": tid, "type": "market"}]
+                                    }))
+                                except Exception:
+                                    pass
+                                try:
+                                    self._clob_ws_pending_subs.add(str(tid))
+                                except Exception:
+                                    pass
+
+            # Prefetch Polymarket open prices in parallel to avoid sequential stalls.
+            pm_open_tasks = {}
+            for cid, m in markets.items():
+                if m.get("start_ts", 0) > now:
+                    continue
+                if (m.get("end_ts", 0) - now) / 60 < 1:
+                    continue
+                src_known = self.open_prices_source.get(cid, "?")
+                need_pm = (cid not in self.open_prices) or (src_known != "PM")
+                if not need_pm:
+                    continue
+                asset = m.get("asset")
+                dur = int(m.get("duration", 0) or 0)
+                start_ts = float(m.get("start_ts", now) or now)
+                end_ts_m = float(m.get("end_ts", now + max(1, dur) * 60) or (now + max(1, dur) * 60))
+                pm_open_tasks[cid] = self._get_polymarket_open_price(asset, start_ts, end_ts_m, dur)
+            pm_open_prefetch = {}
+            if pm_open_tasks:
+                pm_vals = await self._gather_bounded(
+                    list(pm_open_tasks.values()),
+                    limit=max(2, min(12, len(pm_open_tasks))),
+                )
+                for cid, v in zip(pm_open_tasks.keys(), pm_vals):
+                    pm_open_prefetch[cid] = 0.0 if isinstance(v, Exception) else float(v or 0.0)
+
+            # Evaluate ALL eligible markets in parallel — no more sequential blocking
+            candidates = []
+            eligible_started = 0
+            blocked_seen = 0
+            for cid, m in markets.items():
+                if m["start_ts"] > now:
+                    sec_to_start = m["start_ts"] - now
+                    if NEXT_MARKET_ANALYSIS_ENABLED and sec_to_start <= max(30.0, NEXT_MARKET_ANALYSIS_WINDOW_SEC):
+                        flow_pre = self._copyflow_live.get(cid) or self._copyflow_map.get(cid, {})
+                        upc = dnc = 0.0
+                        if isinstance(flow_pre, dict):
+                            upc = float(flow_pre.get("Up", 0.0) or 0.0)
+                            dnc = float(flow_pre.get("Down", 0.0) or 0.0)
+                        flow_dom = (upc - dnc) if (upc + dnc) > 0 else 0.0
+                        flow_conf = max(upc, dnc) if (upc + dnc) > 0 else 0.0
+                        asset_pre = str(m.get("asset", "") or "")
+                        dur_pre = int(m.get("duration", 0) or 0)
+                        mom_up = float(self._momentum_prob(asset_pre, seconds=60))
+                        ob = float(self._binance_imbalance(asset_pre))
+                        tk_ratio, _ = self._binance_taker_flow(asset_pre)
+                        perp_basis, _ = self._binance_perp_signals(asset_pre)
+                        # Pre-open side prior from live feeds (non-blocking, quickly recomputed each scan).
+                        up_score = (
+                            (mom_up - 0.5) * 1.20
+                            + max(-0.25, min(0.25, ob * 0.35))
+                            + max(-0.20, min(0.20, (float(tk_ratio) - 0.5) * 0.90))
+                            + max(-0.12, min(0.12, flow_dom * 0.60))
+                            + max(-0.08, min(0.08, float(perp_basis) * 30.0))
+                        )
+                        side_pre = "Up" if up_score >= 0 else "Down"
+                        conf_pre = max(0.50, min(0.92, 0.50 + abs(up_score)))
+                        # If copyflow is materially strong and disagrees, reduce confidence.
+                        if flow_conf >= 0.60:
+                            side_flow = "Up" if upc >= dnc else "Down"
+                            if side_flow != side_pre:
+                                conf_pre = max(0.50, conf_pre - min(0.18, flow_conf - 0.50))
+                        if PREBID_ARM_ENABLED and conf_pre >= max(PREBID_MIN_CONF, NEXT_MARKET_ANALYSIS_MIN_CONF):
+                            self._prebid_plan[cid] = {
+                                "side": side_pre,
+                                "conf": conf_pre,
+                                "start_ts": float(m.get("start_ts", now)),
+                                "armed_at": _time.time(),
+                            }
+                        if self._should_log(f"next-analysis:{cid}", NEXT_MARKET_ANALYSIS_LOG_EVERY_SEC):
+                            print(
+                                f"{B}[NEXT-ANALYSIS]{RS} {asset_pre} {dur_pre}m starts in {sec_to_start:.0f}s | "
+                                f"side={side_pre} conf={conf_pre:.2f} "
+                                f"(mom={mom_up:.2f} ob={ob:+.2f} tk={float(tk_ratio):.2f} flow={flow_dom:+.2f}) | "
+                                f"rk={self._round_key(cid=cid, m=m)}"
+                            )
+                    continue
+                if (m["end_ts"] - now) / 60 < 1: continue
+                eligible_started += 1
+                m["mins_left"] = (m["end_ts"] - now) / 60
+                # Set open_price from Chainlink at exact market start time.
+                # Must match Polymarket's resolution reference ("price to beat").
+                asset    = m.get("asset")
+                dur      = m.get("duration", 0)
+                title_s  = m.get("question", "")[:50]
+                if cid not in self.open_prices:
+                    start_ts = m.get("start_ts", now)
+                    # Authoritative reference: Polymarket's own price API
+                    ref = float(pm_open_prefetch.get(cid, 0.0) or 0.0)
+                    if ref > 0:
+                        src = "PM"
+                    else:
+                        # Fallback to Chainlink
+                        ref, src = await self._get_chainlink_at(asset, start_ts)
+                    if src == "not-ready":
+                        print(
+                            f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | waiting for first round... | "
+                            f"rk={self._round_key(cid=cid, m=m)} cid={self._short_cid(cid)}{RS}"
+                        )
+                    elif ref <= 0:
+                        print(
+                            f"{Y}[NEW MARKET] {asset} {dur}m | {title_s} | no open price yet — retry | "
+                            f"rk={self._round_key(cid=cid, m=m)} cid={self._short_cid(cid)}{RS}"
+                        )
+                    else:
+                        if asset in self.asset_cur_open:
+                            self.asset_prev_open[asset] = self.asset_cur_open[asset]
+                        self.asset_cur_open[asset]   = ref
+                        self.open_prices[cid]        = ref
+                        self.open_prices_source[cid] = src
+                        print(
+                            f"{W}[NEW MARKET] {asset} {dur}m | {title_s} | beat=${ref:,.4f} [{src}] | "
+                            f"{m['mins_left']:.1f}min left | rk={self._round_key(cid=cid, m=m)} "
+                            f"cid={self._short_cid(cid)}{RS}"
+                        )
+                else:
+                    # Already known — but if source isn't PM yet, retry authoritative API
+                    src = self.open_prices_source.get(cid, "?")
+                    if src != "PM":
+                        pm_ref = float(pm_open_prefetch.get(cid, 0.0) or 0.0)
+                        if pm_ref > 0:
+                            self.open_prices[cid]        = pm_ref
+                            self.open_prices_source[cid] = "PM"
+                            src = "PM"
+                    ref = self.open_prices[cid]
+                    cur = self.prices.get(asset, 0) or self.cl_prices.get(asset, 0)
+                    now_ts = _time.time()
+                    if cur > 0 and now_ts - self._mkt_log_ts.get(cid, 0) >= LOG_MARKET_EVERY_SEC:
+                        self._mkt_log_ts[cid] = now_ts
+                        move = (cur - ref) / ref * 100
+                        if LOG_VERBOSE or abs(move) >= LOG_MKT_MOVE_THRESHOLD_PCT:
+                            ref_fmt = f"{ref:,.6f}" if ref < 100 else f"{ref:,.2f}"
+                            cur_fmt = f"{cur:,.6f}" if cur < 100 else f"{cur:,.2f}"
+                            print(f"{B}[MKT] {asset} {dur}m | beat=${ref_fmt} [{src}] | "
+                                  f"now=${cur_fmt} move={move:+.3f}% | {m['mins_left']:.1f}min left{RS}")
+                if cid not in self.seen:
+                    candidates.append(m)
+                else:
+                    blocked_seen += 1
+            if candidates:
+                # Score all markets in parallel.
+                t_score = _time.perf_counter()
+                signals = list(await asyncio.gather(*[self._score_market(m) for m in candidates]))
+                elapsed_ms = (_time.perf_counter() - t_score) * 1000.0
+                if candidates:
+                    self._perf_update("score_ms", elapsed_ms / max(1, len(candidates)))
+                valid   = sorted([s for s in signals if s is not None], key=lambda x: -x["score"])
+                # Must-fire: if no signal passed gate and we're in last N min of a 15m window, relax gate
+                if not valid and LATE_MUST_FIRE_ENABLED:
+                    late_cands = [
+                        c for c in candidates
+                        if c.get("duration", 0) >= 15 and c.get("mins_left", 99) <= LATE_MUST_FIRE_MINS_LEFT
+                    ]
+                    if late_cands:
+                        late_sigs = list(await asyncio.gather(*[self._score_market(c, late_relax=True) for c in late_cands]))
+                        late_valid = sorted([s for s in late_sigs if s is not None], key=lambda x: -x["score"])
+                        if late_valid:
+                            print(
+                                f"{Y}[MUST-FIRE]{RS} last {LATE_MUST_FIRE_MINS_LEFT:.0f}min: gate relaxed → "
+                                f"{late_valid[0]['asset']} {late_valid[0]['side']} score={late_valid[0]['score']}"
+                            )
+                            valid = late_valid
+                if not valid and FORCE_TRADE_EVERY_ROUND and candidates:
+                    relaxed_all = list(await asyncio.gather(*[self._score_market(c, late_relax=True) for c in candidates]))
+                    relaxed_valid = sorted([s for s in relaxed_all if s is not None], key=self._signal_growth_score, reverse=True)
+                    if relaxed_valid:
+                        for s in relaxed_valid:
+                            s["round_force_coverage"] = True
+                        valid = relaxed_valid
+                        if self._should_log("round-force-coverage", 20):
+                            top = relaxed_valid[0]
+                            print(
+                                f"{Y}[ROUND-FORCE]{RS} coverage fallback -> "
+                                f"{top['asset']} {top['duration']}m {top['side']} score={top['score']} "
+                                f"g={self._signal_growth_score(top):+.3f}"
+                            )
+                if ENABLE_5M and (not self._enable_5m_runtime) and valid and not (PROFIT_PUSH_MODE and PROFIT_PUSH_ADAPTIVE_MODE):
+                    pre_n = len(valid)
+                    valid = [s for s in valid if int(s.get("duration", 0) or 0) > 5]
+                    if pre_n != len(valid) and self._should_log("5m-guard-filter", 20):
+                        print(
+                            f"{Y}[5M-GUARD]{RS} filtered {pre_n-len(valid)} x 5m signals "
+                            f"(runtime OFF)"
+                        )
+                if valid:
+                    best = valid[0]
+                    other_strs = " | others: " + ", ".join(s["asset"] + "=" + str(s["score"]) for s in valid[1:]) if len(valid) > 1 else ""
+                    best_sig = f"{best.get('cid','')}|{best['asset']}|{best['side']}|{best['score']}"
+                    now_log = _time.time()
+                    should_emit_best = (
+                        (
+                            best_sig != self._last_round_best
+                            and (now_log - self._last_round_best_ts) >= max(LOG_ROUND_SIGNAL_MIN_SEC, float(LOG_ROUND_SIGNAL_EVERY_SEC))
+                        )
+                        or self._should_log("round-best-heartbeat", LOG_ROUND_SIGNAL_EVERY_SEC)
+                    )
+                    if should_emit_best:
+                        self._last_round_best = best_sig
+                        self._last_round_best_ts = now_log
+                        print(f"{B}[ROUND] Best signal: {best['asset']} {best['side']} score={best['score']}{other_strs}{RS}")
+                elif self._should_log("round-empty", LOG_ROUND_EMPTY_EVERY_SEC):
+                    print(f"{Y}[ROUND]{RS} no executable signal")
+                    print(
+                        f"{Y}[ROUND-DIAG]{RS} eligible={eligible_started} candidates={len(candidates)} "
+                        f"blocked_seen={blocked_seen} pending_redeem={len(self.pending_redeem)} "
+                        f"open_onchain={self.onchain_open_count} enable_5m={ENABLE_5M}/{self._enable_5m_runtime}"
+                    )
+                active_pending = {c: (m2, t) for c, (m2, t) in self.pending.items() if m2.get("end_ts", 0) > now}
+                shadow_pending = dict(active_pending)
+                slots = max(0, MAX_OPEN - len(active_pending))
+                to_exec = []
+                selected = sorted(valid, key=self._signal_growth_score, reverse=True)
+                if FORCE_TRADE_EVERY_ROUND and selected:
+                    cap = max(1, min(6, ROUND_MAX_TRADES))
+                    if cap <= 1:
+                        selected = selected[:1]
+                    else:
+                        first = selected[0]
+                        filtered = [first]
+                        for cand in selected[1:]:
+                            if len(filtered) >= cap:
+                                break
+                            if self._allow_second_round_trade(cand, first):
+                                filtered.append(cand)
+                        selected = filtered
+                if ROUND_BEST_ONLY and valid:
+                    best_5m = max((s for s in valid if s.get("duration", 0) <= 5), key=self._signal_growth_score, default=None)
+                    best_15m = max((s for s in valid if s.get("duration", 0) > 5), key=self._signal_growth_score, default=None)
+                    selected = [s for s in (best_5m, best_15m) if s is not None]
+                    if selected:
+                        picks = " | ".join(
+                            f"{s['asset']} {s['duration']}m {s['side']} g={self._signal_growth_score(s):+.3f}"
+                            for s in selected
+                        )
+                        now_log = _time.time()
+                        should_emit_pick = (
+                            (
+                                picks != self._last_round_pick
+                                and (now_log - self._last_round_pick_ts) >= max(LOG_ROUND_SIGNAL_MIN_SEC, float(LOG_ROUND_SIGNAL_EVERY_SEC))
+                            )
+                            or self._should_log("round-pick-heartbeat", LOG_ROUND_SIGNAL_EVERY_SEC)
+                        )
+                        if should_emit_pick:
+                            self._last_round_pick = picks
+                            self._last_round_pick_ts = now_log
+                            print(f"{B}[ROUND-PICK]{RS} {picks}")
+                consensus_side_15m = None
+                if ROUND_CONSENSUS_15M_ENABLED:
+                    up_votes = 0
+                    dn_votes = 0
+                    move_sum = 0.0
+                    # Use all active 15m markets (not just untraded candidates) for a fuller macro picture.
+                    _cons_mkts = list(self.active_mkts.values()) if self.active_mkts else candidates
+                    for m in _cons_mkts:
+                        if int(m.get("duration", 0) or 0) < 15:
+                            continue
+                        _cid_c  = m.get("conditionId", "")
+                        _asset_c = m.get("asset", "")
+                        op = float(self.open_prices.get(_cid_c, 0.0) or 0.0)
+                        cur = float(self.prices.get(_asset_c, 0) or 0.0) or float(self.cl_prices.get(_asset_c, 0) or 0.0)
+                        if op <= 0 or cur <= 0:
+                            continue
+                        rel = (cur - op) / max(op, 1e-9)
+                        move_sum += rel
+                        if cur >= op:
+                            up_votes += 1
+                        else:
+                            dn_votes += 1
+                    net = abs(up_votes - dn_votes)
+                    if net >= max(1, ROUND_CONSENSUS_MIN_NET):
+                        consensus_side_15m = "Up" if up_votes > dn_votes else "Down"
+                    else:
+                        move_thr = max(0.0, float(ROUND_CONSENSUS_MOVE_BPS or 0.0)) / 10000.0
+                        if abs(move_sum) >= move_thr and (up_votes + dn_votes) >= 2:
+                            consensus_side_15m = "Up" if move_sum > 0 else "Down"
+                    if consensus_side_15m and self._should_log("round-consensus-15m", LOG_ROUND_SIGNAL_EVERY_SEC):
+                        print(
+                            f"{B}[CONSENSUS]{RS} 15m side={consensus_side_15m} "
+                            f"(up={up_votes} down={dn_votes} net={net} move={(move_sum*100):+.3f}%)"
+                        )
+                blackout_ev = self._macro_blackout_active()
+                if blackout_ev:
+                    if self._should_log("macro-blackout", 120):
+                        print(f"{Y}[MACRO-BLACKOUT]{RS} skipping trades — {blackout_ev} event window active")
+                for sig in selected:
+                    if len(to_exec) >= slots:
+                        break
+                    if blackout_ev:
+                        continue
+                    if (
+                        consensus_side_15m
+                        and int(sig.get("duration", 0) or 0) >= 15
+                        and str(sig.get("side", "") or "") != consensus_side_15m
+                    ):
+                        if ROUND_CONSENSUS_STRICT_15M:
+                            self._skip_tick("consensus_contra")
+                            continue
+                        over = (
+                            int(sig.get("score", 0) or 0) >= ROUND_CONSENSUS_OVERRIDE_SCORE
+                            and float(sig.get("edge", 0.0) or 0.0) >= ROUND_CONSENSUS_OVERRIDE_EDGE
+                        )
+                        if not over:
+                            self._skip_tick("consensus_contra")
+                            continue
+                    if not self._exposure_ok(sig, shadow_pending):
+                        continue
+                    if not TRADE_ALL_MARKETS:
+                        pending_up = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Up")
+                        pending_dn = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Down")
+                        if sig["side"] == "Up" and pending_up >= MAX_SAME_DIR:
+                            continue
+                        if sig["side"] == "Down" and pending_dn >= MAX_SAME_DIR:
+                            continue
+                        # Unified direction: correlated assets move together — never hold Up + Down simultaneously
+                        if pending_dn > 0 and sig["side"] == "Up":   continue
+                        if pending_up > 0 and sig["side"] == "Down":  continue
+                    # NOTE: correlated Kelly sizing is handled by ROUND_CORR_SAME_SIDE_DECAY in execution path.
+                    # Removed scan_loop 1/sqrt(N) division to avoid double-applying the same reduction.
+                    to_exec.append(sig)
+                    m_sig = sig.get("m", {}) if isinstance(sig.get("m", {}), dict) else {}
+                    t_sig = {
+                        "side": sig.get("side", ""),
+                        "size": float(sig.get("size", 0.0) or 0.0),
+                        "asset": sig.get("asset", ""),
+                        "duration": int(sig.get("duration", 0) or 0),
+                        "end_ts": float(m_sig.get("end_ts", now + 60) or (now + 60)),
+                    }
+                    shadow_pending[f"__pick__{len(to_exec)}"] = (m_sig, t_sig)
+                if to_exec:
+                    await asyncio.gather(*[self._execute_trade(sig) for sig in to_exec])
+
+            await asyncio.sleep(SCAN_INTERVAL)
+          except Exception as e:
+            print(f"{R}[SCAN] Error (continuing): {e}{RS}")
+            await asyncio.sleep(SCAN_INTERVAL)
+
+    async def _refresh_balance(self):
+        """Always sync bankroll, trades and win rate from on-chain truth.
+        Never skips — no local accounting assumptions."""
+        USDC_E = USDC_E_ADDR
+        ERC20_ABI = [{"inputs":[{"name":"account","type":"address"}],
+                      "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
+                      "stateMutability":"view","type":"function"}]
+        usdc_contract = None
+        addr_cs = None
+        if self.w3 is not None:
+            try:
+                usdc_contract = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(USDC_E), abi=ERC20_ABI
+                )
+                addr_cs = Web3.to_checksum_address(ADDRESS)
+            except Exception:
+                pass
+
+        tick = 0
+        while True:
+            await asyncio.sleep(max(0.8, ONCHAIN_SYNC_SEC))
+            if DRY_RUN or self.w3 is None:
+                continue
+            # Skip API calls if data-api is in 429 backoff — don't compound rate limits
+            _data_api_backoff = self._http_429_backoff.get("data-api.polymarket.com", 0.0)
+            if _data_api_backoff > _time.time():
+                continue
+            tick += 1
+            try:
+                loop = asyncio.get_running_loop()
+
+                # 1) On-chain wallet USDC + Polymarket positions fetched in parallel.
+                usdc_task = (
+                    loop.run_in_executor(
+                        None, lambda: usdc_contract.functions.balanceOf(addr_cs).call()
+                    )
+                    if usdc_contract and addr_cs
+                    else asyncio.sleep(0, result=0)
+                )
+                positions_open_task = self._http_get_json(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "false"},
+                    timeout=10,
+                )
+                positions_redeem_task = self._http_get_json(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "true"},
+                    timeout=10,
+                )
+                usdc_raw, positions_open, positions_redeem = await asyncio.gather(
+                    usdc_task, positions_open_task, positions_redeem_task
+                )
+                usdc = float(usdc_raw or 0) / 1e6
+                if not isinstance(positions_open, list):
+                    positions_open = []
+                if not isinstance(positions_redeem, list):
+                    positions_redeem = []
+                positions = positions_open + positions_redeem
+                now_ts = datetime.now(timezone.utc).timestamp()
+
+                # 2) On-chain-backed open/settling valuation from positions feed.
+                open_val = 0.0
+                open_stake_total = 0.0
+                open_count = 0
+                settling_claim_val = 0.0
+                settling_claim_count = 0
+                onchain_open_cids = set()
+                onchain_open_usdc_by_cid = {}
+                onchain_open_stake_by_cid = {}
+                onchain_open_shares_by_cid = {}
+                onchain_open_meta_by_cid = {}
+                onchain_settling_usdc_by_cid = {}
+                for p in positions:
+                    cid = str(p.get("conditionId", "") or "")
+                    if not cid:
+                        continue
+                    side = self._normalize_side_label(str(p.get("outcome", "") or ""))
+                    val = float(p.get("currentValue", 0) or 0.0)
+                    size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    spent_probe = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            spent_probe = vv
+                            break
+                    # Open position presence must be on-chain truth (shares/spent), not mark-only.
+                    has_open_presence = (
+                        size_tok > 0
+                        or spent_probe >= OPEN_PRESENCE_MIN
+                        or val >= OPEN_PRESENCE_MIN
+                    )
+                    if not side or not has_open_presence:
+                        continue
+                    title = str(p.get("title", "") or "")
+                    redeemable = bool(p.get("redeemable", False))
+                    # Filter expired worthless positions: losing tokens have size_tok>0 but val≈0
+                    # and are never marked redeemable by Polymarket — use 90s grace (not 1200s)
+                    # to stop them counting as "open" for 20 minutes after round end.
+                    if (not redeemable) and val < OPEN_PRESENCE_MIN:
+                        if self._is_historical_expired_position(p, now_ts, grace_sec=90.0):
+                            continue
+                    if redeemable:
+                        # Ignore dust/zero redeemables to avoid huge stale settling queues.
+                        if val < 0.01:
+                            continue
+                        settling_claim_val += val
+                        settling_claim_count += 1
+                        onchain_settling_usdc_by_cid[cid] = round(
+                            float(onchain_settling_usdc_by_cid.get(cid, 0.0) or 0.0) + val, 6
+                        )
+                        # Fast on-chain-first settle queue: don't wait for slower scan loops.
+                        if cid not in self.pending_redeem and cid not in self.redeemed_cids:
+                            asset = (
+                                "BTC" if "Bitcoin" in title else
+                                "ETH" if "Ethereum" in title else
+                                "SOL" if "Solana" in title else
+                                "XRP" if "XRP" in title else "?"
+                            )
+                            avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
+                            size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                            spent_guess = 0.0
+                            for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                                vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                                if vv > 0:
+                                    spent_guess = vv
+                                    break
+                            if spent_guess <= 0 and size_tok > 0 and avg_px > 0:
+                                spent_guess = size_tok * avg_px
+                            if spent_guess <= 0:
+                                spent_guess = val
+                            m_s = {"conditionId": cid, "question": title, "asset": asset}
+                            t_s = {
+                                "side": side,
+                                "asset": asset,
+                                "size": spent_guess,
+                                "entry": (avg_px if avg_px > 0 else 0.5),
+                                "duration": 0,
+                                "mkt_price": 0.5,
+                                "mins_left": 0,
+                                "open_price": 0,
+                                "token_id": "",
+                                "order_id": "ONCHAIN-REDEEM-QUEUE",
+                            }
+                            self.pending.pop(cid, None)
+                            self.pending_redeem[cid] = (m_s, t_s)
+                            self._redeem_queued_ts[cid] = _time.time()
+                            print(
+                                f"{G}[ONCHAIN-REDEEM-QUEUE]{RS} {title[:45]} {side} "
+                                f"~${val:.2f} | cid={self._short_cid(cid)}"
+                            )
+                        continue
+                    size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
+                    stake_guess = 0.0
+                    stake_src = "value_fallback"
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            stake_guess = vv
+                            stake_src = k_st
+                            break
+                    if stake_guess <= 0 and size_tok > 0 and avg_px > 0:
+                        stake_guess = size_tok * avg_px
+                        stake_src = "size_x_avgPrice"
+                    if stake_guess <= 0:
+                        stake_guess = val
+                        stake_src = "value_fallback"
+                    open_val += val
+                    open_count += 1
+                    onchain_open_cids.add(cid)
+                    onchain_open_usdc_by_cid[cid] = round(
+                        float(onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0) + val, 6
+                    )
+                    if size_tok > 0:
+                        onchain_open_shares_by_cid[cid] = round(
+                            float(onchain_open_shares_by_cid.get(cid, 0.0) or 0.0) + size_tok, 6
+                        )
+                    open_stake_total += stake_guess
+                    onchain_open_stake_by_cid[cid] = round(
+                        float(onchain_open_stake_by_cid.get(cid, 0.0) or 0.0) + stake_guess, 6
+                    )
+                    prev_meta = onchain_open_meta_by_cid.get(cid) or {}
+                    if (not prev_meta) or (val >= float(prev_meta.get("value", 0.0) or 0.0)):
+                        asset = (
+                            "BTC" if "Bitcoin" in title else
+                            "ETH" if "Ethereum" in title else
+                            "SOL" if "Solana" in title else
+                            "XRP" if "XRP" in title else "?"
+                        )
+                        start_ts = 0.0
+                        end_ts = 0.0
+                        for ks in ("eventStartTime", "startDate", "start_date"):
+                            s = p.get(ks)
+                            if isinstance(s, str) and s:
+                                try:
+                                    start_ts = datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+                                    break
+                                except Exception:
+                                    pass
+                        for ke in ("endDate", "end_date", "eventEndTime"):
+                            s = p.get(ke)
+                            if isinstance(s, str) and s:
+                                try:
+                                    end_ts = datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+                                    break
+                                except Exception:
+                                    pass
+                        q_st, q_et = self._round_bounds_from_question(title)
+                        if q_st > 0 and q_et > q_st:
+                            start_ts, end_ts = q_st, q_et
+                        elif end_ts <= 0 and q_et > 0:
+                            end_ts = q_et
+                        if start_ts <= 0 and q_st > 0:
+                            start_ts = q_st
+                        dur_guess = 15
+                        if start_ts > 0 and end_ts > start_ts:
+                            dur_guess = max(1, int(round((end_ts - start_ts) / 60.0)))
+                        # Keep stake stable across refreshes (avoid value-driven oscillation).
+                        stable_stake = stake_guess
+                        prev_stake = float(prev_meta.get("stake_usdc", 0.0) or 0.0)
+                        if prev_stake > 0 and stable_stake <= 0:
+                            stable_stake = prev_stake
+                        elif prev_stake > 0 and stable_stake > 0:
+                            stable_stake = max(prev_stake, stable_stake)
+                        open_ref = float(self._open_price_by_cid(cid) or 0.0)
+                        if open_ref <= 0 and asset in ("BTC", "ETH", "SOL", "XRP") and start_ts > 0 and end_ts > start_ts:
+                            try:
+                                pm_ref = float(await self._get_polymarket_open_price(asset, start_ts, end_ts, dur_guess) or 0.0)
+                            except Exception:
+                                pm_ref = 0.0
+                            if pm_ref > 0:
+                                self.open_prices[cid] = pm_ref
+                                self.open_prices_source[cid] = "PM"
+                                open_ref = pm_ref
+                        onchain_open_meta_by_cid[cid] = {
+                            "title": title,
+                            "side": side,
+                            "asset": asset,
+                            "entry": float(p.get("avgPrice", 0.5) or 0.5),
+                            "open_price": float(open_ref or 0.0),
+                            "stake_usdc": round(stable_stake, 6),
+                            "stake_source": stake_src,
+                            "shares": round(size_tok, 6),
+                            "duration": dur_guess,
+                            "start_ts": float(start_ts if start_ts > 0 else 0.0),
+                            "end_ts": float(end_ts if end_ts > 0 else 0.0),
+                            "value": val,
+                        }
+
+                # On-chain accounting view:
+                # - open_positions tracks total stake still at risk (spent, not settled)
+                # - open_mark tracks current mark-to-market value of those positions
+                total = round(usdc + open_stake_total + settling_claim_val, 2)
+                self.onchain_wallet_usdc = round(usdc, 2)
+                self.onchain_open_positions = round(open_stake_total, 2)
+                self.onchain_usdc_balance = round(usdc, 2)
+                self.onchain_open_stake_total = round(open_stake_total, 2)
+                self.onchain_redeemable_usdc = round(settling_claim_val, 2)
+                self.onchain_open_mark_value = round(open_val, 2)
+                self.onchain_open_cids = set(onchain_open_cids)
+                self.onchain_open_usdc_by_cid = dict(onchain_open_usdc_by_cid)
+                self.onchain_open_stake_by_cid = dict(onchain_open_stake_by_cid)
+                self.onchain_open_shares_by_cid = dict(onchain_open_shares_by_cid)
+                self.onchain_open_meta_by_cid = dict(onchain_open_meta_by_cid)
+                # Prune stale/zero-value pending redeem entries that are not claimable on-chain now.
+                stale_redeem = 0
+                for cid_q, val_q in list(self.pending_redeem.items()):
+                    if cid_q in onchain_settling_usdc_by_cid:
+                        continue
+                    t_q = val_q[1] if isinstance(val_q, tuple) and len(val_q) > 1 and isinstance(val_q[1], dict) else {}
+                    q_size = self._as_float(t_q.get("size", 0.0), 0.0)
+                    if q_size > 0.0:
+                        continue
+                    self.pending_redeem.pop(cid_q, None)
+                    stale_redeem += 1
+                if stale_redeem:
+                    print(f"{Y}[SYNC]{RS} pruned stale pending_redeem: {stale_redeem}")
+                # Count unique CIDs for stable on-chain open/settling counters.
+                open_count = len(onchain_open_cids)
+                settling_claim_count = len(onchain_settling_usdc_by_cid)
+                self.onchain_open_count = int(open_count)
+                self.onchain_redeemable_count = int(settling_claim_count)
+                self.onchain_settling_usdc_by_cid = dict(onchain_settling_usdc_by_cid)
+                self.onchain_total_equity = total
+                self.onchain_snapshot_ts = _time.time()
+                self._save_open_state_cache(force=False)
+                bank_state = (
+                    round(usdc, 2),
+                    round(open_stake_total, 2),
+                    int(open_count),
+                    round(settling_claim_val, 2),
+                    int(settling_claim_count),
+                    round(total, 2),
+                )
+                prev_bank_state = self._bank_state_last
+                state_changed = prev_bank_state is None or any(
+                    abs(float(a) - float(b)) >= LOG_BANK_MIN_DELTA
+                    if isinstance(a, (int, float)) and isinstance(b, (int, float))
+                    else a != b
+                    for a, b in zip(bank_state, prev_bank_state)
+                )
+                if state_changed or self._should_log("bank-heartbeat", LOG_BANK_EVERY_SEC):
+                    print(
+                        f"{B}[BANK]{RS} on-chain USDC=${usdc:.2f}  "
+                        f"open_positions(stake)=${open_stake_total:.2f} ({open_count})  "
+                        f"open_mark=${open_val:.2f}  "
+                        f"settling_claimable=${settling_claim_val:.2f} ({settling_claim_count})  "
+                        f"total=${total:.2f}"
+                    )
+                self._bank_state_last = bank_state
+                if total > 0:
+                    # M-7: guard against API-lag deflation (open stakes not yet indexed)
+                    if (
+                        self.bankroll > 0
+                        and open_stake_total == 0
+                        and total < self.bankroll * 0.85
+                    ):
+                        pass  # skip — likely a momentary API miss; keep current bankroll
+                    else:
+                        self.bankroll = total
+                    if total > self.peak_bankroll:
+                        self.peak_bankroll = total
+                    if not self._pnl_baseline_locked:
+                        self.start_bank = total
+                        self._pnl_baseline_locked = True
+                        self._pnl_baseline_ts = datetime.now(timezone.utc).isoformat()
+                        self._save_pnl_baseline(total, usdc)
+                        print(
+                            f"{B}[P&L-BASELINE]{RS} set on-chain baseline=${total:.2f} "
+                            f"at {self._pnl_baseline_ts}"
+                        )
+
+                # 3. API recovery/stats only (does not drive bankroll valuation)
+                api_active_cids = set()
+                for p in positions:
+                    if p.get("redeemable", False):
+                        continue
+                    cid_p = p.get("conditionId", "")
+                    side_p = self._normalize_side_label(p.get("outcome", ""))
+                    if not cid_p or not side_p:
+                        continue
+                    val_p = float(p.get("currentValue", 0) or 0.0)
+                    size_p = self._as_float(p.get("size", 0.0), 0.0)
+                    spent_p = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            spent_p = vv
+                            break
+                    if self._is_historical_expired_position(p, now_ts) and val_p < OPEN_PRESENCE_MIN:
+                        continue
+                    if (size_p > 0) or (spent_p >= OPEN_PRESENCE_MIN) or (val_p >= OPEN_PRESENCE_MIN):
+                        api_active_cids.add(cid_p)
+                # On-chain-first cleanup: if a local pending CID is neither on-chain nor API-active
+                # after a grace window, it is stale and removed from local state.
+                prune_n = 0
+                for cid, (m_p, t_p) in list(self.pending.items()):
+                    if cid in onchain_open_cids or cid in self.pending_redeem or cid in api_active_cids:
+                        self._pending_absent_counts.pop(cid, None)
+                        continue
+                    placed_ts = float(t_p.get("placed_ts", 0) or 0)
+                    if placed_ts > 0 and (now_ts - placed_ts) < 90:
+                        self._pending_absent_counts.pop(cid, None)
+                        continue
+                    # Keep very fresh windows briefly even without placed_ts.
+                    end_ts = float(m_p.get("end_ts", 0) or 0)
+                    if end_ts > 0 and (end_ts - now_ts) > 0 and (end_ts - now_ts) < 90:
+                        self._pending_absent_counts.pop(cid, None)
+                        continue
+                    # On-chain/API indexers can lag; never prune immediately around expiry.
+                    # Require the market to be clearly stale in wall-clock terms first.
+                    if end_ts > 0 and now_ts < (end_ts + 600):
+                        self._pending_absent_counts.pop(cid, None)
+                        continue
+                    miss_n = int(self._pending_absent_counts.get(cid, 0)) + 1
+                    self._pending_absent_counts[cid] = miss_n
+                    # Only prune after multiple consecutive absent checks.
+                    if miss_n < 3:
+                        continue
+                    self.pending.pop(cid, None)
+                    self._pending_absent_counts.pop(cid, None)
+                    prune_n += 1
+                if prune_n:
+                    self._save_pending()
+                    print(f"{Y}[SYNC] pruned stale local pending: {prune_n} (absent on-chain/API){RS}")
+                # Recover any on-chain positions not tracked in pending (every tick = 30s)
+                for p in positions:
+                    cid  = p.get("conditionId", "")
+                    rdm  = p.get("redeemable", False)
+                    val  = float(p.get("currentValue", 0))
+                    side = self._normalize_side_label(p.get("outcome", ""))
+                    title = p.get("title", "")
+                    rec_size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    rec_spent_probe = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            rec_spent_probe = vv
+                            break
+                    rec_present = (
+                        rec_size_tok > 0
+                        or rec_spent_probe >= OPEN_PRESENCE_MIN
+                        or val >= OPEN_PRESENCE_MIN
+                    )
+                    if rdm or not side or not cid or not rec_present:
+                        continue
+                    if self._is_historical_expired_position(p, now_ts) and val < OPEN_PRESENCE_MIN:
+                        continue
+                    if cid in self.pending or cid in self.pending_redeem:
+                        continue
+                    if cid in self.redeemed_cids:
+                        continue   # already processed — don't re-add to pending
+                    # Position exists on-chain but bot has no record — recover it
+                    asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                             else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+                    # Resolve round bounds and tokens from cache (Gamma only on first miss).
+                    end_ts = 0
+                    start_ts = now_ts - 60
+                    duration = 15
+                    token_up = token_down = ""
+                    meta_c = await self._cid_market_cached(cid)
+                    if meta_c:
+                        duration = int(meta_c.get("duration", duration) or duration)
+                        asset = str(meta_c.get("asset", asset) or asset)
+                        start_ts = float(meta_c.get("start_ts", start_ts) or start_ts)
+                        end_ts = float(meta_c.get("end_ts", end_ts) or end_ts)
+                        token_up = str(meta_c.get("token_up", "") or "")
+                        token_down = str(meta_c.get("token_down", "") or "")
+                    q_st, q_et = self._round_bounds_from_question(title)
+                    if self._is_exact_round_bounds(q_st, q_et, duration):
+                        start_ts, end_ts = q_st, q_et
+                    elif q_et > 0 and q_et <= now_ts:
+                        end_ts = q_et
+                    if end_ts > 0 and end_ts <= now_ts:
+                        stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
+                        if stored_end > now_ts:
+                            end_ts = stored_end  # trust stored real end_ts
+                        elif end_ts % 86400 < 3600:  # midnight UTC — Gamma sent date-only, false expiry
+                            if not self._is_exact_round_bounds(start_ts, end_ts, duration):
+                                end_ts = now_ts + duration * 60
+                        # else: genuinely expired — keep real end_ts; _resolve() queues immediately
+                    if end_ts == 0:
+                        end_ts = now_ts + duration * 60
+                    mins_left = (end_ts - now_ts) / 60
+                    open_p, _ = await self._get_chainlink_at(asset, start_ts) if start_ts > 0 else (0, "")
+                    m_r = {"conditionId": cid, "question": title, "asset": asset,
+                           "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
+                           "up_price": 0.5, "mins_left": mins_left,
+                           "token_up": token_up, "token_down": token_down}
+                    rec_avg_px = self._as_float(p.get("avgPrice", 0.0), 0.0)
+                    rec_size_tok = self._as_float(p.get("size", 0.0), 0.0)
+                    rec_spent = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(p.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            rec_spent = vv
+                            break
+                    if rec_spent <= 0 and rec_size_tok > 0 and rec_avg_px > 0:
+                        rec_spent = rec_size_tok * rec_avg_px
+                    if rec_spent <= 0:
+                        rec_spent = val
+                    rec_entry = rec_avg_px if rec_avg_px > 0 else 0.5
+                    t_r = {"side": side, "size": rec_spent, "entry": rec_entry,
+                           "open_price": open_p, "current_price": 0, "true_prob": 0.5,
+                           "mkt_price": 0.5, "edge": 0, "mins_left": mins_left,
+                           "end_ts": end_ts, "asset": asset, "duration": duration,
+                           "token_id": token_up if side == "Up" else token_down,
+                           "order_id": "RECOVERED",
+                           "core_position": True,
+                           "core_entry_locked": True,
+                           "core_entry": rec_entry,
+                           "core_size_usdc": rec_spent,
+                           "addon_count": 0,
+                           "addon_stake_usdc": 0.0}
+                    self.pending[cid] = (m_r, t_r)
+                    self.seen.add(cid)
+                    self._save_pending()
+                    print(
+                        f"{G}[RECOVER]{RS} Added to pending: {title[:40]} {side} "
+                        f"spent=${rec_spent:.2f} mark=${val:.2f} entry={rec_entry:.3f} "
+                        f"| open={open_p:.2f} | {mins_left:.1f}min left"
+                    )
+
+                # 4. Sync trades + win rate from Polymarket activity API (every 5 ticks ~2.5min)
+                if tick % 5 == 1:
+                    await self._sync_stats_from_api()
+
+            except Exception as e:
+                _es = str(e).lower()
+                if "429" in _es or "backoff active" in _es:
+                    pass  # 429 backoff is expected when other loops hit rate limit — not an error
+                else:
+                    self._errors.tick("refresh_balance", print, err=e, every=10)
+                    print(f"{Y}[BANK] refresh error: {e}{RS}")
+
+    async def _sync_stats_from_api(self):
+        """Sync win/loss stats from Polymarket activity API (on-chain truth).
+        BUY = bet placed, REDEEM = win. Also syncs recent_trades deque for last-5 gate."""
+        try:
+            activity = await self._http_get_json(
+                "https://data-api.polymarket.com/activity",
+                params={"user": ADDRESS, "limit": "500"},
+                timeout=10,
+            )
+            if not isinstance(activity, list):
+                return
+
+            # Group by conditionId, preserving order (API returns newest first)
+            by_cid = {}
+            order  = []   # conditionIds in newest-first order
+            for evt in activity:
+                typ = (evt.get("type") or "").upper()
+                cid = evt.get("conditionId") or evt.get("market", {}).get("conditionId", "")
+                if not cid:
+                    continue
+                if cid not in by_cid:
+                    by_cid[cid] = {"buy": False, "redeem": False}
+                    order.append(cid)
+                if typ in ("BUY", "TRADE", "PURCHASE"):
+                    by_cid[cid]["buy"] = True
+                elif typ == "REDEEM":
+                    by_cid[cid]["redeem"] = True
+
+            total_bets = sum(1 for d in by_cid.values() if d["buy"])
+            total_wins = sum(1 for d in by_cid.values() if d["buy"] and d["redeem"])
+
+            # Last 5 COMPLETED bets from API (skip still-open/settling positions)
+            api_last5 = []
+            for cid in order:
+                if len(api_last5) >= 5:
+                    break
+                if not by_cid[cid]["buy"]:
+                    continue
+                if cid in self.pending or cid in self.pending_redeem:
+                    continue  # still active — not resolved yet
+                api_last5.append(1 if by_cid[cid]["redeem"] else 0)
+
+            if total_bets > 0 and total_bets >= self.total:  # never go backwards (API can return partial page)
+                old_t, old_w = self.total, self.wins
+                self.total = total_bets
+                self.wins  = total_wins
+                # Overwrite the tail of recent_trades with API truth (oldest→newest)
+                if api_last5:
+                    api_oldest_first = list(reversed(api_last5))
+                    cur = list(self.recent_trades)
+                    if len(cur) >= len(api_oldest_first):
+                        cur[-len(api_oldest_first):] = api_oldest_first
+                    else:
+                        cur = api_oldest_first
+                    self.recent_trades = deque(cur, maxlen=30)
+                wr  = f"{total_wins/total_bets*100:.1f}%"
+                wr5 = f"{sum(api_last5)/len(api_last5):.0%}" if api_last5 else "–"
+                streak = "".join("W" if x else "L" for x in api_last5)
+                print(f"{B}[STATS] {total_bets} bets {total_wins} wins ({wr}) | "
+                      f"Last{len(api_last5)}={streak} ({wr5}) ← on-chain truth{RS}")
+        except Exception as e:
+            self._errors.tick("sync_stats_api", print, err=e, every=10)
+            print(f"{Y}[STATS] activity sync error: {e}{RS}")
+
+    async def _redeemable_scan(self):
+        """Every 60s, re-scan Polymarket API for redeemable positions not yet queued.
+        Catches winners that weren't on-chain resolved when _sync_redeemable ran at startup."""
+        if DRY_RUN or self.w3 is None:
+            return
+        while True:
+            try:
+                positions = await self._http_get_json(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "true"},
+                    timeout=10,
+                )
+                for pos in positions:
+                    cid        = pos.get("conditionId", "")
+                    redeemable = pos.get("redeemable", False)
+                    val        = float(pos.get("currentValue", 0))
+                    outcome    = self._normalize_side_label(pos.get("outcome", ""))
+                    title      = pos.get("title", "")[:45]
+                    if not redeemable or val < 0.01 or not outcome or not cid:
+                        continue
+                    if cid in self.pending_redeem:
+                        continue
+                    if cid in self.redeemed_cids:
+                        continue
+                    asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                             else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+                    m_s = {"conditionId": cid, "question": title}
+                    t_s = {"side": outcome, "asset": asset, "size": val, "entry": 0.5,
+                           "duration": 0, "mkt_price": 0.5, "mins_left": 0,
+                           "open_price": 0, "token_id": "", "order_id": "SCAN"}
+                    self.pending.pop(cid, None)   # remove from pending — _redeem_loop now owns it
+                    self.pending_redeem[cid] = (m_s, t_s)
+                    print(f"{G}[SCAN-REDEEM] Queued: {title} {outcome} ~${val:.2f}{RS}")
+            except Exception as e:
+                _es = str(e).lower()
+                if "429" not in _es and "backoff active" not in _es:
+                    self._errors.tick("redeemable_scan", print, err=e, every=10)
+                    print(f"{Y}[SCAN-REDEEM] Error: {e}{RS}")
+            await asyncio.sleep(REDEEMABLE_SCAN_SEC)
+
+    async def _force_redeem_backfill_loop(self):
+        """Periodic backfill: force redeem resolved winners from recent activity.
+        Prevents missed redeems when pending tracking is incomplete."""
+        if DRY_RUN or self.w3 is None:
+            return
+        cfg      = get_contract_config(CHAIN_ID, neg_risk=False)
+        ctf_addr = Web3.to_checksum_address(cfg.conditional_tokens)
+        collat   = Web3.to_checksum_address(cfg.collateral)
+        acct     = Account.from_key(PRIVATE_KEY)
+        ctf = self.w3.eth.contract(address=ctf_addr, abi=[
+            {"inputs":[{"name":"collateralToken","type":"address"},
+                       {"name":"parentCollectionId","type":"bytes32"},
+                       {"name":"conditionId","type":"bytes32"},
+                       {"name":"indexSets","type":"uint256[]"}],
+             "name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"name":"conditionId","type":"bytes32"}],
+             "name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"conditionId","type":"bytes32"},{"name":"index","type":"uint256"}],
+             "name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],
+             "stateMutability":"view","type":"function"},
+        ])
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                activity = await self._http_get_json(
+                    "https://data-api.polymarket.com/activity",
+                    params={"user": ADDRESS, "limit": "600"},
+                    timeout=12,
+                )
+                if not isinstance(activity, list):
+                    continue
+
+                by_cid = {}
+                for evt in activity:
+                    cid = evt.get("conditionId") or ""
+                    if not cid:
+                        continue
+                    typ = (evt.get("type") or "").upper()
+                    d = by_cid.setdefault(cid, {"redeem": False, "net": {}, "title": evt.get("title", "")})
+                    if typ == "REDEEM":
+                        d["redeem"] = True
+                    elif typ in ("BUY", "TRADE", "PURCHASE"):
+                        outcome = self._normalize_side_label(evt.get("outcome") or "")
+                        if not outcome:
+                            continue
+                        side = (evt.get("side") or "BUY").upper()
+                        size = float(evt.get("size") or 0.0)
+                        if size <= 0:
+                            continue
+                        prev = d["net"].get(outcome, 0.0)
+                        d["net"][outcome] = prev + (size if side == "BUY" else -size)
+
+                attempts = 0
+                for cid, d in by_cid.items():
+                    if attempts >= 8:  # bound each cycle
+                        break
+                    if d["redeem"] or cid in self.redeemed_cids:
+                        continue
+                    cid_bytes = bytes.fromhex(cid.lstrip("0x").zfill(64))
+                    try:
+                        denom = await loop.run_in_executor(None, lambda b=cid_bytes: ctf.functions.payoutDenominator(b).call())
+                        if denom == 0:
+                            continue
+                        n0 = await loop.run_in_executor(None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 0).call())
+                        n1 = await loop.run_in_executor(None, lambda b=cid_bytes: ctf.functions.payoutNumerators(b, 1).call())
+                    except Exception:
+                        continue
+                    if n0 > 0 and n1 == 0:
+                        winner = "Up"
+                    elif n1 > 0 and n0 == 0:
+                        winner = "Down"
+                    else:
+                        continue
+                    held = d["net"].get(winner, 0.0)
+                    if held <= 0.0001:
+                        continue
+                    idx = 1 if winner == "Up" else 2
+                    if not await self._is_redeem_claimable(
+                        ctf=ctf, collat=collat, acct_addr=acct.address,
+                        cid_bytes=cid_bytes, index_set=idx, loop=loop
+                    ):
+                        continue
+                    try:
+                        tx_hash = await self._submit_redeem_tx(
+                            ctf=ctf, collat=collat, acct=acct,
+                            cid_bytes=cid_bytes, index_set=idx, loop=loop
+                        )
+                        attempts += 1
+                        self.redeemed_cids.add(cid)
+                        self.wins += 1; self.total += 1   # H-6: record silent win in stats
+                        self._log_onchain_event("RESOLVE-BACKFILL", cid, {
+                            "side": winner, "result": "WIN",
+                            "held_shares": round(held, 4),
+                            "title": d.get("title", "")[:40],
+                        })
+                        print(
+                            f"{G}[FORCE-REDEEM]{RS} {winner} {d['title'][:36]} | tx={tx_hash[:16]} | "
+                            f"cid={self._short_cid(cid)}"
+                        )
+                    except Exception as e:
+                        print(f"{Y}[FORCE-REDEEM] retry later {self._short_cid(cid)}: {e}{RS}")
+            except Exception as e:
+                self._errors.tick("force_redeem_backfill", print, err=e, every=10)
+                print(f"{Y}[FORCE-REDEEM] Error: {e}{RS}")
+            await asyncio.sleep(FORCE_REDEEM_SCAN_SEC)
+
+    async def _position_sync_loop(self):
+        """Every 5 min: sync on-chain positions to pending — catches any fills the bot missed."""
+        if DRY_RUN:
+            return
+        while True:
+            await asyncio.sleep(300)
+            try:
+                import requests as _req
+                loop = asyncio.get_running_loop()
+                positions = await loop.run_in_executor(None, lambda: _req.get(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "false"}, timeout=10
+                ).json())
+                now = datetime.now(timezone.utc).timestamp()
+                added = 0
+                for pos in positions:
+                    cid  = pos.get("conditionId", "")
+                    rdm  = pos.get("redeemable", False)
+                    val  = float(pos.get("currentValue", 0))
+                    side = self._normalize_side_label(pos.get("outcome", ""))
+                    if rdm or not side or not cid:
+                        continue
+                    self.seen.add(cid)
+                    size_tok = self._as_float(pos.get("size", 0.0), 0.0)
+                    spent_probe = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(pos.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            spent_probe = vv
+                            break
+                    # Presence is based on open shares/spent, not only mark value.
+                    if not ((size_tok > 0) or (spent_probe >= OPEN_PRESENCE_MIN) or (val >= OPEN_PRESENCE_MIN)):
+                        continue
+                    if self._is_historical_expired_position(pos, now, grace_sec=1800.0) and val < OPEN_PRESENCE_MIN:
+                        continue
+                    if cid in self.redeemed_cids:
+                        continue   # already processed — don't re-add
+                    if cid in self.pending or cid in self.pending_redeem:
+                        continue
+                    title = pos.get("title", "")
+                    asset = ("BTC" if "Bitcoin" in title else "ETH" if "Ethereum" in title
+                             else "SOL" if "Solana" in title else "XRP" if "XRP" in title else "?")
+                    # Resolve round bounds/tokens from persistent CID cache.
+                    end_ts = 0
+                    start_ts = now - 60
+                    duration = 15
+                    token_up = token_down = ""
+                    meta_c = await self._cid_market_cached(cid)
+                    if meta_c:
+                        duration = int(meta_c.get("duration", duration) or duration)
+                        asset = str(meta_c.get("asset", asset) or asset)
+                        start_ts = float(meta_c.get("start_ts", start_ts) or start_ts)
+                        end_ts = float(meta_c.get("end_ts", end_ts) or end_ts)
+                        token_up = str(meta_c.get("token_up", "") or "")
+                        token_down = str(meta_c.get("token_down", "") or "")
+                    q_st, q_et = self._round_bounds_from_question(title)
+                    if self._is_exact_round_bounds(q_st, q_et, duration):
+                        start_ts, end_ts = q_st, q_et
+                    elif q_et > 0 and q_et <= now:
+                        end_ts = q_et
+                    # If already expired: check if it's a Gamma date-only midnight UTC false alarm.
+                    if end_ts > 0 and end_ts <= now:
+                        stored_end = self.pending.get(cid, ({},))[0].get("end_ts", 0)
+                        if stored_end > now:
+                            end_ts = stored_end  # trust stored real end_ts
+                        elif end_ts % 86400 < 3600:  # midnight UTC — date-only field, false expiry
+                            if not self._is_exact_round_bounds(start_ts, end_ts, duration):
+                                end_ts = now + duration * 60
+                        # else: genuinely expired — keep real end_ts; _resolve() queues immediately
+                    if end_ts == 0:
+                        print(f"{Y}[SYNC] {title[:40]} — no end_ts from Gamma, skipping{RS}")
+                        continue
+                    mins_left = (end_ts - now) / 60
+                    m_r = {"conditionId": cid, "question": title, "asset": asset,
+                           "duration": duration, "end_ts": end_ts, "start_ts": start_ts,
+                           "up_price": 0.5, "mins_left": mins_left,
+                           "token_up": token_up, "token_down": token_down}
+                    rec_avg_px = self._as_float(pos.get("avgPrice", 0.0), 0.0)
+                    rec_size_tok = self._as_float(pos.get("size", 0.0), 0.0)
+                    rec_spent = 0.0
+                    for k_st in ("initialValue", "costBasis", "totalBought", "amountSpent", "spent"):
+                        vv = self._as_float(pos.get(k_st, 0.0), 0.0)
+                        if vv > 0:
+                            rec_spent = vv
+                            break
+                    if rec_spent <= 0 and rec_size_tok > 0 and rec_avg_px > 0:
+                        rec_spent = rec_size_tok * rec_avg_px
+                    if rec_spent <= 0:
+                        rec_spent = val
+                    rec_entry = rec_avg_px if rec_avg_px > 0 else 0.5
+                    t_r = {"side": side, "size": rec_spent, "entry": rec_entry,
+                           "open_price": 0, "current_price": 0, "true_prob": 0.5,
+                           "mkt_price": 0.5, "edge": 0, "mins_left": mins_left,
+                           "end_ts": end_ts, "asset": asset, "duration": duration,
+                           "token_id": token_up if side == "Up" else token_down,
+                           "order_id": "SYNC-PERIODIC",
+                           "core_position": True,
+                           "core_entry_locked": True,
+                           "core_entry": rec_entry,
+                           "core_size_usdc": rec_spent,
+                           "addon_count": 0,
+                           "addon_stake_usdc": 0.0}
+                    # Verify on-chain before adding — don't trust API alone
+                    _token_id_str = token_up if side == "Up" else token_down
+                    _onchain_bal  = 0
+                    if _token_id_str and self.w3:
+                        try:
+                            _BABI = [{"inputs":[{"name":"owner","type":"address"},{"name":"id","type":"uint256"}],
+                                      "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+                            _ctf_v = self.w3.eth.contract(
+                                address=Web3.to_checksum_address(get_contract_config(CHAIN_ID, neg_risk=False).conditional_tokens),
+                                abi=_BABI)
+                            _onchain_bal = await loop.run_in_executor(
+                                None, lambda ti=int(_token_id_str): _ctf_v.functions.balanceOf(
+                                    Web3.to_checksum_address(ADDRESS), ti).call())
+                        except Exception:
+                            _onchain_bal = -1  # unknown — allow, _verify will catch it
+                    if _onchain_bal == 0 and _token_id_str:
+                        print(f"{Y}[SYNC] Skip recovery (bal=0 on-chain): {title[:35]} {side}{RS}")
+                        continue
+                    if mins_left <= 0:
+                        self.pending_redeem[cid] = (m_r, t_r)
+                        print(
+                            f"{Y}[SYNC]{RS} Recovered->settling: {title[:40]} {side} "
+                            f"spent=${rec_spent:.2f} mark=${val:.2f} entry={rec_entry:.3f} "
+                            f"| {duration}m ended {abs(mins_left):.1f}min ago"
+                        )
+                    else:
+                        self.pending[cid] = (m_r, t_r)
+                        self.seen.add(cid)
+                        added += 1
+                        print(
+                            f"{Y}[SYNC]{RS} Recovered: {title[:40]} {side} "
+                            f"spent=${rec_spent:.2f} mark=${val:.2f} entry={rec_entry:.3f} "
+                            f"| {duration}m ends in {mins_left:.1f}min"
+                        )
+                if added:
+                    self._save_pending()
+                    self._save_seen()
+            except Exception as e:
+                print(f"{Y}[SYNC] position_sync_loop error: {e}{RS}")
+
+    async def _heartbeat_loop(self):
+        """Keep CLOB session warm and open orders alive."""
+        if DRY_RUN:
+            return
+        while True:
+            try:
+                loop = asyncio.get_running_loop()
+                hb_resp = await loop.run_in_executor(
+                    None,
+                    lambda: self.clob.post_heartbeat(self._heartbeat_id),
+                )
+                if isinstance(hb_resp, dict):
+                    next_id = (hb_resp.get("heartbeat_id") or "").strip()
+                    if next_id:
+                        self._heartbeat_id = next_id
+                self._heartbeat_last_ok = _time.time()
+            except Exception as e:
+                # Polymarket heartbeat protocol: first call uses "", then reuse returned heartbeat_id.
+                # On invalid id error, server may return a fresh heartbeat_id in error payload.
+                msg = str(e)
+                m = re.search(r"heartbeat_id['\"]?\s*[:=]\s*['\"]([0-9a-fA-F-]{8,})['\"]", msg)
+                if m:
+                    self._heartbeat_id = m.group(1)
+                self._errors.tick("clob_heartbeat", print, err=e, every=10)
+                if self._should_log("heartbeat-fail", 30):
+                    print(f"{Y}[HEARTBEAT] failed: {e}{RS}")
+            await asyncio.sleep(max(2.0, CLOB_HEARTBEAT_SEC))
+
+    async def _user_events_loop(self):
+        """Near-realtime order status cache from CLOB notifications."""
+        if DRY_RUN or (not USER_EVENTS_ENABLED):
+            return
+        while True:
+            try:
+                loop = asyncio.get_running_loop()
+                rows = await loop.run_in_executor(None, self.clob.get_notifications)
+                if isinstance(rows, dict):
+                    # Different wrappers sometimes return {"data":[...]}
+                    rows = rows.get("data", []) or rows.get("notifications", [])
+                if isinstance(rows, list) and rows:
+                    for r in rows:
+                        oid, st, fs = self._extract_order_event(r)
+                        if oid:
+                            self._cache_order_event(oid, st, fs)
+                    # Acknowledge consumed notifications to keep payload light.
+                    try:
+                        await loop.run_in_executor(None, self.clob.drop_notifications)
+                    except Exception:
+                        pass
+                if len(self._order_event_cache) > 2000:
+                    self._prune_order_event_cache()
+            except Exception as e:
+                self._errors.tick("user_events_loop", print, err=e, every=20)
+            await asyncio.sleep(max(0.25, USER_EVENTS_POLL_SEC))
+
+    async def _health_check(self):
+        now = _time.time()
+
+        # CLOB-WS health: if all active tokens are stale for several checks, force reconnect.
+        if CLOB_MARKET_WS_ENABLED and self.active_mkts:
+            tids = list(self._trade_focus_token_ids() or self._active_token_ids())
+            if tids:
+                ws_age_cap = self._ws_strict_age_cap_ms()
+                stale = [tid for tid in tids if self._clob_ws_book_age_ms(tid) > ws_age_cap]
+                if len(stale) == len(tids):
+                    self._ws_stale_hits += 1
+                    if self._should_log("health-ws-stale", LOG_HEALTH_EVERY_SEC):
+                        age_samples = [self._clob_ws_book_age_ms(t) for t in tids[:3]]
+                        age_s = ", ".join(f"{a:.0f}ms" for a in age_samples)
+                        print(
+                            f"{Y}[HEALTH]{RS} CLOB-WS stale {len(stale)}/{len(tids)} tokens "
+                            f"(samples={age_s} cap={ws_age_cap:.0f}ms) hits={self._ws_stale_hits}"
+                        )
+                    if (
+                        self._ws_stale_hits >= max(1, CLOB_WS_STALE_HEAL_HITS)
+                        and (now - float(self._ws_last_heal_ts or 0.0)) >= CLOB_WS_STALE_HEAL_COOLDOWN_SEC
+                    ):
+                        self._ws_last_heal_ts = now
+                        self._ws_stale_hits = 0
+                        print(f"{Y}[HEALTH]{RS} forcing CLOB-WS reconnect (all books stale)")
+                        try:
+                            if self._clob_market_ws is not None:
+                                await self._clob_market_ws.close(code=1012, reason="stale-books")
+                        except Exception:
+                            pass
+                else:
+                    self._ws_stale_hits = 0
+
+        # Leader-flow health: if no fresh leader-flow for active CIDs, force immediate refresh.
+        if COPYFLOW_LIVE_ENABLED and self.active_mkts:
+            cids = list(self.active_mkts.keys())
+            fresh = 0
+            for cid in cids:
+                row = self._copyflow_live.get(cid, {})
+                ts = float(row.get("ts", 0.0) or 0.0)
+                n = int(row.get("n", 0) or 0)
+                if ts > 0 and (now - ts) <= COPYFLOW_LIVE_MAX_AGE_SEC and n > 0:
+                    fresh += 1
+            if fresh == 0 and cids:
+                if self._should_log("health-leader-empty", LOG_HEALTH_EVERY_SEC):
+                    age = (now - self._copyflow_live_last_update_ts) if self._copyflow_live_last_update_ts > 0 else 9e9
+                    print(
+                        f"{Y}[HEALTH]{RS} no fresh leader-flow (active={len(cids)} "
+                        f"last_live={age:.1f}s zero_streak={self._copyflow_live_zero_streak})"
+                    )
+                if (now - float(self._copyflow_force_refresh_ts or 0.0)) >= COPYFLOW_HEALTH_FORCE_REFRESH_SEC:
+                    self._copyflow_force_refresh_ts = now
+                    updated = 0
+                    try:
+                        updated = await self._copyflow_live_refresh_once(reason="health")
+                    except Exception:
+                        updated = 0
+                    if updated <= 0:
+                        self._reload_copyflow()
+
+    async def _status_loop(self):
+        while True:
+            await asyncio.sleep(STATUS_INTERVAL)
+            try:
+                await self._health_check()
+            except Exception as e:
+                self._errors.tick("health_check", print, err=e, every=20)
+            self.status()
+
+    # ── WEB DASHBOARD ─────────────────────────────────────────────────────────
+    def _metrics_resolve_rows_cached(self, ttl_sec: float = 20.0) -> list[dict]:
+        """SQLite-first incremental RESOLVE cache with JSONL fallback."""
+        import os as _os
+        import time as _time
+
+        now = _time.time()
+        cache = self._metrics_resolve_cache
+        db_rowid = int(cache.get("db_rowid", 0) or 0)
+
+        if self._metrics_db_ready:
+            try:
+                conn = sqlite3.connect(METRICS_DB_FILE, timeout=3.0)
+                try:
+                    cur = conn.cursor()
+                    max_id_row = cur.execute("SELECT COALESCE(MAX(id),0) FROM resolve_metrics").fetchone()
+                    max_id = int((max_id_row[0] if max_id_row else 0) or 0)
+                    if max_id == db_rowid and cache.get("rows") and (now - float(cache.get("ts", 0.0) or 0.0)) < max(1.0, float(ttl_sec)):
+                        return cache.get("rows", [])
+                    if max_id > db_rowid and cache.get("rows"):
+                        q = cur.execute(
+                            """
+                            SELECT ts,duration,score,entry_price,pnl,result,asset,id
+                            FROM resolve_metrics
+                            WHERE id > ?
+                            ORDER BY id ASC
+                            """,
+                            (db_rowid,),
+                        ).fetchall()
+                        rows = list(cache.get("rows", []) or [])
+                        for ts, duration, score, entry_price, pnl, result, asset, rid in q:
+                            rows.append(
+                                {
+                                    "ts": str(ts or ""),
+                                    "duration": int(duration or 15),
+                                    "score": int(score or 0),
+                                    "entry_price": float(entry_price or 0.0),
+                                    "pnl": float(pnl or 0.0),
+                                    "result": str(result or ""),
+                                    "asset": str(asset or "?"),
+                                }
+                            )
+                            db_rowid = int(rid or db_rowid)
+                        self._metrics_resolve_cache = {"ts": now, "sig": "sqlite", "rows": rows, "offset": 0, "db_rowid": max_id}
+                        return rows
+                    # cold path from sqlite
+                    q = cur.execute(
+                        """
+                        SELECT ts,duration,score,entry_price,pnl,result,asset,id
+                        FROM resolve_metrics
+                        ORDER BY id ASC
+                        """
+                    ).fetchall()
+                    rows: list[dict] = []
+                    for ts, duration, score, entry_price, pnl, result, asset, rid in q:
+                        rows.append(
+                            {
+                                "ts": str(ts or ""),
+                                "duration": int(duration or 15),
+                                "score": int(score or 0),
+                                "entry_price": float(entry_price or 0.0),
+                                "pnl": float(pnl or 0.0),
+                                "result": str(result or ""),
+                                "asset": str(asset or "?"),
+                            }
+                        )
+                        db_rowid = int(rid or db_rowid)
+                    self._metrics_resolve_cache = {"ts": now, "sig": "sqlite", "rows": rows, "offset": 0, "db_rowid": max_id}
+                    return rows
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        # JSONL fallback (legacy path)
+        try:
+            st = _os.stat(METRICS_FILE)
+            sig = (int(getattr(st, "st_ino", 0)), int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
+        except Exception:
+            sig = None
+        if cache.get("rows") and cache.get("sig") == sig and (now - float(cache.get("ts", 0.0) or 0.0)) < max(1.0, float(ttl_sec)):
+            return cache.get("rows", [])
+        rows: list[dict] = list(cache.get("rows", []) or [])
+        prev_sig = cache.get("sig")
+        prev_off = int(cache.get("offset", 0) or 0)
+        full_reload = True
+        if prev_sig and sig and isinstance(prev_sig, tuple) and len(prev_sig) >= 3:
+            same_inode = int(prev_sig[0]) == int(sig[0])
+            size_grew = int(sig[1]) >= int(prev_sig[1])
+            if same_inode and size_grew:
+                full_reload = False
+        if prev_off < 0:
+            prev_off = 0
+        if full_reload:
+            rows = []
+            prev_off = 0
+        try:
+            with open(METRICS_FILE, encoding="utf-8") as f:
+                try:
+                    f.seek(prev_off)
+                except Exception:
+                    prev_off = 0
+                    f.seek(0)
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if r.get("event") != "RESOLVE":
+                        continue
+                    rows.append(
+                        {
+                            "ts": str(r.get("ts", "") or ""),
+                            "duration": int(r.get("duration") or 15),
+                            "score": int(r.get("score") or 0),
+                            "entry_price": float(r.get("entry_price") or 0.0),
+                            "pnl": float(r.get("pnl") or 0.0),
+                            "result": str(r.get("result", "") or ""),
+                            "asset": str(r.get("asset", "?") or "?"),
+                        }
+                    )
+                end_off = int(f.tell())
+        except Exception:
+            rows = list(cache.get("rows", []) or [])
+            end_off = int(cache.get("offset", 0) or 0)
+        self._metrics_resolve_cache = {"ts": now, "sig": sig, "rows": rows, "offset": end_off, "db_rowid": db_rowid}
+        return rows
+
+    def _dashboard_data(self) -> dict:
+        """Collect current bot state as a JSON-serialisable dict for the web dashboard."""
+        import time as _t
+        now_ts = _t.time()
+        el = datetime.now(timezone.utc) - self.start_time
+        h, m = int(el.total_seconds() // 3600), int(el.total_seconds() % 3600 // 60)
+        display_bank = self.onchain_total_equity if self.onchain_snapshot_ts > 0 else self.bankroll
+        pnl = display_bank - self.start_bank
+        roi = pnl / self.start_bank * 100 if self.start_bank > 0 else 0
+        wr = round(self.wins / self.total * 100, 1) if self.total else 0
+
+        def _norm_round_bounds(start_ts: float, end_ts: float, duration: int) -> tuple[float, float]:
+            """Normalize dashboard round bounds without forcing invalid future windows."""
+            d = int(duration or 0)
+            if d not in (5, 15):
+                return float(start_ts or 0.0), float(end_ts or 0.0)
+            step = float(d * 60)
+            st = float(start_ts or 0.0)
+            et = float(end_ts or 0.0)
+            # Keep explicit window if it is plausible for the duration.
+            if st > 0 and et > st:
+                w = et - st
+                if abs(w - step) <= max(2.0, step * 0.25):
+                    return st, et
+            # If one bound is missing, derive the other from duration.
+            if et > 0 and st <= 0:
+                return et - step, et
+            if st > 0 and et <= 0:
+                return st, st + step
+            # Last fallback: infer current round boundary from wall clock.
+            et_n = math.ceil(now_ts / step) * step
+            st_n = et_n - step
+            return st_n, et_n
+
+        # Price history for charts (last 20 min, ~4 pts/s max → cap at 600 pts)
+        charts = {}
+        for asset, ph in self.price_history.items():
+            cutoff = now_ts - 1200
+            pts = [{"t": round(ts, 1), "p": round(px, 6)}
+                   for ts, px in ph if ts >= cutoff and px > 0]
+            if pts:
+                charts[asset] = pts
+
+        # Open positions
+        positions = []
+        onchain_open_cids_norm = {
+            str(c or "").strip().lower() for c in (self.onchain_open_cids or set())
+            if str(c or "").strip()
+        }
+        seen_cids_norm = set()
+        for cid, (mkt, trade) in list(self.pending.items()):
+            cid_norm = str(cid or "").strip().lower()
+            if not cid_norm or cid_norm in seen_cids_norm:
+                continue
+            seen_cids_norm.add(cid_norm)
+            if (
+                self.onchain_snapshot_ts > 0
+                and cid not in self.onchain_open_cids
+                and cid_norm not in onchain_open_cids_norm
+            ):
+                continue
+            asset = trade.get("asset", "?")
+            side  = trade.get("side", "?")
+            stake = float(self.onchain_open_stake_by_cid.get(cid, 0.0) or 0.0)
+            if stake <= 0:
+                stake = float(self.onchain_open_usdc_by_cid.get(cid, 0.0) or 0.0)
+            if stake <= 0:
+                continue
+            entry     = float(trade.get("fill_price", trade.get("entry", 0.5)) or 0.5)
+            open_p    = float(self._open_price_by_cid(cid) or 0.0)
+            cl_p      = self.cl_prices.get(asset, 0)
+            cl_ts     = self.cl_updated.get(asset, 0)
+            rtds_p    = self.prices.get(asset, 0)
+            _ph       = self.price_history.get(asset)
+            rtds_ts   = _ph[-1][0] if _ph else 0
+            cur_p     = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
+            duration  = int(trade.get("duration", mkt.get("duration", 15)) or 15)
+            end_ts    = float(trade.get("end_ts", mkt.get("end_ts", 0)) or 0)
+            start_ts  = float(mkt.get("start_ts", 0) or 0)
+            # Round timing must follow "price to beat" lock window, not entry timestamp.
+            if end_ts > 0 and duration > 0:
+                start_ts = end_ts - duration * 60.0
+            start_ts, end_ts = _norm_round_bounds(start_ts, end_ts, duration)
+            mins_left = max(0.0, (end_ts - now_ts) / 60)
+            if open_p > 0 and cur_p > 0:
+                pred_winner = "Up" if cur_p >= open_p else "Down"
+                lead = side == pred_winner
+                move_pct = (cur_p - open_p) / open_p * 100
+            else:
+                lead, move_pct = None, 0.0
+            token_id = self._midpoint_token_id_from_cid_side(cid, side, mkt, trade)
+            positions.append({
+                "asset": asset, "side": side, "entry": round(entry, 3),
+                "stake": round(stake, 2), "cur_p": round(cur_p, 2),
+                "open_p": round(open_p, 6), "move_pct": round(move_pct, 3),
+                "lead": lead, "mins_left": round(mins_left, 1),
+                "src": "pending",
+                "cid_full": cid_norm,
+                "cid": cid_norm[:12], "start_ts": start_ts, "end_ts": end_ts,
+                "duration": duration, "token_id": token_id,
+                "rk": self._round_key(cid=cid_norm, m=mkt, t=trade),
+            })
+
+        # Optional fallback rows for on-chain positions not present in local pending state.
+        if SHOW_DASHBOARD_FALLBACK and DASHBOARD_FALLBACK_DEBUG:
+            for cid, meta in list((self.onchain_open_meta_by_cid or {}).items()):
+                cid_norm = str(cid or "").strip().lower()
+                if not cid_norm or cid_norm in seen_cids_norm:
+                    continue
+                seen_cids_norm.add(cid_norm)
+                stake = float((self.onchain_open_stake_by_cid or {}).get(cid, 0.0) or 0.0)
+                if stake <= 0:
+                    stake = float((self.onchain_open_usdc_by_cid or {}).get(cid, 0.0) or 0.0)
+                if stake <= 0:
+                    continue
+                asset = str(meta.get("asset", "?") or "?")
+                side = str(meta.get("side", "?") or "?")
+                entry = float(meta.get("entry", 0.5) or 0.5)
+                open_p = float(self._open_price_by_cid(cid) or 0.0)
+                if open_p <= 0:
+                    open_p = float(meta.get("open_price", 0.0) or 0.0)
+                cl_p = self.cl_prices.get(asset, 0)
+                cl_ts = self.cl_updated.get(asset, 0)
+                rtds_p = self.prices.get(asset, 0)
+                _ph = self.price_history.get(asset)
+                rtds_ts = _ph[-1][0] if _ph else 0
+                cur_p = rtds_p if (rtds_ts > cl_ts and rtds_p > 0) else (cl_p if cl_p > 0 else rtds_p)
+                duration = int(meta.get("duration", 15) or 15)
+                end_ts = float(meta.get("end_ts", 0) or 0)
+                start_ts = float(meta.get("start_ts", 0) or 0)
+                if end_ts > 0 and duration > 0:
+                    start_ts = end_ts - duration * 60.0
+                start_ts, end_ts = _norm_round_bounds(start_ts, end_ts, duration)
+                mins_left = max(0.0, (end_ts - now_ts) / 60.0) if end_ts > 0 else 0.0
+                if open_p > 0 and cur_p > 0:
+                    pred_winner = "Up" if cur_p >= open_p else "Down"
+                    lead = side == pred_winner
+                    move_pct = (cur_p - open_p) / open_p * 100
+                else:
+                    lead, move_pct = None, 0.0
+                token_id = self._midpoint_token_id_from_cid_side(cid, side, meta, None)
+                positions.append({
+                    "asset": asset, "side": side, "entry": round(entry, 3),
+                    "stake": round(stake, 2), "cur_p": round(cur_p, 2),
+                    "open_p": round(open_p, 6), "move_pct": round(move_pct, 3),
+                    "lead": lead, "mins_left": round(mins_left, 1),
+                    "src": "fallback",
+                    "cid_full": cid_norm,
+                    "cid": cid_norm[:12], "start_ts": start_ts, "end_ts": end_ts,
+                    "duration": duration, "token_id": token_id,
+                    "rk": self._round_key(
+                        cid=cid_norm,
+                        m={"asset": asset, "duration": duration, "start_ts": start_ts, "end_ts": end_ts},
+                        t={"asset": asset, "side": side, "duration": duration, "end_ts": end_ts},
+                    ),
+                })
+
+        # If a row has cid-fallback rk (missing exact round bounds), align it to
+        # the nearest exact round for the same asset+duration.
+        if positions:
+            exact_ref = {}
+            for p in positions:
+                rk = str(p.get("rk", "") or "")
+                if "-cid" in rk:
+                    continue
+                k = (
+                    str(p.get("asset", "?")),
+                    int(p.get("duration", 0) or 0),
+                    str(p.get("side", "?")),
+                )
+                prev = exact_ref.get(k)
+                cand = (float(p.get("start_ts", 0.0) or 0.0), float(p.get("end_ts", 0.0) or 0.0))
+                if cand[1] <= 0:
+                    continue
+                if prev is None:
+                    exact_ref[k] = cand
+                    continue
+                # keep the round whose end_ts is closest to "now"
+                if abs(cand[1] - now_ts) < abs(prev[1] - now_ts):
+                    exact_ref[k] = cand
+            for p in positions:
+                rk = str(p.get("rk", "") or "")
+                if "-cid" not in rk:
+                    continue
+                k = (
+                    str(p.get("asset", "?")),
+                    int(p.get("duration", 0) or 0),
+                    str(p.get("side", "?")),
+                )
+                ref = exact_ref.get(k)
+                if not ref:
+                    continue
+                st_ref, et_ref = ref
+                if et_ref > 0:
+                    p["start_ts"] = float(st_ref)
+                    p["end_ts"] = float(et_ref)
+                    p["mins_left"] = round(max(0.0, (et_ref - now_ts) / 60.0), 1)
+
+        # Drop cid-fallback duplicates when an exact row exists for same asset/duration/side.
+        if positions:
+            exact_slots = set()
+            for p in positions:
+                rk = str(p.get("rk", "") or "")
+                if "-cid" in rk:
+                    continue
+                exact_slots.add(
+                    (
+                        str(p.get("asset", "?")),
+                        int(p.get("duration", 0) or 0),
+                        str(p.get("side", "?")),
+                        int(round(float(p.get("end_ts", 0.0) or 0.0))),
+                    )
+                )
+            if exact_slots:
+                keep = []
+                for p in positions:
+                    rk = str(p.get("rk", "") or "")
+                    if "-cid" not in rk:
+                        keep.append(p)
+                        continue
+                    key = (
+                        str(p.get("asset", "?")),
+                        int(p.get("duration", 0) or 0),
+                        str(p.get("side", "?")),
+                        int(round(float(p.get("end_ts", 0.0) or 0.0))),
+                    )
+                    if key in exact_slots:
+                        continue
+                    keep.append(p)
+                positions = keep
+
+        # Avoid contradictory duplicate cards for the same asset and round slot.
+        # Keep the strongest row (higher stake, valid open price preferred).
+        if positions:
+            by_slot = {}
+            for p in positions:
+                d = int(p.get("duration", 0) or 0)
+                et = float(p.get("end_ts", 0.0) or 0.0)
+                if d in (5, 15) and et > 0:
+                    slot = round(et / (d * 60.0))
+                else:
+                    slot = int(et)
+                k = (str(p.get("asset", "?")), d, slot)
+                by_slot.setdefault(k, []).append(p)
+            filtered = []
+            for _, rows_k in by_slot.items():
+                rows_k.sort(
+                    key=lambda r: (
+                        1 if float(r.get("open_p", 0.0) or 0.0) > 0 else 0,
+                        float(r.get("stake", 0.0) or 0.0),
+                        float(r.get("end_ts", 0.0) or 0.0),
+                    ),
+                    reverse=True,
+                )
+                filtered.append(rows_k[0])
+            positions = filtered
+
+        # Strict source-of-truth mode for dashboard: keep only canonical round windows.
+        if DASHBOARD_STRICT_CANONICAL and positions:
+            strict_rows = []
+            for p in positions:
+                d = int(p.get("duration", 0) or 0)
+                st = float(p.get("start_ts", 0.0) or 0.0)
+                et = float(p.get("end_ts", 0.0) or 0.0)
+                if d in (5, 15):
+                    step = float(d * 60)
+                    if st <= 0 or et <= st:
+                        continue
+                    w = et - st
+                    if abs(w - step) > max(2.0, step * 0.25):
+                        continue
+                strict_rows.append(p)
+            positions = strict_rows
+
+        # Keep one row per CID (already ensured by seen_cids_norm above).
+        # Do not collapse by asset/duration/side: multiple real opens can share
+        # the same triplet and must stay visible to match on-chain open_count.
+
+        # Skip top reasons (last 15m)
+        skip_top = []
+        try:
+            _, top = self._skip_top(900, 6)
+            skip_top = [{"reason": r, "count": c} for r, c in top]
+        except Exception:
+            pass
+
+        # ExecQ all buckets
+        execq_all = []
+        execq = {}
+        try:
+            if self._bucket_stats.rows:
+                sorted_rows = sorted(
+                    self._bucket_stats.rows.items(),
+                    key=lambda kv: kv[1].get("fills", 0), reverse=True
+                )
+                for k, v in sorted_rows:
+                    outcomes = int(v.get("outcomes", v.get("wins", 0) + v.get("losses", 0)))
+                    fills    = int(v.get("fills", 0) or 0)
+                    if fills == 0 and outcomes == 0:
+                        continue
+                    wr_b = round(v["wins"] / outcomes * 100, 1) if outcomes > 0 else None
+                    pf_b = (float(v.get("gross_win", 0)) / float(v.get("gross_loss", 1e-9))
+                            if float(v.get("gross_loss", 0)) > 0 else None)
+                    execq_all.append({
+                        "bucket": k, "fills": fills, "outcomes": outcomes,
+                        "wr": wr_b, "pf": round(pf_b, 2) if pf_b else None,
+                        "pnl": round(float(v.get("pnl", 0)), 2),
+                    })
+                if execq_all:
+                    execq = execq_all[0]
+        except Exception:
+            pass
+
+        # Filter to active (non-gated) buckets only
+        def _buck_active(k):
+            pts = k.split("|")
+            if len(pts) < 2: return True
+            d_p, t_p = pts[0], pts[1]
+            if d_p == "5m" and not ENABLE_5M: return False
+            if d_p == "15m":
+                if BLOCK_SCORE_S9_11_15M and t_p == "s9-11": return False
+                if BLOCK_SCORE_S0_8_15M  and t_p == "s0-8":  return False
+                if BLOCK_SCORE_S12P_15M  and t_p == "s12+":  return False
+            return True
+        execq_all = [e for e in execq_all if _buck_active(e["bucket"])]
+        active_gates: list = []
+        if BLOCK_SCORE_S9_11_15M: active_gates.append("soft s9-11" if SCORE_BLOCK_SOFT_MODE else "no s9-11")
+        if BLOCK_SCORE_S0_8_15M:  active_gates.append("soft s0-8" if SCORE_BLOCK_SOFT_MODE else "no s0-8")
+        if BLOCK_SCORE_S12P_15M:  active_gates.append("soft s12+" if SCORE_BLOCK_SOFT_MODE else "no s12+")
+        if BLOCK_ASSET_SOL_15M:   active_gates.append("soft SOL" if ASSET_BLOCK_SOFT_MODE else "no SOL")
+        if BLOCK_ASSET_XRP_15M:   active_gates.append("soft XRP" if ASSET_BLOCK_SOFT_MODE else "no XRP")
+        if not ENABLE_5M:         active_gates.append("5m off")
+        if MIN_ENTRY_PRICE_S0_8_15M > 0:
+            active_gates.append(f"s0-8\u2265{MIN_ENTRY_PRICE_S0_8_15M:.2f}")
+
+        # Daily totals (UTC day) from metrics log, cached to keep dashboard fast.
+        day_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        dc = self._dash_daily_cache
+        if (dc.get("day") != day_utc) or (now_ts - float(dc.get("ts", 0.0) or 0.0) >= 30.0):
+            d_pnl = 0.0
+            d_outcomes = 0
+            d_wins = 0
+            for r in self._metrics_resolve_rows_cached(ttl_sec=20.0):
+                if not str(r.get("ts", "")).startswith(day_utc):
+                    continue
+                d_pnl += float(r.get("pnl") or 0.0)
+                d_outcomes += 1
+                if r.get("result") == "WIN":
+                    d_wins += 1
+            self._dash_daily_cache = {
+                "ts": now_ts,
+                "day": day_utc,
+                "pnl": round(d_pnl, 2),
+                "outcomes": int(d_outcomes),
+                "wins": int(d_wins),
+            }
+            dc = self._dash_daily_cache
+        d_out = int(dc.get("outcomes", 0) or 0)
+        d_wins = int(dc.get("wins", 0) or 0)
+        d_wr = round(d_wins / d_out * 100, 1) if d_out > 0 else 0.0
+
+        # Health
+        cl_ages = {a: round(now_ts - float(self.cl_updated.get(a, 0) or 0), 1)
+                   for a in ("BTC", "ETH", "SOL", "XRP")}
+
+        return {
+            "ts": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+            "now_ts": round(now_ts, 1),
+            "session": f"{h}h{m:02d}m",
+            "network": NETWORK,
+            "rtds_ok": self.rtds_ok,
+            "trades": self.total, "wins": self.wins, "wr": wr,
+            "pnl": round(pnl, 2), "roi": round(roi, 1),
+            "usdc": round(self.onchain_usdc_balance, 2),
+            "open_stake": round(self.onchain_open_stake_total, 2),
+            "open_count": len(positions),
+            "open_mark": round(self.onchain_open_mark_value, 2),
+            "total_equity": round(display_bank, 2),
+            "prices": {a: round(p, 2) for a, p in self.prices.items() if p > 0},
+            "cl_ages": cl_ages,
+            "charts": charts,
+            "positions": positions,
+            "skip_top": skip_top,
+            "execq": execq,
+            "execq_all": execq_all,
+            "active_gates": active_gates,
+            "daily_day": day_utc,
+            "daily_pnl_total": round(float(dc.get("pnl", 0.0) or 0.0), 2),
+            "daily_outcomes": d_out,
+            "daily_wins": d_wins,
+            "daily_wr": d_wr,
+            "dry_run": DRY_RUN,
+        }
+
     async def _dashboard_loop(self):
-        from clawbot_v2.legacy_core.dashboard import dashboard_loop
-        return await dashboard_loop(self)
+        """Serve a live web dashboard on DASHBOARD_PORT (default 8080)."""
+        port = int(os.environ.get("DASHBOARD_PORT", "8080"))
+        from aiohttp import web
+
+        HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClawdBot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+:root{
+  --bg:#06070a;--s1:#0b0d12;--s2:#10131a;--s3:#151a24;
+  --b1:#1b2230;--b2:#273248;--b3:#34435f;
+  --t1:#edf2ff;--t2:#97a5c2;--t3:#4f607d;
+  --g:#00cc78;--gb:rgba(0,204,120,.09);--gbd:rgba(0,204,120,.22);
+  --r:#ff3d3d;--rb:rgba(255,61,61,.09);--rbd:rgba(255,61,61,.22);
+  --bl:#5f8dff;--blb:rgba(95,141,255,.10);--blbd:rgba(95,141,255,.24);
+  --y:#f5a623;--yb:rgba(245,166,35,.09);
+  --rd:12px;--rdl:16px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{font-size:16px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+body{
+  font-family:'Plus Jakarta Sans','Schibsted Grotesk',system-ui,-apple-system,sans-serif;
+  font-variant-numeric:tabular-nums;
+  background:var(--bg);color:var(--t1);min-height:100vh;
+  background-image:
+    radial-gradient(ellipse 88% 52% at 50% -5%,rgba(95,141,255,.09) 0%,transparent 62%),
+    radial-gradient(ellipse 40% 30% at 88% 14%,rgba(0,204,120,.05) 0%,transparent 55%);
+}
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:-1;
+  background:
+    radial-gradient(900px 420px at 10% -5%, rgba(0,204,120,.06), transparent 62%),
+    radial-gradient(860px 420px at 92% -8%, rgba(95,141,255,.08), transparent 66%);
+}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--b2);border-radius:2px}
+
+/* HEADER */
+.H{
+  position:sticky;top:0;z-index:50;height:48px;
+  display:flex;align-items:center;justify-content:space-between;padding:0 28px;
+  background:rgba(6,7,10,.82);backdrop-filter:blur(24px);
+  border-bottom:1px solid rgba(79,96,125,.22);
+}
+.Hl{display:flex;align-items:center;gap:12px}
+.logo{display:flex;align-items:center;gap:7px;font-size:.86rem;font-weight:700;letter-spacing:-.025em}
+.ld{width:5px;height:5px;border-radius:50%;background:var(--g);flex-shrink:0;animation:lp 2.8s ease-in-out infinite}
+@keyframes lp{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(0,204,120,.6)}55%{opacity:.85;box-shadow:0 0 0 5px rgba(0,204,120,0)}}
+.logo b{color:var(--g)}
+.tbadge{font-size:.7rem;color:var(--t3);padding:2px 7px;background:var(--s1);border:1px solid var(--b1);border-radius:3px}
+.drybadge{font-size:.58rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 8px;border-radius:4px;background:var(--yb);color:var(--y);border:1px solid rgba(245,166,35,.3);display:none}
+.Hr{display:flex;align-items:center}
+.hs{display:flex;flex-direction:column;align-items:flex-end;gap:1px;padding:5px 14px;border-right:1px solid var(--b1)}
+.hs:first-child{border-left:1px solid var(--b1)}
+.hsl{font-size:.52rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.1em}
+.hsv{font-size:.95rem;font-weight:600}
+
+/* WRAP */
+.W{padding:22px 28px;max-width:1920px;margin:0 auto;display:flex;flex-direction:column;gap:20px}
+
+/* PRICES */
+.pc-row{display:flex;gap:4px;flex-wrap:wrap}
+.pc{display:flex;align-items:center;gap:6px;background:var(--s1);border:1px solid var(--b1);border-radius:5px;padding:5px 10px;cursor:default;transition:border-color .15s}
+.pc:hover{border-color:var(--b2)}
+.pc .a{font-size:.61rem;font-weight:700;color:var(--t3);letter-spacing:.07em;text-transform:uppercase}
+.pc .v{font-size:.86rem;font-weight:600}
+
+/* METRICS BAR */
+.mbar{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:10px}
+.mi{
+  padding:16px 18px;border:1px solid var(--b1);border-radius:var(--rdl);
+  display:flex;flex-direction:column;gap:6px;transition:all .18s;cursor:default;
+  background:linear-gradient(180deg,rgba(16,19,26,.95) 0%, rgba(11,13,18,.95) 100%);
+}
+.mi:hover{border-color:var(--b2);transform:translateY(-1px);box-shadow:0 10px 26px rgba(0,0,0,.28)}
+.mi-l{font-size:.52rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.1em}
+.mi-v{font-size:1.52rem;font-weight:800;letter-spacing:-.03em;line-height:1}
+.mi-s{font-size:.63rem;color:var(--t2);margin-top:1px}
+.mi-s b{color:var(--t1);font-weight:500}
+
+/* SECTION */
+.sh{display:flex;align-items:baseline;gap:8px;margin-bottom:10px}
+.st{font-size:.6rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.1em}
+
+/* POSITIONS */
+.pgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:14px}
+.pcard{background:#0b111b;border:1px solid #1b2a3f;border-radius:18px;overflow:hidden;display:flex;flex-direction:column;transition:border-color .2s,box-shadow .2s}
+.pcard:hover{box-shadow:0 10px 34px rgba(0,0,0,.46)}
+.pcard{animation:fadeIn .28s ease both}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.pcard.lead{border-color:#1f6a4f;box-shadow:inset 0 0 0 1px rgba(0,204,120,.18)}
+.pcard.trail{border-color:#7a2c38;box-shadow:inset 0 0 0 1px rgba(255,61,61,.16)}
+.pcard.lead .ca{background:linear-gradient(180deg,rgba(9,26,20,.92) 0%,rgba(8,16,13,.98) 100%)}
+.pcard.trail .ca{background:linear-gradient(180deg,rgba(30,12,16,.90) 0%,rgba(15,10,11,.98) 100%)}
+.bstate{font-size:.62rem;font-weight:800;letter-spacing:.06em;padding:2px 8px;border-radius:4px;text-transform:uppercase}
+.bstate.win{background:rgba(0,204,120,.14);border:1px solid rgba(0,204,120,.40);color:#52d69d}
+.bstate.lose{background:rgba(255,61,61,.14);border:1px solid rgba(255,61,61,.38);color:#ff7c7c}
+.bstate.na{background:rgba(95,141,255,.12);border:1px solid rgba(95,141,255,.30);color:#8eb0ff}
+.ph{padding:14px 16px 0;display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+.phl{display:flex;align-items:flex-start;gap:6px;flex-direction:column}
+.psym{font-size:1rem;font-weight:800;letter-spacing:-.02em}
+.pevt{font-size:.8rem;color:var(--t2)}
+.pdur{font-size:.62rem;color:var(--t3);background:var(--s2);border:1px solid var(--b1);padding:2px 5px;border-radius:3px}
+.pup{font-size:.62rem;font-weight:600;padding:2px 7px;border-radius:3px;background:var(--blb);color:var(--bl);border:1px solid var(--blbd)}
+.pdn{font-size:.62rem;font-weight:600;padding:2px 7px;border-radius:3px;background:var(--rb);color:var(--r);border:1px solid var(--rbd)}
+.phr{display:flex;align-items:center;gap:5px}
+.blead{font-size:.58rem;font-weight:700;letter-spacing:.05em;padding:2px 7px;border-radius:3px;background:var(--gb);color:var(--g);border:1px solid var(--gbd)}
+.btrail{font-size:.58rem;font-weight:700;letter-spacing:.05em;padding:2px 7px;border-radius:3px;background:var(--rb);color:var(--r);border:1px solid var(--rbd)}
+.bunk{font-size:.58rem;font-weight:600;padding:2px 6px;border-radius:3px;background:var(--s2);color:var(--t3);border:1px solid var(--b1)}
+.stag{font-size:.62rem;color:var(--t3)}
+.pdata{display:grid;grid-template-columns:1fr 1fr auto;padding:10px 16px 12px;gap:10px;border-bottom:1px solid #1a2a41}
+.di{display:flex;flex-direction:column;gap:3px}
+.dl{font-size:.56rem;font-weight:700;color:#6f85a9;text-transform:uppercase;letter-spacing:.08em}
+.dv{font-size:1.05rem;font-weight:700}
+.pcount{display:flex;flex-direction:column;align-items:flex-end;justify-content:center}
+.pcount .dl{font-size:.52rem}
+.pcv{font-size:1.8rem;font-weight:800;line-height:1;color:#ff6b6b}
+.pcv small{font-size:.65rem;color:#7f90ad;margin-left:2px}
+.ca{height:156px;border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);background:linear-gradient(180deg,rgba(18,22,30,.95) 0%,rgba(9,11,16,.98) 100%);position:relative}
+.ca::after{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(180deg,rgba(95,141,255,.04) 0%,rgba(0,0,0,0) 65%);
+}
+canvas{display:block;width:100%!important}
+.pf{padding:9px 16px;display:flex;justify-content:space-between;align-items:center;font-size:.7rem}
+.pf .lbl{color:var(--t2)}
+.pf b{color:var(--t1);font-size:.75rem}
+.pf .rk{color:var(--t3);font-size:.64rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px}
+.tb{height:2px;background:var(--b1)}
+.tbf{height:100%;transition:width .5s linear}
+
+/* BOTTOM */
+.bot{display:grid;grid-template-columns:300px 1fr;gap:16px;align-items:start}
+@media(max-width:780px){.bot{grid-template-columns:1fr}}
+
+/* SIDE PANEL */
+.lpanel{display:flex;flex-direction:column;gap:9px}
+.card{background:var(--s1);border:1px solid var(--b1);border-radius:var(--rdl);overflow:hidden}
+.ch{padding:10px 14px;border-bottom:1px solid var(--b1);font-size:.58rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.1em}
+.ce{padding:13px;text-align:center;font-size:.7rem;color:var(--t3)}
+.gates{padding:8px 10px;display:flex;flex-wrap:wrap;gap:4px}
+.gtag{font-size:.58rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;padding:3px 7px;border-radius:4px;background:var(--blb);color:var(--bl);border:1px solid var(--blbd)}
+.skrow{display:flex;justify-content:space-between;align-items:center;padding:6px 12px;border-bottom:1px solid rgba(20,20,40,.8)}
+.skrow:last-child{border-bottom:none}
+.skrow:hover{background:var(--s2)}
+.skr{font-size:.64rem;color:var(--t2);line-height:1.4}
+.skc{font-size:.76rem;font-weight:600;color:var(--t1)}
+
+/* EXECQ TABLE */
+.etw{background:var(--s1);border:1px solid var(--b1);border-radius:var(--rdl);overflow:hidden}
+.eth{padding:11px 16px;border-bottom:1px solid var(--b1);display:flex;align-items:center;justify-content:space-between}
+.etl{font-size:.58rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.1em}
+.ett{font-size:.82rem;font-weight:700}
+.et{width:100%;border-collapse:collapse}
+.et th{font-size:.56rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.09em;padding:9px 14px;border-bottom:1px solid var(--b1);text-align:left}
+.et th:last-child{text-align:right}
+.et td{padding:9px 14px;border-bottom:1px solid var(--b1);vertical-align:middle}
+.et tr:last-child td{border-bottom:none}
+.et tr:hover td{background:var(--s2)}
+.etbk{font-size:.8rem;color:var(--t1);font-weight:600}
+.etfo{font-size:.78rem;color:var(--t2)}
+.wrc{display:flex;align-items:center;gap:7px}
+.wrt{flex:1;height:3px;background:var(--b1);border-radius:2px;overflow:hidden;min-width:55px;position:relative}
+.wrt::after{content:'';position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--b2)}
+.wrf{height:100%;border-radius:2px;transition:width .5s ease}
+.wrn{font-size:.76rem;font-weight:600;min-width:40px;text-align:right}
+.etpf{font-size:.76rem;color:var(--t2)}
+.etpnl{font-size:.78rem;font-weight:700;text-align:right}
+
+/* UTILS */
+.g{color:var(--g)}.r{color:var(--r)}.y{color:var(--y)}.d{color:var(--t2)}.dm{color:var(--t3)}
+
+@media(max-width:1240px){
+  .mbar{grid-template-columns:repeat(2,minmax(220px,1fr))}
+  .pgrid{grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+}
+@media(max-width:860px){
+  .H{padding:0 14px}
+  .W{padding:14px}
+  .mbar{grid-template-columns:1fr}
+  .pgrid{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="H">
+  <div class="Hl">
+    <div class="logo"><div class="ld"></div>Clawd<b>Bot</b></div>
+    <span class="tbadge" id="ts">--:--:--</span>
+    <span class="drybadge" id="dry">Dry Run</span>
+  </div>
+  <div class="Hr" id="hstats"></div>
+</div>
+<div class="W">
+  <div class="pc-row" id="prices"></div>
+  <div class="mbar" id="mbar"></div>
+  <div>
+    <div class="sh"><span class="st" id="pos-title">Open Positions</span></div>
+    <div class="pgrid" id="positions"></div>
+  </div>
+  <div class="bot">
+    <div class="lpanel" id="lpanel"></div>
+    <div id="execq"></div>
+  </div>
+</div>
+
+<script>
+const ch={},cm={};
+const _mid404=new Set();
+let _midSeries={},_posMeta={};
+function fmt(n,d=2){return Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d})}
+function fmtT(ts){const x=new Date(ts*1e3);return x.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}
+function pfx(v){return v>0?'+':''}
+function pnl(v){return(v>=0?'+':'-')+'$'+fmt(Math.abs(v))}
+function pdec(p){if(p<=0)return 5;if(p<0.1)return 6;if(p<1)return 5;if(p<10)return 4;if(p<100)return 3;return 2}
+function fmtETRange(sTs,eTs){
+  try{
+    const opt={hour:'numeric',minute:'2-digit',hour12:true,timeZone:'America/New_York'};
+    const s=new Date((sTs||0)*1e3).toLocaleTimeString('en-US',opt);
+    const e=new Date((eTs||0)*1e3).toLocaleTimeString('en-US',opt);
+    return `${s}-${e} ET`;
+  }catch(e){return '';}
+}
+function countdown(minsLeft){
+  const t=Math.max(0,Math.floor((minsLeft||0)*60));
+  const m=Math.floor(t/60), s=t%60;
+  return {m:String(m).padStart(2,'0'),s:String(s).padStart(2,'0')};
+}
+function countdownSec(secLeft){
+  const t=Math.max(0,Math.floor(secLeft||0));
+  const m=Math.floor(t/60), s=t%60;
+  return {m:String(m).padStart(2,'0'),s:String(s).padStart(2,'0')};
+}
+function tickTime(){
+  const now=Math.floor(Date.now()/1000);
+  for(const [uid,pm] of Object.entries(_posMeta||{})){
+    const durSec=Math.max(60,Math.round((pm.duration||15)*60));
+    const secLeft=Math.max(0,Math.round((pm.end_ts||now)-now));
+    const pct=Math.min(100,Math.max(0,((durSec-secLeft)/durSec)*100));
+    const cd=countdownSec(secLeft);
+    const tEl=document.getElementById('tm'+uid);
+    const pEl=document.getElementById('pb'+uid);
+    if(tEl)tEl.innerHTML=`${cd.m}<small>m</small> ${cd.s}<small>s</small>`;
+    if(pEl)pEl.style.width=`${pct}%`;
+  }
+}
+
+function renderHeader(d){
+  document.getElementById('ts').textContent=d.ts;
+  if(d.dry_run)document.getElementById('dry').style.display='';
+  const p=d.pnl,dp=+(d.daily_pnl_total||0),wr=d.wr;
+  document.getElementById('hstats').innerHTML=[
+    ['P&L',pnl(p),p>=0?'g':'r'],
+    ['Today',pnl(dp),dp>=0?'g':'r'],
+    ['WR',wr+'%',wr>=52?'g':wr>=48?'y':'r'],
+    ['Trades',''+d.trades,'d'],
+    ['Equity','$'+fmt(d.total_equity),''],
+    ['RTDS',d.rtds_ok?'●':'○',d.rtds_ok?'g':'r'],
+  ].map(([l,v,c])=>
+    `<div class="hs"><div class="hsl">${l}</div><div class="hsv ${c}">${v}</div></div>`
+  ).join('');
+}
+
+function renderPrices(d){
+  document.getElementById('prices').innerHTML=
+    Object.entries(d.prices).map(([a,p])=>
+      `<div class="pc"><span class="a">${a}</span><span class="v">$${fmt(p,2)}</span></div>`
+    ).join('');
+}
+
+function renderMetrics(d){
+  const p=d.pnl,pc=p>=0?'g':'r';
+  const dp=+(d.daily_pnl_total||0),dpc=dp>=0?'g':'r';
+  const wr=d.wr,wrc=wr>=52?'g':wr>=48?'y':'r';
+  const dwr=+(d.daily_wr||0),dwrc=dwr>=52?'g':dwr>=48?'y':'r';
+  const l=Math.max(0,(d.trades||0)-(d.wins||0));
+  const dl=Math.max(0,(d.daily_outcomes||0)-(d.daily_wins||0));
+  document.getElementById('mbar').innerHTML=[
+    ['Portfolio','$'+fmt(d.total_equity),'Free <b>$'+fmt(d.usdc)+'</b> · Open <b>'+d.open_count+'</b>'],
+    ['Session P&L','<span class="'+pc+'">'+pnl(p)+'</span>','ROI <b class="'+pc+'">'+pfx(d.roi)+d.roi.toFixed(1)+'%</b>'],
+    ['Today','<span class="'+dpc+'">'+pnl(dp)+'</span>',(d.daily_wins||0)+'W · '+dl+'L · <b>'+(d.daily_outcomes||0)+'</b>'],
+    ['Win Rate','<span class="'+wrc+'">'+wr+'%</span>',d.wins+'W / '+l+'L of <b>'+d.trades+'</b>'],
+    ['Today WR','<span class="'+dwrc+'">'+dwr.toFixed(1)+'%</span>','<b>'+(d.daily_day||'')+'</b>'],
+    ['Open Stake','$'+fmt(d.open_stake),'Mark <b>$'+fmt(d.open_mark)+'</b>'],
+  ].map(([l,v,s])=>
+    `<div class="mi"><div class="mi-l">${l}</div><div class="mi-v">${v}</div><div class="mi-s">${s}</div></div>`
+  ).join('');
+}
+
+function drawSparkline(canvas,wp,openP,lead){
+  const rect=canvas.getBoundingClientRect();
+  const cssW=Math.max(16,Math.floor(rect.width||canvas.clientWidth||320));
+  const cssH=Math.max(16,Math.floor(rect.height||canvas.clientHeight||120));
+  const dpr=Math.max(1,window.devicePixelRatio||1);
+  canvas.width=Math.floor(cssW*dpr);
+  canvas.height=Math.floor(cssH*dpr);
+  const g=canvas.getContext('2d');
+  if(!g)return;
+  g.setTransform(1,0,0,1,0,0);
+  g.scale(dpr,dpr);
+  g.clearRect(0,0,cssW,cssH);
+
+  const line=lead===null?'#3a3a5a':(lead?'#00cc78':'#ff3d3d');
+  const fill=lead===null?'rgba(58,58,90,.07)':(lead?'rgba(0,204,120,.09)':'rgba(255,61,61,.09)');
+  const minP=Math.min(...wp.map(x=>x.p));
+  const maxP=Math.max(...wp.map(x=>x.p));
+  const span=Math.max(1e-6,maxP-minP);
+  const padX=6,padY=6;
+  const w=Math.max(8,cssW-padX*2),h=Math.max(8,cssH-padY*2);
+  const pts=wp.map((x,i)=>{
+    const xx=padX+(i/(Math.max(1,wp.length-1)))*w;
+    const yy=padY+(1-(x.p-minP)/span)*h;
+    return [xx,yy];
+  });
+
+  const fg=g.createLinearGradient(0,padY,0,padY+h);
+  fg.addColorStop(0,fill);fg.addColorStop(1,'rgba(0,0,0,0)');
+  g.beginPath();
+  pts.forEach(([x,y],i)=>{if(i===0)g.moveTo(x,y);else g.lineTo(x,y);});
+  g.lineTo(padX+w,padY+h);g.lineTo(padX,padY+h);g.closePath();
+  g.fillStyle=fg;g.fill();
+
+  if(openP>0){
+    const oy=padY+(1-(openP-minP)/span)*h;
+    g.setLineDash([3,4]);g.lineWidth=1;g.strokeStyle='rgba(255,255,255,.1)';
+    g.beginPath();g.moveTo(padX,oy);g.lineTo(padX+w,oy);g.stroke();g.setLineDash([]);
+  }
+
+  g.lineWidth=2.0;g.strokeStyle=line;
+  g.beginPath();
+  pts.forEach(([x,y],i)=>{if(i===0)g.moveTo(x,y);else g.lineTo(x,y);});
+  g.stroke();
+  const lp=pts[pts.length-1];
+  if(lp){
+    g.beginPath();
+    g.fillStyle=line;
+    g.arc(lp[0],lp[1],2.2,0,Math.PI*2);
+    g.fill();
+  }
+}
+
+function drawChart(id,pts,openP,curP,sTs,eTs,now){
+  const ctx=document.getElementById(id);if(!ctx)return;
+  const _w=Math.floor(ctx.getBoundingClientRect().width||ctx.clientWidth||0);
+  if(_w<=8){requestAnimationFrame(()=>drawChart(id,pts,openP,curP,sTs,eTs,now));return;}
+  let wp=(pts||[]).filter(x=>x.t>=sTs-5);
+  if(!wp.length){
+    const op=(typeof openP==='number'&&openP>0)?openP:0.5;
+    const cp=(typeof curP==='number'&&curP>0)?curP:op;
+    const t0=Math.max((sTs||now)-4,0);
+    const t1=Math.max((sTs||now)-1,0);
+    const t2=Math.max(now, t1+1);
+    wp=[{t:t0,p:op},{t:t1,p:(op+cp)/2},{t:t2,p:cp}];
+  }else if(wp.length===1){
+    const p0=wp[0].p;
+    wp=[{t:Math.max(wp[0].t-1,0),p:p0},{t:wp[0].t,p:p0}];
+  }
+  const avg=wp.reduce((s,x)=>s+x.p,0)/wp.length;
+  const dec=pdec(avg);
+  const labels=wp.map(x=>fmtT(x.t));
+  const data=wp.map(x=>x.p);
+  const dMin=Math.min(...data);
+  const dMax=Math.max(...data);
+  const dMid=(dMin+dMax)/2;
+  let span=Math.max(1e-9,dMax-dMin);
+  // Keep y-range tight to expose micro-movements.
+  if(span<Math.max(Math.abs(dMid)*0.000004,1e-6))span=Math.max(Math.abs(dMid)*0.000004,1e-6);
+  const pad=span*0.18;
+  const yMin=dMid-(span/2)-pad;
+  const yMax=dMid+(span/2)+pad;
+  const last=data[data.length-1];
+  const lead=openP>0?last>=openP:null;
+  const lc=lead===null?'#3a3a5a':(lead?'#00cc78':'#ff3d3d');
+  const fg=lead===null?'rgba(58,58,90,.07)':(lead?'rgba(0,204,120,.09)':'rgba(255,61,61,.09)');
+  if(typeof Chart==='undefined'){
+    if(ch[id]){try{ch[id].destroy()}catch(e){}delete ch[id];}
+    drawSparkline(ctx,wp,openP,lead);
+    return;
+  }
+  if(ch[id]&&cm[id]&&cm[id].lead===lead){
+    try{
+      const c=ch[id];
+      c.data.labels=labels;c.data.datasets[0].data=data;
+      if(c.data.datasets[1])c.data.datasets[1].data=wp.map(()=>openP);
+      if(c.options&&c.options.scales&&c.options.scales.y){
+        c.options.scales.y.min=yMin;
+        c.options.scales.y.max=yMax;
+      }
+      c.update('none');return;
+    }catch(e){
+      if(ch[id]){try{ch[id].destroy()}catch(e2){}delete ch[id];}
+      drawSparkline(ctx,wp,openP,lead);
+      return;
+    }
+  }
+  if(ch[id]){ch[id].destroy();delete ch[id];}
+  cm[id]={lead};
+  const ds=[{
+    data,borderColor:lc,borderWidth:1.8,pointRadius:0,pointHoverRadius:2,
+    tension:0.08,fill:'origin',
+    backgroundColor(cx){
+      const g=cx.chart.ctx.createLinearGradient(0,0,0,120);
+      g.addColorStop(0,fg);g.addColorStop(1,'rgba(0,0,0,0)');return g;
+    }
+  }];
+  if(openP>0)ds.push({data:wp.map(()=>openP),borderColor:'rgba(255,255,255,.1)',borderWidth:1,borderDash:[3,4],pointRadius:0,fill:false,tension:0});
+  try{
+    ch[id]=new Chart(ctx,{type:'line',data:{labels,datasets:ds},options:{
+      animation:false,responsive:true,maintainAspectRatio:false,
+      interaction:{mode:'nearest',intersect:false},
+      plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,
+        displayColors:false,
+        backgroundColor:'rgba(12,15,21,.96)',borderColor:'rgba(120,136,168,.28)',borderWidth:1,
+        titleColor:'#8e9ab4',bodyColor:'#eef3ff',padding:7,
+        callbacks:{label:c=>'$'+fmt(c.raw,dec)}}},
+      scales:{
+        x:{display:false,grid:{display:false},border:{display:false}},
+        y:{display:false,grid:{display:false},border:{display:false},
+          min:yMin,max:yMax,
+          ticks:{callback:v=>'$'+fmt(v,dec)}}
+      }
+    }});
+  }catch(e){
+    if(ch[id]){try{ch[id].destroy()}catch(e2){}delete ch[id];}
+    drawSparkline(ctx,wp,openP,lead);
+  }
+}
+
+function renderPositions(d){
+  const now=d.now_ts;
+  document.getElementById('pos-title').textContent='Open Positions'+(d.positions.length?' · '+d.positions.length:'');
+  const el=document.getElementById('positions');
+  // Rebuilding cards replaces canvas nodes: drop stale chart instances first.
+  Object.keys(ch).forEach(k=>{try{if(ch[k])ch[k].destroy()}catch(e){} delete ch[k];});
+  Object.keys(cm).forEach(k=>{delete cm[k];});
+  if(!d.positions.length){el.innerHTML='';return;}
+  _posMeta={};
+  el.innerHTML=d.positions.map((p,idx)=>{
+    const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
+    const cid='c'+uid;
+    const durSec=Math.max(60,Math.round((p.duration||15)*60));
+    const secLeftRaw=Math.max(0,Math.round((p.end_ts||now)-now));
+    const secLeft=Math.min(durSec,secLeftRaw);
+    const pct=Math.min(100,Math.max(0,((durSec-secLeft)/durSec)*100));
+    const cls=p.lead===null?'':p.lead?' lead':' trail';
+    const sideH=p.side==='Up'?'<span class="pup">UP ▲</span>':'<span class="pdn">DOWN ▼</span>';
+    const bH=p.lead===null?'<span class="bstate na">Unknown</span>':p.lead?'<span class="bstate win">Winning</span>':'<span class="bstate lose">Losing</span>';
+    const srcH=p.src==='fallback'?'<span class="bunk">FALLBACK</span>':'';
+    const scoreH=p.score!=null?`<span class="stag">${p.score}</span>`:'';
+    const mc=p.move_pct>=0?'g':'r';
+    const bc=p.lead===null?'#303050':(p.lead?'var(--g)':'var(--r)');
+    const cd=countdownSec(secLeft);
+    const hasBeat=(p.open_p||0)>0;
+    const delta=hasBeat?((p.cur_p||0)-(p.open_p||0)):0;
+    const dc=delta>=0?'g':'r';
+    const openTxt=hasBeat?('$'+fmt(p.open_p,pdec(p.open_p))):'N/A';
+    const curTxt=(p.cur_p||0)>0?('$'+fmt(p.cur_p,pdec(p.cur_p))):'N/A';
+    const deltaTxt=hasBeat?`${pfx(delta)}${fmt(Math.abs(delta),pdec(Math.abs(delta)||0.01))}`:'N/A';
+    return `<div class="pcard${cls}"><div class="ph"><div class="phl">
+  <span class="psym">${p.asset} Up or Down - ${p.duration||15} Minutes</span>
+  <span class="pevt">${fmtETRange(p.start_ts,p.end_ts)}</span>
+  <span class="pdur">${p.duration||15}m</span>${sideH}</div>
+<div class="phr">${bH}${srcH}${scoreH}</div></div>
+<div class="pdata">
+<div class="di"><div class="dl">Price to beat</div><div class="dv">${openTxt}</div></div>
+<div class="di"><div class="dl">Current price</div><div class="dv">${curTxt} <span class="${hasBeat?dc:'dm'}" style="font-size:.8rem">${deltaTxt}</span></div><div class="dv d" style="font-size:.82rem" id="m${uid}">—</div></div>
+<div class="pcount"><div class="dl">Time left</div><div class="pcv" id="tm${uid}">${cd.m}<small>m</small> ${cd.s}<small>s</small></div></div>
+</div>
+<div class="ca"><canvas id="${cid}" height="120"></canvas></div>
+<div class="pf"><span class="lbl">Stake <b>$${fmt(p.stake)}</b> · Move <b class="${mc}">${pfx(p.move_pct)}${p.move_pct.toFixed(2)}%</b></span>
+<span class="rk">${p.rk||''}</span></div>
+<div class="tb"><div class="tbf" id="pb${uid}" style="width:${pct}%;background:${bc}"></div></div>
+</div>`;
+  }).join('');
+  d.positions.forEach((p,idx)=>{
+    const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
+    _posMeta[uid]={open_p:p.open_p,cur_p:p.cur_p,start_ts:p.start_ts,end_ts:p.end_ts,duration:p.duration||15};
+    const basePts=d.charts[p.asset]||[];
+    drawChart('c'+uid,basePts,p.open_p,p.cur_p,p.start_ts,p.end_ts,now);
+  });
+  _mt={};d.positions.forEach((p,idx)=>{
+    const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
+    const tid=String(p.token_id||'').trim();
+    if(tid && !_mid404.has(tid))_mt[uid]=tid;
+  });
+  tickTime();
+  pollMid();
+}
+
+function renderLeft(d){
+  let h='';
+  if(d.active_gates&&d.active_gates.length){
+    h+=`<div class="card"><div class="ch">Active Gates</div><div class="gates">`+
+      d.active_gates.map(g=>`<span class="gtag">${g}</span>`).join('')+`</div></div>`;
+  }
+  const sk=d.skip_top||[];
+  if(!sk.length){
+    h+=`<div class="card"><div class="ch">Skip Reasons</div><div class="ce">None in 15m</div></div>`;
+  }else{
+    h+=`<div class="card"><div class="ch">Skip Reasons · 15m</div>`+
+      sk.map(s=>`<div class="skrow"><span class="skr">${s.reason}</span><span class="skc">${s.count}</span></div>`).join('')+`</div>`;
+  }
+  document.getElementById('lpanel').innerHTML=h;
+}
+
+function renderExecQ(rows){
+  const el=document.getElementById('execq');
+  if(!rows||!rows.length){el.innerHTML='';return;}
+  const tot=rows.reduce((s,r)=>s+r.pnl,0);
+  const trs=rows.map(r=>{
+    const wr=r.wr;
+    const wc=wr===null?'dm':wr>=52?'g':wr>=48?'y':'r';
+    const bw=wr===null?0:Math.min(100,wr);
+    const bc=wr===null?'#242438':wr>=52?'var(--g)':wr>=48?'var(--y)':'var(--r)';
+    return `<tr>
+<td class="etbk">${r.bucket}</td>
+<td class="etfo">${r.fills}/${r.outcomes}</td>
+<td><div class="wrc"><div class="wrt"><div class="wrf" style="width:${bw}%;background:${bc}"></div></div><span class="wrn ${wc}">${wr===null?'—':wr+'%'}</span></div></td>
+<td class="etpf">${r.pf===null?'<span class="dm">—</span>':r.pf.toFixed(2)}</td>
+<td class="etpnl"><span class="${r.pnl>=0?'g':'r'}">${pnl(r.pnl)}</span></td>
+</tr>`;
+  }).join('');
+  el.innerHTML=`<div class="etw"><div class="eth">
+  <span class="etl">ExecQ — Active Buckets</span>
+  <span class="ett ${tot>=0?'g':'r'}">${pnl(tot)}</span>
+</div>
+<table class="et">
+<thead><tr><th>Bucket</th><th>F/O</th><th>Win Rate</th><th>PF</th><th>PnL</th></tr></thead>
+<tbody>${trs}</tbody>
+</table></div>`;
+}
+
+async function refresh(){
+  try{
+    const d=await fetch('/api?t='+Date.now(),{cache:'no-store'}).then(r=>r.json());
+    renderHeader(d);renderPrices(d);renderMetrics(d);
+    renderPositions(d);renderLeft(d);renderExecQ(d.execq_all);
+  }catch(e){console.warn(e);}
+}
+
+let _mt={};
+async function pollMid(){
+  for(const [cid,tid] of Object.entries(_mt)){
+    if(!tid)continue;
+    try{
+      const r=await fetch('https://clob.polymarket.com/midpoint?token_id='+tid);
+      const el=document.getElementById('m'+cid);
+      if(r.status===404){
+        // Invalid or stale token id for this market side; stop polling this row.
+        _mid404.add(String(tid));
+        if(el){el.textContent='n/a';el.className='dv dm';}
+        delete _mt[cid];
+        continue;
+      }
+      if(!r.ok)continue;
+      const j=await r.json();
+      if(el){
+        if(j&&j.mid!=null){
+          const v=parseFloat(j.mid);
+          if(Number.isFinite(v)){
+            el.textContent=v.toFixed(3);
+            el.className='dv '+(v>=0.5?'g':'r');
+            const pm=_posMeta[cid];
+            // Keep midpoint as metric text only; chart uses underlying asset price series.
+            if(pm && Number(pm.open_p)<=2){
+              const now=Math.floor(Date.now()/1000);
+              const s=_midSeries[cid]||[];
+              s.push({t:now,p:v});
+              if(s.length>320)s.splice(0,s.length-320);
+              _midSeries[cid]=s;
+            }
+          }
+        }else{
+          el.textContent='—';
+          el.className='dv d';
+        }
+      }
+    }catch(e){}
+  }
+}
+
+refresh();
+setInterval(refresh,5000);
+setInterval(tickTime,1000);
+setInterval(pollMid,2000);
+</script>
+</body></html>"""
+
+        _NO_CACHE_HEADERS = {
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+
+        async def handle_html(request):
+            return web.Response(
+                text=HTML,
+                content_type="text/html",
+                headers=_NO_CACHE_HEADERS,
+            )
+
+        async def handle_api(request):
+            try:
+                data = self._dashboard_data()
+            except Exception as e:
+                data = {"error": str(e)}
+            return web.Response(
+                text=json.dumps(data),
+                content_type="application/json",
+                headers=_NO_CACHE_HEADERS,
+            )
+
+        async def handle_reload_buckets(request):
+            try:
+                self._bucket_stats.rows.clear()
+                _bs_load(self._bucket_stats)
+                n = sum(v.get("outcomes", 0) for v in self._bucket_stats.rows.values())
+                return web.Response(
+                    text=json.dumps({"ok": True, "outcomes": n, "buckets": len(self._bucket_stats.rows)}),
+                    content_type="application/json",
+                    headers=_NO_CACHE_HEADERS,
+                )
+            except Exception as e:
+                return web.Response(text=json.dumps({"ok": False, "error": str(e)}),
+                                    content_type="application/json")
+
+        async def handle_analyze(request):
+            """Detailed breakdown by score|entry_band|asset for a given date prefix."""
+            try:
+                date = request.rel_url.query.get("date", "")[:10]
+                dur_filter = request.rel_url.query.get("dur", "")
+                from collections import defaultdict as _dd
+                rows = _dd(lambda: {"wins": 0, "outcomes": 0, "pnl": 0.0,
+                                    "gross_win": 0.0, "gross_loss": 0.0})
+                for r in self._metrics_resolve_rows_cached(ttl_sec=15.0):
+                    if date and not str(r.get("ts", "")).startswith(date):
+                        continue
+                    if dur_filter and str(r.get("duration", "15")) != dur_filter:
+                        continue
+                    score = int(r.get("score") or 0)
+                    entry = float(r.get("entry_price") or 0)
+                    pnl   = float(r.get("pnl") or 0)
+                    won   = r.get("result") == "WIN"
+                    asset = str(r.get("asset", "?"))
+                    sc = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
+                    if entry < 0.30:   eb = "<30c"
+                    elif entry < 0.51: eb = "30-50c"
+                    elif entry < 0.61: eb = "51-60c"
+                    elif entry < 0.71: eb = "61-70c"
+                    else:              eb = ">70c"
+                    by = request.rel_url.query.get("by", "bucket")
+                    if by == "asset":
+                        k = asset
+                    elif by == "asset-score":
+                        k = asset + "|" + sc
+                    else:
+                        k = sc + "|" + eb
+                    rows[k]["outcomes"] += 1
+                    rows[k]["pnl"] += pnl
+                    if won:
+                        rows[k]["wins"] += 1
+                        rows[k]["gross_win"] += max(0.0, pnl)
+                    else:
+                        rows[k]["gross_loss"] += max(0.0, -pnl)
+                out = []
+                for k, v in sorted(rows.items(), key=lambda x: x[1]["pnl"], reverse=True):
+                    n = v["outcomes"]
+                    wr = round(v["wins"] / n * 100, 1) if n else 0
+                    pf = round(v["gross_win"] / v["gross_loss"], 2) if v["gross_loss"] > 0 else None
+                    be = round(v["gross_loss"] / (v["gross_win"] + v["gross_loss"]) * 100, 1) if (v["gross_win"] + v["gross_loss"]) > 0 else None
+                    out.append({"bucket": k, "n": n, "wr": wr, "pf": pf,
+                                "be_wr": be, "pnl": round(v["pnl"], 2)})
+                return web.Response(text=json.dumps({"date": date, "rows": out}),
+                                    content_type="application/json",
+                                    headers=_NO_CACHE_HEADERS)
+            except Exception as e:
+                return web.Response(text=json.dumps({"error": str(e)}),
+                                    content_type="application/json")
+
+        async def handle_daily(request):
+            try:
+                dur_filter = request.rel_url.query.get("dur", "")
+                daily = {}
+                for r in self._metrics_resolve_rows_cached(ttl_sec=15.0):
+                    if dur_filter and str(r.get("duration", "15")) != dur_filter:
+                        continue
+                    day = str(r.get("ts", ""))[:10]
+                    pnl = float(r.get("pnl") or 0)
+                    won = r.get("result") == "WIN"
+                    if day not in daily:
+                        daily[day] = {"wins": 0, "outcomes": 0, "pnl": 0.0}
+                    daily[day]["outcomes"] += 1
+                    daily[day]["pnl"] += pnl
+                    if won:
+                        daily[day]["wins"] += 1
+                out = []
+                cumul = 0.0
+                for day in sorted(daily):
+                    v = daily[day]
+                    wr = round(v["wins"] / v["outcomes"] * 100, 1) if v["outcomes"] else 0
+                    cumul += v["pnl"]
+                    out.append({"day": day, "n": v["outcomes"], "wr": wr,
+                                "pnl": round(v["pnl"], 2), "cumul": round(cumul, 2)})
+                return web.Response(text=json.dumps(out),
+                                    content_type="application/json",
+                                    headers=_NO_CACHE_HEADERS)
+            except Exception as e:
+                return web.Response(text=json.dumps({"error": str(e)}),
+                                    content_type="application/json")
+
+        async def handle_dur_stats(request):
+            """Duration breakdown (5m vs 15m) from metrics file."""
+            try:
+                from collections import defaultdict as _dd
+                rows = _dd(lambda: {"wins": 0, "losses": 0, "pnl": 0.0,
+                                    "gross_win": 0.0, "gross_loss": 0.0})
+                n5 = n15 = 0
+                for r in self._metrics_resolve_rows_cached(ttl_sec=15.0):
+                    dur = int(r.get("duration") or 15)
+                    score = int(r.get("score") or 0)
+                    entry = float(r.get("entry_price") or 0)
+                    pnl = float(r.get("pnl") or 0)
+                    won = r.get("result") == "WIN"
+                    sc = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
+                    if entry < 0.30:   eb = "<30c"
+                    elif entry < 0.51: eb = "30-50c"
+                    elif entry < 0.61: eb = "51-60c"
+                    elif entry < 0.71: eb = "61-70c"
+                    else:              eb = ">70c"
+                    k = f"{dur}m|{sc}|{eb}"
+                    rows[k]["wins" if won else "losses"] += 1
+                    rows[k]["pnl"] += pnl
+                    if won: rows[k]["gross_win"] += max(0.0, pnl)
+                    else:   rows[k]["gross_loss"] += max(0.0, -pnl)
+                    if dur == 5: n5 += 1
+                    else: n15 += 1
+                out = []
+                for k, v in sorted(rows.items(), key=lambda x: x[1]["pnl"], reverse=True):
+                    n = v["wins"] + v["losses"]
+                    wr = round(v["wins"] / n * 100, 1) if n else 0
+                    denom = v["gross_win"] + v["gross_loss"]
+                    be = round(v["gross_loss"] / denom * 100, 1) if denom > 0 else None
+                    pf = round(v["gross_win"] / v["gross_loss"], 2) if v["gross_loss"] > 0 else None
+                    out.append({"bucket": k, "n": n, "wr": wr, "pf": pf,
+                                "be_wr": be, "pnl": round(v["pnl"], 2)})
+                return web.Response(
+                    text=json.dumps({"n5m": n5, "n15m": n15, "rows": out}),
+                    content_type="application/json",
+                    headers=_NO_CACHE_HEADERS)
+            except Exception as e:
+                return web.Response(text=json.dumps({"error": str(e)}),
+                                    content_type="application/json")
+
+        _CORR_CACHE_PATH = "/data/corr_cache.json"
+        _corr_cache = {"source": "polymarket", "windows": 0, "rows": [], "built_at": ""}
+
+        def _build_corr_cache_sync():
+            """Fetch Polymarket historical data (15m + 5m) and compute direction correlation.
+            Runs in a worker thread to avoid blocking the main asyncio event loop.
+            """
+            import urllib.request as _ur
+            from collections import defaultdict as _dd
+            from itertools import combinations
+            # {asset: (series_id, duration_label)}
+            _SERIES = {
+                "BTC|15m": (10192, "15m"), "ETH|15m": (10191, "15m"),
+                "SOL|15m": (10423, "15m"), "XRP|15m": (10422, "15m"),
+                "BTC|5m":  (10684, "5m"),  "ETH|5m":  (10683, "5m"),
+            }
+            _HDRS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+            # windows[slot][asset|dur] = direction
+            windows = _dd(dict)
+            counts = {}
+            for key, (sid, dur) in _SERIES.items():
+                asset = key.split("|")[0]
+                offset = 0; total = 0
+                while True:
+                    url = (f"https://gamma-api.polymarket.com/events"
+                           f"?series_id={sid}&closed=true&limit=200&offset={offset}")
+                    req = _ur.Request(url, headers=_HDRS)
+                    try:
+                        with _ur.urlopen(req, timeout=15) as resp:
+                            events = json.loads(resp.read())
+                    except Exception:
+                        break
+                    if not events:
+                        break
+                    for ev in events:
+                        for mkt in ev.get("markets", []):
+                            end = str(ev.get("endDate", ""))[:16]
+                            if not end:
+                                continue
+                            try:
+                                prices   = json.loads(mkt["outcomePrices"]) if isinstance(mkt.get("outcomePrices"), str) else mkt.get("outcomePrices", [])
+                                outcomes = json.loads(mkt["outcomes"])      if isinstance(mkt.get("outcomes"), str)      else mkt.get("outcomes", [])
+                                p0, p1 = float(prices[0]), float(prices[1])
+                            except Exception:
+                                continue
+                            if p0 > 0.95:   winner = outcomes[0]
+                            elif p1 > 0.95: winner = outcomes[1]
+                            else:           continue
+                            slot = end + "|" + dur
+                            wkey = asset + "|" + dur
+                            if wkey not in windows[slot]:
+                                windows[slot][wkey] = winner
+                                total += 1
+                    offset += 200
+                    if len(events) < 200:
+                        break
+                counts[key] = total
+            pairs = _dd(lambda: {"uu": 0, "dd": 0, "sp": 0, "n": 0})
+            for slot, assets in windows.items():
+                dur = slot.rsplit("|", 1)[-1]
+                # only pair assets within same duration
+                same_dur = [(k, v) for k, v in assets.items() if k.endswith("|" + dur)]
+                for (a1, d1), (a2, d2) in combinations(same_dur, 2):
+                    a1n = a1.split("|")[0]; a2n = a2.split("|")[0]
+                    key = "|".join(sorted([a1n, a2n])) + "|" + dur
+                    pairs[key]["n"] += 1
+                    if d1 == "Up"   and d2 == "Up":   pairs[key]["uu"] += 1
+                    elif d1 == "Down" and d2 == "Down": pairs[key]["dd"] += 1
+                    else:                               pairs[key]["sp"] += 1
+            out = []
+            for k, v in sorted(pairs.items()):
+                n = v["n"]
+                if n == 0: continue
+                same_pct = round((v["uu"] + v["dd"]) / n * 100, 1)
+                out.append({"pair": k, "n": n, "up_up": v["uu"],
+                            "down_down": v["dd"], "split": v["sp"],
+                            "same_pct": same_pct})
+            result = {"source": "polymarket", "windows": len(windows),
+                      "rows": out, "built_at": datetime.now(timezone.utc).isoformat()}
+            _corr_cache.update(result)
+            try:
+                with open(_CORR_CACHE_PATH, "w") as _f:
+                    json.dump(result, _f)
+            except Exception:
+                pass
+
+        async def _build_corr_cache_async():
+            # Offload blocking urllib/file work so trading loops stay responsive.
+            await asyncio.to_thread(_build_corr_cache_sync)
+
+        async def _corr_refresh_loop():
+            """Rebuild correlation cache once at startup then every 6 hours."""
+            try:
+                with open(_CORR_CACHE_PATH) as _f:
+                    _corr_cache.update(json.load(_f))
+            except Exception:
+                pass
+            # Let trading loops settle first; correlation cache is non-critical.
+            await asyncio.sleep(2)
+            while True:
+                try:
+                    await asyncio.wait_for(_build_corr_cache_async(), timeout=120)
+                except Exception:
+                    pass
+                await asyncio.sleep(6 * 3600)
+
+        async def handle_corr(request):
+            """Token direction correlation from Polymarket historical data (cached)."""
+            return web.Response(text=json.dumps(_corr_cache),
+                                content_type="application/json",
+                                headers=_NO_CACHE_HEADERS)
+
+        app = web.Application()
+        app.router.add_get("/", handle_html)
+        app.router.add_get("/api", handle_api)
+        app.router.add_get("/daily", handle_daily)
+        app.router.add_get("/analyze", handle_analyze)
+        app.router.add_get("/dur-stats", handle_dur_stats)
+        app.router.add_get("/corr", handle_corr)
+        app.router.add_get("/reload-buckets", handle_reload_buckets)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"[DASH] Dashboard running on http://0.0.0.0:{port}")
+        asyncio.ensure_future(_corr_refresh_loop())
+        while True:
+            await asyncio.sleep(3600)
+
+    # ── MAIN ──────────────────────────────────────────────────────────────────
     async def run(self):
         print(f"""
 {B}╔══════════════════════════════════════════════════════════════╗
