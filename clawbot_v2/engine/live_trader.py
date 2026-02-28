@@ -4238,54 +4238,74 @@ class LiveTrader:
                     async def pinger():
                         while True:
                             await asyncio.sleep(PING_INTERVAL)
-                            try: await ws.send("PING")
-                            except: break
+                            try:
+                                await ws.send(json.dumps({"action": "ping"}))
+                            except Exception:
+                                try:
+                                    await ws.send("PING")
+                                except Exception:
+                                    break
                     asyncio.create_task(pinger())
 
                     async for raw in ws:
                         if not raw: continue
-                        try: msg = json.loads(raw)
+                        try:
+                            if isinstance(raw, (bytes, bytearray)):
+                                raw = raw.decode("utf-8", "ignore")
+                            msg = json.loads(raw)
                         except: continue
+                        events = msg if isinstance(msg, list) else [msg]
 
                         # ── Market token price update (instant up_price refresh) ──
-                        if msg.get("event_type") == "price_change" or msg.get("topic") == "market":
-                            pl = msg.get("payload", {}) or msg
-                            tid   = pl.get("asset_id") or pl.get("token_id","")
-                            price = float(pl.get("price") or pl.get("mid_price") or 0)
-                            if tid and price > 0:
-                                self.token_prices[tid] = price
-                                # Update active_mkts up_price in real time
-                                for cid, m in list(self.active_mkts.items()):
-                                    if m.get("token_up") == tid:
-                                        m["up_price"] = price
-                                    elif m.get("token_down") == tid:
-                                        m["up_price"] = 1 - price
+                        for ev in events:
+                            if not isinstance(ev, dict):
+                                continue
+                            if ev.get("event_type") == "price_change" or ev.get("topic") == "market":
+                                pl = ev.get("payload", {}) or ev
+                                tid   = pl.get("asset_id") or pl.get("token_id","")
+                                price = float(pl.get("price") or pl.get("mid_price") or 0)
+                                if tid and price > 0:
+                                    self.token_prices[tid] = price
+                                    # Update active_mkts up_price in real time
+                                    for cid, m in list(self.active_mkts.items()):
+                                        if m.get("token_up") == tid:
+                                            m["up_price"] = price
+                                        elif m.get("token_down") == tid:
+                                            m["up_price"] = 1 - price
 
-                        if msg.get("topic") != "crypto_prices": continue
-                        p   = msg.get("payload", {})
-                        sym = p.get("symbol", "").lower()
-                        val = float(p.get("value", 0) or 0)
-                        if val == 0: continue
-                        MAP = {"btcusdt":"BTC","ethusdt":"ETH","solusdt":"SOL","xrpusdt":"XRP"}
-                        asset = MAP.get(sym)
-                        if asset:
-                            self.prices[asset] = val
-                            _now_ts = _time.time()
-                            self._rtds_asset_ts[asset] = _now_ts
-                            self.price_history[asset].append((_now_ts, val))
-                            self._tick_update(asset, val, _now_ts)
-                            # Event-driven: evaluate unseen markets immediately on price tick
-                            now_t = _time.time()
-                            for cid, m in list(self.active_mkts.items()):
-                                if m.get("asset") != asset: continue
-                                if cid in self.seen: continue
-                                if cid not in self.open_prices: continue
-                                if now_t - self._last_eval_time.get(cid, 0) < 0.25: continue
-                                mins = (m["end_ts"] - now_t) / 60
-                                if mins < 1: continue
-                                self._last_eval_time[cid] = now_t
-                                m_rt = dict(m); m_rt["mins_left"] = mins
-                                asyncio.create_task(self.evaluate(m_rt))
+                            topic = str(ev.get("topic", "") or "").lower()
+                            if topic not in ("crypto_prices", "crypto_prices_update", "crypto_prices_v2"):
+                                continue
+                            payload = ev.get("payload", {}) or {}
+                            payloads = payload if isinstance(payload, list) else [payload]
+                            for p in payloads:
+                                if not isinstance(p, dict):
+                                    continue
+                                sym = str(p.get("symbol", "") or p.get("pair", "") or p.get("s", "")).lower()
+                                val = float(p.get("value") or p.get("price") or p.get("v") or 0)
+                                if val <= 0:
+                                    continue
+                                MAP = {"btcusdt":"BTC","ethusdt":"ETH","solusdt":"SOL","xrpusdt":"XRP"}
+                                asset = MAP.get(sym)
+                                if not asset:
+                                    continue
+                                self.prices[asset] = val
+                                _now_ts = _time.time()
+                                self._rtds_asset_ts[asset] = _now_ts
+                                self.price_history[asset].append((_now_ts, val))
+                                self._tick_update(asset, val, _now_ts)
+                                # Event-driven: evaluate unseen markets immediately on price tick
+                                now_t = _time.time()
+                                for cid, m in list(self.active_mkts.items()):
+                                    if m.get("asset") != asset: continue
+                                    if cid in self.seen: continue
+                                    if cid not in self.open_prices: continue
+                                    if now_t - self._last_eval_time.get(cid, 0) < 0.25: continue
+                                    mins = (m["end_ts"] - now_t) / 60
+                                    if mins < 1: continue
+                                    self._last_eval_time[cid] = now_t
+                                    m_rt = dict(m); m_rt["mins_left"] = mins
+                                    asyncio.create_task(self.evaluate(m_rt))
             except Exception as e:
                 self.rtds_ok = False
                 print(f"{R}[RTDS] Reconnect: {e}{RS}")
