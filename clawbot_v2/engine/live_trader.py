@@ -398,6 +398,8 @@ CHAINLINK_ABI = [
 # keccak256("AnswerUpdated(int256,uint256,uint256)") — Chainlink aggregator event
 CL_ANSWER_UPDATED_TOPIC = "0x0559884fd3a460db3073b7fc896cc77986f16e378210ded43186175bf646fc5f"
 SCAN_INTERVAL  = float(os.environ.get("SCAN_INTERVAL", "0.5"))
+SCORE_DEBOUNCE_SEC = float(os.environ.get("SCORE_DEBOUNCE_SEC", "0.9"))
+RTDS_EVAL_MIN_INTERVAL_SEC = float(os.environ.get("RTDS_EVAL_MIN_INTERVAL_SEC", "1.0"))
 MARKET_REFRESH_SEC = float(os.environ.get("MARKET_REFRESH_SEC", "30.0"))  # how often to re-fetch Gamma API (was every 0.5s = 600 req/min!)
 PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "5"))
 STATUS_INTERVAL= int(os.environ.get("STATUS_INTERVAL", "15"))
@@ -1374,6 +1376,7 @@ class LiveTrader:
         self._pm_pattern_stats = {}
         self.side_perf       = {}                 # "ASSET|SIDE" -> {n, gross_win, gross_loss, pnl}
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
+        self._score_cache_by_key = {}             # (cid, late_relax) -> {"ts","fp","sig"}
         self._exec_lock         = asyncio.Lock()
         self._executing_cids    = set()
         self._reserved_bankroll = 0.0             # sum of in-flight trade sizes (race guard)
@@ -4331,7 +4334,7 @@ class LiveTrader:
                                     if m.get("asset") != asset: continue
                                     if cid in self.seen: continue
                                     if cid not in self.open_prices: continue
-                                    if now_t - self._last_eval_time.get(cid, 0) < 0.25: continue
+                                    if now_t - self._last_eval_time.get(cid, 0) < RTDS_EVAL_MIN_INTERVAL_SEC: continue
                                     mins = (m["end_ts"] - now_t) / 60
                                     if mins < 1: continue
                                     self._last_eval_time[cid] = now_t
@@ -4918,7 +4921,45 @@ class LiveTrader:
 
     async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
         from clawbot_v2.strategy.core import _score_market
-        return await _score_market(self, m, late_relax)
+        cid = str(m.get("conditionId", "") or "")
+        if not cid:
+            return await _score_market(self, m, late_relax)
+
+        key = (cid, bool(late_relax))
+        now = _time.time()
+        asset = str(m.get("asset", "") or "")
+        up_price = float(m.get("up_price", 0.0) or 0.0)
+        mins_left = float(m.get("mins_left", 0.0) or 0.0)
+        cl_p = float(self.cl_prices.get(asset, 0.0) or 0.0) if asset else 0.0
+        rtds_p = float(self.prices.get(asset, 0.0) or 0.0) if asset else 0.0
+        fp = (
+            round(up_price, 4),
+            round(mins_left, 1),
+            round(cl_p, 4),
+            round(rtds_p, 4),
+            int(m.get("start_ts", 0) or 0),
+            int(m.get("end_ts", 0) or 0),
+        )
+        cached = self._score_cache_by_key.get(key)
+        if cached:
+            age = now - float(cached.get("ts", 0.0) or 0.0)
+            if age < SCORE_DEBOUNCE_SEC and cached.get("fp") == fp:
+                sig_cached = cached.get("sig")
+                return dict(sig_cached) if isinstance(sig_cached, dict) else None
+        if len(self._score_cache_by_key) > 5000:
+            cutoff = now - 180.0
+            self._score_cache_by_key = {
+                k: v for k, v in self._score_cache_by_key.items()
+                if float((v or {}).get("ts", 0.0) or 0.0) >= cutoff
+            }
+
+        sig = await _score_market(self, m, late_relax)
+        self._score_cache_by_key[key] = {
+            "ts": now,
+            "fp": fp,
+            "sig": dict(sig) if isinstance(sig, dict) else None,
+        }
+        return sig
 
     async def _execute_trade(self, sig: dict):
         from clawbot_v2.execution.core import _execute_trade
