@@ -752,6 +752,11 @@ LEADER_STYLE_EDGE_BONUS = float(os.environ.get("LEADER_STYLE_EDGE_BONUS", "0.005
 LEADER_STYLE_EDGE_PENALTY = float(os.environ.get("LEADER_STYLE_EDGE_PENALTY", "0.005"))
 PM_PUBLIC_OCROWD_AVG_C_MIN = float(os.environ.get("PM_PUBLIC_OCROWD_AVG_C_MIN", "85.0"))
 LEADER_NOFLOW_SIZE_SCALE = float(os.environ.get("LEADER_NOFLOW_SIZE_SCALE", "0.90"))
+LEADER_FORCE_QUALITY_GUARD_ENABLED = os.environ.get("LEADER_FORCE_QUALITY_GUARD_ENABLED", "true").lower() == "true"
+LEADER_FORCE_MIN_WR_LB = float(os.environ.get("LEADER_FORCE_MIN_WR_LB", "0.44"))
+LEADER_FORCE_MIN_PF = float(os.environ.get("LEADER_FORCE_MIN_PF", "0.90"))
+LEADER_FORCE_MIN_EXP = float(os.environ.get("LEADER_FORCE_MIN_EXP", "-0.10"))
+LEADER_FORCE_MIN_N = int(os.environ.get("LEADER_FORCE_MIN_N", "12"))
 IMBALANCE_CONFIRM_MIN = float(os.environ.get("IMBALANCE_CONFIRM_MIN", "0.10"))
 ANALYSIS_CL_FRESH_MAX_AGE_SEC = float(os.environ.get("ANALYSIS_CL_FRESH_MAX_AGE_SEC", "35.0"))
 ANALYSIS_QUOTE_FRESH_MAX_MS = float(os.environ.get("ANALYSIS_QUOTE_FRESH_MAX_MS", "1200.0"))
@@ -5621,7 +5626,40 @@ class LiveTrader:
                     LEADER_ENTRY_CAP_HARD_MAX,
                     MAX_ENTRY_PRICE + MAX_ENTRY_TOL + LEADER_ENTRY_CAP_EXTRA,
                 )
-                if leader_entry <= leader_entry_cap:
+                leader_quality_ok = True
+                if LEADER_FORCE_QUALITY_GUARD_ENABLED:
+                    try:
+                        q = self._asset_entry_profile(
+                            asset, duration, leader_side, leader_entry, open_src, cl_age_s
+                        )
+                        q_n = int(q.get("n", 0) or 0)
+                        q_wr = float(q.get("wr_lb", 0.5) or 0.5)
+                        q_pf = float(q.get("pf", 1.0) or 1.0)
+                        q_exp = float(q.get("exp", 0.0) or 0.0)
+                        rs = self._recent_side_profile(asset, duration, leader_side)
+                        rs_n = int(rs.get("n", 0) or 0)
+                        rs_wr = float(rs.get("wr_lb", 0.5) or 0.5)
+                        rs_exp = float(rs.get("exp", 0.0) or 0.0)
+                        bad_band = (
+                            q_n >= LEADER_FORCE_MIN_N
+                            and (q_wr < LEADER_FORCE_MIN_WR_LB or q_pf < LEADER_FORCE_MIN_PF or q_exp < LEADER_FORCE_MIN_EXP)
+                        )
+                        bad_recent = (
+                            rs_n >= LEADER_FORCE_MIN_N
+                            and rs_wr < LEADER_FORCE_MIN_WR_LB
+                            and rs_exp < LEADER_FORCE_MIN_EXP
+                        )
+                        if bad_band or bad_recent:
+                            leader_quality_ok = False
+                            if self._noisy_log_enabled(f"leader-block:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                                print(
+                                    f"{Y}[LEADER-BLOCK]{RS} {asset} {duration}m side={leader_side} "
+                                    f"band(n={q_n} wr_lb={q_wr:.2f} pf={q_pf:.2f} exp={q_exp:+.2f}) "
+                                    f"recent(n={rs_n} wr_lb={rs_wr:.2f} exp={rs_exp:+.2f})"
+                                )
+                    except Exception:
+                        pass
+                if leader_entry <= leader_entry_cap and leader_quality_ok:
                     if side != leader_side:
                         if self._noisy_log_enabled(f"leader-follow:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                             print(
