@@ -13413,8 +13413,19 @@ setInterval(pollMid,2000);
 </script>
 </body></html>"""
 
+        _NO_CACHE_HEADERS = {
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+
         async def handle_html(request):
-            return web.Response(text=HTML, content_type="text/html")
+            return web.Response(
+                text=HTML,
+                content_type="text/html",
+                headers=_NO_CACHE_HEADERS,
+            )
 
         async def handle_api(request):
             try:
@@ -13424,7 +13435,7 @@ setInterval(pollMid,2000);
             return web.Response(
                 text=json.dumps(data),
                 content_type="application/json",
-                headers={"Access-Control-Allow-Origin": "*"},
+                headers=_NO_CACHE_HEADERS,
             )
 
         async def handle_reload_buckets(request):
@@ -13435,7 +13446,7 @@ setInterval(pollMid,2000);
                 return web.Response(
                     text=json.dumps({"ok": True, "outcomes": n, "buckets": len(self._bucket_stats.rows)}),
                     content_type="application/json",
-                    headers={"Access-Control-Allow-Origin": "*"},
+                    headers=_NO_CACHE_HEADERS,
                 )
             except Exception as e:
                 return web.Response(text=json.dumps({"ok": False, "error": str(e)}),
@@ -13489,7 +13500,7 @@ setInterval(pollMid,2000);
                                 "be_wr": be, "pnl": round(v["pnl"], 2)})
                 return web.Response(text=json.dumps({"date": date, "rows": out}),
                                     content_type="application/json",
-                                    headers={"Access-Control-Allow-Origin": "*"})
+                                    headers=_NO_CACHE_HEADERS)
             except Exception as e:
                 return web.Response(text=json.dumps({"error": str(e)}),
                                     content_type="application/json")
@@ -13520,7 +13531,7 @@ setInterval(pollMid,2000);
                                 "pnl": round(v["pnl"], 2), "cumul": round(cumul, 2)})
                 return web.Response(text=json.dumps(out),
                                     content_type="application/json",
-                                    headers={"Access-Control-Allow-Origin": "*"})
+                                    headers=_NO_CACHE_HEADERS)
             except Exception as e:
                 return web.Response(text=json.dumps({"error": str(e)}),
                                     content_type="application/json")
@@ -13563,7 +13574,7 @@ setInterval(pollMid,2000);
                 return web.Response(
                     text=json.dumps({"n5m": n5, "n15m": n15, "rows": out}),
                     content_type="application/json",
-                    headers={"Access-Control-Allow-Origin": "*"})
+                    headers=_NO_CACHE_HEADERS)
             except Exception as e:
                 return web.Response(text=json.dumps({"error": str(e)}),
                                     content_type="application/json")
@@ -13678,7 +13689,7 @@ setInterval(pollMid,2000);
             """Token direction correlation from Polymarket historical data (cached)."""
             return web.Response(text=json.dumps(_corr_cache),
                                 content_type="application/json",
-                                headers={"Access-Control-Allow-Origin": "*"})
+                                headers=_NO_CACHE_HEADERS)
 
         app = web.Application()
         app.router.add_get("/", handle_html)
