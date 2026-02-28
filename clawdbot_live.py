@@ -3157,7 +3157,9 @@ class LiveTrader:
         vol_t   = vol_btc * math.sqrt(30 / (252 * 24 * 3600))
         if vol_t == 0:
             return 0.5
-        corr = 0.75   # empirical BTC→altcoin lag correlation
+        # Per-asset empirical BTC→altcoin lag correlation (from 15m co-window analysis)
+        _btc_lag_corr = {"ETH": 0.82, "SOL": 0.80, "XRP": 0.78}
+        corr = _btc_lag_corr.get(asset, 0.77)
         return float(norm.cdf(btc_lag_move / vol_t * corr))
 
     def _init_metrics_db(self):
@@ -9188,16 +9190,22 @@ class LiveTrader:
 
     def _cross_asset_direction(self, asset: str, direction: str) -> int:
         """Count how many OTHER assets are trending in the same direction right now.
-        Uses current Binance RTDS price vs each market's Chainlink open_price.
-        Returns 0-3."""
+        Uses current Binance RTDS price (preferred) vs each market's Chainlink open_price.
+        Only counts an asset when RTDS price is fresh (< 30s stale). Returns 0-3."""
         is_up = (direction == "Up")
         count = 0
+        now_ts = _time.time()
         for cid, m in self.active_mkts.items():
             a = m.get("asset", "")
             if a == asset:
                 continue
             op  = self.open_prices.get(cid, 0)
-            cur = self.prices.get(a, 0) or self.cl_prices.get(a, 0)
+            # Prefer RTDS price; skip if stale (> 30s) to avoid false consensus from stale feed
+            cur = self.prices.get(a, 0)
+            ph = self.price_history.get(a)
+            ts_cur = ph[-1][0] if ph else 0.0
+            if cur <= 0 or (ts_cur > 0 and now_ts - ts_cur > 30.0):
+                cur = self.cl_prices.get(a, 0)
             if op <= 0 or cur <= 0:
                 continue
             if (cur > op) == is_up:
@@ -10107,7 +10115,7 @@ class LiveTrader:
         """Calibrate model confidence to realized PnL quality (anti-overconfidence)."""
         snap = self._growth_snapshot()
         if snap["outcomes"] < 8:
-            return 0.70
+            return 0.78  # was 0.70: less aggressive cold-start suppression
         shrink = 0.82
         if snap["pf"] < 1.0:
             shrink -= min(0.25, (1.0 - snap["pf"]) * 0.50)
@@ -10135,7 +10143,8 @@ class LiveTrader:
         edge = float(sig.get("edge", 0.0))
         cl_bonus = 0.02 if sig.get("cl_agree", True) else -0.03
         payout = (1.0 / entry) - 1.0
-        ev_net = float(sig.get("execution_ev", (float(sig.get("true_prob", 0.5)) / entry) - 1.0 - FEE_RATE_EST))
+        _fee_dyn_sg = max(0.001, entry * (1.0 - entry) * 0.0624)  # parabolic fee model (peaks at 0.50)
+        ev_net = float(sig.get("execution_ev", (float(sig.get("true_prob", 0.5)) / entry) - 1.0 - _fee_dyn_sg))
         q_age = float(sig.get("quote_age_ms", 0.0) or 0.0)
         s_lat = float(sig.get("signal_latency_ms", 0.0) or 0.0)
         lag_penalty = 0.0
