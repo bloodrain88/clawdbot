@@ -10080,6 +10080,12 @@ class LiveTrader:
             and ev_net >= CORE_MIN_EV
         ):
             core_bonus += 0.03
+        # Wallet-alpha (Polymarket copyflow) bonus: reward fresh, coherent leader flow,
+        # but keep bounded to avoid overfitting crowd signals.
+        wallet_alpha = self._wallet_alpha_bonus(sig)
+        # Horizon optimizer (Polymarket 5m/15m round outcomes): reward duration
+        # with stronger recent win-quality / expectancy on resolved markets.
+        horizon_bonus = self._horizon_quality_bonus(int(sig.get("duration", 0) or 0))
         return (
             ev_net
             + edge * 0.38
@@ -10087,10 +10093,61 @@ class LiveTrader:
             + score * 0.003
             + cl_bonus
             + core_bonus
+            + wallet_alpha
+            + horizon_bonus
             + low_cent_pen
             + wr_pen
             + lag_penalty
         )
+
+    def _wallet_alpha_bonus(self, sig: dict) -> float:
+        """Bounded alpha bonus from Polymarket leader-flow quality."""
+        try:
+            copy_net = float(sig.get("copy_net", 0.0) or 0.0)
+            src = str(sig.get("signal_source", "") or "")
+            tier = str(sig.get("signal_tier", "") or "")
+            aq = float(sig.get("analysis_quality", 0.0) or 0.0)
+            b = 0.0
+            if src.startswith("leader"):
+                b += 0.010
+            if tier == "TIER-A":
+                b += 0.008
+            b += max(-0.010, min(0.010, copy_net * 0.025))
+            # Only trust copyflow more when full signal stack is fresh/coherent.
+            b *= max(0.55, min(1.10, 0.65 + (aq * 0.55)))
+            return max(-0.018, min(0.028, b))
+        except Exception:
+            return 0.0
+
+    def _horizon_quality_bonus(self, duration: int) -> float:
+        """Duration-level adaptive bonus from resolved Polymarket round outcomes."""
+        d = int(duration or 0)
+        if d not in (5, 15):
+            return 0.0
+        vals = []
+        for s in reversed(self._resolved_samples):
+            if int(s.get("duration", 0) or 0) != d:
+                continue
+            vals.append(s)
+            if len(vals) >= 160:
+                break
+        n = len(vals)
+        if n < 12:
+            return 0.0
+        wins = sum(1 for x in vals if bool(x.get("won", False)))
+        pnl = sum(float(x.get("pnl", 0.0) or 0.0) for x in vals)
+        wr_lb = self._wilson_lower_bound(int(wins), int(n), z=1.0)
+        exp = pnl / max(1, n)
+        b = 0.0
+        if wr_lb >= 0.52:
+            b += min(0.012, (wr_lb - 0.52) * 0.10)
+        elif wr_lb <= 0.47:
+            b -= min(0.012, (0.47 - wr_lb) * 0.10)
+        if exp > 0:
+            b += min(0.010, exp / 60.0)
+        elif exp < 0:
+            b -= min(0.010, abs(exp) / 60.0)
+        return max(-0.016, min(0.020, b))
 
     def _allow_second_round_trade(self, sig: dict, first_sig: dict | None = None) -> bool:
         """Permit second trade in same round only for high-quality push setups."""
