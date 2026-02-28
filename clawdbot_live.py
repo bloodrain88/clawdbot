@@ -388,6 +388,9 @@ METRICS_FILE   = os.path.join(_DATA_DIR, "clawdbot_onchain_metrics.jsonl")
 RUNTIME_JSON_LOG_FILE = os.path.join(_DATA_DIR, "clawdbot_runtime_logs.jsonl")
 PNL_BASELINE_FILE = os.path.join(_DATA_DIR, "clawdbot_pnl_baseline.json")
 SETTLED_FILE   = os.path.join(_DATA_DIR, "clawdbot_settled_cids.json")
+PRICE_CACHE_FILE = os.path.join(_DATA_DIR, "clawdbot_price_cache.json")
+PRICE_CACHE_SAVE_SEC = float(os.environ.get("PRICE_CACHE_SAVE_SEC", "20"))
+PRICE_CACHE_POINTS = int(os.environ.get("PRICE_CACHE_POINTS", "300"))
 PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false").lower() == "true"
 LOSS_STREAK_PAUSE_ENABLED = os.environ.get("LOSS_STREAK_PAUSE_ENABLED", "false").lower() == "true"
 LOSS_STREAK_PAUSE_N = int(os.environ.get("LOSS_STREAK_PAUSE_N", "3"))     # tightened 4→3
@@ -1274,6 +1277,7 @@ class LiveTrader:
         }
         # ── Adaptive strategy state ──────────────────────────────────────────
         self.price_history   = {a: deque(maxlen=300) for a in ["BTC","ETH","SOL","XRP"]}
+        self._price_cache_last_persist_ts = 0.0
         self.stats           = {}    # {asset: {side: {wins, total}}} — persisted
         self.recent_trades   = deque(maxlen=30)   # rolling window for WR adaptation
         self.recent_pnl      = deque(maxlen=40)   # rolling pnl window for profit-factor/expectancy adaptation
@@ -1337,6 +1341,7 @@ class LiveTrader:
         self.kalman  = {a: {"pos":0.0,"vel":0.0,"p00":1.0,"p01":0.0,"p11":1.0,"rdy":False}
                         for a in ["BTC","ETH","SOL","XRP"]}
         self._init_log()
+        self._load_price_cache()
         self._load_pending()
         self._load_stats()
         self._load_pnl_baseline()
@@ -2966,6 +2971,80 @@ class LiveTrader:
         except Exception:
             pass
 
+    def _save_price_cache(self, force: bool = False):
+        try:
+            now_ts = _time.time()
+            if not force and (now_ts - float(self._price_cache_last_persist_ts or 0.0)) < max(5.0, PRICE_CACHE_SAVE_SEC):
+                return
+            payload = {
+                "ts": now_ts,
+                "prices": {k: float(v or 0.0) for k, v in (self.prices or {}).items()},
+                "cl_prices": {k: float(v or 0.0) for k, v in (self.cl_prices or {}).items()},
+                "cl_updated": {k: float(v or 0.0) for k, v in (self.cl_updated or {}).items()},
+                "open_prices": {str(k): float(v or 0.0) for k, v in (self.open_prices or {}).items()},
+                "price_history": {
+                    a: [[float(ts), float(px)] for ts, px in list(ph)[-max(20, PRICE_CACHE_POINTS):] if px > 0]
+                    for a, ph in (self.price_history or {}).items()
+                },
+            }
+            with open(PRICE_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            self._price_cache_last_persist_ts = now_ts
+        except Exception:
+            pass
+
+    def _load_price_cache(self):
+        if not os.path.exists(PRICE_CACHE_FILE):
+            return
+        try:
+            with open(PRICE_CACHE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            prices = data.get("prices", {}) if isinstance(data, dict) else {}
+            cl_prices = data.get("cl_prices", {}) if isinstance(data, dict) else {}
+            cl_updated = data.get("cl_updated", {}) if isinstance(data, dict) else {}
+            open_prices = data.get("open_prices", {}) if isinstance(data, dict) else {}
+            ph_all = data.get("price_history", {}) if isinstance(data, dict) else {}
+            if isinstance(prices, dict):
+                for a, v in prices.items():
+                    vv = float(v or 0.0)
+                    if vv > 0:
+                        self.prices[str(a)] = vv
+            if isinstance(cl_prices, dict):
+                for a, v in cl_prices.items():
+                    vv = float(v or 0.0)
+                    if vv > 0:
+                        self.cl_prices[str(a)] = vv
+            if isinstance(cl_updated, dict):
+                for a, v in cl_updated.items():
+                    vv = float(v or 0.0)
+                    if vv > 0:
+                        self.cl_updated[str(a)] = vv
+            if isinstance(open_prices, dict):
+                for cid, v in open_prices.items():
+                    vv = float(v or 0.0)
+                    if vv > 0:
+                        self.open_prices[str(cid)] = vv
+            if isinstance(ph_all, dict):
+                for a, pts in ph_all.items():
+                    if a not in self.price_history:
+                        continue
+                    if not isinstance(pts, list):
+                        continue
+                    q = deque(maxlen=max(20, PRICE_CACHE_POINTS))
+                    for p in pts[-max(20, PRICE_CACHE_POINTS):]:
+                        if not isinstance(p, (list, tuple)) or len(p) < 2:
+                            continue
+                        ts = float(p[0] or 0.0)
+                        px = float(p[1] or 0.0)
+                        if ts > 0 and px > 0:
+                            q.append((ts, px))
+                    if q:
+                        self.price_history[a] = q
+            self._price_cache_last_persist_ts = _time.time()
+            print(f"{B}[BOOT]{RS} loaded persisted price cache ({len(self.prices)} spot, {len(self.open_prices)} open refs)")
+        except Exception:
+            pass
+
     def _save_seen(self):
         try:
             with open(SEEN_FILE, "w") as f:
@@ -3197,6 +3276,7 @@ class LiveTrader:
         return open_local, len(self.pending_redeem)
 
     def status(self):
+        self._save_price_cache(force=False)
         el   = datetime.now(timezone.utc) - self.start_time
         h, m = int(el.total_seconds()//3600), int(el.total_seconds()%3600//60)
         wr   = f"{self.wins/self.total*100:.1f}%" if self.total else "–"
