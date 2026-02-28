@@ -6080,6 +6080,7 @@ class LiveTrader:
         token_id = m["token_up"] if side == "Up" else m["token_down"]
         if not token_id:
             return None
+        opp_token_id = m["token_down"] if side == "Up" else m["token_up"]
         pm_book_data = _pm_book if token_id == prefetch_token else None
         if pm_book_data is None:
             # Ensure entry/payout gates use the actual traded side book, not synthetic 1-up_price.
@@ -6102,6 +6103,28 @@ class LiveTrader:
                 return 0.0
 
         fair_side_entry = up_price if side == "Up" else (1.0 - up_price)
+        chosen_ask = _best_ask_from(pm_book_data)
+        if opp_token_id:
+            opp_book = self._get_clob_ws_book(opp_token_id, max_age_ms=CLOB_MARKET_WS_MAX_AGE_MS)
+            if opp_book is None:
+                opp_book = await self._fetch_pm_book_safe(opp_token_id)
+            opp_ask = _best_ask_from(opp_book)
+            # Token-map drift guard:
+            # if selected token ask is far from expected side entry while opposite token is close,
+            # remap token ids for this decision to avoid inverted execution.
+            if chosen_ask > 0 and opp_ask > 0:
+                err_keep = abs(chosen_ask - fair_side_entry)
+                err_swap = abs(opp_ask - fair_side_entry)
+                if err_keep >= 0.18 and (err_swap + 0.05) < err_keep:
+                    if self._noisy_log_enabled(f"side-remap:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                        print(
+                            f"{Y}[SIDE-REMAP]{RS} {asset} {duration}m {side} "
+                            f"token {self._short_cid(token_id)}->{self._short_cid(opp_token_id)} "
+                            f"ask={chosen_ask:.3f} opp_ask={opp_ask:.3f} fair={fair_side_entry:.3f}"
+                        )
+                    token_id = opp_token_id
+                    pm_book_data = opp_book
+                    chosen_ask = opp_ask
 
         # ── Live CLOB price (more accurate than Gamma up_price) ──────────────
         live_entry = entry
@@ -6222,7 +6245,7 @@ class LiveTrader:
                 strong_relax = 0.02
             if FORCE_TRADE_EVERY_ROUND and late_relax and true_prob >= 0.66 and score >= 10 and edge >= 0.10:
                 strong_relax = max(strong_relax, 0.03)
-            max_entry_allowed = min(max_entry_allowed, 0.54 + strong_relax)
+            max_entry_allowed = min(max_entry_allowed, min(0.90, ENTRY_HARD_CAP_15M + strong_relax))
         else:
             max_entry_allowed = min(max_entry_allowed, max(0.60, adaptive_hard_cap))
         # Dynamic min-entry (not fixed hard floor): adapt to setup quality + microstructure.
