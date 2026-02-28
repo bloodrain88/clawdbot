@@ -494,13 +494,13 @@ USER_EVENTS_POLL_SEC = float(os.environ.get("USER_EVENTS_POLL_SEC", "0.8"))
 USER_EVENTS_CACHE_TTL_SEC = float(os.environ.get("USER_EVENTS_CACHE_TTL_SEC", "180"))
 CLOB_MARKET_WS_ENABLED = os.environ.get("CLOB_MARKET_WS_ENABLED", "true").lower() == "true"
 CLOB_MARKET_WS_SYNC_SEC = float(os.environ.get("CLOB_MARKET_WS_SYNC_SEC", "2.0"))
-CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "2000"))
-CLOB_MARKET_WS_SOFT_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_SOFT_AGE_MS", "6000"))
+CLOB_MARKET_WS_MAX_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_MAX_AGE_MS", "8000"))
+CLOB_MARKET_WS_SOFT_AGE_MS = float(os.environ.get("CLOB_MARKET_WS_SOFT_AGE_MS", "20000"))
 WS_STRICT_ADAPTIVE_ENABLED = os.environ.get("WS_STRICT_ADAPTIVE_ENABLED", "true").lower() == "true"
 WS_STRICT_ADAPTIVE_MULT = float(os.environ.get("WS_STRICT_ADAPTIVE_MULT", "1.35"))
-WS_STRICT_ADAPTIVE_MIN_MS = float(os.environ.get("WS_STRICT_ADAPTIVE_MIN_MS", "2200"))
-WS_STRICT_ADAPTIVE_MAX_MS = float(os.environ.get("WS_STRICT_ADAPTIVE_MAX_MS", "6500"))
-CLOB_REST_FALLBACK_ENABLED = os.environ.get("CLOB_REST_FALLBACK_ENABLED", "true").lower() == "true"
+WS_STRICT_ADAPTIVE_MIN_MS = float(os.environ.get("WS_STRICT_ADAPTIVE_MIN_MS", "5000"))
+WS_STRICT_ADAPTIVE_MAX_MS = float(os.environ.get("WS_STRICT_ADAPTIVE_MAX_MS", "20000"))
+CLOB_REST_FALLBACK_ENABLED = os.environ.get("CLOB_REST_FALLBACK_ENABLED", "false").lower() == "true"
 CLOB_REST_FRESH_MAX_AGE_MS = float(os.environ.get("CLOB_REST_FRESH_MAX_AGE_MS", "4000"))  # was 1500; REST scan cycle can be 2-3s
 CLOB_WS_STALE_HEAL_HITS = int(os.environ.get("CLOB_WS_STALE_HEAL_HITS", "1"))         # was 3; detect in 0.5s not 1.5s
 CLOB_WS_STALE_HEAL_COOLDOWN_SEC = float(os.environ.get("CLOB_WS_STALE_HEAL_COOLDOWN_SEC", "10"))  # was 20
@@ -547,15 +547,15 @@ LEADER_FRESH_SIZE_SCALE = float(os.environ.get("LEADER_FRESH_SIZE_SCALE", "1.00"
 LEADER_STALE_SIZE_SCALE = float(os.environ.get("LEADER_STALE_SIZE_SCALE", "0.75"))
 LEADER_SYNTH_SIZE_SCALE = float(os.environ.get("LEADER_SYNTH_SIZE_SCALE", "0.55"))
 REQUIRE_ORDERBOOK_WS = os.environ.get("REQUIRE_ORDERBOOK_WS", "true").lower() == "true"
-WS_BOOK_FALLBACK_ENABLED = os.environ.get("WS_BOOK_FALLBACK_ENABLED", "true").lower() == "true"   # was false
+WS_BOOK_FALLBACK_ENABLED = os.environ.get("WS_BOOK_FALLBACK_ENABLED", "false").lower() == "true"
 WS_BOOK_FALLBACK_MAX_AGE_MS = float(os.environ.get("WS_BOOK_FALLBACK_MAX_AGE_MS", "6000"))         # was 2500
-PM_BOOK_FALLBACK_ENABLED = os.environ.get("PM_BOOK_FALLBACK_ENABLED", "true").lower() == "true"   # was false
+PM_BOOK_FALLBACK_ENABLED = os.environ.get("PM_BOOK_FALLBACK_ENABLED", "false").lower() == "true"
 LEADER_FLOW_FALLBACK_ENABLED = os.environ.get("LEADER_FLOW_FALLBACK_ENABLED", "true").lower() == "true"
 LEADER_FLOW_FALLBACK_MAX_AGE_SEC = float(os.environ.get("LEADER_FLOW_FALLBACK_MAX_AGE_SEC", "90"))
 REQUIRE_VOLUME_SIGNAL = os.environ.get("REQUIRE_VOLUME_SIGNAL", "true").lower() == "true"
 STRICT_REQUIRE_FRESH_LEADER = os.environ.get("STRICT_REQUIRE_FRESH_LEADER", "false").lower() == "true"
 STRICT_REQUIRE_FRESH_BOOK_WS = os.environ.get("STRICT_REQUIRE_FRESH_BOOK_WS", "true").lower() == "true"
-WS_BOOK_SOFT_MAX_AGE_MS = float(os.environ.get("WS_BOOK_SOFT_MAX_AGE_MS", "20000"))
+WS_BOOK_SOFT_MAX_AGE_MS = float(os.environ.get("WS_BOOK_SOFT_MAX_AGE_MS", "12000"))
 ANALYSIS_PROB_SCALE_MIN = float(os.environ.get("ANALYSIS_PROB_SCALE_MIN", "0.65"))
 ANALYSIS_PROB_SCALE_MAX = float(os.environ.get("ANALYSIS_PROB_SCALE_MAX", "1.20"))
 # Small tolerance for payout threshold to avoid dead-zone misses (e.g. 1.98x vs 2.00x).
