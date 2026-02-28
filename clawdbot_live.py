@@ -487,6 +487,11 @@ HTTP_CONN_LIMIT = int(os.environ.get("HTTP_CONN_LIMIT", "80"))
 HTTP_CONN_PER_HOST = int(os.environ.get("HTTP_CONN_PER_HOST", "30"))
 HTTP_DNS_TTL_SEC = int(os.environ.get("HTTP_DNS_TTL_SEC", "300"))
 HTTP_KEEPALIVE_SEC = float(os.environ.get("HTTP_KEEPALIVE_SEC", "30"))
+HTTP_MIN_GAP_MS = float(os.environ.get("HTTP_MIN_GAP_MS", "120"))
+HTTP_429_RETRIES = int(os.environ.get("HTTP_429_RETRIES", "2"))
+HTTP_5XX_RETRIES = int(os.environ.get("HTTP_5XX_RETRIES", "1"))
+HTTP_CACHE_DEFAULT_TTL_SEC = float(os.environ.get("HTTP_CACHE_DEFAULT_TTL_SEC", "0.8"))
+HTTP_CACHE_STALE_TTL_SEC = float(os.environ.get("HTTP_CACHE_STALE_TTL_SEC", "45"))
 BOOK_CACHE_TTL_MS = float(os.environ.get("BOOK_CACHE_TTL_MS", "450"))  # ~scan_interval to avoid double-fetch
 BOOK_CACHE_MAX = int(os.environ.get("BOOK_CACHE_MAX", "256"))
 BOOK_FETCH_CONCURRENCY = int(os.environ.get("BOOK_FETCH_CONCURRENCY", "16"))
@@ -1278,6 +1283,9 @@ class LiveTrader:
         self.seen            = set()
         self._session        = None   # persistent aiohttp session
         self._http_429_backoff: dict = {}  # host -> backoff_until timestamp
+        self._http_cache: dict = {}  # (url+params key) -> {"ts": float, "data": any}
+        self._http_host_last_ts: dict = {}  # host -> last request timestamp
+        self._http_host_locks: dict = {}  # host -> asyncio.Lock
         self._book_cache     = {}     # token_id -> {"ts_ms": float, "book": OrderBook}
         self._book_sem       = asyncio.Semaphore(max(1, BOOK_FETCH_CONCURRENCY))
         self._clob_market_ws = None
@@ -1964,13 +1972,26 @@ class LiveTrader:
         except Exception:
             return False
 
-    async def _http_get_json(self, url: str, params: dict | None = None, timeout: float = 8.0):
-        # Per-host 429 backoff: skip the request if we're in a backoff window.
+    async def _http_get_json(
+        self,
+        url: str,
+        params: dict | None = None,
+        timeout: float = 8.0,
+        cache_ttl: float = HTTP_CACHE_DEFAULT_TTL_SEC,
+        stale_ttl: float = HTTP_CACHE_STALE_TTL_SEC,
+    ):
+        import json as _json
+        import random as _rnd
         import urllib.parse as _up
+
+        now = _time.time()
         _host = _up.urlparse(url).netloc
-        _bt = self._http_429_backoff.get(_host, 0.0)
-        if _bt > _time.time():
-            raise RuntimeError(f"http 429 backoff active for {_host} ({_bt - _time.time():.0f}s left)")
+        _pk = _json.dumps(params or {}, sort_keys=True, separators=(",", ":"))
+        _ck = f"{url}?{_pk}"
+        cached = self._http_cache.get(_ck)
+        if cached is not None and (now - float(cached.get("ts", 0.0) or 0.0)) <= max(0.0, cache_ttl):
+            return cached.get("data")
+
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(
                 limit=max(1, HTTP_CONN_LIMIT),
@@ -1983,26 +2004,73 @@ class LiveTrader:
                 connector=connector,
                 headers={"User-Agent": "clawdbot-live/1.0"},
             )
-        try:
-            async with self._session.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as r:
-                if r.status == 429:
-                    retry_after = float(r.headers.get("Retry-After", "30"))
-                    self._http_429_backoff[_host] = _time.time() + max(30.0, retry_after)
-                    if self._should_log(f"429:{_host}", 60):
-                        print(f"{Y}[HTTP] 429 rate-limit from {_host} — backing off {retry_after:.0f}s{RS}")
-                    raise RuntimeError(f"http 429 {url}")
-                if r.status >= 400:
-                    raise RuntimeError(f"http {r.status} {url}")
-                return await r.json()
-        except RuntimeError:
-            raise
-        except Exception as e:
-            self._errors.tick("http_get_json", print, err=e, every=20)
-            raise
+
+        host_lock = self._http_host_locks.get(_host)
+        if host_lock is None:
+            host_lock = asyncio.Lock()
+            self._http_host_locks[_host] = host_lock
+
+        async with host_lock:
+            now = _time.time()
+            last_ts = float(self._http_host_last_ts.get(_host, 0.0) or 0.0)
+            min_gap = max(0.0, float(HTTP_MIN_GAP_MS) / 1000.0)
+            if last_ts > 0 and (now - last_ts) < min_gap:
+                await asyncio.sleep(min_gap - (now - last_ts))
+            self._http_host_last_ts[_host] = _time.time()
+
+            _bt = float(self._http_429_backoff.get(_host, 0.0) or 0.0)
+            if _bt > _time.time():
+                if cached is not None and (_time.time() - float(cached.get("ts", 0.0) or 0.0)) <= max(1.0, stale_ttl):
+                    return cached.get("data")
+                raise RuntimeError(f"http 429 backoff active for {_host} ({_bt - _time.time():.0f}s left)")
+
+            last_err = None
+            attempts = max(1, int(HTTP_429_RETRIES) + 1)
+            for i in range(attempts):
+                try:
+                    async with self._session.get(
+                        url,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                    ) as r:
+                        if r.status == 429:
+                            retry_after = float(r.headers.get("Retry-After", "2") or 2.0)
+                            retry_after = max(1.0, retry_after)
+                            backoff_s = min(90.0, retry_after + (0.35 * i) + _rnd.uniform(0.05, 0.35))
+                            self._http_429_backoff[_host] = max(
+                                float(self._http_429_backoff.get(_host, 0.0) or 0.0),
+                                _time.time() + backoff_s,
+                            )
+                            if i < (attempts - 1):
+                                await asyncio.sleep(backoff_s)
+                                continue
+                            if cached is not None and (_time.time() - float(cached.get("ts", 0.0) or 0.0)) <= max(1.0, stale_ttl):
+                                if self._should_log(f"429-stale:{_host}", 45):
+                                    print(f"{Y}[HTTP]{RS} 429 {_host} -> using stale cache")
+                                return cached.get("data")
+                            raise RuntimeError(f"http 429 {url}")
+                        if r.status >= 500 and i < max(0, int(HTTP_5XX_RETRIES)):
+                            await asyncio.sleep(0.25 + (0.25 * i))
+                            continue
+                        if r.status >= 400:
+                            if cached is not None and (_time.time() - float(cached.get("ts", 0.0) or 0.0)) <= max(1.0, stale_ttl):
+                                return cached.get("data")
+                            raise RuntimeError(f"http {r.status} {url}")
+                        payload = await r.json()
+                        self._http_cache[_ck] = {"ts": _time.time(), "data": payload}
+                        return payload
+                except RuntimeError as e:
+                    last_err = e
+                except Exception as e:
+                    last_err = e
+                    if i < (attempts - 1):
+                        await asyncio.sleep(0.20 + (0.15 * i))
+                        continue
+
+            if cached is not None and (_time.time() - float(cached.get("ts", 0.0) or 0.0)) <= max(1.0, stale_ttl):
+                return cached.get("data")
+            self._errors.tick("http_get_json", print, err=last_err, every=20)
+            raise RuntimeError(f"http get failed: {url} err={last_err}")
 
     async def _gather_bounded(self, coros, limit: int):
         """Run awaitables with bounded concurrency to avoid network bursts."""
@@ -4526,36 +4594,20 @@ class LiveTrader:
         """Fetch one series — called in parallel for all series."""
         result = {}
         try:
-            if self._session is None or self._session.closed:
-                connector = aiohttp.TCPConnector(
-                    limit=max(1, HTTP_CONN_LIMIT),
-                    limit_per_host=max(1, HTTP_CONN_PER_HOST),
-                    ttl_dns_cache=max(0, HTTP_DNS_TTL_SEC),
-                    enable_cleanup_closed=True,
-                    keepalive_timeout=max(5.0, HTTP_KEEPALIVE_SEC),
-                )
-                self._session = aiohttp.ClientSession(
-                    connector=connector,
-                    headers={"User-Agent": "clawdbot-live/1.0"},
-                )
-            async with self._session.get(
+            data = await self._http_get_json(
                 f"{GAMMA}/events",
                 params={
-                    "series_id":  info["id"],
-                    "active":     "true",
-                    "closed":     "false",
-                    "order":      "startDate",
-                    "ascending":  "true",
-                    "limit":      "20",
+                    "series_id": info["id"],
+                    "active": "true",
+                    "closed": "false",
+                    "order": "startDate",
+                    "ascending": "true",
+                    "limit": "20",
                 },
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as r:
-                if r.status == 429:
-                    retry = int(r.headers.get("Retry-After", 30))
-                    print(f"{Y}[FETCH] Rate limited — waiting {retry}s{RS}")
-                    await asyncio.sleep(retry)
-                    return result
-                data = await r.json()
+                timeout=5,
+                cache_ttl=max(0.8, MARKET_REFRESH_SEC / 3.0),
+                stale_ttl=max(12.0, MARKET_REFRESH_SEC * 2.0),
+            )
             events = data if isinstance(data, list) else data.get("data", [])
             for ev in events:
                 end_str   = ev.get("endDate", "")
@@ -4589,7 +4641,8 @@ class LiveTrader:
                     "token_down":  token_down,
                 }
         except Exception as e:
-            print(f"{R}[FETCH] {slug}: {e}{RS}")
+            if self._should_log(f"fetch-series:{slug}", 20):
+                print(f"{Y}[FETCH]{RS} {slug} degraded: {e}")
         return result
 
     async def fetch_markets(self):
