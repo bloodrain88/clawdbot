@@ -266,6 +266,8 @@ ROUND_SECOND_TRADE_MIN_TRUE_PROB = float(os.environ.get("ROUND_SECOND_TRADE_MIN_
 ROUND_SECOND_TRADE_REQUIRE_CL_AGREE = os.environ.get("ROUND_SECOND_TRADE_REQUIRE_CL_AGREE", "true").lower() == "true"
 ROUND_SECOND_TRADE_MAX_ENTRY = float(os.environ.get("ROUND_SECOND_TRADE_MAX_ENTRY", "0.52"))
 ROUND_SECOND_TRADE_MAX_GSCORE_GAP = float(os.environ.get("ROUND_SECOND_TRADE_MAX_GSCORE_GAP", "0.030"))
+ROUND_FORCE_MAX_BANK_FRAC = float(os.environ.get("ROUND_FORCE_MAX_BANK_FRAC", "0.08"))
+ROUND_FORCE_MIN_NOTIONAL_MULT = float(os.environ.get("ROUND_FORCE_MIN_NOTIONAL_MULT", "1.00"))
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "0"))
 MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "0"))
@@ -7145,6 +7147,7 @@ class LiveTrader:
                 hc15_mode=sig.get("hc15_mode", False),
                 hc15_fallback_cap=HC15_FALLBACK_MAX_ENTRY,
                 core_position=(not is_booster),
+                round_force=bool(sig.get("round_force_coverage", False)),
             )
             self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
             order_id = (exec_result or {}).get("order_id", "")
@@ -7390,7 +7393,7 @@ class LiveTrader:
         if sig and sig["score"] >= MIN_SCORE_GATE:
             await self._execute_trade(sig)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None, hc15_mode=False, hc15_fallback_cap=0.36, core_position=True):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None, hc15_mode=False, hc15_fallback_cap=0.36, core_position=True, round_force=False):
         """Maker-first order strategy:
         1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
         2. Wait up to 45s for fill (other market evals run in parallel via asyncio)
@@ -7407,11 +7410,22 @@ class LiveTrader:
         # accidentally emits a tiny size. This is the final safety net before on-chain send.
         hard_min_notional = max(float(MIN_EXEC_NOTIONAL_USDC), float(MIN_BET_ABS), 1.0)
         if float(size_usdc or 0.0) < hard_min_notional:
-            print(
-                f"{Y}[SKIP]{RS} {asset} {side} size=${float(size_usdc or 0.0):.2f} "
-                f"< hard_min=${hard_min_notional:.2f} (exec backstop)"
-            )
-            return None
+            allow_bump = bool(core_position) and (bool(round_force) or FORCE_TRADE_EVERY_ROUND)
+            target_min = hard_min_notional * max(1.0, float(ROUND_FORCE_MIN_NOTIONAL_MULT))
+            bank_cap = max(0.0, float(self.bankroll or 0.0)) * max(0.01, float(ROUND_FORCE_MAX_BANK_FRAC))
+            if allow_bump and bank_cap >= target_min:
+                bumped = round(max(float(size_usdc or 0.0), target_min), 2)
+                print(
+                    f"{Y}[SIZE-BUMP]{RS} {asset} {side} size ${float(size_usdc or 0.0):.2f} -> ${bumped:.2f} "
+                    f"(hard_min=${hard_min_notional:.2f} bank_cap=${bank_cap:.2f})"
+                )
+                size_usdc = bumped
+            else:
+                print(
+                    f"{Y}[SKIP]{RS} {asset} {side} size=${float(size_usdc or 0.0):.2f} "
+                    f"< hard_min=${hard_min_notional:.2f} (exec backstop)"
+                )
+                return None
 
         for attempt in range(max(1, ORDER_RETRY_MAX)):
             try:
@@ -10913,6 +10927,8 @@ class LiveTrader:
                     relaxed_all = list(await asyncio.gather(*[self._score_market(c, late_relax=True) for c in candidates]))
                     relaxed_valid = sorted([s for s in relaxed_all if s is not None], key=self._signal_growth_score, reverse=True)
                     if relaxed_valid:
+                        for s in relaxed_valid:
+                            s["round_force_coverage"] = True
                         valid = relaxed_valid
                         if self._should_log("round-force-coverage", 20):
                             top = relaxed_valid[0]
