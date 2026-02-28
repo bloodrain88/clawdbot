@@ -407,6 +407,11 @@ SCORE_DEBOUNCE_SEC = float(os.environ.get("SCORE_DEBOUNCE_SEC", "0.9"))
 RTDS_EVAL_MIN_INTERVAL_SEC = float(os.environ.get("RTDS_EVAL_MIN_INTERVAL_SEC", "1.0"))
 MARKET_REFRESH_SEC = float(os.environ.get("MARKET_REFRESH_SEC", "30.0"))  # how often to re-fetch Gamma API (was every 0.5s = 600 req/min!)
 PING_INTERVAL  = int(os.environ.get("PING_INTERVAL", "5"))
+RTDS_RECV_TIMEOUT_SEC = float(os.environ.get("RTDS_RECV_TIMEOUT_SEC", "20.0"))
+RTDS_IDLE_RECONNECT_SEC = float(os.environ.get("RTDS_IDLE_RECONNECT_SEC", "30.0"))
+RTDS_CONNECT_MIN_GAP_SEC = float(os.environ.get("RTDS_CONNECT_MIN_GAP_SEC", "3.0"))
+RTDS_429_BASE_BACKOFF_SEC = float(os.environ.get("RTDS_429_BASE_BACKOFF_SEC", "45.0"))
+RTDS_429_MAX_BACKOFF_SEC = float(os.environ.get("RTDS_429_MAX_BACKOFF_SEC", "900.0"))
 STATUS_INTERVAL= int(os.environ.get("STATUS_INTERVAL", "15"))
 ONCHAIN_SYNC_SEC = float(os.environ.get("ONCHAIN_SYNC_SEC", "2.0"))
 _DATA_DIR      = os.environ.get("DATA_DIR", os.path.expanduser("~"))
@@ -1288,6 +1293,11 @@ class LiveTrader:
         self.token_prices    = {}     # token_id → real-time price from RTDS market stream
         self._rtds_asset_ts  = {}     # asset -> last RTDS crypto_prices tick ts
         self._rtds_ws        = None   # live WebSocket handle for dynamic subscriptions
+        self._rtds_fails = 0
+        self._rtds_cooldown_until = 0.0
+        self._rtds_last_msg_ts = 0.0
+        self._rtds_last_connect_try_ts = 0.0
+        self._rtds_ping_task = None
         self._redeem_queued_ts = {}  # cid → timestamp when queued for redeem
         self._redeem_verify_counts = {}  # cid → non-claimable verification cycles before auto-close
         self._pending_absent_counts = {}  # cid -> consecutive sync cycles absent from on-chain/API
@@ -4250,9 +4260,19 @@ class LiveTrader:
     # ── RTDS ──────────────────────────────────────────────────────────────────
     async def stream_rtds(self):
         while True:
+            now0 = _time.time()
+            wait_until = max(
+                float(self._rtds_cooldown_until or 0.0),
+                float(self._rtds_last_connect_try_ts or 0.0) + max(0.2, RTDS_CONNECT_MIN_GAP_SEC),
+            )
+            if wait_until > now0:
+                await asyncio.sleep(wait_until - now0)
+            self._rtds_last_connect_try_ts = _time.time()
+            pinger_task = None
             try:
                 async with websockets.connect(
                     RTDS, additional_headers={"Origin": "https://polymarket.com"},
+                    ping_interval=None,
                     compression=None,
                 ) as ws:
                     await ws.send(json.dumps({
@@ -4261,6 +4281,9 @@ class LiveTrader:
                     }))
                     self.rtds_ok = True
                     self._rtds_ws = ws   # expose for dynamic market subscriptions
+                    self._rtds_fails = 0
+                    self._rtds_cooldown_until = 0.0
+                    self._rtds_last_msg_ts = _time.time()
                     print(f"{G}[RTDS] Live — streaming BTC/ETH/SOL/XRP{RS}")
 
                     # Subscribe to active market token prices for instant up_price updates
@@ -4285,10 +4308,23 @@ class LiveTrader:
                                     await ws.send("PING")
                                 except Exception:
                                     break
-                    asyncio.create_task(pinger())
+                            # If server is silent for too long, force reconnect.
+                            if (_time.time() - float(self._rtds_last_msg_ts or 0.0)) > max(8.0, RTDS_IDLE_RECONNECT_SEC):
+                                try:
+                                    await ws.close(code=1012, reason="rtds-idle-timeout")
+                                except Exception:
+                                    pass
+                                break
+                    pinger_task = asyncio.create_task(pinger())
+                    self._rtds_ping_task = pinger_task
 
-                    async for raw in ws:
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=max(5.0, RTDS_RECV_TIMEOUT_SEC))
+                        except asyncio.TimeoutError:
+                            raise TimeoutError("RTDS recv timeout")
                         if not raw: continue
+                        self._rtds_last_msg_ts = _time.time()
                         try:
                             if isinstance(raw, (bytes, bytearray)):
                                 raw = raw.decode("utf-8", "ignore")
@@ -4348,21 +4384,37 @@ class LiveTrader:
                                     asyncio.create_task(self.evaluate(m_rt))
             except Exception as e:
                 self.rtds_ok = False
+                self._rtds_ws = None
                 print(f"{R}[RTDS] Reconnect: {e}{RS}")
                 err_s = str(e).lower()
                 fails = int(getattr(self, "_rtds_fails", 0) or 0) + 1
                 self._rtds_fails = fails
                 if "429" in err_s or "too many requests" in err_s:
                     # Upstream throttling: back off harder to recover stable freshness.
-                    wait_s = min(300.0, 20.0 * (2.0 ** min(8, fails - 1)))
+                    wait_s = min(
+                        max(10.0, RTDS_429_MAX_BACKOFF_SEC),
+                        max(5.0, RTDS_429_BASE_BACKOFF_SEC) * (2.0 ** min(8, fails - 1)),
+                    )
                 else:
-                    wait_s = min(30.0, 2.0 * (2 ** min(5, fails - 1)))
+                    wait_s = min(60.0, 2.0 * (2 ** min(5, fails - 1)))
                 wait_s = wait_s * random.uniform(0.90, 1.25)
+                self._rtds_cooldown_until = max(float(self._rtds_cooldown_until or 0.0), _time.time() + wait_s)
                 if self._noisy_log_enabled("rtds-retry", 5.0):
                     print(f"{Y}[RTDS]{RS} retry in {wait_s:.1f}s (fails={fails})")
                 await asyncio.sleep(wait_s)
             else:
                 self._rtds_fails = 0
+                self._rtds_cooldown_until = 0.0
+            finally:
+                self.rtds_ok = False
+                self._rtds_ws = None
+                if pinger_task is not None:
+                    try:
+                        pinger_task.cancel()
+                    except Exception:
+                        pass
+                if self._rtds_ping_task is pinger_task:
+                    self._rtds_ping_task = None
 
     # ── VOL LOOP ──────────────────────────────────────────────────────────────
     async def vol_loop(self):
