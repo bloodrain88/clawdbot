@@ -252,6 +252,8 @@ LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE = int(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_K
 LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB", "0.80"))
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
+FORCE_TRADE_EVERY_ROUND = os.environ.get("FORCE_TRADE_EVERY_ROUND", "false").lower() == "true"
+ROUND_MAX_TRADES = int(os.environ.get("ROUND_MAX_TRADES", "2"))
 MIN_SCORE_GATE = int(os.environ.get("MIN_SCORE_GATE", "0"))
 MIN_SCORE_GATE_5M = int(os.environ.get("MIN_SCORE_GATE_5M", "0"))
 MIN_SCORE_GATE_15M = int(os.environ.get("MIN_SCORE_GATE_15M", "0"))
@@ -2695,7 +2697,8 @@ class LiveTrader:
             f"near_miss_tol={ENTRY_NEAR_MISS_TOL:.3f} "
             f"ev_net>={MIN_EV_NET:.3f} fee={FEE_RATE_EST:.4f} "
             f"risk(max_open/same_dir/cid)={MAX_OPEN}/{MAX_SAME_DIR}/{MAX_CID_EXPOSURE_PCT:.0%} "
-            f"block_opp(cid/round)={BLOCK_OPPOSITE_SIDE_SAME_CID}/{BLOCK_OPPOSITE_SIDE_SAME_ROUND}"
+            f"block_opp(cid/round)={BLOCK_OPPOSITE_SIDE_SAME_CID}/{BLOCK_OPPOSITE_SIDE_SAME_ROUND} "
+            f"round_coverage={FORCE_TRADE_EVERY_ROUND} round_max_trades={max(1, ROUND_MAX_TRADES)}"
         )
         print(
             f"{B}[BOOT]{RS} profit_push_mode={PROFIT_PUSH_MODE} mult={PROFIT_PUSH_MULT:.2f} "
@@ -10089,6 +10092,18 @@ class LiveTrader:
                                 f"{late_valid[0]['asset']} {late_valid[0]['side']} score={late_valid[0]['score']}"
                             )
                             valid = late_valid
+                if not valid and FORCE_TRADE_EVERY_ROUND and candidates:
+                    relaxed_all = list(await asyncio.gather(*[self._score_market(c, late_relax=True) for c in candidates]))
+                    relaxed_valid = sorted([s for s in relaxed_all if s is not None], key=self._signal_growth_score, reverse=True)
+                    if relaxed_valid:
+                        valid = relaxed_valid
+                        if self._should_log("round-force-coverage", 20):
+                            top = relaxed_valid[0]
+                            print(
+                                f"{Y}[ROUND-FORCE]{RS} coverage fallback -> "
+                                f"{top['asset']} {top['duration']}m {top['side']} score={top['score']} "
+                                f"g={self._signal_growth_score(top):+.3f}"
+                            )
                 if ENABLE_5M and (not self._enable_5m_runtime) and valid and not (PROFIT_PUSH_MODE and PROFIT_PUSH_ADAPTIVE_MODE):
                     pre_n = len(valid)
                     valid = [s for s in valid if int(s.get("duration", 0) or 0) > 5]
@@ -10124,7 +10139,9 @@ class LiveTrader:
                 shadow_pending = dict(active_pending)
                 slots = max(0, MAX_OPEN - len(active_pending))
                 to_exec = []
-                selected = valid
+                selected = sorted(valid, key=self._signal_growth_score, reverse=True)
+                if FORCE_TRADE_EVERY_ROUND and selected:
+                    selected = selected[:max(1, min(6, ROUND_MAX_TRADES))]
                 if ROUND_BEST_ONLY and valid:
                     best_5m = max((s for s in valid if s.get("duration", 0) <= 5), key=self._signal_growth_score, default=None)
                     best_15m = max((s for s in valid if s.get("duration", 0) > 5), key=self._signal_growth_score, default=None)
