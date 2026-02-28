@@ -32,6 +32,7 @@ import re
 import sqlite3
 import sys
 import threading
+import random
 import time as _time
 from collections import deque, defaultdict
 from datetime import datetime, timezone
@@ -269,7 +270,7 @@ ROUND_SECOND_TRADE_MAX_ENTRY = float(os.environ.get("ROUND_SECOND_TRADE_MAX_ENTR
 ROUND_SECOND_TRADE_MAX_GSCORE_GAP = float(os.environ.get("ROUND_SECOND_TRADE_MAX_GSCORE_GAP", "0.030"))
 ROUND_FORCE_MAX_BANK_FRAC = float(os.environ.get("ROUND_FORCE_MAX_BANK_FRAC", "0.08"))
 ROUND_FORCE_MIN_NOTIONAL_MULT = float(os.environ.get("ROUND_FORCE_MIN_NOTIONAL_MULT", "1.00"))
-ROUND_FORCE_PAYOUT_CAP_15M = float(os.environ.get("ROUND_FORCE_PAYOUT_CAP_15M", "1.72"))
+ROUND_FORCE_PAYOUT_CAP_15M = float(os.environ.get("ROUND_FORCE_PAYOUT_CAP_15M", "1.58"))
 ROUND_FORCE_PAYOUT_CAP_5M = float(os.environ.get("ROUND_FORCE_PAYOUT_CAP_5M", "1.68"))
 ROUND_CONSENSUS_15M_ENABLED = os.environ.get("ROUND_CONSENSUS_15M_ENABLED", "true").lower() == "true"
 ROUND_CONSENSUS_MIN_NET = int(os.environ.get("ROUND_CONSENSUS_MIN_NET", "2"))
@@ -300,7 +301,7 @@ MAX_ENTRY_TOL = float(os.environ.get("MAX_ENTRY_TOL", "0.015"))
 MIN_ENTRY_PRICE_15M = float(os.environ.get("MIN_ENTRY_PRICE_15M", "0.40"))
 MIN_ENTRY_PRICE_5M = float(os.environ.get("MIN_ENTRY_PRICE_5M", "0.35"))
 MAX_ENTRY_PRICE_5M = float(os.environ.get("MAX_ENTRY_PRICE_5M", "0.52"))
-MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "1.72"))
+MIN_PAYOUT_MULT = float(os.environ.get("MIN_PAYOUT_MULT", "1.58"))
 # Late-window payout relaxation: aligned entry in last 28% of window → lower payout OK, win rate is higher
 LATE_PAYOUT_RELAX_ENABLED   = os.environ.get("LATE_PAYOUT_RELAX_ENABLED", "true").lower() == "true"
 LATE_PAYOUT_RELAX_PCT_LEFT  = float(os.environ.get("LATE_PAYOUT_RELAX_PCT_LEFT", "0.45"))   # last 45% of window (was 0.28)
@@ -677,7 +678,7 @@ CONSISTENCY_REQUIRE_CL_AGREE_15M = os.environ.get("CONSISTENCY_REQUIRE_CL_AGREE_
 CONSISTENCY_MIN_TRUE_PROB_15M = float(os.environ.get("CONSISTENCY_MIN_TRUE_PROB_15M", "0.54"))
 CONSISTENCY_MIN_EXEC_EV_15M = float(os.environ.get("CONSISTENCY_MIN_EXEC_EV_15M", "0.010"))
 CONSISTENCY_MAX_ENTRY_15M = float(os.environ.get("CONSISTENCY_MAX_ENTRY_15M", "0.60"))
-CONSISTENCY_MIN_PAYOUT_15M = float(os.environ.get("CONSISTENCY_MIN_PAYOUT_15M", "1.72"))
+CONSISTENCY_MIN_PAYOUT_15M = float(os.environ.get("CONSISTENCY_MIN_PAYOUT_15M", "1.58"))
 EV_FRONTIER_ENABLED = os.environ.get("EV_FRONTIER_ENABLED", "false").lower() == "true"
 EV_FRONTIER_MARGIN_BASE = float(os.environ.get("EV_FRONTIER_MARGIN_BASE", "0.010"))
 EV_FRONTIER_MARGIN_HIGH_ENTRY = float(os.environ.get("EV_FRONTIER_MARGIN_HIGH_ENTRY", "0.050"))
@@ -4314,9 +4315,12 @@ class LiveTrader:
                 self._rtds_fails = fails
                 if "429" in err_s or "too many requests" in err_s:
                     # Upstream throttling: back off harder to recover stable freshness.
-                    wait_s = min(90.0, 12.0 * (1.6 ** min(6, fails - 1)))
+                    wait_s = min(180.0, 12.0 * (1.8 ** min(8, fails - 1)))
                 else:
                     wait_s = min(30.0, 2.0 * (2 ** min(5, fails - 1)))
+                wait_s = wait_s * random.uniform(0.90, 1.25)
+                if self._noisy_log_enabled("rtds-retry", 5.0):
+                    print(f"{Y}[RTDS]{RS} retry in {wait_s:.1f}s (fails={fails})")
                 await asyncio.sleep(wait_s)
             else:
                 self._rtds_fails = 0

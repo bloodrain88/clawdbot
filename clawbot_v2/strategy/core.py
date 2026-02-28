@@ -49,7 +49,15 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
     # then apply soft penalties for source divergence instead of hard blocking.
     rtds_now = float(self.prices.get(asset, 0) or 0.0)
     cl_now = float(self.cl_prices.get(asset, 0) or 0.0)
-    last_tick_ts = self.price_history.get(asset, deque(maxlen=1))[-1][0] if self.price_history.get(asset) else 0
+    last_tick_ts = 0.0
+    _ph = self.price_history.get(asset)
+    if _ph:
+        _last = _ph[-1]
+        if isinstance(_last, (tuple, list)):
+            last_tick_ts = float(_last[0] or 0.0) if len(_last) >= 1 else 0.0
+        elif isinstance(_last, (int, float)):
+            # Backward-compat: some persisted caches may store plain timestamps.
+            last_tick_ts = float(_last)
     quote_age_ms = (_time.time() - last_tick_ts) * 1000.0 if last_tick_ts else 9e9
     cl_updated = self.cl_updated.get(asset, 0)
     cl_age_s = (_time.time() - cl_updated) if cl_updated else None
