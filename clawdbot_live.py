@@ -13359,7 +13359,7 @@ function renderExecQ(rows){
 
 async function refresh(){
   try{
-    const d=await fetch('/api').then(r=>r.json());
+    const d=await fetch('/api?t='+Date.now(),{cache:'no-store'}).then(r=>r.json());
     renderHeader(d);renderPrices(d);renderMetrics(d);
     renderPositions(d);renderLeft(d);renderExecQ(d.execq_all);
   }catch(e){console.warn(e);}
