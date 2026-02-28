@@ -1473,6 +1473,9 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
         else:
             dyn_floor = 1.62
         min_payout_req = max(min_payout_req, dyn_floor)
+    if force_coverage_mode and duration >= 15:
+        min_payout_req = min(min_payout_req, max(1.10, FORCE_COVERAGE_MIN_PAYOUT_15M))
+        min_ev_req = min(min_ev_req, FORCE_COVERAGE_MIN_EV_15M)
     # Late-window locked-direction payout relax:
     # Win rate is ~72-78% in last LATE_PAYOUT_RELAX_PCT_LEFT of window → 1.65x payout is +EV.
     # This recovers the 33% skip rate from payout_below on late-window aligned entries.
@@ -1592,14 +1595,22 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
     exec_slip_cost, exec_nofill_penalty, exec_fill_ratio = self._execution_penalties(duration, score, entry)
     execution_ev = ev_net - exec_slip_cost - exec_nofill_penalty
     if execution_ev < min_ev_req:
-        if self._noisy_log_enabled(f"skip-score-ev:{asset}:{side}", LOG_SKIP_EVERY_SEC):
-            print(
-                f"{Y}[SKIP] {asset} {side} exec_ev={execution_ev:.3f} "
-                f"(ev={ev_net:.3f} slip={exec_slip_cost:.3f} nofill={exec_nofill_penalty:.3f}) "
-                f"< min={min_ev_req:.3f}{RS}"
-            )
-        self._skip_tick("ev_below")
-        return None
+        if force_coverage_mode and duration >= 15 and execution_ev >= FORCE_COVERAGE_HARD_MIN_EV_15M:
+            if self._noisy_log_enabled(f"force-ev-relax:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+                print(
+                    f"{Y}[FORCE-EV-RELAX]{RS} {asset} {duration}m {side} "
+                    f"exec_ev={execution_ev:.3f} < min={min_ev_req:.3f} "
+                    f"(hard_min={FORCE_COVERAGE_HARD_MIN_EV_15M:.3f})"
+                )
+        else:
+            if self._noisy_log_enabled(f"skip-score-ev:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP] {asset} {side} exec_ev={execution_ev:.3f} "
+                    f"(ev={ev_net:.3f} slip={exec_slip_cost:.3f} nofill={exec_nofill_penalty:.3f}) "
+                    f"< min={min_ev_req:.3f}{RS}"
+                )
+            self._skip_tick("ev_below")
+            return None
     if duration >= 15 and (not booster_eval) and CONSISTENCY_CORE_ENABLED:
         must_fire_active = late_relax and LATE_MUST_FIRE_ENABLED
         core_payout = 1.0 / max(entry, 1e-9)

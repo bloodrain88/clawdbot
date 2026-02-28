@@ -263,6 +263,9 @@ ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
 FORCE_TRADE_EVERY_ROUND = os.environ.get("FORCE_TRADE_EVERY_ROUND", "true").lower() == "true"
 NO_TRADE_RECOVERY_ENABLED = os.environ.get("NO_TRADE_RECOVERY_ENABLED", "true").lower() == "true"
 NO_TRADE_RECOVERY_ROUNDS = int(os.environ.get("NO_TRADE_RECOVERY_ROUNDS", "2"))
+FORCE_COVERAGE_MIN_PAYOUT_15M = float(os.environ.get("FORCE_COVERAGE_MIN_PAYOUT_15M", "1.40"))
+FORCE_COVERAGE_MIN_EV_15M = float(os.environ.get("FORCE_COVERAGE_MIN_EV_15M", "0.000"))
+FORCE_COVERAGE_HARD_MIN_EV_15M = float(os.environ.get("FORCE_COVERAGE_HARD_MIN_EV_15M", "-0.015"))
 ROUND_MAX_TRADES = int(os.environ.get("ROUND_MAX_TRADES", "2"))
 ROUND_SECOND_TRADE_PUSH_ONLY = os.environ.get("ROUND_SECOND_TRADE_PUSH_ONLY", "true").lower() == "true"
 ROUND_SECOND_TRADE_MIN_SCORE = int(os.environ.get("ROUND_SECOND_TRADE_MIN_SCORE", "12"))
