@@ -11286,27 +11286,25 @@ class LiveTrader:
         wr = round(self.wins / self.total * 100, 1) if self.total else 0
 
         def _norm_round_bounds(start_ts: float, end_ts: float, duration: int) -> tuple[float, float]:
-            """Normalize dashboard round bounds to canonical 5m/15m windows."""
+            """Normalize dashboard round bounds without forcing invalid future windows."""
             d = int(duration or 0)
             if d not in (5, 15):
                 return float(start_ts or 0.0), float(end_ts or 0.0)
             step = float(d * 60)
             st = float(start_ts or 0.0)
             et = float(end_ts or 0.0)
-            exact = (
-                et > 0
-                and abs((et / step) - round(et / step)) < 1e-6
-                and abs(((et - st) if st > 0 else step) - step) <= 2.0
-            )
-            if exact:
-                return st if st > 0 else (et - step), et
-            # Bad/non-canonical timestamps (e.g., 7:06-7:21): snap to nearest valid boundary.
-            if et > 0:
-                et_n = round(et / step) * step
-            else:
-                et_n = math.ceil(now_ts / step) * step
-            if et_n <= now_ts:
-                et_n = math.ceil(now_ts / step) * step
+            # Keep explicit window if it is plausible for the duration.
+            if st > 0 and et > st:
+                w = et - st
+                if abs(w - step) <= max(2.0, step * 0.25):
+                    return st, et
+            # If one bound is missing, derive the other from duration.
+            if et > 0 and st <= 0:
+                return et - step, et
+            if st > 0 and et <= 0:
+                return st, st + step
+            # Last fallback: infer current round boundary from wall clock.
+            et_n = math.ceil(now_ts / step) * step
             st_n = et_n - step
             return st_n, et_n
 
@@ -11441,7 +11439,11 @@ class LiveTrader:
                 rk = str(p.get("rk", "") or "")
                 if "-cid" in rk:
                     continue
-                k = (str(p.get("asset", "?")), int(p.get("duration", 0) or 0))
+                k = (
+                    str(p.get("asset", "?")),
+                    int(p.get("duration", 0) or 0),
+                    str(p.get("side", "?")),
+                )
                 prev = exact_ref.get(k)
                 cand = (float(p.get("start_ts", 0.0) or 0.0), float(p.get("end_ts", 0.0) or 0.0))
                 if cand[1] <= 0:
@@ -11456,7 +11458,11 @@ class LiveTrader:
                 rk = str(p.get("rk", "") or "")
                 if "-cid" not in rk:
                     continue
-                k = (str(p.get("asset", "?")), int(p.get("duration", 0) or 0))
+                k = (
+                    str(p.get("asset", "?")),
+                    int(p.get("duration", 0) or 0),
+                    str(p.get("side", "?")),
+                )
                 ref = exact_ref.get(k)
                 if not ref:
                     continue
@@ -11465,6 +11471,39 @@ class LiveTrader:
                     p["start_ts"] = float(st_ref)
                     p["end_ts"] = float(et_ref)
                     p["mins_left"] = round(max(0.0, (et_ref - now_ts) / 60.0), 1)
+
+        # Drop cid-fallback duplicates when an exact row exists for same asset/duration/side.
+        if positions:
+            exact_slots = set()
+            for p in positions:
+                rk = str(p.get("rk", "") or "")
+                if "-cid" in rk:
+                    continue
+                exact_slots.add(
+                    (
+                        str(p.get("asset", "?")),
+                        int(p.get("duration", 0) or 0),
+                        str(p.get("side", "?")),
+                        int(round(float(p.get("end_ts", 0.0) or 0.0))),
+                    )
+                )
+            if exact_slots:
+                keep = []
+                for p in positions:
+                    rk = str(p.get("rk", "") or "")
+                    if "-cid" not in rk:
+                        keep.append(p)
+                        continue
+                    key = (
+                        str(p.get("asset", "?")),
+                        int(p.get("duration", 0) or 0),
+                        str(p.get("side", "?")),
+                        int(round(float(p.get("end_ts", 0.0) or 0.0))),
+                    )
+                    if key in exact_slots:
+                        continue
+                    keep.append(p)
+                positions = keep
 
         # Avoid contradictory duplicate cards for the same asset and round slot.
         # Keep the strongest row (higher stake, valid open price preferred).
@@ -12061,7 +12100,8 @@ function renderPositions(d){
     const uid=((p.cid_full||p.cid||'x').replace(/[^a-zA-Z0-9]/g,'').slice(-20)||'x')+'_'+idx;
     const cid='c'+uid;
     const durSec=Math.max(60,Math.round((p.duration||15)*60));
-    const secLeft=Math.max(0,Math.round((p.end_ts||now)-now));
+    const secLeftRaw=Math.max(0,Math.round((p.end_ts||now)-now));
+    const secLeft=Math.min(durSec,secLeftRaw);
     const pct=Math.min(100,Math.max(0,((durSec-secLeft)/durSec)*100));
     const cls=p.lead===null?'':p.lead?' lead':' trail';
     const sideH=p.side==='Up'?'<span class="pup">UP ▲</span>':'<span class="pdn">DOWN ▼</span>';
