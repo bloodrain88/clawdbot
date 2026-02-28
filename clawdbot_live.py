@@ -1264,6 +1264,7 @@ class LiveTrader:
         self.pending_redeem  = {}   # cid → (side, asset)  — waiting on-chain resolution
         self.redeemed_cids   = set()  # cids already processed — prevents _redeemable_scan re-queueing
         self.token_prices    = {}     # token_id → real-time price from RTDS market stream
+        self._rtds_asset_ts  = {}     # asset -> last RTDS crypto_prices tick ts
         self._rtds_ws        = None   # live WebSocket handle for dynamic subscriptions
         self._redeem_queued_ts = {}  # cid → timestamp when queued for redeem
         self._redeem_verify_counts = {}  # cid → non-claimable verification cycles before auto-close
@@ -4230,6 +4231,7 @@ class LiveTrader:
                         if asset:
                             self.prices[asset] = val
                             _now_ts = _time.time()
+                            self._rtds_asset_ts[asset] = _now_ts
                             self.price_history[asset].append((_now_ts, val))
                             self._tick_update(asset, val, _now_ts)
                             # Event-driven: evaluate unseen markets immediately on price tick
@@ -4319,6 +4321,12 @@ class LiveTrader:
                     if age < 60:   # only use if fresh (<60s)
                         self.cl_prices[asset]  = price
                         self.cl_updated[asset] = updated
+                        # Dashboard fallback: if RTDS is stale, drive spot/chart from Chainlink.
+                        now = _time.time()
+                        if (now - float(self._rtds_asset_ts.get(asset, 0.0) or 0.0)) > 3.0:
+                            self.prices[asset] = price
+                            self.price_history[asset].append((now, price))
+                            self._tick_update(asset, price, now)
                 except Exception:
                     pass
             await asyncio.sleep(2)   # reduced from 5s — fallback for when WS is active
@@ -4357,6 +4365,11 @@ class LiveTrader:
                         if updated_at > prev_ts:   # only update if newer round
                             self.cl_prices[asset]  = price
                             self.cl_updated[asset] = updated_at
+                            # Dashboard fallback: if RTDS is stale, drive spot/chart from Chainlink.
+                            if (now - float(self._rtds_asset_ts.get(asset, 0.0) or 0.0)) > 3.0:
+                                self.prices[asset] = price
+                                self.price_history[asset].append((now, price))
+                                self._tick_update(asset, price, now)
                             print(f"{G}[CL-WS]{RS} {asset} {price:.4f} detect={detect_lag*1000:.0f}ms "
                                   f"via {ws_url.split('//')[1].split('/')[0]}")
                 except Exception:
