@@ -508,7 +508,16 @@ async def _score_market(self, m: dict) -> dict | None:
     # 8. BTC lead for altcoins
     if asset != "BTC":
         llr += (btc_lead_p - 0.5) * LLR_BTC_LEAD_MULT
-    # 9. Regime scale
+    # 9. 20-minute kline trend (macro directional context)
+    _klines = (self.binance_cache.get(asset, {}) or {}).get("klines", [])
+    if len(_klines) >= 4 and sigma_15m > 0:
+        _n = min(20, len(_klines) - 1)
+        _c0 = float(_klines[-_n - 1][4])
+        _c1 = float(_klines[-1][4])
+        if _c0 > 0:
+            _kl_ret = (_c1 - _c0) / _c0
+            llr += _kl_ret / (sigma_15m * (20 / 15) ** 0.5) * LLR_KLINE_TREND_MULT
+    # 10. Regime scale
     llr *= regime_mult
     # Sigmoid → prob_up
     p_up_ll   = 1.0 / (1.0 + math.exp(-max(-LLR_CLAMP, min(LLR_CLAMP, llr))))
