@@ -199,7 +199,6 @@ async def _execute_trade(self, sig: dict):
             hc15_mode=sig.get("hc15_mode", False),
             hc15_fallback_cap=HC15_FALLBACK_MAX_ENTRY,
             core_position=(not is_booster),
-            round_force=bool(sig.get("round_force_coverage", False)),
         )
         self._perf_update("order_ms", (_time.perf_counter() - t_ord) * 1000.0)
         order_id = (exec_result or {}).get("order_id", "")
@@ -390,22 +389,7 @@ async def _place_order(self, token_id, side, price, size_usdc, asset, duration, 
     # Using MIN_BET_ABS here can reject valid autopilot-sized trades.
     hard_min_notional = max(float(MIN_EXEC_NOTIONAL_USDC), 1.0)
     if float(size_usdc or 0.0) < hard_min_notional:
-        allow_bump = bool(core_position) and (bool(round_force) or FORCE_TRADE_EVERY_ROUND)
-        target_min = hard_min_notional * max(1.0, float(ROUND_FORCE_MIN_NOTIONAL_MULT))
-        bank_cap = max(0.0, float(self.bankroll or 0.0)) * max(0.01, float(ROUND_FORCE_MAX_BANK_FRAC))
-        if allow_bump and bank_cap >= target_min:
-            bumped = round(max(float(size_usdc or 0.0), target_min), 2)
-            print(
-                f"{Y}[SIZE-BUMP]{RS} {asset} {side} size ${float(size_usdc or 0.0):.2f} -> ${bumped:.2f} "
-                f"(hard_min=${hard_min_notional:.2f} bank_cap=${bank_cap:.2f})"
-            )
-            size_usdc = bumped
-        else:
-            print(
-                f"{Y}[SKIP]{RS} {asset} {side} size=${float(size_usdc or 0.0):.2f} "
-                f"< hard_min=${hard_min_notional:.2f} (exec backstop)"
-            )
-            return None
+        return None
 
     for attempt in range(max(1, ORDER_RETRY_MAX)):
         try:
@@ -578,21 +562,19 @@ async def _place_order(self, token_id, side, price, size_usdc, asset, duration, 
                 print(f"{B}[LIMIT]{RS} {asset} {side} target={price:.3f} limit_edge={limit_edge:.3f} ask={best_ask:.3f}")
             elif score >= 10:
                 # High conviction: gate on maker edge (mid price), not taker (ask)
-                if maker_edge_est < 0 and not round_force:
+                if maker_edge_est < 0:
                     print(f"{Y}[SKIP] {asset} {side} [high-conv]: maker_edge={maker_edge_est:.3f} < 0 "
                           f"(mid={mid_est:.3f} model={true_prob:.3f}){RS}")
                     return None
                 print(f"{B}[EXEC-CHECK]{RS} {asset} {side} score={score} maker_edge={maker_edge_est:.3f} taker_edge={taker_edge:.3f}")
             else:
                 # Normal conviction: taker edge gate applies
-                if taker_edge < edge_floor and not round_force:
+                if taker_edge < edge_floor:
                     kind = "disagree" if not cl_agree else "directional"
                     print(f"{Y}[SKIP] {asset} {side} [{kind}]: taker_edge={taker_edge:.3f} < {edge_floor:.2f} "
                           f"(ask={best_ask:.3f} model={true_prob:.3f}){RS}")
                     return None
                 print(f"{B}[EXEC-CHECK]{RS} {asset} {side} edge={taker_edge:.3f} floor={edge_floor:.2f}")
-            if round_force and not use_limit and not force_taker:
-                force_taker = True
 
             # High conviction: skip maker, go straight to FOK taker for instant fill
             # FOK = Fill-or-Kill: fills completely at price or cancels instantly — no waiting
@@ -746,8 +728,6 @@ async def _place_order(self, token_id, side, price, size_usdc, asset, duration, 
                 max_gap_ticks = MAKER_PULLBACK_MAX_GAP_TICKS_5M if duration <= 5 else MAKER_PULLBACK_MAX_GAP_TICKS_15M
                 if strong_exec:
                     max_gap_ticks += (1 if duration <= 5 else 2)
-                if round_force:
-                    max_gap_ticks += (2 if duration <= 5 else 3)
                 if gap_ticks > float(max_gap_ticks):
                     eff_max_entry = max_entry_allowed if max_entry_allowed is not None else 0.99
                     if best_ask <= eff_max_entry and taker_edge >= edge_floor:
@@ -767,10 +747,9 @@ async def _place_order(self, token_id, side, price, size_usdc, asset, duration, 
                                 print(f"{G}[FAST-FILL]{RS} {side} {asset} {duration}m | ${size_usdc:.2f} @ {taker_price:.3f} | Bank ${self.bankroll:.2f}")
                                 return {"order_id": order_id, "fill_price": taker_price, "mode": "fok_maker_bypass", "notional_usdc": size_usdc}
                             bypass_filled = False
-                            if not (strong_exec or round_force):
-                                print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=maker_bypass_fok_unfilled")
-                                return None
-                    if strong_exec or round_force:
+                            print(f"{Y}[EXEC-RESULT]{RS} {asset} {side} no-fill reason=maker_bypass_fok_unfilled")
+                            return None
+                    if strong_exec:
                         maker_price = round(min(max(tick, best_bid), eff_max_entry, 0.97), 4)
                         if self._noisy_log_enabled(f"maker-reprice-gap:{asset}:{side}", LOG_EXEC_EVERY_SEC):
                             print(
@@ -948,12 +927,7 @@ async def _place_order(self, token_id, side, price, size_usdc, asset, duration, 
                         return None
                 fresh_payout = 1.0 / max(fresh_ask, 1e-9)
                 min_payout_fb, min_ev_fb, _ = self._adaptive_thresholds(duration)
-                _must_fire_exec = bool(round_force)
-                if _must_fire_exec:
-                    # Must-fire: accept any EV-positive payout (>= 1.30x minimum)
-                    min_payout_fb = max(1.30, min_payout_fb - 0.35)
-                    min_ev_fb     = max(-0.005, min_ev_fb - 0.015)
-                elif core_position and duration >= 15 and CONSISTENCY_CORE_ENABLED:
+                if core_position and duration >= 15 and CONSISTENCY_CORE_ENABLED:
                     # Keep execution fully aligned with core 15m consistency floor.
                     min_payout_fb = max(min_payout_fb, CONSISTENCY_MIN_PAYOUT_15M)
                 elif strong_exec:

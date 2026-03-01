@@ -5026,8 +5026,8 @@ class LiveTrader:
         return sig
 
     def _build_forced_round_signal(self, m: dict) -> dict | None:
-        """Build a minimally-complete executable signal when score path yields no candidates.
-        This is used only for force-coverage recovery to avoid prolonged zero-trade stalls.
+        """Removed — force/synth trade path eliminated.
+        Kept as stub to avoid AttributeError if called from stale code.
         """
         try:
             cid = str(m.get("conditionId", "") or "")
@@ -5119,11 +5119,10 @@ class LiveTrader:
                 "vol_ratio": 0.0,
                 "snap_token_up": str(m.get("token_up", "") or ""),
                 "snap_token_down": str(m.get("token_down", "") or ""),
-                "round_force_coverage": True,
-                "round_force_execute": True,
             }
         except Exception:
-            return None
+            pass
+        return None
 
     async def _execute_trade(self, sig: dict):
         from clawbot_v2.execution.core import _execute_trade
@@ -7795,32 +7794,17 @@ class LiveTrader:
                 if blackout_ev:
                     if self._should_log("macro-blackout", 120):
                         print(f"{Y}[MACRO-BLACKOUT]{RS} skipping trades — {blackout_ev} event window active")
-                force_round_now = bool(
-                    FORCE_TRADE_EVERY_ROUND
-                    and slots > 0
-                    and selected
-                    and not blackout_ev
-                )
-                force_picked = False
                 for sig in selected:
                     if len(to_exec) >= slots:
                         break
                     if blackout_ev:
                         continue
-                    bypass_gates = bool(force_round_now and not force_picked)
                     if (
                         consensus_side_15m
                         and int(sig.get("duration", 0) or 0) >= 15
                         and str(sig.get("side", "") or "") != consensus_side_15m
                     ):
-                        if bypass_gates:
-                            if self._should_log("round-force-bypass-consensus", 10):
-                                print(
-                                    f"{Y}[ROUND-FORCE-BYPASS]{RS} consensus "
-                                    f"{sig.get('asset','?')} {sig.get('duration','?')}m "
-                                    f"{sig.get('side','?')} != {consensus_side_15m}"
-                                )
-                        elif ROUND_CONSENSUS_STRICT_15M:
+                        if ROUND_CONSENSUS_STRICT_15M:
                             self._skip_tick("consensus_contra")
                             continue
                         else:
@@ -7831,65 +7815,32 @@ class LiveTrader:
                             if not over:
                                 self._skip_tick("consensus_contra")
                                 continue
-                    if (not bypass_gates) and (not self._exposure_ok(sig, shadow_pending)):
+                    if not self._exposure_ok(sig, shadow_pending):
                         continue
-                    if (not bypass_gates) and (not TRADE_ALL_MARKETS):
+                    if not TRADE_ALL_MARKETS:
                         pending_up = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Up")
                         pending_dn = sum(1 for _, t in shadow_pending.values() if t.get("side") == "Down")
                         if sig["side"] == "Up" and pending_up >= MAX_SAME_DIR:
                             continue
                         if sig["side"] == "Down" and pending_dn >= MAX_SAME_DIR:
                             continue
-                        # Unified direction: correlated assets move together — never hold Up + Down simultaneously
                         if pending_dn > 0 and sig["side"] == "Up":   continue
                         if pending_up > 0 and sig["side"] == "Down":  continue
-                    # NOTE: correlated Kelly sizing is handled by ROUND_CORR_SAME_SIDE_DECAY in execution path.
-                    # Removed scan_loop 1/sqrt(N) division to avoid double-applying the same reduction.
-                    picked_sig = dict(sig) if bypass_gates else sig
-                    if bypass_gates:
-                        picked_sig["round_force_coverage"] = True
-                        picked_sig["round_force_execute"] = True
-                        force_picked = True
-                    to_exec.append(picked_sig)
+                    to_exec.append(sig)
                     m_sig = sig.get("m", {}) if isinstance(sig.get("m", {}), dict) else {}
                     t_sig = {
-                        "side": picked_sig.get("side", ""),
-                        "size": float(picked_sig.get("size", 0.0) or 0.0),
-                        "asset": picked_sig.get("asset", ""),
-                        "duration": int(picked_sig.get("duration", 0) or 0),
+                        "side": sig.get("side", ""),
+                        "size": float(sig.get("size", 0.0) or 0.0),
+                        "asset": sig.get("asset", ""),
+                        "duration": int(sig.get("duration", 0) or 0),
                         "end_ts": float(m_sig.get("end_ts", now + 60) or (now + 60)),
                     }
                     shadow_pending[f"__pick__{len(to_exec)}"] = (m_sig, t_sig)
-                counted_no_trade = False
-                if (
-                    NO_TRADE_RECOVERY_ENABLED
-                    and (not to_exec)
-                    and selected
-                    and slots > 0
-                    and not blackout_ev
-                ):
-                    self._no_trade_rounds += 1
-                    counted_no_trade = True
-                    if self._no_trade_rounds >= max(1, NO_TRADE_RECOVERY_ROUNDS):
-                        forced = dict(selected[0])
-                        forced["round_force_coverage"] = True
-                        forced["round_force_execute"] = True
-                        to_exec.append(forced)
-                        if self._should_log("round-no-trade-recovery", 10):
-                            print(
-                                f"{Y}[ROUND-RECOVERY]{RS} forcing execution after "
-                                f"{self._no_trade_rounds} empty rounds -> "
-                                f"{forced.get('asset','?')} {forced.get('duration','?')}m "
-                                f"{forced.get('side','?')} score={forced.get('score','?')}"
-                            )
                 if to_exec:
                     self._no_trade_rounds = 0
                     await asyncio.gather(*[self._execute_trade(sig) for sig in to_exec])
-                elif selected:
-                    if not counted_no_trade:
-                        self._no_trade_rounds += 1
                 else:
-                    self._no_trade_rounds = max(0, self._no_trade_rounds - 1)
+                    self._no_trade_rounds += 1
 
             await asyncio.sleep(SCAN_INTERVAL)
           except Exception as e:

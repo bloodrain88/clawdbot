@@ -1209,8 +1209,6 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
 
     # ── Minimum true_prob gate (2/3-rule: need ≥60% confidence) ─────────
     min_tp = MIN_TRUE_PROB_GATE_5M if duration <= 5 else MIN_TRUE_PROB_GATE_15M
-    if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
-        min_tp = max(0.50, min_tp - LATE_MUST_FIRE_PROB_RELAX)   # 0.60 → 0.55 in must-fire window
     _payout_mult_local = 1.0 / max(entry, 1e-9)
     _highpayout_bypass = (   # 10x+ entries get a lower prob floor — still profitable at 45% win rate
         _payout_mult_local >= HIGHPAYOUT_MIN_PAYOUT
@@ -1242,9 +1240,6 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
         and duration >= 15
     ):
         min_score_local = max(4, min_score_local - CROSS_CONSENSUS_SCORE_RELAX)
-    # Must-fire late-window relaxation: lower gate in last N minutes to guarantee entry
-    if late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15:
-        min_score_local = max(LATE_MUST_FIRE_MIN_SCORE, min_score_local - LATE_MUST_FIRE_SCORE_RELAX)
     if duration <= 5 and FIVE_M_DYNAMIC_SCORE_ENABLED:
         snap5 = self._five_m_quality_snapshot(max(FIVE_M_GUARD_WINDOW, FIVE_M_DYNAMIC_SCORE_MIN_OUTCOMES))
         n5 = int(snap5.get("n", 0) or 0)
@@ -1495,8 +1490,6 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
         strong_relax = 0.0
         if true_prob >= 0.72 and score >= 14 and edge >= 0.14:
             strong_relax = 0.02
-        if FORCE_TRADE_EVERY_ROUND and late_relax and true_prob >= 0.66 and score >= 10 and edge >= 0.10:
-            strong_relax = max(strong_relax, 0.03)
         max_entry_allowed = min(max_entry_allowed, min(0.90, ENTRY_HARD_CAP_15M + strong_relax))
     else:
         max_entry_allowed = min(max_entry_allowed, max(0.60, adaptive_hard_cap))
@@ -2300,7 +2293,7 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
         "quote_age_ms": 0.0 if px_src == "CL" else quote_age_ms,
         "signal_latency_ms": (_time.perf_counter() - score_started) * 1000.0,
         "prebid_arm": arm_active,
-        "must_fire": bool(late_relax and LATE_MUST_FIRE_ENABLED and duration >= 15),
+        "must_fire": False,
         "profit_push_tier": profit_push_tier,
         "profit_push_size_mult": profit_push_size_mult,
         "runtime_5m_size_mult": float(self._five_m_runtime_size_mult or 1.0),
