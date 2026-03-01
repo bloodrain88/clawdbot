@@ -1337,6 +1337,7 @@ class LiveTrader:
         self._clob_ws_assets_subscribed = set()
         # Token ids queued for immediate market-WS subscribe (e.g. newly discovered rounds).
         self._clob_ws_pending_subs = set()
+        self._clob_ws_connected_at = 0.0   # timestamp of last successful WS connect
         self._heartbeat_last_ok = 0.0
         self._heartbeat_id   = ""
         self._order_event_cache = {}  # order_id -> {"status": str, "filled_size": float, "ts": float}
@@ -4832,6 +4833,31 @@ class LiveTrader:
                     if k not in keep:
                         self._clob_ws_books.pop(k, None)
 
+    async def _bootstrap_ws_books(self, token_ids: set):
+        """Seed WS book cache from REST right after subscription.
+        Prevents the health-check reconnect loop caused by books sitting at 9e9ms
+        while waiting for Polymarket to push the first snapshot event."""
+        loop = asyncio.get_running_loop()
+        for tid in token_ids:
+            try:
+                book = await self._get_order_book(tid, force_fresh=True)
+                if not book:
+                    continue
+                asks_raw = sorted(book.asks, key=lambda x: float(x.price)) if book.asks else []
+                bids_raw = sorted(book.bids, key=lambda x: float(x.price), reverse=True) if book.bids else []
+                if not asks_raw:
+                    continue
+                tick = float(getattr(book, "tick_size", None) or "0.01")
+                event = {
+                    "asset_id": tid,
+                    "asks": [{"price": a.price, "size": a.size} for a in asks_raw[:20]],
+                    "bids": [{"price": b.price, "size": b.size} for b in bids_raw[:20]],
+                    "tick_size": str(tick),
+                }
+                self._ingest_clob_ws_event(event)
+            except Exception:
+                pass
+
     def _get_clob_ws_book(self, token_id: str, max_age_ms: float | None = None):
         if not token_id:
             return None
@@ -4879,6 +4905,7 @@ class LiveTrader:
                 ) as ws:
                     self._clob_market_ws = ws
                     self._clob_ws_assets_subscribed = set()
+                    self._clob_ws_connected_at = _time.time()
                     print(f"{G}[CLOB-WS] market connected{RS}")
                     _conn_start = _time.time()
                     delay = 2
@@ -4907,6 +4934,9 @@ class LiveTrader:
                                 )
                                 self._clob_ws_assets_subscribed |= set(add)
                                 self._clob_ws_pending_subs -= set(add)
+                                # Seed WS cache from REST immediately — avoids 8s staleness gap
+                                # while waiting for Polymarket to send the initial book snapshot.
+                                asyncio.ensure_future(self._bootstrap_ws_books(set(add)))
                             try:
                                 # Keep a short poll interval so new-token subscriptions are flushed
                                 # quickly at round rollover (prevents ws_age=9e9 gaps).
@@ -8773,6 +8803,7 @@ class LiveTrader:
                     if (
                         self._ws_stale_hits >= max(1, CLOB_WS_STALE_HEAL_HITS)
                         and (now - float(self._ws_last_heal_ts or 0.0)) >= CLOB_WS_STALE_HEAL_COOLDOWN_SEC
+                        and (now - float(self._clob_ws_connected_at or 0.0)) >= 20.0  # grace: skip reconnect loop at startup
                     ):
                         self._ws_last_heal_ts = now
                         self._ws_stale_hits = 0
