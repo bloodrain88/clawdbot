@@ -106,6 +106,9 @@ except ModuleNotFoundError:
             self._load()
 
         def _load(self):
+            if BUCKET_STATS_RESET_ON_BOOT:
+                self.rows.clear()
+                return
             try:
                 with open(BUCKET_STATS_PATH) as f:
                     data = json.load(f)
@@ -228,7 +231,7 @@ MIN_EDGE       = float(os.environ.get("MIN_EDGE", "0.20"))     # base edge floor
 MIN_MOVE       = float(os.environ.get("MIN_MOVE", "0.0003"))   # flat filter threshold
 MOMENTUM_WEIGHT = float(os.environ.get("MOMENTUM_WEIGHT", "0.40"))
 DUST_BET       = float(os.environ.get("DUST_BET", "5.0"))
-MIN_BET_ABS    = float(os.environ.get("MIN_BET_ABS", "2.50"))
+MIN_BET_ABS    = float(os.environ.get("MIN_BET_ABS", "1.0"))
 MIN_EXEC_NOTIONAL_USDC = float(os.environ.get("MIN_EXEC_NOTIONAL_USDC", "1.0"))
 MIN_ORDER_SIZE_SHARES = float(os.environ.get("MIN_ORDER_SIZE_SHARES", "5.0"))
 ORDER_SIZE_PAD_SHARES = float(os.environ.get("ORDER_SIZE_PAD_SHARES", "0.02"))
@@ -440,6 +443,7 @@ AUTOPILOT_POLICY_FILE = os.environ.get("AUTOPILOT_POLICY_FILE", os.path.join(_DA
 PRED_AGENT_ENABLED = os.environ.get("PRED_AGENT_ENABLED", "true").lower() == "true"
 PRED_AGENT_MIN_SAMPLES = int(os.environ.get("PRED_AGENT_MIN_SAMPLES", "24"))
 PNL_BASELINE_RESET_ON_BOOT = os.environ.get("PNL_BASELINE_RESET_ON_BOOT", "false").lower() == "true"
+BUCKET_STATS_RESET_ON_BOOT = os.environ.get("BUCKET_STATS_RESET_ON_BOOT", "false").lower() == "true"
 LOSS_STREAK_PAUSE_ENABLED = os.environ.get("LOSS_STREAK_PAUSE_ENABLED", "false").lower() == "true"
 LOSS_STREAK_PAUSE_N = int(os.environ.get("LOSS_STREAK_PAUSE_N", "3"))     # tightened 4→3
 LOSS_STREAK_PAUSE_SEC = float(os.environ.get("LOSS_STREAK_PAUSE_SEC", "1800"))  # 900→1800s
@@ -1436,6 +1440,7 @@ class LiveTrader:
         self._copyflow_last_try = 0.0
         self.peak_bankroll      = BANKROLL           # track peak for drawdown guard
         self.consec_losses      = 0                  # consecutive resolved losses counter
+        self.consec_wins        = 0                  # consecutive resolved wins counter
         self._pause_entries_until = 0.0
         self._settled_outcomes = {}
         self._last_round_best   = ""
@@ -6712,34 +6717,27 @@ class LiveTrader:
 
         snap = self._growth_snapshot()
         tightness = 0.0
-        if snap["outcomes"] >= 10 and snap["pf"] < 1.0:
-            tightness += min(1.2, (1.0 - snap["pf"]) * 1.5)
-        if snap["outcomes"] >= 10 and snap["expectancy"] < 0:
-            tightness += min(1.0, abs(snap["expectancy"]) / 0.8)
-        # Conservative confidence guard: if the lower confidence bound of recent WR drops below 50%,
-        # tighten aggressively to protect EV under uncertainty.
-        if snap["recent_n"] >= 10 and snap["recent_wr_lb"] < 0.50:
-            tightness += min(0.45, (0.50 - snap["recent_wr_lb"]) * 2.0)
-        if snap["avg_slip"] > 220:
-            tightness += min(0.6, (snap["avg_slip"] - 220.0) / 600.0)
-        if self.consec_losses >= 2:
-            tightness += min(0.45, (self.consec_losses - 1) * 0.15)
-        if snap["outcomes"] >= 12 and snap["pf"] > 1.35 and snap["expectancy"] > 0.30 and snap["avg_slip"] < 120:
-            tightness -= 0.35
-        # Momentum regime relaxation: require both observed WR and confidence.
-        if (
-            snap["outcomes"] >= 12
-            and snap["pf"] >= 1.15
-            and snap["recent_pf"] >= 1.10
-            and snap["expectancy"] >= 0.10
-            and snap["avg_slip"] < 180
-            and snap["recent_n"] >= 12
-            and snap["recent_wr"] >= 0.58
-            and snap["recent_wr_lb"] >= 0.50
-            and self.consec_losses == 0
-        ):
-            tightness -= 0.15
-        tightness = min(1.8, max(-0.5, tightness))
+        # Cold start: recent_n < 15 → use base thresholds, no tightening from old data.
+        # This ensures a fresh deposit isn't punished by historical bad stats.
+        if snap["recent_n"] >= 15:
+            # Only tighten based on RECENT window (last 20 trades), not all-time bucket_stats
+            if snap["recent_wr_lb"] < 0.48:
+                tightness += min(0.60, (0.48 - snap["recent_wr_lb"]) * 1.5)
+            if snap["recent_pf"] < 0.95:
+                tightness += min(0.40, (0.95 - snap["recent_pf"]) * 0.80)
+            if snap["avg_slip"] > 220:
+                tightness += min(0.4, (snap["avg_slip"] - 220.0) / 800.0)
+            if self.consec_losses >= 3:
+                tightness += min(0.30, (self.consec_losses - 2) * 0.10)
+            # Relaxation on recent good performance
+            if snap["recent_wr"] >= 0.56 and snap["recent_wr_lb"] >= 0.50:
+                tightness -= 0.25
+            if snap["recent_pf"] >= 1.20 and snap["recent_wr_lb"] >= 0.52:
+                tightness -= 0.15
+        # Win streak: aggressively relax — bot is calibrated, press the edge
+        if self.consec_wins >= 3:
+            tightness -= min(0.40, (self.consec_wins - 2) * 0.15)
+        tightness = min(1.4, max(-0.6, tightness))
 
         min_payout_raw = base_payout + (0.20 * tightness)
         if duration >= 15:
@@ -6780,29 +6778,32 @@ class LiveTrader:
         return slip_cost, nofill_penalty, max(0.0, min(1.0, fill_ratio))
 
     def _prob_shrink_factor(self) -> float:
-        """Calibrate model confidence to realized PnL quality (anti-overconfidence)."""
+        """Calibrate model confidence to realized PnL quality (anti-overconfidence).
+        Uses recent window only to avoid poisoning by old bad data.
+        Floor raised to 0.65 — never fully kills signals; bot must keep trading to learn."""
         snap = self._growth_snapshot()
-        if snap["outcomes"] < 8:
-            return 0.78  # was 0.70: less aggressive cold-start suppression
-        shrink = 0.82
-        if snap["pf"] < 1.0:
-            shrink -= min(0.25, (1.0 - snap["pf"]) * 0.50)
-        if snap["expectancy"] < 0:
-            shrink -= min(0.20, abs(snap["expectancy"]) / 1.0)
-        if snap["avg_slip"] > 240:
-            shrink -= min(0.10, (snap["avg_slip"] - 240.0) / 900.0)
-        if snap["pf"] > 1.40 and snap["expectancy"] > 0.20 and snap["avg_slip"] < 120:
-            shrink += 0.05
-        if self.consec_losses >= 2:
-            shrink -= min(0.15, 0.04 * self.consec_losses)
-        # Anchor to realized win rate: if recent WR is below 50%, model is overconfident
+        # Cold start or after reset: use neutral shrink — don't pre-punish
+        if snap["recent_n"] < 8:
+            return 0.82
+        shrink = 0.85
+        # Use recent win rate as primary anchor (last 20 trades, not all-time)
         if snap["recent_n"] >= 10:
-            rwr = snap["recent_wr_lb"]  # Wilson lower bound on last 20 trades
-            if rwr < 0.50:
-                shrink -= min(0.20, (0.50 - rwr) * 2.5)
+            rwr = snap["recent_wr_lb"]
+            if rwr < 0.48:
+                shrink -= min(0.12, (0.48 - rwr) * 1.5)
             elif rwr > 0.55:
-                shrink += min(0.05, (rwr - 0.55) * 0.50)
-        return max(0.35, min(0.92, shrink))
+                shrink += min(0.07, (rwr - 0.55) * 0.80)
+        # Win streak boost: model is in calibration, trust it more
+        if self.consec_wins >= 3:
+            shrink += min(0.07, (self.consec_wins - 2) * 0.025)
+        # Losing streak: reduce confidence moderately (not to floor)
+        if self.consec_losses >= 3:
+            shrink -= min(0.08, (self.consec_losses - 2) * 0.025)
+        # Slip penalty (fill quality)
+        if snap["avg_slip"] > 240:
+            shrink -= min(0.06, (snap["avg_slip"] - 240.0) / 1500.0)
+        # Floor is 0.65: ensures signals always pass EV gate — bot keeps trading
+        return max(0.65, min(0.95, shrink))
 
     def _signal_growth_score(self, sig: dict) -> float:
         """Rank candidates by growth quality (higher is better)."""
@@ -7081,19 +7082,26 @@ class LiveTrader:
         return n, pf, exp
 
     def _kelly_drawdown_scale(self) -> float:
-        """Scale Kelly fraction down when in drawdown vs session high.
-        Bot keeps trading but reduces size automatically — no hard stop."""
+        """Scale Kelly fraction based on drawdown (down) or win streak (up).
+        Bot keeps trading but sizes up/down automatically — no hard stop."""
+        # Win streak: scale up to press edge during hot runs
+        if self.consec_wins >= 5:
+            win_boost = min(1.35, 1.0 + (self.consec_wins - 4) * 0.08)
+        elif self.consec_wins >= 3:
+            win_boost = 1.15
+        else:
+            win_boost = 1.0
         if self.peak_bankroll <= 0:
-            return 1.0
+            return win_boost
         dd = (self.peak_bankroll - self.bankroll) / self.peak_bankroll
         if dd < 0.10:
-            return 1.0       # normal
+            return win_boost  # normal / growing
         elif dd < 0.20:
-            return 0.60      # -10-20% drawdown: 60% of normal size
+            return 0.65       # -10-20% drawdown: 65% of normal size
         elif dd < 0.30:
-            return 0.35      # -20-30%: 35%
+            return 0.40       # -20-30%: 40%
         else:
-            return 0.20      # >30%: 20% (survival mode, still trading)
+            return 0.25       # >30%: 25% (survival mode, still trading)
 
     def _wr_bet_scale(self) -> float:
         """EV/PF-only size controller for growth. No win-rate input."""
@@ -7260,9 +7268,11 @@ class LiveTrader:
         # Track consecutive losses for adaptive signals (no pause — trade every cycle)
         if won:
             self.consec_losses = 0
+            self.consec_wins += 1
             self._pause_entries_until = 0.0
         else:
             self.consec_losses += 1
+            self.consec_wins = 0
             if (
                 LOSS_STREAK_PAUSE_ENABLED
                 and self.consec_losses >= max(1, int(LOSS_STREAK_PAUSE_N))
@@ -7286,7 +7296,7 @@ class LiveTrader:
             f"{B}[ADAPT]{RS} Last5PnL={streak or '–'} PF={snap['recent_pf']:.2f} "
             f"WR={snap['recent_wr']*100:.1f}% LB={snap['recent_wr_lb']*100:.1f}% "
             f"Exp={sum(last5)/max(1,len(last5)):+.2f} MinEdge={me:.2f} "
-            f"Streak={self.consec_losses}L DrawdownScale={self._kelly_drawdown_scale():.0%}{wr_str}"
+            f"Streak={self.consec_wins}W/{self.consec_losses}L Scale={self._kelly_drawdown_scale():.0%}{wr_str}"
         )
         if self._pause_entries_until > _time.time():
             rem_s = max(0.0, self._pause_entries_until - _time.time())
