@@ -1397,7 +1397,7 @@ class LiveTrader:
         self._pm_pattern_stats = {}
         self.side_perf       = {}                 # "ASSET|SIDE" -> {n, gross_win, gross_loss, pnl}
         self._last_eval_time    = {}              # cid → last RTDS-triggered evaluate() timestamp
-        self._score_cache_by_key = {}             # (cid, late_relax) -> {"ts","fp","sig"}
+        self._score_cache_by_key = {}             # cid -> {"ts","fp","sig"}
         self._exec_lock         = asyncio.Lock()
         self._executing_cids    = set()
         self._reserved_bankroll = 0.0             # sum of in-flight trade sizes (race guard)
@@ -4983,13 +4983,13 @@ class LiveTrader:
         except Exception:
             return None
 
-    async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
+    async def _score_market(self, m: dict) -> dict | None:
         from clawbot_v2.strategy.core import _score_market
         cid = str(m.get("conditionId", "") or "")
         if not cid:
-            return await _score_market(self, m, late_relax)
+            return await _score_market(self, m)
 
-        key = (cid, bool(late_relax))
+        key = cid
         now = _time.time()
         asset = str(m.get("asset", "") or "")
         up_price = float(m.get("up_price", 0.0) or 0.0)
@@ -5017,7 +5017,7 @@ class LiveTrader:
                 if float((v or {}).get("ts", 0.0) or 0.0) >= cutoff
             }
 
-        sig = await _score_market(self, m, late_relax)
+        sig = await _score_market(self, m)
         self._score_cache_by_key[key] = {
             "ts": now,
             "fp": fp,
@@ -5208,9 +5208,9 @@ class LiveTrader:
         from clawbot_v2.execution.core import evaluate
         return await evaluate(self, m)
 
-    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None, hc15_mode=False, hc15_fallback_cap=0.36, core_position=True, round_force=False):
+    async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None, hc15_mode=False, hc15_fallback_cap=0.36, core_position=True):
         from clawbot_v2.execution.core import _place_order
-        return await _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob, cl_agree, min_edge_req, force_taker, score, pm_book_data, use_limit, max_entry_allowed, hc15_mode, hc15_fallback_cap, core_position, round_force)
+        return await _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob, cl_agree, min_edge_req, force_taker, score, pm_book_data, use_limit, max_entry_allowed, hc15_mode, hc15_fallback_cap, core_position)
 
     # ── RESOLVE ───────────────────────────────────────────────────────────────
     async def _resolve(self):

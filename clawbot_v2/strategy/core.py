@@ -15,11 +15,10 @@ def _ensure_globals() -> None:
             g[k] = v
     _LOADED = True
 
-async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
+async def _score_market(self, m: dict) -> dict | None:
     _ensure_globals()
     """Score a market opportunity. Returns signal dict or None if hard-blocked.
-    Pure analysis — no side effects, no order placement.
-    late_relax=True: relax score gate by LATE_MUST_FIRE_SCORE_RELAX (must-fire last N min)."""
+    Pure analysis — no side effects, no order placement."""
     score_started = _time.perf_counter()
     cid       = m["conditionId"]
     booster_eval = False
@@ -1643,16 +1642,15 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
             max_entry_allowed = core_entry_cap
             if min_entry_allowed >= max_entry_allowed:
                 min_entry_allowed = max(0.01, max_entry_allowed - 0.01)
-        _entry_cap_consistency = CONSISTENCY_MAX_ENTRY_15M if not must_fire_active else max(CONSISTENCY_MAX_ENTRY_15M, 0.70)
-        if entry > _entry_cap_consistency and (not core_strong):
+        if entry > CONSISTENCY_MAX_ENTRY_15M and (not core_strong):
             if self._noisy_log_enabled(f"skip-consistency-entry:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
                     f"{Y}[SKIP] {asset} {duration}m consistency entry={entry:.3f} "
-                    f"> cap={_entry_cap_consistency:.3f} (not strong-core){RS}"
+                    f"> cap={CONSISTENCY_MAX_ENTRY_15M:.3f} (not strong-core){RS}"
                 )
             self._skip_tick("consistency_entry_high")
             return None
-        if not core_lead_now and not must_fire_active:
+        if not core_lead_now:
             trail_ok = pct_remaining >= CONSISTENCY_TRAIL_ALLOW_MIN_PCT_LEFT_15M and core_strong
             if not trail_ok:
                 if self._noisy_log_enabled(f"skip-consistency-trail:{asset}:{cid}", LOG_SKIP_EVERY_SEC):

@@ -369,7 +369,7 @@ async def evaluate(self, m: dict):
     if sig and sig["score"] >= MIN_SCORE_GATE:
         await self._execute_trade(sig)
 
-async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None, hc15_mode=False, hc15_fallback_cap=0.36, core_position=True, round_force=False):
+async def _place_order(self, token_id, side, price, size_usdc, asset, duration, mins_left, true_prob=0.5, cl_agree=True, min_edge_req=None, force_taker=False, score=0, pm_book_data=None, use_limit=False, max_entry_allowed=None, hc15_mode=False, hc15_fallback_cap=0.36, core_position=True):
     _ensure_globals()
     """Maker-first order strategy:
     1. Post bid at mid-price (best_bid+best_ask)/2 — collect the spread
@@ -539,9 +539,6 @@ async def _place_order(self, token_id, side, price, size_usdc, asset, duration, 
             edge_floor = min_edge_req if min_edge_req is not None else EXEC_EDGE_FLOOR_DEFAULT
             if not cl_agree:
                 edge_floor += EXEC_EDGE_FLOOR_NO_CL
-            if round_force:
-                # Forced round coverage: allow execution even with weak edge.
-                edge_floor = min(edge_floor, -0.03)
             strong_exec = (
                 (score >= 12)
                 and cl_agree
