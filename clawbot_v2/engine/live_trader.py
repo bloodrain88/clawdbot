@@ -108,6 +108,7 @@ except ModuleNotFoundError:
         def _load(self):
             if BUCKET_STATS_RESET_ON_BOOT:
                 self.rows.clear()
+                self._save()   # write empty file — idempotent on next restart
                 return
             try:
                 with open(BUCKET_STATS_PATH) as f:
@@ -457,32 +458,32 @@ RUNTIME_JSON_LOG_ROTATE_DAILY = os.environ.get("RUNTIME_JSON_LOG_ROTATE_DAILY", 
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() == "true"
 SHOW_DASHBOARD_FALLBACK = os.environ.get("SHOW_DASHBOARD_FALLBACK", "false").lower() == "true"
 STRICT_ONCHAIN_STATE = os.environ.get("STRICT_ONCHAIN_STATE", "true").lower() == "true"
-LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "true").lower() == "true"
+LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "false").lower() == "true"   # default off: cleaner logs
 LOG_STATS_LOCAL = os.environ.get("LOG_STATS_LOCAL", "false").lower() == "true"
-LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "30"))
+LOG_SCAN_EVERY_SEC = int(os.environ.get("LOG_SCAN_EVERY_SEC", "60"))
 LOG_SCAN_ON_CHANGE_ONLY = os.environ.get("LOG_SCAN_ON_CHANGE_ONLY", "true").lower() == "true"
-LOG_FLOW_EVERY_SEC = int(os.environ.get("LOG_FLOW_EVERY_SEC", "300"))
-LOG_ROUND_EMPTY_EVERY_SEC = int(os.environ.get("LOG_ROUND_EMPTY_EVERY_SEC", "30"))
-LOG_SETTLE_FIRST_EVERY_SEC = int(os.environ.get("LOG_SETTLE_FIRST_EVERY_SEC", "20"))
+LOG_FLOW_EVERY_SEC = int(os.environ.get("LOG_FLOW_EVERY_SEC", "600"))
+LOG_ROUND_EMPTY_EVERY_SEC = int(os.environ.get("LOG_ROUND_EMPTY_EVERY_SEC", "120"))
+LOG_SETTLE_FIRST_EVERY_SEC = int(os.environ.get("LOG_SETTLE_FIRST_EVERY_SEC", "60"))
 SETTLE_FIRST_REQUIRE_ONCHAIN_CLAIMABLE = os.environ.get("SETTLE_FIRST_REQUIRE_ONCHAIN_CLAIMABLE", "true").lower() == "true"
 SETTLE_FIRST_FORCE_BLOCK_AFTER_MIN = float(os.environ.get("SETTLE_FIRST_FORCE_BLOCK_AFTER_MIN", "6.0"))
-LOG_BANK_EVERY_SEC = int(os.environ.get("LOG_BANK_EVERY_SEC", "45"))
+LOG_BANK_EVERY_SEC = int(os.environ.get("LOG_BANK_EVERY_SEC", "120"))
 LOG_BANK_MIN_DELTA = float(os.environ.get("LOG_BANK_MIN_DELTA", "0.50"))
-LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "90"))
+LOG_MARKET_EVERY_SEC = int(os.environ.get("LOG_MARKET_EVERY_SEC", "180"))
 LOG_LIVE_DETAIL = os.environ.get("LOG_LIVE_DETAIL", "true").lower() == "true"
-LOG_LIVE_RK_MAX = int(os.environ.get("LOG_LIVE_RK_MAX", "12"))
+LOG_LIVE_RK_MAX = int(os.environ.get("LOG_LIVE_RK_MAX", "8"))
 LIVE_RK_REAL_ONLY = os.environ.get("LIVE_RK_REAL_ONLY", "false").lower() == "true"
 LOG_TAIL_EQ_ENABLED = os.environ.get("LOG_TAIL_EQ_ENABLED", "true").lower() == "true"
-LOG_TAIL_EQ_EVERY_SEC = int(os.environ.get("LOG_TAIL_EQ_EVERY_SEC", "15"))
-LOG_TAIL_EQ_MAX_ROWS = int(os.environ.get("LOG_TAIL_EQ_MAX_ROWS", "20"))
+LOG_TAIL_EQ_EVERY_SEC = int(os.environ.get("LOG_TAIL_EQ_EVERY_SEC", "30"))
+LOG_TAIL_EQ_MAX_ROWS = int(os.environ.get("LOG_TAIL_EQ_MAX_ROWS", "12"))
 # Keep freshly-filled local positions visible while on-chain position APIs catch up.
 LIVE_LOCAL_GRACE_SEC = float(os.environ.get("LIVE_LOCAL_GRACE_SEC", "120"))
-LOG_ROUND_SIGNAL_MIN_SEC = float(os.environ.get("LOG_ROUND_SIGNAL_MIN_SEC", "5"))
-LOG_DEBUG_EVERY_SEC = int(os.environ.get("LOG_DEBUG_EVERY_SEC", "60"))
-LOG_ROUND_SIGNAL_EVERY_SEC = int(os.environ.get("LOG_ROUND_SIGNAL_EVERY_SEC", "30"))
-LOG_SKIP_EVERY_SEC = int(os.environ.get("LOG_SKIP_EVERY_SEC", "30"))
-LOG_EDGE_EVERY_SEC = int(os.environ.get("LOG_EDGE_EVERY_SEC", "30"))
-LOG_EXEC_EVERY_SEC = int(os.environ.get("LOG_EXEC_EVERY_SEC", "30"))
+LOG_ROUND_SIGNAL_MIN_SEC = float(os.environ.get("LOG_ROUND_SIGNAL_MIN_SEC", "10"))
+LOG_DEBUG_EVERY_SEC = int(os.environ.get("LOG_DEBUG_EVERY_SEC", "120"))
+LOG_ROUND_SIGNAL_EVERY_SEC = int(os.environ.get("LOG_ROUND_SIGNAL_EVERY_SEC", "60"))
+LOG_SKIP_EVERY_SEC = int(os.environ.get("LOG_SKIP_EVERY_SEC", "120"))
+LOG_EDGE_EVERY_SEC = int(os.environ.get("LOG_EDGE_EVERY_SEC", "60"))
+LOG_EXEC_EVERY_SEC = int(os.environ.get("LOG_EXEC_EVERY_SEC", "60"))
 SKIP_STATS_WINDOW_SEC = int(os.environ.get("SKIP_STATS_WINDOW_SEC", "900"))
 SKIP_STATS_TOP_N = int(os.environ.get("SKIP_STATS_TOP_N", "6"))
 WS_HEALTH_REQUIRED = os.environ.get("WS_HEALTH_REQUIRED", "true").lower() == "true"
@@ -7144,6 +7145,21 @@ class LiveTrader:
         return MOMENTUM_WEIGHT
 
     def _load_stats(self):
+        if BUCKET_STATS_RESET_ON_BOOT:
+            # One-time fresh start: wipe all historical stats and write empty files.
+            # Subsequent restarts with same flag load the empty files → no-op.
+            self.stats = {}
+            self.recent_trades = deque(maxlen=30)
+            self.recent_pnl = deque(maxlen=40)
+            self.side_perf = {}
+            self._pm_pattern_stats = {}
+            try:
+                with open(STATS_FILE, "w") as f:
+                    json.dump({}, f)
+            except Exception:
+                pass
+            print(f"{Y}[RESET]{RS} stats cleared (BUCKET_STATS_RESET_ON_BOOT=true) — fresh start")
+            return
         try:
             with open(STATS_FILE) as f:
                 data = json.load(f)
