@@ -7476,26 +7476,13 @@ class LiveTrader:
                         oldest_q_min = max(0.0, (now_q - oldest_q) / 60.0)
                     except Exception:
                         oldest_q_min = 0.0
-                should_block_settle = True
-                if SETTLE_FIRST_REQUIRE_ONCHAIN_CLAIMABLE:
-                    should_block_settle = (
-                        (claimable_n > 0)
-                        or (oldest_q_min >= max(0.0, SETTLE_FIRST_FORCE_BLOCK_AFTER_MIN))
-                    )
-                if should_block_settle:
-                    if self._should_log("settle-first", LOG_SETTLE_FIRST_EVERY_SEC):
-                        print(
-                            f"{Y}[SETTLE-FIRST]{RS} pending_redeem={pending_n} "
-                            f"(claimable={claimable_n}, oldest={oldest_q_min:.1f}m) "
-                            f"— skipping new entries until win/loss is finalized on-chain"
-                        )
-                    await asyncio.sleep(SCAN_INTERVAL)
-                    continue
+                # Never hard-block entries on pending redeem; redeem loop runs in parallel.
+                # Keep visibility via logs only.
                 if self._should_log("settle-first-soft", LOG_SETTLE_FIRST_EVERY_SEC):
                     print(
                         f"{Y}[SETTLE-FIRST-SOFT]{RS} pending_redeem={pending_n} "
                         f"(claimable={claimable_n}, oldest={oldest_q_min:.1f}m) "
-                        f"— continue scanning while waiting on redeem claimability"
+                        f"— redeem runs in parallel; continue scanning"
                     )
             if self._pause_entries_until > _time.time():
                 if self._should_log("pause-entries", LOG_SETTLE_FIRST_EVERY_SEC):

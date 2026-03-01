@@ -99,27 +99,18 @@ async def _redeem_loop(self):
     _addr_cs = Web3.to_checksum_address(ADDRESS)
 
     _wait_log_ts = {}   # cid → last time we printed [WAIT] for it
+    if not hasattr(self, "_redeem_retry_not_before"):
+        self._redeem_retry_not_before = {}
     while True:
         poll_sleep = REDEEM_POLL_SEC_ACTIVE if self.pending_redeem else REDEEM_POLL_SEC
         await asyncio.sleep(max(0.05, poll_sleep))
         if not self.pending_redeem:
             continue
-        positions_by_cid = {}
-        try:
-            pos_rows = await self._http_get_json(
-                "https://data-api.polymarket.com/positions",
-                params={"user": ADDRESS, "sizeThreshold": "0.01", "redeemable": "true"},
-                timeout=8,
-            )
-            if isinstance(pos_rows, list):
-                positions_by_cid = {
-                    p.get("conditionId", ""): p
-                    for p in pos_rows if p.get("conditionId")
-                }
-        except Exception:
-            positions_by_cid = {}
         done = []
         for cid, val in list(self.pending_redeem.items()):
+            now_retry = _time.time()
+            if now_retry < float(self._redeem_retry_not_before.get(cid, 0.0) or 0.0):
+                continue
             # Support both (m, trade) from _resolve and legacy (side, asset) from _sync_redeemable
             if isinstance(val[0], dict):
                 m, trade = val
@@ -226,59 +217,62 @@ async def _redeem_loop(self):
                         tx_hash_full = tx_hash
                         redeem_confirmed = True
                         suffix = f"tx={tx_hash[:16]}"
-                    except Exception:
-                        # If still claimable, keep in queue and retry later (never miss redeem).
-                        if await self._is_redeem_claimable(
-                            ctf=ctf, collat=collat, acct_addr=acct.address,
-                            cid_bytes=cid_bytes, index_set=(1 if side == "Up" else 2), loop=loop
-                        ):
-                            print(
-                                f"{Y}[REDEEM-RETRY]{RS} claimable but tx failed; will retry "
-                                f"{asset} {side} | rk={rk} cid={self._short_cid(cid)}"
-                            )
-                            continue
-                        pos = positions_by_cid.get(cid, {})
-                        pos_redeemable = bool(pos.get("redeemable", False))
-                        pos_val = float(pos.get("currentValue", 0) or 0)
-                        if pos_redeemable and pos_val >= 0.01:
-                            print(
-                                f"{Y}[REDEEM-PENDING]{RS} still redeemable on API "
-                                f"(value=${pos_val:.2f}) | rk={rk} cid={self._short_cid(cid)}"
-                            )
-                            continue
-                        if REDEEM_REQUIRE_ONCHAIN_CONFIRM:
-                            # Strict mode: close only with explicit on-chain confirmation.
-                            # If winning token balance is zero on-chain, there is nothing claimable
-                            # in this wallet, so position can be finalized as non-wallet-redeem.
-                            tok = str(trade.get("token_id", "") or "").strip()
-                            tok_bal = -1
-                            if tok.isdigit():
-                                try:
-                                    tok_bal = await loop.run_in_executor(
-                                        None,
-                                        lambda ti=int(tok): ctf.functions.balanceOf(_addr_cs, ti).call(),
-                                    )
-                                except Exception:
-                                    tok_bal = -1
-                            if tok_bal == 0:
-                                redeem_confirmed = True
-                                suffix = "onchain-no-wallet-balance"
-                            else:
-                                print(
-                                    f"{Y}[REDEEM-UNCONFIRMED]{RS} waiting on-chain confirm "
-                                    f"(tx missing, token_balance={tok_bal}) | rk={rk} cid={self._short_cid(cid)}"
+                        self._redeem_retry_not_before.pop(cid, None)
+                    except Exception as e:
+                        tx_err = ""
+                        try:
+                            tx_err = str(e)
+                        except Exception:
+                            tx_err = ""
+                        # On-chain only: if wallet has no winning token balance, close immediately.
+                        tok = str(trade.get("token_id", "") or "").strip()
+                        tok_bal = -1
+                        if tok.isdigit():
+                            try:
+                                tok_bal = await loop.run_in_executor(
+                                    None,
+                                    lambda ti=int(tok): ctf.functions.balanceOf(_addr_cs, ti).call(),
                                 )
-                                continue
+                            except Exception:
+                                tok_bal = -1
+                        if tok_bal == 0:
+                            redeem_confirmed = True
+                            suffix = "onchain-no-wallet-balance"
+                            self._redeem_retry_not_before.pop(cid, None)
                         else:
-                            checks = int(self._redeem_verify_counts.get(cid, 0)) + 1
-                            self._redeem_verify_counts[cid] = checks
-                            if checks < 3:
-                                print(
-                                    f"{Y}[REDEEM-VERIFY]{RS} non-claimable; waiting confirm "
-                                    f"({checks}/3) | rk={rk} cid={self._short_cid(cid)}"
-                                )
+                            # Still claimable by on-chain preflight: keep queue, retry with cooldown.
+                            if await self._is_redeem_claimable(
+                                ctf=ctf, collat=collat, acct_addr=acct.address,
+                                cid_bytes=cid_bytes, index_set=(1 if side == "Up" else 2), loop=loop
+                            ):
+                                self._redeem_retry_not_before[cid] = _time.time() + 2.5
+                                if self._noisy_log_enabled(f"redeem-retry:{cid}", LOG_REDEEM_WAIT_EVERY_SEC):
+                                    extra = f" ({tx_err})" if tx_err else ""
+                                    print(
+                                        f"{Y}[REDEEM-RETRY]{RS} claimable but tx failed; will retry "
+                                        f"{asset} {side}{extra} | rk={rk} cid={self._short_cid(cid)}"
+                                    )
                                 continue
-                            self._redeem_verify_counts.pop(cid, None)
+                            if REDEEM_REQUIRE_ONCHAIN_CONFIRM:
+                                if tok_bal == 0:
+                                    redeem_confirmed = True
+                                    suffix = "onchain-no-wallet-balance"
+                                else:
+                                    print(
+                                        f"{Y}[REDEEM-UNCONFIRMED]{RS} waiting on-chain confirm "
+                                        f"(tx missing, token_balance={tok_bal}) | rk={rk} cid={self._short_cid(cid)}"
+                                    )
+                                    continue
+                            else:
+                                checks = int(self._redeem_verify_counts.get(cid, 0)) + 1
+                                self._redeem_verify_counts[cid] = checks
+                                if checks < 3:
+                                    print(
+                                        f"{Y}[REDEEM-VERIFY]{RS} non-claimable; waiting confirm "
+                                        f"({checks}/3) | rk={rk} cid={self._short_cid(cid)}"
+                                    )
+                                    continue
+                                self._redeem_verify_counts.pop(cid, None)
 
                     # Record win only after strict on-chain confirmation.
                     if REDEEM_REQUIRE_ONCHAIN_CONFIRM and not redeem_confirmed:
@@ -486,5 +480,6 @@ async def _redeem_loop(self):
             self.onchain_open_shares_by_cid.pop(cid, None)
             self.onchain_open_meta_by_cid.pop(cid, None)
             self._booster_used_by_cid.pop(cid, None)
+            self._redeem_retry_not_before.pop(cid, None)
         if changed_pending:
             self._save_pending()
