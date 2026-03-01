@@ -89,7 +89,7 @@ async def _execute_trade(self, sig: dict):
               f"bs={sig['bs_prob']:.3f} mom={sig['mom_prob']:.3f} prob={sig['true_prob']:.3f} "
               f"mkt={sig['up_price']:.3f} edge={sig['edge']:.3f} "
               f"@{sig['entry']*100:.0f}¢→{(1/sig['entry']):.2f}x ${sig['size']:.2f}"
-              f"{agree_str}{ob_str}{tf_str} tk={sig['taker_ratio']:.2f} vol={sig['vol_ratio']:.1f}x"
+              f"{agree_str}{ob_str}{tf_str} tk={sig.get('taker_ratio', 0.0):.2f} vol={sig.get('vol_ratio', 0.0):.1f}x"
               f"{perp_str}{vwap_str}{cross_str} {chain_str}{cont_str}{hc_tag}{RS}")
     else:
         hc_tag = " hc15" if sig.get("hc15_mode") else ""
@@ -169,8 +169,9 @@ async def _execute_trade(self, sig: dict):
             return
         # Side/token integrity check before execution:
         # ensures we are sending BUY on the token corresponding to the normalized side.
-        token_up = str((m or {}).get("token_up", "") or "")
-        token_down = str((m or {}).get("token_down", "") or "")
+        # Prefer token snapshot from signal creation time (avoids stale-m race condition)
+        token_up = str(sig.get("snap_token_up") or (m or {}).get("token_up", "") or "")
+        token_down = str(sig.get("snap_token_down") or (m or {}).get("token_down", "") or "")
         expected_token = token_up if sig.get("side") == "Up" else (token_down if sig.get("side") == "Down" else "")
         actual_token = str(sig.get("token_id", "") or "")
         if expected_token and actual_token and expected_token != actual_token:

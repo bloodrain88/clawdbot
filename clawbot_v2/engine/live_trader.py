@@ -5109,6 +5109,10 @@ class LiveTrader:
                 "max_entry_allowed": max_entry_allowed,
                 "analysis_quality": 0.50,
                 "analysis_conviction": 0.50,
+                "taker_ratio": 0.0,
+                "vol_ratio": 0.0,
+                "snap_token_up": str(m.get("token_up", "") or ""),
+                "snap_token_down": str(m.get("token_down", "") or ""),
                 "round_force_coverage": True,
                 "round_force_execute": True,
             }

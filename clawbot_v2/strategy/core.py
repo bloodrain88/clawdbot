@@ -2274,6 +2274,8 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
 
     return {
         "cid": cid, "m": m, "score": score,
+        "snap_token_up": str(m.get("token_up", "") or ""),
+        "snap_token_down": str(m.get("token_down", "") or ""),
         "side": side, "entry": entry, "size": size, "token_id": token_id,
         "true_prob": true_prob, "cl_agree": cl_agree, "min_edge": min_edge,
         "force_taker": force_taker, "edge": edge,
