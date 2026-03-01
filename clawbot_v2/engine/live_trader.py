@@ -260,8 +260,8 @@ LOW_ENTRY_SIZE_HAIRCUT_KEEP_SCORE = int(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_K
 LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB = float(os.environ.get("LOW_ENTRY_SIZE_HAIRCUT_KEEP_PROB", "0.80"))
 TRADE_ALL_MARKETS = os.environ.get("TRADE_ALL_MARKETS", "true").lower() == "true"
 ROUND_BEST_ONLY = os.environ.get("ROUND_BEST_ONLY", "false").lower() == "true"
-FORCE_TRADE_EVERY_ROUND = os.environ.get("FORCE_TRADE_EVERY_ROUND", "true").lower() == "true"
-NO_TRADE_RECOVERY_ENABLED = True
+FORCE_TRADE_EVERY_ROUND = os.environ.get("FORCE_TRADE_EVERY_ROUND", "false").lower() == "true"
+NO_TRADE_RECOVERY_ENABLED = False
 NO_TRADE_RECOVERY_ROUNDS = int(os.environ.get("NO_TRADE_RECOVERY_ROUNDS", "2"))
 FORCE_COVERAGE_MIN_PAYOUT_15M = float(os.environ.get("FORCE_COVERAGE_MIN_PAYOUT_15M", "1.40"))
 FORCE_COVERAGE_MIN_EV_15M = float(os.environ.get("FORCE_COVERAGE_MIN_EV_15M", "0.000"))
@@ -7657,53 +7657,7 @@ class LiveTrader:
                 if candidates:
                     self._perf_update("score_ms", elapsed_ms / max(1, len(candidates)))
                 valid   = sorted([s for s in signals if s is not None], key=lambda x: -x["score"])
-                # Must-fire: if no signal passed gate and we're in last N min of a 15m window, relax gate
-                if not valid and LATE_MUST_FIRE_ENABLED:
-                    late_cands = [
-                        c for c in candidates
-                        if c.get("duration", 0) >= 15 and c.get("mins_left", 99) <= LATE_MUST_FIRE_MINS_LEFT
-                    ]
-                    if late_cands:
-                        late_sigs = list(await asyncio.gather(*[self._score_market(c, late_relax=True) for c in late_cands]))
-                        late_valid = sorted([s for s in late_sigs if s is not None], key=lambda x: -x["score"])
-                        if late_valid:
-                            print(
-                                f"{Y}[MUST-FIRE]{RS} last {LATE_MUST_FIRE_MINS_LEFT:.0f}min: gate relaxed → "
-                                f"{late_valid[0]['asset']} {late_valid[0]['side']} score={late_valid[0]['score']}"
-                            )
-                            valid = late_valid
-                if not valid and candidates:
-                    relaxed_all = list(await asyncio.gather(*[self._score_market(c, late_relax=True) for c in candidates]))
-                    relaxed_valid = sorted([s for s in relaxed_all if s is not None], key=self._signal_growth_score, reverse=True)
-                    if relaxed_valid:
-                        for s in relaxed_valid:
-                            s["round_force_coverage"] = True
-                        valid = relaxed_valid
-                        if self._should_log("round-force-coverage", 20):
-                            top = relaxed_valid[0]
-                            print(
-                                f"{Y}[ROUND-FORCE]{RS} coverage fallback -> "
-                                f"{top['asset']} {top['duration']}m {top['side']} score={top['score']} "
-                                f"g={self._signal_growth_score(top):+.3f}"
-                            )
-                    else:
-                        forced_sigs = [self._build_forced_round_signal(c) for c in candidates]
-                        forced_valid = [s for s in forced_sigs if s is not None]
-                        forced_valid = sorted(
-                            forced_valid,
-                            key=lambda s: abs(float(s.get("edge", 0.0) or 0.0)),
-                            reverse=True,
-                        )
-                        if forced_valid:
-                            valid = forced_valid
-                            if self._should_log("round-force-synth", 10):
-                                top = forced_valid[0]
-                                print(
-                                    f"{Y}[ROUND-FORCE-SYNTH]{RS} "
-                                    f"{top.get('asset','?')} {top.get('duration','?')}m "
-                                    f"{top.get('side','?')} entry={float(top.get('entry',0.0) or 0.0):.3f} "
-                                    f"edge={float(top.get('edge',0.0) or 0.0):+.3f}"
-                                )
+                # Force/synth fallback disabled: only real high-quality signals execute.
                 if ENABLE_5M and (not self._enable_5m_runtime) and valid and not (PROFIT_PUSH_MODE and PROFIT_PUSH_ADAPTIVE_MODE):
                     pre_n = len(valid)
                     valid = [s for s in valid if int(s.get("duration", 0) or 0) > 5]

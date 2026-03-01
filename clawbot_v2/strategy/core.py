@@ -323,22 +323,12 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
             and ((_time.time() - float(ws_book_now.get("ts", 0.0) or 0.0)) * 1000.0) <= CLOB_REST_FRESH_MAX_AGE_MS
         )
         if not allow_strict_rest:
-            strict_bypass = bool(FORCE_TRADE_EVERY_ROUND and late_relax and isinstance(ws_book_now, dict))
-            if strict_bypass:
-                score -= max(1, int(round(WS_FALLBACK_SCORE_PEN)))
-                edge -= 0.003
-                if self._noisy_log_enabled(f"ws-strict-bypass:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    print(
-                        f"{Y}[WS-STRICT-BYPASS]{RS} {asset} {duration}m using degraded book "
-                        f"(round-force late-relax)"
-                    )
-            else:
-                if self._noisy_log_enabled(f"skip-strict-ws:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
-                    print(
-                        f"{Y}[SKIP] {asset} {duration}m strict WS required (no fresh strict book){RS}"
-                    )
-                self._skip_tick("book_ws_strict_required")
-                return None
+            if self._noisy_log_enabled(f"skip-strict-ws:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
+                print(
+                    f"{Y}[SKIP] {asset} {duration}m strict WS required (no fresh strict book){RS}"
+                )
+            self._skip_tick("book_ws_strict_required")
+            return None
 
     # Additional instant signals from Binance cache (zero latency)
     dw_ob     = self._ob_depth_weighted(asset)
@@ -1275,7 +1265,6 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                     )
     if score < min_score_local:
         return None
-    force_coverage_mode = bool(FORCE_TRADE_EVERY_ROUND and late_relax)
     # Per-asset blocking for 15m
     if duration >= 15:
         asset = m.get("asset", "")
@@ -1292,12 +1281,8 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                     self._skip_tick("asset_soft_blocked_low_score")
                     return None
             else:
-                if force_coverage_mode:
-                    score -= max(2, ASSET_BLOCK_SOFT_SCORE_PEN + 1)
-                    edge -= max(0.010, ASSET_BLOCK_SOFT_EDGE_PEN + 0.004)
-                else:
-                    self._skip_tick("asset_blocked_sol" if asset == "SOL" else "asset_blocked_xrp")
-                    return None
+                self._skip_tick("asset_blocked_sol" if asset == "SOL" else "asset_blocked_xrp")
+                return None
     # Per-tier blocking via env vars (default all off)
     if duration >= 15:
         score_tier = "s12+" if score >= 12 else ("s9-11" if score >= 9 else "s0-8")
@@ -1314,22 +1299,14 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                     self._skip_tick(f"score_tier_soft_blocked_{score_tier}")
                     return None
             else:
-                if force_coverage_mode:
-                    score -= 2
-                    edge -= max(0.006, SCORE_BLOCK_SOFT_EDGE_PEN)
-                else:
-                    self._skip_tick(
-                        "score_tier_blocked_s0_8" if score_tier == "s0-8"
-                        else ("score_tier_blocked_s9_11" if score_tier == "s9-11" else "score_tier_blocked_s12p")
-                    )
-                    return None
-        if score_tier == "s0-8" and MIN_ENTRY_PRICE_S0_8_15M > 0 and entry < MIN_ENTRY_PRICE_S0_8_15M:
-            if force_coverage_mode:
-                score -= 1
-                edge -= 0.004
-            else:
-                self._skip_tick("score_s0_8_entry_too_low")
+                self._skip_tick(
+                    "score_tier_blocked_s0_8" if score_tier == "s0-8"
+                    else ("score_tier_blocked_s9_11" if score_tier == "s9-11" else "score_tier_blocked_s12p")
+                )
                 return None
+        if score_tier == "s0-8" and MIN_ENTRY_PRICE_S0_8_15M > 0 and entry < MIN_ENTRY_PRICE_S0_8_15M:
+            self._skip_tick("score_s0_8_entry_too_low")
+            return None
 
     token_id = m["token_up"] if side == "Up" else m["token_down"]
     if not token_id:
@@ -1467,9 +1444,6 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
         else:
             dyn_floor = 1.62
         min_payout_req = max(min_payout_req, dyn_floor)
-    if force_coverage_mode and duration >= 15:
-        min_payout_req = min(min_payout_req, max(1.10, FORCE_COVERAGE_MIN_PAYOUT_15M))
-        min_ev_req = min(min_ev_req, FORCE_COVERAGE_MIN_EV_15M)
     # Late-window locked-direction payout relax:
     # Win rate is ~72-78% in last LATE_PAYOUT_RELAX_PCT_LEFT of window → 1.65x payout is +EV.
     # This recovers the 33% skip rate from payout_below on late-window aligned entries.
@@ -1560,12 +1534,6 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
             # Don't miss good-payout setups: park a pullback limit at max acceptable entry.
             use_limit = True
             entry = max_entry_allowed
-        elif force_coverage_mode:
-            # Force coverage near expiry: clamp entry to allowed range, use taker.
-            entry = max(min_entry_allowed, min(live_entry, max_entry_allowed))
-            use_limit = False
-            if self._noisy_log_enabled(f"entry-force-clamp:{asset}:{side}", LOG_FLOW_EVERY_SEC):
-                print(f"{Y}[ENTRY-FORCE-CLAMP]{RS} {asset} {side} entry={live_entry:.3f}→{entry:.3f} (force-coverage)")
         else:
             if self._noisy_log_enabled(f"skip-score-entry:{asset}:{side}", LOG_SKIP_EVERY_SEC):
                 print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} outside [{min_entry_allowed:.2f},{max_entry_allowed:.2f}]{RS}")
@@ -1595,24 +1563,15 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
     exec_slip_cost, exec_nofill_penalty, exec_fill_ratio = self._execution_penalties(duration, score, entry)
     execution_ev = ev_net - exec_slip_cost - exec_nofill_penalty
     if execution_ev < min_ev_req:
-        if force_coverage_mode and duration >= 15 and execution_ev >= FORCE_COVERAGE_HARD_MIN_EV_15M:
-            if self._noisy_log_enabled(f"force-ev-relax:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
-                print(
-                    f"{Y}[FORCE-EV-RELAX]{RS} {asset} {duration}m {side} "
-                    f"exec_ev={execution_ev:.3f} < min={min_ev_req:.3f} "
-                    f"(hard_min={FORCE_COVERAGE_HARD_MIN_EV_15M:.3f})"
-                )
-        else:
-            if self._noisy_log_enabled(f"skip-score-ev:{asset}:{side}", LOG_SKIP_EVERY_SEC):
-                print(
-                    f"{Y}[SKIP] {asset} {side} exec_ev={execution_ev:.3f} "
-                    f"(ev={ev_net:.3f} slip={exec_slip_cost:.3f} nofill={exec_nofill_penalty:.3f}) "
-                    f"< min={min_ev_req:.3f}{RS}"
-                )
-            self._skip_tick("ev_below")
-            return None
+        if self._noisy_log_enabled(f"skip-score-ev:{asset}:{side}", LOG_SKIP_EVERY_SEC):
+            print(
+                f"{Y}[SKIP] {asset} {side} exec_ev={execution_ev:.3f} "
+                f"(ev={ev_net:.3f} slip={exec_slip_cost:.3f} nofill={exec_nofill_penalty:.3f}) "
+                f"< min={min_ev_req:.3f}{RS}"
+            )
+        self._skip_tick("ev_below")
+        return None
     if duration >= 15 and (not booster_eval) and CONSISTENCY_CORE_ENABLED:
-        must_fire_active = late_relax and LATE_MUST_FIRE_ENABLED
         core_payout = 1.0 / max(entry, 1e-9)
         dyn_prob_floor = max(
             0.50,
@@ -1628,11 +1587,7 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                 CONSISTENCY_MIN_EXEC_EV_15M + float(rolling_profile.get("ev_add", 0.0) or 0.0),
             ),
         )
-        # Must-fire: relax all consistency floors so at least one trade fires per 15m round
-        if must_fire_active:
-            dyn_prob_floor = max(0.48, dyn_prob_floor - LATE_MUST_FIRE_PROB_RELAX)
-            dyn_ev_floor   = max(0.001, dyn_ev_floor - 0.010)
-        if EV_FRONTIER_ENABLED and (not must_fire_active):
+        if EV_FRONTIER_ENABLED:
             # Entry-aware minimum probability: allow sub-2x only when posterior is strong enough.
             # required_prob = breakeven(entry+fees) + safety margin increasing with expensive entries.
             req_prob = (
@@ -1659,7 +1614,7 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
             and tf_votes >= 3
             and cl_agree
         )
-        _min_payout_consistency = max(1.30, CONSISTENCY_MIN_PAYOUT_15M) if not must_fire_active else 1.30
+        _min_payout_consistency = max(1.30, CONSISTENCY_MIN_PAYOUT_15M)
         if core_payout + 1e-9 < _min_payout_consistency:
             if self._noisy_log_enabled(f"skip-consistency-payout:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(
@@ -1668,7 +1623,7 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                 )
             self._skip_tick("consistency_payout_low")
             return None
-        if CONSISTENCY_REQUIRE_CL_AGREE_15M and (not cl_agree) and (not must_fire_active):
+        if CONSISTENCY_REQUIRE_CL_AGREE_15M and (not cl_agree):
             if self._noisy_log_enabled(f"skip-consistency-cl:{asset}:{cid}", LOG_SKIP_EVERY_SEC):
                 print(f"{Y}[SKIP] {asset} {duration}m consistency: CL disagree on core trade{RS}")
             self._skip_tick("consistency_cl_disagree")
@@ -1947,10 +1902,7 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                     )
 
     if size < MIN_EXEC_NOTIONAL_USDC:
-        if force_coverage_mode:
-            size = max(size, MIN_EXEC_NOTIONAL_USDC, MIN_BET_ABS)
-        else:
-            return None
+        return None
 
     # Portfolio sizing mix (non-blocking):
     # - core zone: slightly larger size
