@@ -1562,6 +1562,12 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
             # Don't miss good-payout setups: park a pullback limit at max acceptable entry.
             use_limit = True
             entry = max_entry_allowed
+        elif force_coverage_mode:
+            # Force coverage near expiry: clamp entry to allowed range, use taker.
+            entry = max(min_entry_allowed, min(live_entry, max_entry_allowed))
+            use_limit = False
+            if self._noisy_log_enabled(f"entry-force-clamp:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                print(f"{Y}[ENTRY-FORCE-CLAMP]{RS} {asset} {side} entry={live_entry:.3f}→{entry:.3f} (force-coverage)")
         else:
             if self._noisy_log_enabled(f"skip-score-entry:{asset}:{side}", LOG_SKIP_EVERY_SEC):
                 print(f"{Y}[SKIP] {asset} {side} entry={live_entry:.3f} outside [{min_entry_allowed:.2f},{max_entry_allowed:.2f}]{RS}")
