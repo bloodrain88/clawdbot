@@ -505,9 +505,21 @@ async def _score_market(self, m: dict) -> dict | None:
     # 7. Chainlink oracle agreement
     if cl_agree:  llr += LLR_CL_AGREE
     else:         llr -= LLR_CL_DISAGREE
-    # 8. BTC lead for altcoins
+    # 8. BTC lead for altcoins (30-60s lag momentum)
     if asset != "BTC":
         llr += (btc_lead_p - 0.5) * LLR_BTC_LEAD_MULT
+    # 8b. BTC round-open displacement for alts (established trend this round)
+    if asset != "BTC":
+        _btc_cur = float(self.cl_prices.get("BTC") or self.prices.get("BTC") or 0)
+        _btc_ph  = self.price_history.get("BTC") or []
+        _st      = m["start_ts"]
+        _btc_at_open = next((p for ts, p in _btc_ph if _st - 30 <= ts <= _st + 90), None)
+        if _btc_at_open and _btc_cur > 0 and _btc_at_open > 0:
+            _btc_rnd_ret  = (_btc_cur - _btc_at_open) / _btc_at_open
+            _btc_sigma15  = self.vols.get("BTC", 0.65) * (15 / (252 * 390)) ** 0.5
+            if _btc_sigma15 > 0:
+                _corr = {"ETH": 0.82, "SOL": 0.80, "XRP": 0.78}.get(asset, 0.77)
+                llr += _btc_rnd_ret / _btc_sigma15 * _corr * LLR_BTC_ROUNDDISP_MULT
     # 9. 20-minute kline trend (macro directional context)
     _klines = (self.binance_cache.get(asset, {}) or {}).get("klines", [])
     if len(_klines) >= 4 and sigma_15m > 0:
