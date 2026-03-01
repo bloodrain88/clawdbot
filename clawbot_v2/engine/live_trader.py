@@ -5034,9 +5034,11 @@ class LiveTrader:
                 return None
             open_price = float(self.open_prices.get(cid, 0.0) or 0.0)
             if open_price <= 0:
+                print(f"{Y}[FORCE-SYNTH-SKIP]{RS} {asset} {duration}m no open_price (cid={self._short_cid(cid)})")
                 return None
             current = float(self._current_price(asset) or 0.0)
             if current <= 0:
+                print(f"{Y}[FORCE-SYNTH-SKIP]{RS} {asset} {duration}m no current price (RTDS+CL both 0)")
                 return None
             side = "Up" if current >= open_price else "Down"
             up_price = float(m.get("up_price", 0.5) or 0.5)
@@ -5060,6 +5062,8 @@ class LiveTrader:
             size = max(max(MIN_BET_ABS, MIN_EXEC_NOTIONAL_USDC), round(size, 2))
             if size > self.bankroll * MAX_BANKROLL_PCT:
                 size = round(self.bankroll * MAX_BANKROLL_PCT, 2)
+            # Guarantee size is always above execution minimum after bankroll cap.
+            size = max(size, MIN_EXEC_NOTIONAL_USDC, MIN_BET_ABS)
             if size <= 0:
                 return None
             cl_now = float(self.cl_prices.get(asset, 0.0) or 0.0)

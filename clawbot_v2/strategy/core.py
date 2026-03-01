@@ -1293,14 +1293,9 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                     return None
             else:
                 if force_coverage_mode:
-                    score -= max(2, ASSET_BLOCK_SOFT_SCORE_PEN + 1)
-                    edge -= max(0.010, ASSET_BLOCK_SOFT_EDGE_PEN + 0.004)
-                    if self._noisy_log_enabled(f"asset-force-soft:{asset}:{side}", LOG_FLOW_EVERY_SEC):
-                        print(
-                            f"{Y}[ASSET-GATE-FORCE]{RS} {asset} {duration}m soften hard block "
-                            f"(score-={max(2, ASSET_BLOCK_SOFT_SCORE_PEN + 1)} "
-                            f"edge-={max(0.010, ASSET_BLOCK_SOFT_EDGE_PEN + 0.004):.3f})"
-                        )
+                    # Force coverage: pass through with no penalty so EV stays above hard floor.
+                    if self._noisy_log_enabled(f"asset-force-bypass:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                        print(f"{Y}[ASSET-FORCE-BYPASS]{RS} {asset} {duration}m bypassed (force-coverage)")
                 else:
                     self._skip_tick("asset_blocked_sol" if asset == "SOL" else "asset_blocked_xrp")
                     return None
@@ -1321,8 +1316,9 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                     return None
             else:
                 if force_coverage_mode:
-                    score -= 2
-                    edge -= max(0.006, SCORE_BLOCK_SOFT_EDGE_PEN)
+                    # Force coverage: pass through with no penalty so EV stays above hard floor.
+                    if self._noisy_log_enabled(f"tier-force-bypass:{asset}:{side}", LOG_FLOW_EVERY_SEC):
+                        print(f"{Y}[TIER-FORCE-BYPASS]{RS} {asset} {duration}m {score_tier} bypassed (force-coverage)")
                 else:
                     self._skip_tick(
                         "score_tier_blocked_s0_8" if score_tier == "s0-8"
@@ -1595,12 +1591,12 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
     exec_slip_cost, exec_nofill_penalty, exec_fill_ratio = self._execution_penalties(duration, score, entry)
     execution_ev = ev_net - exec_slip_cost - exec_nofill_penalty
     if execution_ev < min_ev_req:
-        if force_coverage_mode and duration >= 15 and execution_ev >= FORCE_COVERAGE_HARD_MIN_EV_15M:
-            if self._noisy_log_enabled(f"force-ev-relax:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
+        if force_coverage_mode and duration >= 15:
+            # Force coverage: accept any EV — must fire a trade this round.
+            if self._noisy_log_enabled(f"force-ev-accept:{asset}:{cid}", LOG_FLOW_EVERY_SEC):
                 print(
-                    f"{Y}[FORCE-EV-RELAX]{RS} {asset} {duration}m {side} "
-                    f"exec_ev={execution_ev:.3f} < min={min_ev_req:.3f} "
-                    f"(hard_min={FORCE_COVERAGE_HARD_MIN_EV_15M:.3f})"
+                    f"{Y}[FORCE-EV-ACCEPT]{RS} {asset} {duration}m {side} "
+                    f"exec_ev={execution_ev:.3f} < min={min_ev_req:.3f} (force-coverage)"
                 )
         else:
             if self._noisy_log_enabled(f"skip-score-ev:{asset}:{side}", LOG_SKIP_EVERY_SEC):
