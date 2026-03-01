@@ -5058,7 +5058,7 @@ class LiveTrader:
             move_str = f"{move_rel:+.3%}"
             true_prob = max(0.50, min(0.62, 0.50 + min(0.12, abs(move_rel) * 3.0)))
             edge = true_prob - entry
-            size = float(self._kelly_size(true_prob=true_prob, entry=entry, kelly_frac=KELLY_FRACTION))
+            size = float(self._kelly_size(true_prob=true_prob, entry=entry, kelly_frac=0.10))
             size = max(max(MIN_BET_ABS, MIN_EXEC_NOTIONAL_USDC), round(size, 2))
             if size > self.bankroll * MAX_BANKROLL_PCT:
                 size = round(self.bankroll * MAX_BANKROLL_PCT, 2)

@@ -1949,7 +1949,10 @@ async def _score_market(self, m: dict, late_relax: bool = False) -> dict | None:
                     )
 
     if size < MIN_EXEC_NOTIONAL_USDC:
-        return None
+        if force_coverage_mode:
+            size = max(size, MIN_EXEC_NOTIONAL_USDC, MIN_BET_ABS)
+        else:
+            return None
 
     # Portfolio sizing mix (non-blocking):
     # - core zone: slightly larger size
